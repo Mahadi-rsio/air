@@ -71,6 +71,14 @@
 
 ---
 
-## Stage 3 — Cooperative Scale-to-Zero, Deep Freeze & Wire Multiplexer (`PENDING`)
-- [ ] **`EXP-B1`..`EXP-B5` (`UQR-08`, `ADR-007`):** Warm/crash/cold wake latency benchmarks (`ConnectTime` vs `FirstQueryTime`), Gateway-controlled cooperative drain (`LISTEN`/`TEMP`/`2PC` pinning + `0` `ECONNRESET` across 1,000 shutdown boundary races), and `singleflight` 1,000-client wake-storm coalescing (`1` PG spawn per DB).
-- [ ] **`EXP-E1`..`EXP-E4` (`UQR-09`, `ADR-009`):** Stage-3 `pgproto3` session-state virtualizer, ORM/driver compatibility suite (`pgx`, `psql`, prepared statement remapping, `CancelRequest`), and slow-reader `COPY OUT` backpressure stress test.
+## Stage 3 — Cooperative Scale-to-Zero, Deep Freeze & Wire Multiplexer (`COMPLETED`)
+- [x] **`EXP-B1`..`EXP-B5` (`UQR-08`, `ADR-007` — [stage3/pkg/scalezero/exp_b.go](file:///workspaces/air/stage3/pkg/scalezero/exp_b.go)):**
+  - [x] **`EXP-B1` (`pass: true`):** Warm local NVMe wake (`10` tables `FirstQueryTime p50 = 149.88 ms`, `500` tables `FirstQueryTime p50 = 145.39 ms`), dirty `SIGKILL` crash-recovery wake (`FirstQueryTime p50 = 238.64 ms`), and Cold `DEEP_FROZEN` Cloudflare R2 hydration (`pg_verifybackup` + restore `FirstQueryTime p50 = 2,913.72 ms`, `deep_freeze_verified: true`).
+  - [x] **`EXP-B2` (`pass: true`):** Cooperative drain vetoed by `LISTEN` (with live `NOTIFY` delivery `listen_notify_delivered: true`), `CREATE TEMP TABLE`, `pg_advisory_lock`, `PREPARE TRANSACTION` (2PC), and `maintenance_lock`; `25/25` sleep/wake loops verified `pg_controldata` `shut down` with `0` `ECONNRESET`.
+  - [x] **`EXP-B3` (`pass: true`):** `1,000/1,000` concurrent `T_idle - 1ms` shutdown-boundary races succeeded with **`0` `ECONNRESET`**.
+  - [x] **`EXP-B4` & `EXP-B5` (`pass: true`):** `100`, `500`, and `1,000` concurrent wake-storm clients coalesced via `singleflight` into exactly **`1` PG spawn per storm** (`pg_spawns = 1`), overflow cleanly rejected with `SQLSTATE 53300` (`0` `other_errors`), and `max_concurrent_starts = 5` semaphore protected sibling OLTP (`p99 = 33.60 ms` during storm).
+- [x] **`EXP-E1`..`EXP-E4` (`UQR-09`, `ADR-009` — [stage3/pkg/wire/virtualizer.go](file:///workspaces/air/stage3/pkg/wire/virtualizer.go) & [stage3/pkg/compatibility/exp_e.go](file:///workspaces/air/stage3/pkg/compatibility/exp_e.go)):**
+  - [x] **`EXP-E1` (`pass: true`):** Stage-3 `pgproto3` session-state virtualizer verified `pgx` Extended Query prepared-statement hashing & backend re-injection across pooled connections, `pgx.Batch` pipeline mode, DDL `0A000`/`26000` invalidation & re-bind, `psql` + `COPY FROM STDIN` / `COPY TO STDOUT`, irreversible session auto-pinning (`LISTEN`/`TEMP`/`SET`), `CancelRequest` (`80877102`) forwarding (`150.43 ms`), and `PgBouncer 1.26.1` compatibility.
+  - [x] **`EXP-E2` (`pass: true`):** `2 GB` `StartupMessage` length-bomb rejected, `SNI != tenant` spoof rejected (`28000`), `Slowloris` stalled pre-auth closed cleanly, and local `bbolt` WAL ledger (`18` events) + `5x` Queue replay (`72` deduplicated) achieved **`0%` duplicate billing** (`23 == 23` RUs).
+  - [x] **`EXP-E3` & `EXP-E4` (`pass: true`):** `5,000` concurrent idle client connections held at **`10.43 KB/conn`** (`< 20 KB` gate), and `20` slow `COPY OUT` readers streaming `92 MB` completed with **`1.20 MB` Gateway heap delta** (`< 30 MB` gate) via per-chunk backpressure.
+- [x] **Stage 3 Artifacts:** Recorded in [stage3-results.json](file:///workspaces/air/stage3/stage3-results.json) (`all_passed: true`).

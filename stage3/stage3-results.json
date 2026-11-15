@@ -1,0 +1,154 @@
+{
+  "timestamp": "2026-11-15T12:30:20Z",
+  "all_passed": true,
+  "group_b": {
+    "pass": true,
+    "exp_b1": {
+      "pass": true,
+      "warm_10tables_connect": {
+        "samples": 10,
+        "p50_ms": 148.21,
+        "p95_ms": 642.03,
+        "p99_ms": 642.03,
+        "max_ms": 642.03
+      },
+      "warm_10tables_first_query": {
+        "samples": 10,
+        "p50_ms": 149.88,
+        "p95_ms": 643.37,
+        "p99_ms": 643.37,
+        "max_ms": 643.37
+      },
+      "warm_500tables_connect": {
+        "samples": 5,
+        "p50_ms": 144.52,
+        "p95_ms": 991.99,
+        "p99_ms": 991.99,
+        "max_ms": 991.99
+      },
+      "warm_500tables_first_query": {
+        "samples": 5,
+        "p50_ms": 145.39,
+        "p95_ms": 998.84,
+        "p99_ms": 998.84,
+        "max_ms": 998.84
+      },
+      "crash_dirty_connect": {
+        "samples": 5,
+        "p50_ms": 237.91,
+        "p95_ms": 1060.09,
+        "p99_ms": 1060.09,
+        "max_ms": 1060.09
+      },
+      "crash_dirty_first_query": {
+        "samples": 5,
+        "p50_ms": 238.64,
+        "p95_ms": 1061.36,
+        "p99_ms": 1061.36,
+        "max_ms": 1061.36
+      },
+      "cold_deep_freeze_connect": {
+        "samples": 2,
+        "p50_ms": 2909.07,
+        "p95_ms": 3490.12,
+        "p99_ms": 3490.12,
+        "max_ms": 3490.12
+      },
+      "cold_deep_freeze_first_query": {
+        "samples": 2,
+        "p50_ms": 2913.72,
+        "p95_ms": 3494.69,
+        "p99_ms": 3494.69,
+        "max_ms": 3494.69
+      },
+      "deep_freeze_verified": true
+    },
+    "exp_b2": {
+      "pass": true,
+      "listen_drain_vetoed": true,
+      "listen_notify_delivered": true,
+      "temp_table_drain_vetoed": true,
+      "advisory_lock_drain_vetoed": true,
+      "two_pc_drain_vetoed": true,
+      "maintenance_lock_vetoed": true,
+      "sleep_wake_loops": 25,
+      "clean_shutdown_count": 25,
+      "unexpected_econnreset": 0
+    },
+    "exp_b3": {
+      "pass": true,
+      "boundary_races": 1000,
+      "succeeded_requests": 1000,
+      "econnreset_count": 0
+    },
+    "exp_b4_b5": {
+      "pass": true,
+      "storm_100": {
+        "clients": 100,
+        "pg_spawns": 1,
+        "succeeded": 90,
+        "clean_53300_rejected": 10,
+        "other_errors": 0,
+        "duration_ms": 1388.68,
+        "gateway_heap_delta_kb": 2246
+      },
+      "storm_500": {
+        "clients": 500,
+        "pg_spawns": 1,
+        "succeeded": 199,
+        "clean_53300_rejected": 301,
+        "other_errors": 0,
+        "duration_ms": 2124.88,
+        "gateway_heap_delta_kb": 7484
+      },
+      "storm_1000": {
+        "clients": 1000,
+        "pg_spawns": 1,
+        "succeeded": 200,
+        "clean_53300_rejected": 800,
+        "other_errors": 0,
+        "duration_ms": 2171.83,
+        "gateway_heap_delta_kb": 19755
+      },
+      "neighbor_baseline_p99_ms": 2.72,
+      "neighbor_during_p99_ms": 33.6,
+      "max_concurrent_starts_cap": 5
+    }
+  },
+  "group_e": {
+    "pass": true,
+    "exp_e1": {
+      "pass": true,
+      "pgx_prepared_virtual_ok": true,
+      "pgx_pipeline_batch_ok": true,
+      "ddl_invalidation_rebind_ok": true,
+      "psql_simple_and_copy_ok": true,
+      "auto_pin_listen_temp_set_ok": true,
+      "cancel_request_ms": 150.43,
+      "cancel_request_ok": true,
+      "pgbouncer_version": "PgBouncer 1.26.1"
+    },
+    "exp_e2": {
+      "pass": true,
+      "length_bomb_rejected": true,
+      "sni_spoof_rejected": true,
+      "slowloris_closed_cleanly": true,
+      "bbolt_events_written": 18,
+      "queue_replay_attempts": 5,
+      "queue_inserted_unique": 18,
+      "queue_deduplicated": 72,
+      "duplicate_billing_pct": 0,
+      "expected_total_rus": 23,
+      "ledger_total_rus": 23
+    },
+    "exp_e3_e4": {
+      "pass": true,
+      "idle_conns_held": 5000,
+      "heap_per_idle_conn_kb": 10.43,
+      "slow_copy_readers": 20,
+      "slow_copy_total_mb": 92,
+      "slow_copy_heap_delta_mb": 1.2,
+      "slow_copy_completed_count": 20
+    }
+  }
+}
