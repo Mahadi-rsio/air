@@ -171,14 +171,25 @@ func (a *Agent) releaseFlockLocked(tenantID string) {
 func (a *Agent) allocOrReusePort(tenantID string) int {
 	a.tenantMu.Lock()
 	defer a.tenantMu.Unlock()
-	if p, ok := a.tenantPorts[tenantID]; ok && p > 0 {
+	portFree := func(p int) bool {
+		for tid, assigned := range a.tenantPorts {
+			if tid != tenantID && assigned == p {
+				return false
+			}
+		}
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err != nil {
+			return false
+		}
+		_ = ln.Close()
+		return true
+	}
+	if p, ok := a.tenantPorts[tenantID]; ok && p > 0 && portFree(p) {
 		return p
 	}
 	for i := 0; i < 200; i++ {
 		p := int(a.portSeq.Add(1))
-		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
-		if err == nil {
-			_ = ln.Close()
+		if portFree(p) {
 			a.tenantPorts[tenantID] = p
 			return p
 		}
@@ -377,7 +388,9 @@ func (a *Agent) StartOrAdoptTenant(tenantID string, epoch int64) (*TenantRuntime
 		logFile := filepath.Join(activeBase, "postgresql.log")
 		if out, err := a.runPostgresCmd(
 			filepath.Join(a.pgBin, "pg_ctl"),
-			"-D", pgData, "-l", logFile, "-w", "-t", "15", "start",
+			"-D", pgData, "-l", logFile, "-w", "-t", "15",
+			"-o", fmt.Sprintf("-p %d", port),
+			"start",
 		); err != nil {
 			a.tenantMu.Lock()
 			a.releaseFlockLocked(tenantID)
