@@ -1,0 +1,227 @@
+#ifndef PG_PRELUDE_H
+#define PG_PRELUDE_H
+
+// pragmas needed to pass compiling with -Wextra
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+
+#include <postgres.h>
+
+#include <access/htup_details.h>
+#include <access/xact.h>
+#include <catalog/namespace.h>
+#include <catalog/pg_authid.h>
+#include <catalog/pg_collation_d.h>
+#include <catalog/pg_proc.h>
+#include <commands/defrem.h>
+#include <commands/event_trigger.h>
+#include <commands/publicationcmds.h>
+#include <common/jsonapi.h>
+#include <executor/executor.h>
+#include <executor/spi.h>
+#include <fmgr.h>
+#include <miscadmin.h>
+#include <nodes/bitmapset.h>
+#include <nodes/makefuncs.h>
+#include <nodes/parsenodes.h>
+#include <nodes/pg_list.h>
+#include <nodes/value.h>
+#include <optimizer/planner.h>
+#include <parser/parse_func.h>
+#include <tcop/utility.h>
+#include <tsearch/ts_locale.h>
+#include <utils/acl.h>
+#include <utils/builtins.h>
+#include <utils/fmgrprotos.h>
+#include <utils/formatting.h>
+#include <utils/guc.h>
+#include <utils/guc_tables.h>
+#include <utils/json.h>
+#include <utils/jsonb.h>
+#include <utils/jsonfuncs.h>
+#include <utils/lsyscache.h>
+#include <utils/memutils.h>
+#include <utils/regproc.h>
+#include <utils/snapmgr.h>
+#include <utils/syscache.h>
+#include <utils/varlena.h>
+
+#pragma GCC diagnostic pop
+
+#define PG14_GTE (PG_VERSION_NUM >= 140000)
+#define PG15_GTE (PG_VERSION_NUM >= 150000)
+#define PG16_GTE (PG_VERSION_NUM >= 160000)
+#define PG17_GTE (PG_VERSION_NUM >= 170000)
+#define PG18_GTE (PG_VERSION_NUM >= 180000)
+#define PG19_GTE (PG_VERSION_NUM >= 190000)
+#define PG17_LT (PG_VERSION_NUM < 170000)
+#define PG16_LT (PG_VERSION_NUM < 160000)
+
+#if PG17_GTE
+
+#  define NEW_JSON_LEX_CONTEXT_CSTRING_LEN(a, b, c, d)                         \
+    makeJsonLexContextCstringLen(NULL, a, b, c, d)
+
+#else
+
+#  define NEW_JSON_LEX_CONTEXT_CSTRING_LEN(a, b, c, d)                         \
+    makeJsonLexContextCstringLen(a, b, c, d)
+
+#endif
+
+#if PG16_GTE
+
+#  define JSON_ACTION_RETURN_TYPE JsonParseErrorType
+#  define JSON_ACTION_RETURN return JSON_SUCCESS
+
+#else
+
+#  define JSON_ACTION_RETURN_TYPE void
+#  define JSON_ACTION_RETURN return
+
+#endif
+
+#if PG14_GTE
+
+#  define PROCESS_UTILITY_PARAMS                                               \
+    PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,            \
+        ProcessUtilityContext context, ParamListInfo params,                   \
+        QueryEnvironment *queryEnv, DestReceiver *dest, QueryCompletion *qc
+#  define PROCESS_UTILITY_ARGS                                                 \
+    pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc
+
+#else // PG13 and below
+
+#  define PROCESS_UTILITY_PARAMS                                               \
+    PlannedStmt *pstmt, const char *queryString,                               \
+        ProcessUtilityContext context, ParamListInfo params,                   \
+        QueryEnvironment *queryEnv, DestReceiver *dest, QueryCompletion *qc
+#  define PROCESS_UTILITY_ARGS                                                 \
+    pstmt, queryString, context, params, queryEnv, dest, qc
+
+// The EVENT_TRIGGEROID was called EVTTRIGGEROID prior pg 14
+#  define EVENT_TRIGGEROID EVTTRIGGEROID
+
+#endif
+
+// The arguments of one ProcessUtility call, so code outside the hook function
+// can chain to the previous hook.
+typedef struct {
+  ProcessUtility_hook_type prev_hook;
+  PlannedStmt             *pstmt;
+  const char              *queryString;
+#if PG14_GTE
+  bool readOnlyTree;
+#endif
+  ProcessUtilityContext context;
+  ParamListInfo         params;
+  QueryEnvironment     *queryEnv;
+  DestReceiver         *dest;
+  QueryCompletion      *qc;
+} utility_hook_args;
+
+// Builds a utility_hook_args from the PROCESS_UTILITY_PARAMS in scope.
+#define UTILITY_HOOK_ARGS(prev_hook)                                           \
+  ((utility_hook_args){prev_hook, PROCESS_UTILITY_ARGS})
+
+static inline void run_prev_utility_hook(const utility_hook_args *args) {
+  if (args->prev_hook != NULL) {
+    args->prev_hook(args->pstmt, args->queryString,
+#if PG14_GTE
+                    args->readOnlyTree,
+#endif
+                    args->context, args->params, args->queryEnv, args->dest,
+                    args->qc);
+  } else {
+    standard_ProcessUtility(args->pstmt, args->queryString,
+#if PG14_GTE
+                            args->readOnlyTree,
+#endif
+                            args->context, args->params, args->queryEnv,
+                            args->dest, args->qc);
+  }
+}
+
+// polyfill
+#if PG17_LT
+
+#  define foreach_internal(type, pointer, var, lst, func)                      \
+    for (type pointer var = 0, pointer var##__outerloop = (type pointer)1;     \
+         var##__outerloop; var##__outerloop = 0)                               \
+      for (ForEachState var##__state = {(lst), 0};                             \
+           (var##__state.l != NIL &&                                           \
+            var##__state.i < var##__state.l->length &&                         \
+            (var = (type pointer)func(                                         \
+                 &var##__state.l->elements[var##__state.i]),                   \
+            true));                                                            \
+           var##__state.i++)
+
+#  define foreach_ptr(type, var, lst)                                          \
+    foreach_internal(type, *, var, lst, lfirst)
+
+#endif
+
+/*
+ * Role lookups. The raw core lookups require a RoleSpec that names a role;
+ * ALTER ROLE ALL has none and PUBLIC is not one. These helpers are the only
+ * callers: they are defined here, above the pragma that blocks the raw names
+ * everywhere else at compile time.
+ */
+
+/**
+ * Oid of the role used for elevation: `supautils.superuser` when set,
+ * otherwise the bootstrap superuser.
+ */
+static inline Oid superuser_oid(const char *superuser) {
+  if (superuser != NULL) {
+    return get_role_oid(superuser, false);
+  }
+  return BOOTSTRAP_SUPERUSERID;
+}
+
+static inline bool role_oid_is_privileged(Oid         role_oid,
+                                          const char *privileged_role) {
+  Oid privileged_role_oid;
+
+  if (privileged_role == NULL || !OidIsValid(role_oid)) {
+    return false;
+  }
+  privileged_role_oid = get_role_oid(privileged_role, true);
+
+  return OidIsValid(privileged_role_oid) &&
+         has_privs_of_role(role_oid, privileged_role_oid);
+}
+
+/**
+ * Whether the current role, or a named role, has the privileges of
+ * `privileged_role`. Both return false when no privileged role is configured.
+ */
+static inline bool is_current_role_privileged(const char *privileged_role) {
+  return role_oid_is_privileged(GetUserId(), privileged_role);
+}
+
+static inline bool is_role_privileged(const char *role,
+                                      const char *privileged_role) {
+  if (role == NULL) return false;
+  return role_oid_is_privileged(get_role_oid(role, true), privileged_role);
+}
+
+/**
+ * The role a RoleSpec names, resolving CURRENT_USER, CURRENT_ROLE and
+ * SESSION_USER. NULL when there is no single named role: a NULL spec, as in
+ * ALTER ROLE ALL, or PUBLIC.
+ */
+static inline const char *rolespec_name_or_null(const RoleSpec *spec) {
+  if (spec == NULL || spec->roletype == ROLESPEC_PUBLIC) return NULL;
+  return get_rolespec_name(spec);
+}
+
+/** Whether a role with this name exists. False for NULL. */
+static inline bool role_exists(const char *role) {
+  return role != NULL && OidIsValid(get_role_oid(role, true));
+}
+
+#pragma GCC poison get_rolespec_name get_rolespec_tuple get_rolespec_oid get_role_oid
+
+#endif /* PG_PRELUDE_H */

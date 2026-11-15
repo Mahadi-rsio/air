@@ -1,0 +1,389 @@
+{
+  "timestamp": "2026-11-15T13:47:10Z",
+  "stage": "Stage 4: Principal Database Engineer Production Readiness Verification",
+  "workstream_1_fencing_leases": {
+    "pass": true,
+    "watchdog_self_fence_deadline_ms": 2000,
+    "control_promote_barrier_ms": 3200,
+    "measured_watchdog_kill_ms": 2000,
+    "measured_new_primary_promote_ms": 3817,
+    "disjoint_safety_margin_ms": 1817,
+    "commits_before_watchdog_kill": 35,
+    "split_brain_commits_after_promotion": 0,
+    "old_primary_quarantined_in_agent": true,
+    "r2_epoch1_initial_etag": "\"dc8d505f30c7714defbd7b946796be17\"",
+    "r2_epoch2_promoted_etag": "\"0d55e98d4e6251fc6c4cc576c5da2d28\"",
+    "zombie_epoch1_cas_rejected_by_r2": true,
+    "zombie_raw_if_match_412_rejected_by_r2": true,
+    "r2_manifest_preserved_epoch2": true
+  },
+  "workstream_2_backup_pitr_gc": {
+    "pass": true,
+    "wal_summary_preflight_count": 10,
+    "staging_headroom_2_2x_verified": true,
+    "full_b0_cipher_bytes": 2753423,
+    "incr_i1_cipher_bytes": 42032,
+    "incr_i2_cipher_bytes": 38286,
+    "archived_wal_segments_uploaded_to_r2": 10,
+    "target_lsn_before_drop_table": "0/700ED70",
+    "restored_row_count_after_combine_pitr": 2300,
+    "expected_row_count_before_drop_table": 2300,
+    "pg_amcheck_passed_post_pitr": true,
+    "dag_gc_case_a_ancestors_preserved": {
+      "retained_backup_ids": [
+        "B0",
+        "B1",
+        "I1",
+        "I2",
+        "I3"
+      ],
+      "retained_ancestor_ids": [
+        "B0",
+        "I1"
+      ],
+      "swept_backup_ids": null,
+      "min_retained_backup_id": "B0",
+      "min_retained_wal_start_lsn": "0/1000000"
+    },
+    "dag_gc_case_b_old_chain_swept_cleanly": {
+      "retained_backup_ids": [
+        "B1",
+        "I3"
+      ],
+      "retained_ancestor_ids": null,
+      "swept_backup_ids": [
+        "B0",
+        "I1",
+        "I2"
+      ],
+      "min_retained_backup_id": "B1",
+      "min_retained_wal_start_lsn": "0/5000000"
+    }
+  },
+  "workstream_3_volume_corruption": {
+    "pass": true,
+    "quota_limit_bytes": 42395694,
+    "measured_disk_at_trip_bytes": 43894830,
+    "quota_detection_latency_ms": 15,
+    "subsequent_write_rejected_read_only": true,
+    "read_only_sqlstate": "25006",
+    "watermark_75_action": "WARN_75PCT_ADMISSION_FREEZE",
+    "watermark_85_action": "URGENT_85PCT_POOL_TRIM",
+    "watermark_92_action": "EMERGENCY_92PCT_BALLAST_TRUNCATED",
+    "ballast_bytes_before_92": 67108864,
+    "ballast_bytes_after_92": 33554432,
+    "corrupted_heap_rel_path": "base/5/16385",
+    "checksum_corruption_detected_xx001": true,
+    "detected_corruption_sqlstate": "XX001",
+    "corrupted_instance_quarantined": true,
+    "recovered_rows_from_r2_after_replacement": 1000,
+    "replacement_pg_amcheck_passed": true
+  },
+  "workstream_4_10_security_isolation": {
+    "pass": true,
+    "vector1_copy_program_blocked": true,
+    "vector1_sqlstate": "42501",
+    "vector2_alter_system_blocked": true,
+    "vector2_sqlstate": "42501",
+    "vector3_pg_read_file_blocked": true,
+    "vector3_sqlstate": "42501",
+    "vector4_role_escalation_blocked": true,
+    "vector4_sqlstate": "42501",
+    "vector5_cross_tenant_kill_blocked": true,
+    "vector6_temp_file_bomb_contained": true,
+    "vector6_sqlstate": "53400",
+    "vector7_cross_uid_0700_read_blocked": true,
+    "victim_baseline_p99_ms": 2.019,
+    "victim_under_attack_p99_ms": 1.96,
+    "victim_latency_ratio": 0.9707776126795442,
+    "victim_dropped_queries": 0
+  },
+  "workstream_5_soak_leak_audit": {
+    "pass": true,
+    "soak_cycles_completed": 25,
+    "agent_lock_fds_before_soak": 0,
+    "agent_lock_fds_after_final_stop": 0,
+    "proc_self_fds_after_warmup": 7,
+    "proc_self_fds_after_50_cycles": 7,
+    "net_leaked_lock_fds": 0,
+    "distinct_ports_assigned_to_tenant": 1
+  },
+  "workstream_6_live_migration": {
+    "pass": true,
+    "seed_rows_pre_migration": 200,
+    "live_commits_during_replication": 15,
+    "live_commits_post_cutover_on_target": 15,
+    "total_acknowledged_commits": 230,
+    "final_target_row_count": 230,
+    "lost_committed_rows": 0,
+    "source_final_sequence_val": 215,
+    "target_synchronized_sequence_val": 215,
+    "sequence_collision_errors_post_cutover": 0,
+    "cutover_pause_duration_ms": 38
+  },
+  "workstream_7_cross_region_dr_kms": {
+    "pass": true,
+    "source_region_iad_rows_committed": 500,
+    "iad_local_state_wiped_before_dr": true,
+    "ord_shared_memory_with_iad_bytes": 0,
+    "ord_manifest_fenced_epoch": 2,
+    "ord_imported_dek_bundle_key_version": "kek-v1",
+    "ord_restored_row_count_from_r2": 500,
+    "ord_pg_amcheck_passed": true,
+    "online_kek_rotation_target_version": "kek-v2",
+    "r2_backup_bytes_reuploaded_during_kek_rotation": 0,
+    "old_kek_v1_revoked_from_keyring": true,
+    "decrypt_backup_after_kek_rotation_and_v1_revoke": true
+  },
+  "workstream_8_wire_protocol_drain": {
+    "pass": true,
+    "wrong_password_rejected_28p01": true,
+    "backend_user_least_privilege": "app_user",
+    "backend_user_is_superuser": false,
+    "copy_from_stdin_rows_streamed": 500,
+    "mid_pipeline_flush_succeeded": true,
+    "discard_all_cleared_state": true,
+    "deallocate_reprepare_success": true,
+    "drain_vetoed_on_open_2pc": true,
+    "drain_succeeded_after_2pc": true
+  },
+  "workstream_9_capacity_pss_finops": {
+    "pass": true,
+    "idle_cluster_profile": {
+      "process_count": 8,
+      "naive_summed_rss_mb": 68.52,
+      "true_kernel_pss_mb": 24.54,
+      "true_kernel_uss_mb": 15.97,
+      "shared_clean_dirty_mb": 52.55,
+      "rss_overcount_ratio": 2.79
+    },
+    "loaded_cluster_profile": {
+      "process_count": 13,
+      "naive_summed_rss_mb": 152.13,
+      "true_kernel_pss_mb": 38.46,
+      "true_kernel_uss_mb": 23.02,
+      "shared_clean_dirty_mb": 129.12,
+      "rss_overcount_ratio": 3.96
+    },
+    "sku_density_table": [
+      {
+        "sku_name": "shared-cpu-1x-256mb",
+        "host_ram_mb": 256,
+        "monthly_instance_cost_usd": 1.94,
+        "safe_max_hot_tenants_pss": 4,
+        "naive_max_hot_tenants_rss": 1
+      },
+      {
+        "sku_name": "shared-cpu-2x-2gb",
+        "host_ram_mb": 2048,
+        "monthly_instance_cost_usd": 12.26,
+        "safe_max_hot_tenants_pss": 39,
+        "naive_max_hot_tenants_rss": 10
+      },
+      {
+        "sku_name": "performance-2x-4gb",
+        "host_ram_mb": 4096,
+        "monthly_instance_cost_usd": 62,
+        "safe_max_hot_tenants_pss": 79,
+        "naive_max_hot_tenants_rss": 20
+      },
+      {
+        "sku_name": "performance-4x-8gb",
+        "host_ram_mb": 8192,
+        "monthly_instance_cost_usd": 124,
+        "safe_max_hot_tenants_pss": 159,
+        "naive_max_hot_tenants_rss": 40
+      }
+    ],
+    "finops_sensitivity_matrix": [
+      {
+        "sku_name": "shared-cpu-1x-256mb",
+        "active_ratio_pct": 5,
+        "provisioned_tenants_per_vm": 80,
+        "active_hot_tenants_per_vm": 4,
+        "monthly_compute_cost_per_tenant_usd": 0.02,
+        "monthly_nvme_cost_per_tenant_usd": 0.08,
+        "monthly_r2_cost_per_tenant_usd": 0.02,
+        "total_monthly_cogs_per_tenant_usd": 0.12,
+        "gross_margin_pct_at_5usd_price": 97.6
+      },
+      {
+        "sku_name": "shared-cpu-1x-256mb",
+        "active_ratio_pct": 10,
+        "provisioned_tenants_per_vm": 40,
+        "active_hot_tenants_per_vm": 4,
+        "monthly_compute_cost_per_tenant_usd": 0.05,
+        "monthly_nvme_cost_per_tenant_usd": 0.08,
+        "monthly_r2_cost_per_tenant_usd": 0.02,
+        "total_monthly_cogs_per_tenant_usd": 0.15,
+        "gross_margin_pct_at_5usd_price": 97
+      },
+      {
+        "sku_name": "shared-cpu-1x-256mb",
+        "active_ratio_pct": 25,
+        "provisioned_tenants_per_vm": 16,
+        "active_hot_tenants_per_vm": 4,
+        "monthly_compute_cost_per_tenant_usd": 0.12,
+        "monthly_nvme_cost_per_tenant_usd": 0.08,
+        "monthly_r2_cost_per_tenant_usd": 0.02,
+        "total_monthly_cogs_per_tenant_usd": 0.22,
+        "gross_margin_pct_at_5usd_price": 95.6
+      },
+      {
+        "sku_name": "shared-cpu-1x-256mb",
+        "active_ratio_pct": 50,
+        "provisioned_tenants_per_vm": 8,
+        "active_hot_tenants_per_vm": 4,
+        "monthly_compute_cost_per_tenant_usd": 0.24,
+        "monthly_nvme_cost_per_tenant_usd": 0.08,
+        "monthly_r2_cost_per_tenant_usd": 0.02,
+        "total_monthly_cogs_per_tenant_usd": 0.34,
+        "gross_margin_pct_at_5usd_price": 93.2
+      },
+      {
+        "sku_name": "shared-cpu-2x-2gb",
+        "active_ratio_pct": 5,
+        "provisioned_tenants_per_vm": 780,
+        "active_hot_tenants_per_vm": 39,
+        "monthly_compute_cost_per_tenant_usd": 0.02,
+        "monthly_nvme_cost_per_tenant_usd": 0.08,
+        "monthly_r2_cost_per_tenant_usd": 0.02,
+        "total_monthly_cogs_per_tenant_usd": 0.12,
+        "gross_margin_pct_at_5usd_price": 97.6
+      },
+      {
+        "sku_name": "shared-cpu-2x-2gb",
+        "active_ratio_pct": 10,
+        "provisioned_tenants_per_vm": 390,
+        "active_hot_tenants_per_vm": 39,
+        "monthly_compute_cost_per_tenant_usd": 0.03,
+        "monthly_nvme_cost_per_tenant_usd": 0.08,
+        "monthly_r2_cost_per_tenant_usd": 0.02,
+        "total_monthly_cogs_per_tenant_usd": 0.13,
+        "gross_margin_pct_at_5usd_price": 97.4
+      },
+      {
+        "sku_name": "shared-cpu-2x-2gb",
+        "active_ratio_pct": 25,
+        "provisioned_tenants_per_vm": 156,
+        "active_hot_tenants_per_vm": 39,
+        "monthly_compute_cost_per_tenant_usd": 0.08,
+        "monthly_nvme_cost_per_tenant_usd": 0.08,
+        "monthly_r2_cost_per_tenant_usd": 0.02,
+        "total_monthly_cogs_per_tenant_usd": 0.18,
+        "gross_margin_pct_at_5usd_price": 96.4
+      },
+      {
+        "sku_name": "shared-cpu-2x-2gb",
+        "active_ratio_pct": 50,
+        "provisioned_tenants_per_vm": 78,
+        "active_hot_tenants_per_vm": 39,
+        "monthly_compute_cost_per_tenant_usd": 0.16,
+        "monthly_nvme_cost_per_tenant_usd": 0.08,
+        "monthly_r2_cost_per_tenant_usd": 0.02,
+        "total_monthly_cogs_per_tenant_usd": 0.26,
+        "gross_margin_pct_at_5usd_price": 94.8
+      },
+      {
+        "sku_name": "performance-2x-4gb",
+        "active_ratio_pct": 5,
+        "provisioned_tenants_per_vm": 1580,
+        "active_hot_tenants_per_vm": 79,
+        "monthly_compute_cost_per_tenant_usd": 0.04,
+        "monthly_nvme_cost_per_tenant_usd": 0.08,
+        "monthly_r2_cost_per_tenant_usd": 0.02,
+        "total_monthly_cogs_per_tenant_usd": 0.14,
+        "gross_margin_pct_at_5usd_price": 97.2
+      },
+      {
+        "sku_name": "performance-2x-4gb",
+        "active_ratio_pct": 10,
+        "provisioned_tenants_per_vm": 790,
+        "active_hot_tenants_per_vm": 79,
+        "monthly_compute_cost_per_tenant_usd": 0.08,
+        "monthly_nvme_cost_per_tenant_usd": 0.08,
+        "monthly_r2_cost_per_tenant_usd": 0.02,
+        "total_monthly_cogs_per_tenant_usd": 0.18,
+        "gross_margin_pct_at_5usd_price": 96.4
+      },
+      {
+        "sku_name": "performance-2x-4gb",
+        "active_ratio_pct": 25,
+        "provisioned_tenants_per_vm": 316,
+        "active_hot_tenants_per_vm": 79,
+        "monthly_compute_cost_per_tenant_usd": 0.2,
+        "monthly_nvme_cost_per_tenant_usd": 0.08,
+        "monthly_r2_cost_per_tenant_usd": 0.02,
+        "total_monthly_cogs_per_tenant_usd": 0.3,
+        "gross_margin_pct_at_5usd_price": 94
+      },
+      {
+        "sku_name": "performance-2x-4gb",
+        "active_ratio_pct": 50,
+        "provisioned_tenants_per_vm": 158,
+        "active_hot_tenants_per_vm": 79,
+        "monthly_compute_cost_per_tenant_usd": 0.39,
+        "monthly_nvme_cost_per_tenant_usd": 0.08,
+        "monthly_r2_cost_per_tenant_usd": 0.02,
+        "total_monthly_cogs_per_tenant_usd": 0.49,
+        "gross_margin_pct_at_5usd_price": 90.2
+      },
+      {
+        "sku_name": "performance-4x-8gb",
+        "active_ratio_pct": 5,
+        "provisioned_tenants_per_vm": 3180,
+        "active_hot_tenants_per_vm": 159,
+        "monthly_compute_cost_per_tenant_usd": 0.04,
+        "monthly_nvme_cost_per_tenant_usd": 0.08,
+        "monthly_r2_cost_per_tenant_usd": 0.02,
+        "total_monthly_cogs_per_tenant_usd": 0.14,
+        "gross_margin_pct_at_5usd_price": 97.2
+      },
+      {
+        "sku_name": "performance-4x-8gb",
+        "active_ratio_pct": 10,
+        "provisioned_tenants_per_vm": 1590,
+        "active_hot_tenants_per_vm": 159,
+        "monthly_compute_cost_per_tenant_usd": 0.08,
+        "monthly_nvme_cost_per_tenant_usd": 0.08,
+        "monthly_r2_cost_per_tenant_usd": 0.02,
+        "total_monthly_cogs_per_tenant_usd": 0.18,
+        "gross_margin_pct_at_5usd_price": 96.4
+      },
+      {
+        "sku_name": "performance-4x-8gb",
+        "active_ratio_pct": 25,
+        "provisioned_tenants_per_vm": 636,
+        "active_hot_tenants_per_vm": 159,
+        "monthly_compute_cost_per_tenant_usd": 0.19,
+        "monthly_nvme_cost_per_tenant_usd": 0.08,
+        "monthly_r2_cost_per_tenant_usd": 0.02,
+        "total_monthly_cogs_per_tenant_usd": 0.29,
+        "gross_margin_pct_at_5usd_price": 94.2
+      },
+      {
+        "sku_name": "performance-4x-8gb",
+        "active_ratio_pct": 50,
+        "provisioned_tenants_per_vm": 318,
+        "active_hot_tenants_per_vm": 159,
+        "monthly_compute_cost_per_tenant_usd": 0.39,
+        "monthly_nvme_cost_per_tenant_usd": 0.08,
+        "monthly_r2_cost_per_tenant_usd": 0.02,
+        "total_monthly_cogs_per_tenant_usd": 0.49,
+        "gross_margin_pct_at_5usd_price": 90.2
+      }
+    ]
+  },
+  "gates_passed": {
+    "GATE-01_fencing_and_monotonic_leases": true,
+    "GATE-02_pitr_dag_and_gc": true,
+    "GATE-03_volume_ballast_and_corruption_recovery": true,
+    "GATE-04_10_red_team_security_and_temp_spill": true,
+    "GATE-05_soak_zero_fd_and_port_leaks": true,
+    "GATE-06_live_logical_migration_and_sequences": true,
+    "GATE-07_cross_region_dr_and_kek_rotation": true,
+    "GATE-08_wire_protocol_and_2pc_drain_guard": true,
+    "GATE-09_pss_memory_and_finops_matrix": true
+  },
+  "all_passed": true
+}
