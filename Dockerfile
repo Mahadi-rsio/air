@@ -38,7 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get update && apt-get install -y --no-install-recommends \
     postgresql-17 postgresql-contrib-17 \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /var/lib/air && chmod 0755 /var/lib/air
+    && mkdir -p /var/lib/air && chown -R postgres:postgres /var/lib/air && chmod 0755 /var/lib/air
 
 COPY --from=pg-builder /usr/lib/postgresql/17/lib/supautils.so /usr/lib/postgresql/17/lib/supautils.so
 COPY --from=go-builder /out/air-server /usr/local/bin/air-server
@@ -52,4 +52,4 @@ ENV AIR_DATA_DIR=/var/lib/air \
     AIR_POOL_MODE=true
 
 EXPOSE 8080 5432
-ENTRYPOINT ["/usr/local/bin/air-server"]
+ENTRYPOINT ["/bin/sh", "-c", "mkdir -p \"${AIR_DATA_DIR:-/var/lib/air}\"; if [ \"$(id -u)\" = \"0\" ]; then chown -R postgres:postgres \"${AIR_DATA_DIR:-/var/lib/air}\"; exec gosu postgres /usr/local/bin/air-server \"$@\"; fi; exec /usr/local/bin/air-server \"$@\"", "--"]

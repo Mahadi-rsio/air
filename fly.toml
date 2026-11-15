@@ -1,0 +1,50 @@
+app = "air-pg-server"
+primary_region = "iad"
+
+[build]
+  image = "ghcr.io/mahadi-rsio/air:v2.0.1"
+
+[experimental]
+  entrypoint = ["/bin/sh", "-c", "mkdir -p /var/lib/air && chown -R postgres:postgres /var/lib/air && exec gosu postgres /usr/local/bin/air-server"]
+
+[env]
+  AIR_DATA_DIR = "/var/lib/air"
+  AIR_PG_BIN_DIR = "/usr/lib/postgresql/17/bin"
+  AIR_HTTP_ADDR = "0.0.0.0:8080"
+  AIR_GATEWAY_ADDR = "0.0.0.0:5432"
+  AIR_POOL_MODE = "true"
+  AIR_BOOTSTRAP_ACCOUNT_ID = "acct_default"
+
+[mounts]
+  source = "air_data"
+  destination = "/var/lib/air"
+  initial_size = "1gb"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "15s"
+    method = "GET"
+    path = "/healthz"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 5432
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 5432
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 2
+  memory = "512mb"
