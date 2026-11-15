@@ -23,6 +23,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// ErrDrainVetoed is returned when cooperative drain/suspend is unsafe because of active transactions,
+// 2PC prepared transactions, session advisory locks, session pins, or unknown backend state.
+var ErrDrainVetoed = errors.New("drain vetoed")
+
 type TenantRuntime struct {
 	TenantID         string `json:"tenant_id"`
 	Port             int    `json:"port"`
@@ -254,6 +258,7 @@ func (a *Agent) ActivateCluster(tenantID, appPassword string, epoch int64) (*Ten
 port = %d
 unix_socket_directories = '%s'
 max_connections = 100
+max_prepared_transactions = 16
 shared_buffers = 32MB
 work_mem = 4MB
 maintenance_work_mem = 16MB
@@ -281,6 +286,7 @@ supautils.restrict_extension_versions = 'error'
 	hba := `
 local   all             postgres                                trust
 local   replication     postgres                                trust
+local   all             app_user                                password
 host    all             postgres        127.0.0.1/32            reject
 host    all             all             127.0.0.1/32            scram-sha-256
 host    replication     postgres        127.0.0.1/32            reject
@@ -911,6 +917,42 @@ func (a *Agent) killAndRemoveTenantCgroupV2(tenantID string, rootPID int) error 
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
+	}
+	return nil
+}
+
+// CheckTenantDrainSafety verifies fail-closed that a tenant has no open 2PC transactions,
+// session advisory locks, or non-idle client backends before cooperative scale-to-zero.
+func (a *Agent) CheckTenantDrainSafety(ctx context.Context, tenantID string) error {
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return err
+	}
+	a.tenantMu.RLock()
+	rt, ok := a.tenants[tenantID]
+	a.tenantMu.RUnlock()
+	if !ok || rt == nil || rt.Port <= 0 {
+		return fmt.Errorf("%w: tenant %s runtime unavailable", ErrDrainVetoed, tenantID)
+	}
+
+	dsn := fmt.Sprintf("postgres://postgres@localhost:%d/%s?host=%s", rt.Port, tenantID, rt.SockDir)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return fmt.Errorf("%w: backend state unknown: %v", ErrDrainVetoed, err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+
+	var prepCount, advCount, busyCount int
+	err = conn.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*)::int FROM pg_prepared_xacts),
+			(SELECT count(*)::int FROM pg_locks WHERE locktype = 'advisory' AND granted),
+			(SELECT count(*)::int FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend' AND state <> 'idle')
+	`).Scan(&prepCount, &advCount, &busyCount)
+	if err != nil {
+		return fmt.Errorf("%w: backend state query failed: %v", ErrDrainVetoed, err)
+	}
+	if prepCount > 0 || advCount > 0 || busyCount > 0 {
+		return fmt.Errorf("%w: prepared_xacts=%d advisory_locks=%d active_clients=%d", ErrDrainVetoed, prepCount, advCount, busyCount)
 	}
 	return nil
 }

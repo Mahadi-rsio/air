@@ -26,6 +26,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/singleflight"
 )
 
 const currentSchemaVersion = 2
@@ -92,6 +93,9 @@ type ControlPlane struct {
 	gatewayPort  int
 	s3Client     *s3.Client
 	backupBucket string
+	wakeGroup    singleflight.Group
+	activityMu   sync.Mutex
+	lastActivity map[string]time.Time
 }
 
 // NewControlPlane initializes a ControlPlane backed by a local single-node PG17 MetaDir.
@@ -198,6 +202,7 @@ func NewControlPlaneWithConfig(ctx context.Context, cfg ControlPlaneConfig) (*Co
 		db:           pool,
 		agent:        cfg.Agent,
 		kms:          cfg.KMS,
+		lastActivity: make(map[string]time.Time),
 	}
 	if err := cp.runMigrations(ctx); err != nil {
 		pool.Close()
@@ -902,6 +907,223 @@ func (cp *ControlPlane) GetTenantRoute(ctx context.Context, tenantID string) (st
 	}
 	err = cp.db.QueryRow(ctx, `SELECT state, direct_port FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&state, &directPort)
 	return state, directPort, err
+}
+
+// TouchTenantActivity updates the in-memory last activity timestamp for idle scale-to-zero tracking.
+func (cp *ControlPlane) TouchTenantActivity(tenantID string) {
+	if tenantID == "" {
+		return
+	}
+	cp.activityMu.Lock()
+	if cp.lastActivity == nil {
+		cp.lastActivity = make(map[string]time.Time)
+	}
+	cp.lastActivity[tenantID] = time.Now()
+	cp.activityMu.Unlock()
+}
+
+// GetTenantRouteAndCredentials resolves tenant state, backend endpoint, and decrypted app_user password.
+func (cp *ControlPlane) GetTenantRouteAndCredentials(ctx context.Context, tenantID string) (state string, directPort int, sockDir string, appPassword string, err error) {
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return "", 0, "", "", err
+	}
+	var owner, encB64, wrappedDEK string
+	err = cp.db.QueryRow(ctx,
+		`SELECT state, direct_port, account_id, app_password_enc, wrapped_dek FROM clusters WHERE tenant_id = $1`,
+		tenantID,
+	).Scan(&state, &directPort, &owner, &encB64, &wrappedDEK)
+	if err != nil {
+		return "", 0, "", "", err
+	}
+	if wrappedDEK != "" {
+		_ = cp.kms.LoadWrappedDEK(tenantID, wrappedDEK)
+	}
+	raw, decErr := base64.StdEncoding.DecodeString(encB64)
+	if decErr == nil {
+		if pt, ptErr := cp.kms.DecryptObject(tenantID, 1, "app_password", raw); ptErr == nil {
+			appPassword = string(pt)
+		}
+	}
+	if cp.agent != nil {
+		if rt, ok := cp.agent.GetTenant(tenantID); ok && rt != nil {
+			sockDir = rt.SockDir
+			if rt.Port > 0 {
+				directPort = rt.Port
+			}
+		} else if sp, spErr := tenant.SafeSubpath(cp.agent.VolDir(), "tenants/active", tenantID); spErr == nil {
+			sockDir = filepath.Join(sp, "sock")
+		}
+	}
+	return state, directPort, sockDir, appPassword, nil
+}
+
+// WakeTenant coalesces concurrent wake requests for a SUSPENDED tenant via singleflight,
+// starting the tenant's PostgreSQL 17 instance once and transitioning state back to ACTIVE.
+func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (directPort int, sockDir string, appPassword string, err error) {
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return 0, "", "", err
+	}
+	if cp.agent == nil {
+		return 0, "", "", errors.New("cell agent not configured")
+	}
+	v, err, _ := cp.wakeGroup.Do(tenantID, func() (any, error) {
+		var curState string
+		var curPort int
+		var epoch int64
+		if qErr := cp.db.QueryRow(ctx,
+			`SELECT state, direct_port, fencing_epoch FROM clusters WHERE tenant_id = $1`,
+			tenantID,
+		).Scan(&curState, &curPort, &epoch); qErr != nil {
+			return nil, qErr
+		}
+		if curState != "SUSPENDED" && curState != "ACTIVE" {
+			return nil, fmt.Errorf("tenant %s cannot wake from state %s", tenantID, curState)
+		}
+		rt, sErr := cp.agent.StartOrAdoptTenant(tenantID, epoch)
+		if sErr != nil {
+			return nil, sErr
+		}
+		if _, uErr := cp.db.Exec(ctx,
+			`UPDATE clusters SET state = 'ACTIVE', direct_port = $2, updated_at = NOW() WHERE tenant_id = $1`,
+			tenantID, rt.Port,
+		); uErr != nil {
+			return nil, uErr
+		}
+		cp.TouchTenantActivity(tenantID)
+		_, _, _, pw, credErr := cp.GetTenantRouteAndCredentials(ctx, tenantID)
+		if credErr != nil {
+			return nil, credErr
+		}
+		return struct {
+			port     int
+			sockDir  string
+			password string
+		}{port: rt.Port, sockDir: rt.SockDir, password: pw}, nil
+	})
+	if err != nil {
+		return 0, "", "", err
+	}
+	res := v.(struct {
+		port     int
+		sockDir  string
+		password string
+	})
+	return res.port, res.sockDir, res.password, nil
+}
+
+// SuspendTenant verifies fail-closed drain guards (including optional pooler drain and live PG17 checks)
+// and transitions an ACTIVE tenant to SUSPENDED via clean pg_ctl stop -m fast.
+func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drainTimeout time.Duration, poolDrainFn func(tenantID string, timeout time.Duration) error) error {
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return err
+	}
+	if cp.agent == nil {
+		return errors.New("cell agent not configured")
+	}
+	if drainTimeout <= 0 {
+		drainTimeout = 3 * time.Second
+	}
+
+	var state string
+	if err := cp.db.QueryRow(ctx, `SELECT state FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&state); err != nil {
+		return err
+	}
+	if state == "SUSPENDED" {
+		return nil
+	}
+	if state != "ACTIVE" {
+		return fmt.Errorf("%w: tenant %s is in state %s", cell.ErrDrainVetoed, tenantID, state)
+	}
+
+	if poolDrainFn != nil {
+		if err := poolDrainFn(tenantID, drainTimeout); err != nil {
+			return err
+		}
+	}
+
+	drainCtx, cancel := context.WithTimeout(ctx, drainTimeout)
+	defer cancel()
+	if err := cp.agent.CheckTenantDrainSafety(drainCtx, tenantID); err != nil {
+		return err
+	}
+
+	if err := cp.agent.StopTenantClean(tenantID); err != nil {
+		return err
+	}
+
+	_, err := cp.db.Exec(ctx,
+		`UPDATE clusters SET state = 'SUSPENDED', updated_at = NOW() WHERE tenant_id = $1 AND state = 'ACTIVE'`,
+		tenantID,
+	)
+	return err
+}
+
+// SuspendIdleTenants suspends any ACTIVE tenant whose last recorded activity exceeds idleTimeout.
+func (cp *ControlPlane) SuspendIdleTenants(ctx context.Context, idleTimeout time.Duration, poolDrainFn func(tenantID string, timeout time.Duration) error) (int, error) {
+	if idleTimeout <= 0 {
+		return 0, nil
+	}
+	rows, err := cp.db.Query(ctx, `SELECT tenant_id FROM clusters WHERE state = 'ACTIVE'`)
+	if err != nil {
+		return 0, err
+	}
+	var activeIDs []string
+	for rows.Next() {
+		var tid string
+		if scanErr := rows.Scan(&tid); scanErr == nil {
+			activeIDs = append(activeIDs, tid)
+		}
+	}
+	rows.Close()
+
+	now := time.Now()
+	suspended := 0
+	for _, tid := range activeIDs {
+		cp.activityMu.Lock()
+		if cp.lastActivity == nil {
+			cp.lastActivity = make(map[string]time.Time)
+		}
+		last, seen := cp.lastActivity[tid]
+		if !seen {
+			cp.lastActivity[tid] = now
+			cp.activityMu.Unlock()
+			continue
+		}
+		cp.activityMu.Unlock()
+
+		if now.Sub(last) < idleTimeout {
+			continue
+		}
+		if err := cp.SuspendTenant(ctx, tid, 2*time.Second, poolDrainFn); err == nil {
+			suspended++
+		}
+	}
+	return suspended, nil
+}
+
+// StartIdleReaper runs periodic cooperative scale-to-zero checks until ctx is cancelled.
+func (cp *ControlPlane) StartIdleReaper(ctx context.Context, idleTimeout, interval time.Duration, poolDrainFn func(tenantID string, timeout time.Duration) error) {
+	if idleTimeout <= 0 {
+		return
+	}
+	if interval <= 0 {
+		interval = idleTimeout / 2
+		if interval < 50*time.Millisecond {
+			interval = 50 * time.Millisecond
+		}
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_, _ = cp.SuspendIdleTenants(ctx, idleTimeout, poolDrainFn)
+			}
+		}
+	}()
 }
 
 func (cp *ControlPlane) decryptTenantPassword(ctx context.Context, accountID, tenantID string) (string, error) {

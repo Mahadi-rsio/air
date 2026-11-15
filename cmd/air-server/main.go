@@ -66,14 +66,21 @@ func main() {
 	}
 
 	gw, err := gateway.NewGatewayWithOptions(cfg.GatewayAddr, cp, gateway.GatewayOptions{
-		RequireTLS:  cfg.RequireTLS,
-		TLSCertPath: cfg.TLSCertPath,
-		TLSKeyPath:  cfg.TLSKeyPath,
+		RequireTLS:      cfg.RequireTLS,
+		TLSCertPath:     cfg.TLSCertPath,
+		TLSKeyPath:      cfg.TLSKeyPath,
+		PoolMode:        cfg.PoolMode,
+		PoolMaxBackends: cfg.PoolMaxBackends,
 	})
 	if err != nil {
 		log.Fatalf("init gateway: %v", err)
 	}
 	defer gw.Close()
+
+	if cfg.IdleTimeout > 0 {
+		cp.StartIdleReaper(ctx, cfg.IdleTimeout, 0, gw.RequestTenantDrain)
+		log.Printf("[air-server] cooperative scale-to-zero enabled (idle_timeout=%s)", cfg.IdleTimeout)
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,

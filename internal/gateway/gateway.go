@@ -27,23 +27,29 @@ const (
 	sslRequestCode         = 80877103
 )
 
-// GatewayOptions configures TLS enforcement and optional custom certificate loading on the Gateway.
+// GatewayOptions configures TLS enforcement, optional custom certificate loading, and transaction-mode pooling on the Gateway.
 type GatewayOptions struct {
-	RequireTLS  bool
-	TLSCertPath string
-	TLSKeyPath  string
+	RequireTLS      bool
+	TLSCertPath     string
+	TLSKeyPath      string
+	PoolMode        bool
+	PoolMaxBackends int
 }
 
 // Gateway is the AIR PostgreSQL wire-protocol gateway.
 // It terminates TLS/SNI, enforces tenant identity & role checks,
-// and proxies authenticated sessions to the tenant's PostgreSQL 17 backend.
+// and proxies or transaction-pools authenticated sessions to the tenant's PostgreSQL 17 backend.
 type Gateway struct {
-	listenAddr string
-	listener   net.Listener
-	tlsConfig  *tls.Config
-	requireTLS bool
-	cp         *control.ControlPlane
-	bufPool    sync.Pool
+	listenAddr      string
+	listener        net.Listener
+	tlsConfig       *tls.Config
+	requireTLS      bool
+	poolMode        bool
+	poolMaxBackends int
+	cp              *control.ControlPlane
+	bufPool         sync.Pool
+	poolsMu         sync.Mutex
+	pools           map[string]*TenantPool
 }
 
 func NewGateway(listenAddr string, cp *control.ControlPlane) (*Gateway, error) {
@@ -74,12 +80,19 @@ func NewGatewayWithOptions(listenAddr string, cp *control.ControlPlane, opts Gat
 	if err != nil {
 		return nil, err
 	}
+	maxBackends := opts.PoolMaxBackends
+	if maxBackends <= 0 {
+		maxBackends = 16
+	}
 	gw := &Gateway{
-		listenAddr: ln.Addr().String(),
-		listener:   ln,
-		tlsConfig:  tlsCfg,
-		requireTLS: opts.RequireTLS,
-		cp:         cp,
+		listenAddr:      ln.Addr().String(),
+		listener:        ln,
+		tlsConfig:       tlsCfg,
+		requireTLS:      opts.RequireTLS,
+		poolMode:        opts.PoolMode,
+		poolMaxBackends: maxBackends,
+		cp:              cp,
+		pools:           make(map[string]*TenantPool),
 		bufPool: sync.Pool{
 			New: func() any {
 				b := make([]byte, 32*1024)
@@ -96,7 +109,35 @@ func (g *Gateway) Addr() string {
 }
 
 func (g *Gateway) Close() error {
+	g.poolsMu.Lock()
+	for _, p := range g.pools {
+		p.closeAllIdle()
+	}
+	g.poolsMu.Unlock()
 	return g.listener.Close()
+}
+
+// RequestTenantDrain drains pooled connections for tenantID before cooperative scale-to-zero.
+func (g *Gateway) RequestTenantDrain(tenantID string, timeout time.Duration) error {
+	g.poolsMu.Lock()
+	p, ok := g.pools[tenantID]
+	g.poolsMu.Unlock()
+	if !ok || p == nil {
+		return nil
+	}
+	return p.RequestDrain(timeout)
+}
+
+func (g *Gateway) getOrCreatePool(tenantID, sockDir string, port int, appPassword string) *TenantPool {
+	g.poolsMu.Lock()
+	defer g.poolsMu.Unlock()
+	if p, ok := g.pools[tenantID]; ok {
+		p.updateEndpoint(sockDir, port, appPassword)
+		return p
+	}
+	p := newTenantPool(tenantID, sockDir, port, appPassword, g.poolMaxBackends)
+	g.pools[tenantID] = p
+	return p
 }
 
 func (g *Gateway) acceptLoop() {
@@ -184,14 +225,39 @@ func (g *Gateway) handleConn(rawConn net.Conn) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	state, directPort, err := g.cp.GetTenantRoute(ctx, startupTenant)
+	state, directPort, sockDir, appPassword, err := g.cp.GetTenantRouteAndCredentials(ctx, startupTenant)
 	cancel()
 	if err != nil {
 		_ = writePGError(clientConn, "3D000", fmt.Sprintf("tenant database %q not found", startupTenant))
 		return
 	}
+	if state == "SUSPENDED" {
+		wakeCtx, wakeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		wPort, wSock, wPass, wakeErr := g.cp.WakeTenant(wakeCtx, startupTenant)
+		wakeCancel()
+		if wakeErr != nil {
+			_ = writePGError(clientConn, "57P03", fmt.Sprintf("tenant database %q wake failed: %v", startupTenant, wakeErr))
+			return
+		}
+		state = "ACTIVE"
+		directPort = wPort
+		sockDir = wSock
+		if wPass != "" {
+			appPassword = wPass
+		}
+	}
 	if state != "ACTIVE" || directPort <= 0 {
 		_ = writePGError(clientConn, "57P03", fmt.Sprintf("tenant database %q is in state %s", startupTenant, state))
+		return
+	}
+	g.cp.TouchTenantActivity(startupTenant)
+
+	if g.poolMode {
+		_ = clientConn.SetDeadline(time.Time{})
+		pool := g.getOrCreatePool(startupTenant, sockDir, directPort, appPassword)
+		pool.serveClient(clientConn, reqUser, appPassword, func() {
+			g.cp.TouchTenantActivity(startupTenant)
+		})
 		return
 	}
 

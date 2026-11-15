@@ -14,7 +14,7 @@ flowchart LR
         PC --> PD["Phase D: Live PG17 E2E Verification (9/9 Pass)"]
     end
 
-    subgraph Next["Upcoming: AIR v1.1–1.3 Hardening & AIR v2.0 Pooler"]
+    subgraph Next["Completed: AIR v1.1–1.3 Hardening & AIR v2.0 Pooler"]
         PE["Phase E: Bearer API Auth & Mandatory Gateway TLS"]
         PF["Phase F: CAS-Fenced R2 Backups, WAL Spool & Safe PITR"]
         PG["Phase G: Per-Tenant cgroup v2 & External HA Meta DSN"]
@@ -33,7 +33,7 @@ flowchart LR
 | **Phase E** | Control Plane Bearer Auth & Mandatory Gateway TLS (`AIR v1.1`) | **COMPLETED** | [002_api_keys.sql](file:///workspaces/air/migrations/002_api_keys.sql), [internal/control/http.go](file:///workspaces/air/internal/control/http.go), [internal/gateway/gateway.go](file:///workspaces/air/internal/gateway/gateway.go), [internal/config/config.go](file:///workspaces/air/internal/config/config.go) |
 | **Phase F** | Encrypted WAL Durability, CAS Backups & Safe PITR (`AIR v1.2`) | **COMPLETED** | `internal/fencing`, `internal/backup`, [internal/control/http.go](file:///workspaces/air/internal/control/http.go), [tests/e2e/phase_f_test.go](file:///workspaces/air/tests/e2e/phase_f_test.go) |
 | **Phase G** | Per-Tenant `cgroup v2` Isolation & External HA Meta DB (`AIR v1.3`) | **COMPLETED** | [internal/cell/agent.go](file:///workspaces/air/internal/cell/agent.go), [internal/control/control.go](file:///workspaces/air/internal/control/control.go), [internal/config/config.go](file:///workspaces/air/internal/config/config.go), [tests/e2e/phase_g_test.go](file:///workspaces/air/tests/e2e/phase_g_test.go) |
-| **Phase H** | Transaction-Mode Wire Pooler & Cooperative Scale-to-Zero (`AIR v2.0`) | **NEXT (`PENDING`)** | [internal/gateway](file:///workspaces/air/internal/gateway/gateway.go), [internal/cell/agent.go](file:///workspaces/air/internal/cell/agent.go), [internal/control/control.go](file:///workspaces/air/internal/control/control.go) |
+| **Phase H** | Transaction-Mode Wire Pooler & Cooperative Scale-to-Zero (`AIR v2.0`) | **COMPLETED** | [internal/gateway/pooler.go](file:///workspaces/air/internal/gateway/pooler.go), [internal/gateway/gateway.go](file:///workspaces/air/internal/gateway/gateway.go), [internal/cell/agent.go](file:///workspaces/air/internal/cell/agent.go), [internal/control/control.go](file:///workspaces/air/internal/control/control.go), [tests/e2e/phase_h_test.go](file:///workspaces/air/tests/e2e/phase_h_test.go) |
 
 ---
 
@@ -69,9 +69,9 @@ flowchart LR
 
 ---
 
-## 3. Upcoming Phases (Phases E–H)
+## 3. Completed Hardening & Pooler Phases (Phases E–H — `AIR v1.1` to `AIR v2.0`)
 
-### Phase E — Control Plane Bearer Authentication & Mandatory Gateway TLS (`AIR v1.1`)
+### Phase E — Control Plane Bearer Authentication & Mandatory Gateway TLS (`AIR v1.1` — `COMPLETED`)
 
 #### Objective
 Close the authentication and transport security prerequisites from [16-updated-production-verdict.md](file:///workspaces/air/audit/16-updated-production-verdict.md#L28):
@@ -103,7 +103,7 @@ Close the authentication and transport security prerequisites from [16-updated-p
 
 ---
 
-### Phase F — Encrypted WAL Durability, CAS-Fenced Backups & Streaming-Safe PITR (`AIR v1.2`)
+### Phase F — Encrypted WAL Durability, CAS-Fenced Backups & Streaming-Safe PITR (`AIR v1.2` — `COMPLETED`)
 
 #### Objective
 Close the backup/WAL/PITR production readiness prerequisites from [16-updated-production-verdict.md](file:///workspaces/air/audit/16-updated-production-verdict.md#L29-L30) and integrate continuous durability into the root codebase.
@@ -131,7 +131,7 @@ Close the backup/WAL/PITR production readiness prerequisites from [16-updated-pr
 
 ---
 
-### Phase G — Per-Tenant `cgroup v2` Resource Isolation & External HA Metadata DB (`AIR v1.3`)
+### Phase G — Per-Tenant `cgroup v2` Resource Isolation & External HA Metadata DB (`AIR v1.3` — `COMPLETED`)
 
 #### Objective
 Enforce kernel-level noisy-neighbor isolation per tenant process tree and decouple the Control Plane from a single-node local metadata directory ([16-updated-production-verdict.md](file:///workspaces/air/audit/16-updated-production-verdict.md#L27-L30)).
@@ -154,7 +154,7 @@ Enforce kernel-level noisy-neighbor isolation per tenant process tree and decoup
 
 ---
 
-### Phase H — Transaction-Mode Wire Virtualizer / Pooler & Cooperative Scale-to-Zero (`AIR v2.0`)
+### Phase H — Transaction-Mode Wire Virtualizer / Pooler & Cooperative Scale-to-Zero (`AIR v2.0` — `COMPLETED`)
 
 #### Objective
 Evolve the Gateway from a 1:1 TCP/TLS proxy into a transaction-mode connection pooler with cooperative scale-to-zero and wake-on-connect.

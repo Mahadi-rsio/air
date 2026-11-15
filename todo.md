@@ -207,13 +207,13 @@
 
 ---
 
-## Phase H — Transaction-Mode Wire Virtualizer / Pooler & Cooperative Scale-to-Zero (`AIR v2.0` — `PENDING`)
+## Phase H — Transaction-Mode Wire Virtualizer / Pooler & Cooperative Scale-to-Zero (`AIR v2.0` — `COMPLETED`)
 
-- [ ] **Transaction-Mode Wire Pooler (`internal/gateway/pooler.go`):**
-  - [ ] Integrate transaction-mode connection multiplexing from `stage_test/stage4/pkg/wire/virtualizer.go` into `internal/gateway`.
-  - [ ] Enforce `DISCARD ALL;` on cross-client backend reuse (`lastClientID`), Extended Query prepared-statement tracking, `COPY FROM STDIN` / `COPY TO STDOUT`, and session pinning (`LISTEN`, temp tables, advisory locks).
-- [ ] **Cooperative Drain Guards & Scale-to-Zero (`internal/cell` & `internal/control`):**
-  - [ ] Enforce fail-closed drain guards (`ErrDrainVetoed` on active tx, `pg_prepared_xacts`, session pin, or backend error).
-  - [ ] Implement idle tenant suspend (`ACTIVE -> SUSPENDED`) and `singleflight` wake-on-connect in the Gateway.
-- [ ] **Phase H Live PG17 Verification:**
-  - [ ] Verify pooled concurrency, session isolation, drain vetoes, and `singleflight` wake storms against PostgreSQL 17 with `go test -v -race -count=1 ./...`.
+- [x] **Transaction-Mode Wire Pooler ([internal/gateway/pooler.go](file:///workspaces/air/internal/gateway/pooler.go)):**
+  - [x] Integrate transaction-mode connection multiplexing from `stage_test/stage4/pkg/wire/virtualizer.go` into `internal/gateway`.
+  - [x] Enforce `DISCARD ALL;` on cross-client backend reuse (`lastClientID`), Extended Query prepared-statement tracking, `COPY FROM STDIN` / `COPY TO STDOUT`, and session pinning (`LISTEN`, temp tables, advisory locks).
+- [x] **Cooperative Drain Guards & Scale-to-Zero ([internal/cell/agent.go](file:///workspaces/air/internal/cell/agent.go) & [internal/control/control.go](file:///workspaces/air/internal/control/control.go)):**
+  - [x] Enforce fail-closed drain guards (`ErrDrainVetoed` on active tx, `pg_prepared_xacts`, session pin, or backend error).
+  - [x] Implement idle tenant suspend (`ACTIVE -> SUSPENDED`) and `singleflight` wake-on-connect in the Gateway.
+- [x] **Phase H Live PG17 Verification ([tests/e2e/phase_h_test.go](file:///workspaces/air/tests/e2e/phase_h_test.go)):**
+  - [x] Verify pooled concurrency, session isolation, drain vetoes, and `singleflight` wake storms against PostgreSQL 17 with `go test -v -race -count=1 ./...`.

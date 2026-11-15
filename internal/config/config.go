@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds runtime configuration for the AIR single-cell server.
@@ -23,6 +24,9 @@ type Config struct {
 	RequireTLS         bool
 	TLSCertPath        string
 	TLSKeyPath         string
+	PoolMode           bool
+	PoolMaxBackends    int
+	IdleTimeout        time.Duration
 }
 
 // Default returns safe defaults rooted under dataDir.
@@ -39,6 +43,7 @@ func Default(dataDir string) Config {
 		HTTPAddr:           "127.0.0.1:8080",
 		GatewayAddr:        "127.0.0.1:5432",
 		BootstrapAccountID: "acct_default",
+		PoolMaxBackends:    16,
 	}
 }
 
@@ -57,6 +62,19 @@ func Load(args []string) (Config, error) {
 	cfg.TLSKeyPath = envOr("AIR_TLS_KEY", cfg.TLSKeyPath)
 	if v := strings.TrimSpace(os.Getenv("AIR_REQUIRE_TLS")); v != "" {
 		cfg.RequireTLS = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := strings.TrimSpace(os.Getenv("AIR_POOL_MODE")); v != "" {
+		cfg.PoolMode = v == "1" || strings.EqualFold(v, "true")
+	}
+	if p := os.Getenv("AIR_POOL_MAX_BACKENDS"); p != "" {
+		if v, err := strconv.Atoi(p); err == nil && v > 0 {
+			cfg.PoolMaxBackends = v
+		}
+	}
+	if d := strings.TrimSpace(os.Getenv("AIR_IDLE_TIMEOUT")); d != "" {
+		if parsed, err := time.ParseDuration(d); err == nil && parsed >= 0 {
+			cfg.IdleTimeout = parsed
+		}
 	}
 	if p := os.Getenv("AIR_META_PORT"); p != "" {
 		if v, err := strconv.Atoi(p); err == nil && v > 0 {
@@ -78,6 +96,9 @@ func Load(args []string) (Config, error) {
 	fs.BoolVar(&cfg.RequireTLS, "require-tls", cfg.RequireTLS, "Require SSL/TLS negotiation on all Gateway client connections")
 	fs.StringVar(&cfg.TLSCertPath, "tls-cert", cfg.TLSCertPath, "Optional path to PEM TLS certificate for Gateway")
 	fs.StringVar(&cfg.TLSKeyPath, "tls-key", cfg.TLSKeyPath, "Optional path to PEM TLS private key for Gateway")
+	fs.BoolVar(&cfg.PoolMode, "pool-mode", cfg.PoolMode, "Enable transaction-mode connection pooling in the Gateway")
+	fs.IntVar(&cfg.PoolMaxBackends, "pool-max-backends", cfg.PoolMaxBackends, "Max pooled backend PostgreSQL connections per tenant")
+	fs.DurationVar(&cfg.IdleTimeout, "idle-timeout", cfg.IdleTimeout, "Idle duration before cooperative tenant scale-to-zero (0 disables)")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
