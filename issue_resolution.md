@@ -89,7 +89,7 @@
 13. **Failure Recovery Strategy:** If Control Plane insert hits duplicate `system_identifier` (practically impossible across CSPRNG/time entropy, caught defensively) or fails mid-claim, roll back `/vol/tenants/claiming/{tenant_id}` to quarantine/delete via `control-reconcile-queue`; on agent crash mid-`initdb`, startup wipes `/vol/pool/staging/*` cleanly before serving claims.
 14. **Validation Method:** `EXP-A1` (Identity & WAL uniqueness audit), `EXP-A2` (1,000 concurrent claims + `UNIQUE` collision check), `EXP-A3` (`SIGKILL` mid-`initdb` and mid-claim crash test).
 15. **Acceptance Criteria:** `100%` unique 64-bit `system_identifier` values across 1,000 concurrently provisioned clusters; `0` half-initialized or unverified clusters assigned across 50 injected crash restarts; steady-state claim `<15ms` p99.
-16. **Remaining Uncertainty:** Exact steady-state disk space consumed by a PG17 `--data-checksums` cluster on Fly's specific `ext4` block/inode configuration and real concurrent `initdb` refill throughput under OLTP neighbor load (`UQR-02`).
+16. **Remaining Uncertainty:** **Stage 0 Resolved (`UQR-02`):** Measured ~29–42 MB per PG17 `--data-checksums` cluster on `ext4`, `0.141–0.194 ms` atomic pool claim latency across 3 slots (`100%` unique `system_identifier`), and `28.17 ms` p50 / `195.04 ms` p99 sibling OLTP latency during concurrent `nice -n 19 initdb` refill ([stage0-results.json](file:///workspaces/air/stage0/stage0-results.json)). Stage 1 `EXP-A2` will extend to 1,000-client API burst testing.
 
 ---
 
