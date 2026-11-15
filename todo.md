@@ -158,20 +158,20 @@
 
 ---
 
-## Phase E — Control Plane Bearer Auth & Mandatory Gateway TLS (`AIR v1.1` — `PENDING`)
+## Phase E — Control Plane Bearer Auth & Mandatory Gateway TLS (`AIR v1.1` — `COMPLETED`)
 
-- [ ] **Schema Migration (`migrations/002_api_keys.sql` & [internal/control/control.go](file:///workspaces/air/internal/control/control.go)):**
-  - [ ] Add migration version `2` creating `api_keys` (`key_id`, `key_sha256 UNIQUE`, `account_id`, `description`, `created_at`, `revoked_at`).
-  - [ ] Implement `CreateAPIKey`, `AuthenticateAPIKey`, and `RevokeAPIKey` on `ControlPlane`.
-  - [ ] Add `--bootstrap-api-key` (`AIR_BOOTSTRAP_API_KEY`) and `--bootstrap-account-id` (`AIR_BOOTSTRAP_ACCOUNT_ID`) in [internal/config/config.go](file:///workspaces/air/internal/config/config.go) and seed on `air-server` startup when configured.
-- [ ] **HTTP Bearer Authentication Middleware ([internal/control/http.go](file:///workspaces/air/internal/control/http.go)):**
-  - [ ] Enforce `Authorization: Bearer <token>` on all `/v1/*` routes (`POST /v1/databases`, `GET /v1/databases/{id}`, `DELETE /v1/databases/{id}`).
-  - [ ] Derive `accountID` from the verified API key; return `401 Unauthorized` on missing/invalid/revoked token and `403 Forbidden` if `X-Account-ID` header is provided and mismatches the token's `account_id`.
-- [ ] **Gateway Mandatory TLS & Certificate Loading ([internal/gateway/gateway.go](file:///workspaces/air/internal/gateway/gateway.go)):**
-  - [ ] Add `--require-tls` (`AIR_REQUIRE_TLS`), `--tls-cert` (`AIR_TLS_CERT`), and `--tls-key` (`AIR_TLS_KEY`) to `config.Config`.
-  - [ ] Reject non-TLS `StartupMessage` connections with `SQLSTATE 28000` (`"SSL/TLS connection is required"`) when `RequireTLS` is enabled.
-- [ ] **Phase E Live PG17 Verification ([tests/e2e/e2e_test.go](file:///workspaces/air/tests/e2e/e2e_test.go)):**
-  - [ ] Verify unauthenticated/revoked token (`401`), cross-account token isolation (`403`), and `sslmode=disable` rejection under `RequireTLS: true` with `go test -v -race -count=1 ./...`.
+- [x] **Schema Migration ([migrations/002_api_keys.sql](file:///workspaces/air/migrations/002_api_keys.sql) & [internal/control/control.go](file:///workspaces/air/internal/control/control.go)):**
+  - [x] Add migration version `2` creating `api_keys` (`key_id`, `key_sha256 UNIQUE`, `account_id`, `description`, `created_at`, `revoked_at`).
+  - [x] Implement `CreateAPIKey`, `SeedAPIKey`, `AuthenticateAPIKey`, and `RevokeAPIKey` on `ControlPlane`.
+  - [x] Add `--bootstrap-api-key` (`AIR_BOOTSTRAP_API_KEY`) and `--bootstrap-account-id` (`AIR_BOOTSTRAP_ACCOUNT_ID`) in [internal/config/config.go](file:///workspaces/air/internal/config/config.go) and seed on `air-server` startup when configured.
+- [x] **HTTP Bearer Authentication Middleware ([internal/control/http.go](file:///workspaces/air/internal/control/http.go)):**
+  - [x] Enforce `Authorization: Bearer <token>` on all `/v1/*` routes (`POST /v1/databases`, `GET /v1/databases/{id}`, `DELETE /v1/databases/{id}`, `DELETE /v1/api-keys/{id}`).
+  - [x] Derive `accountID` from the verified API key; return `401 Unauthorized` on missing/invalid/revoked token and `403 Forbidden` if `X-Account-ID` header is provided and mismatches the token's `account_id`.
+- [x] **Gateway Mandatory TLS & Certificate Loading ([internal/gateway/gateway.go](file:///workspaces/air/internal/gateway/gateway.go)):**
+  - [x] Add `--require-tls` (`AIR_REQUIRE_TLS`), `--tls-cert` (`AIR_TLS_CERT`), and `--tls-key` (`AIR_TLS_KEY`) to `config.Config` and `gateway.GatewayOptions`.
+  - [x] Reject non-TLS `StartupMessage` connections with `SQLSTATE 28000` (`"SSL/TLS connection is required"`) when `RequireTLS` is enabled.
+- [x] **Phase E Live PG17 Verification ([tests/e2e/e2e_test.go](file:///workspaces/air/tests/e2e/e2e_test.go)):**
+  - [x] Verified unauthenticated/revoked token (`401`), cross-account token isolation (`403`), and `sslmode=disable` rejection (`SQLSTATE 28000`) under `RequireTLS: true` (`TestAIRv1_1_PhaseE_BearerAuthAndMandatoryGatewayTLS` PASS with `go test -v -race -count=1 ./...`).
 
 ---
 

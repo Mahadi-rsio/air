@@ -27,21 +27,48 @@ const (
 	sslRequestCode         = 80877103
 )
 
-// Gateway is the AIR v1 PostgreSQL wire-protocol gateway.
-// It terminates optional TLS/SNI, enforces tenant identity & role checks,
+// GatewayOptions configures TLS enforcement and optional custom certificate loading on the Gateway.
+type GatewayOptions struct {
+	RequireTLS  bool
+	TLSCertPath string
+	TLSKeyPath  string
+}
+
+// Gateway is the AIR PostgreSQL wire-protocol gateway.
+// It terminates TLS/SNI, enforces tenant identity & role checks,
 // and proxies authenticated sessions to the tenant's PostgreSQL 17 backend.
 type Gateway struct {
 	listenAddr string
 	listener   net.Listener
 	tlsConfig  *tls.Config
+	requireTLS bool
 	cp         *control.ControlPlane
 	bufPool    sync.Pool
 }
 
 func NewGateway(listenAddr string, cp *control.ControlPlane) (*Gateway, error) {
-	tlsCfg, err := generateSelfSignedTLSConfig()
-	if err != nil {
-		return nil, err
+	return NewGatewayWithOptions(listenAddr, cp, GatewayOptions{})
+}
+
+func NewGatewayWithOptions(listenAddr string, cp *control.ControlPlane, opts GatewayOptions) (*Gateway, error) {
+	var (
+		tlsCfg *tls.Config
+		err    error
+	)
+	if opts.TLSCertPath != "" && opts.TLSKeyPath != "" {
+		cert, loadErr := tls.LoadX509KeyPair(opts.TLSCertPath, opts.TLSKeyPath)
+		if loadErr != nil {
+			return nil, fmt.Errorf("load gateway TLS cert/key: %w", loadErr)
+		}
+		tlsCfg = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+	} else {
+		tlsCfg, err = generateSelfSignedTLSConfig()
+		if err != nil {
+			return nil, err
+		}
 	}
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -51,6 +78,7 @@ func NewGateway(listenAddr string, cp *control.ControlPlane) (*Gateway, error) {
 		listenAddr: ln.Addr().String(),
 		listener:   ln,
 		tlsConfig:  tlsCfg,
+		requireTLS: opts.RequireTLS,
 		cp:         cp,
 		bufPool: sync.Pool{
 			New: func() any {
@@ -94,6 +122,7 @@ func (g *Gateway) handleConn(rawConn net.Conn) {
 
 	var clientConn net.Conn = rawConn
 	var sniHost string
+	var tlsNegotiated bool
 
 	if msgLen == 8 && code == sslRequestCode {
 		if _, err := rawConn.Write([]byte{'S'}); err != nil {
@@ -103,6 +132,7 @@ func (g *Gateway) handleConn(rawConn net.Conn) {
 		if err := tlsConn.Handshake(); err != nil {
 			return
 		}
+		tlsNegotiated = true
 		sniHost = tlsConn.ConnectionState().ServerName
 		clientConn = tlsConn
 
@@ -111,6 +141,11 @@ func (g *Gateway) handleConn(rawConn net.Conn) {
 		}
 		msgLen = int(binary.BigEndian.Uint32(hdr[0:4]))
 		code = int(binary.BigEndian.Uint32(hdr[4:8]))
+	}
+
+	if g.requireTLS && !tlsNegotiated {
+		_ = writePGError(clientConn, "28000", "SSL/TLS connection is required")
+		return
 	}
 
 	if msgLen < 8 || msgLen > maxStartupMessageBytes {

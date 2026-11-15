@@ -25,14 +25,22 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 var (
 	ErrIdempotencyConflict = errors.New("idempotency key conflict: different account or payload")
 	ErrNotFound            = errors.New("database not found")
 	ErrForbidden           = errors.New("forbidden: database belongs to another account")
+	ErrUnauthorized        = errors.New("unauthorized: missing, invalid, or revoked API key")
 	ErrCorruptedMetadata   = errors.New("corrupted metadata directory: refusing destructive reset")
 )
+
+type APIKeyInfo struct {
+	KeyID       string `json:"key_id"`
+	AccountID   string `json:"account_id"`
+	Token       string `json:"token,omitempty"`
+	Description string `json:"description"`
+}
 
 type ProvisionResponse struct {
 	AccountID        string `json:"account_id"`
@@ -224,6 +232,33 @@ func (cp *ControlPlane) runMigrations(ctx context.Context) error {
 		for _, s := range stmts {
 			if _, err := tx.Exec(ctx, s); err != nil {
 				return fmt.Errorf("migration v1 failed: %w", err)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+	}
+	if current < 2 {
+		tx, err := cp.db.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		stmts := []string{
+			`CREATE TABLE IF NOT EXISTS api_keys (
+				key_id TEXT PRIMARY KEY,
+				key_sha256 TEXT UNIQUE NOT NULL,
+				account_id TEXT NOT NULL,
+				description TEXT NOT NULL DEFAULT '',
+				created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+				revoked_at TIMESTAMPTZ
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_api_keys_account_id ON api_keys(account_id)`,
+			`INSERT INTO schema_migrations(version) VALUES (2) ON CONFLICT DO NOTHING`,
+		}
+		for _, s := range stmts {
+			if _, err := tx.Exec(ctx, s); err != nil {
+				return fmt.Errorf("migration v2 failed: %w", err)
 			}
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -612,6 +647,90 @@ func (cp *ControlPlane) decryptTenantPassword(ctx context.Context, accountID, te
 		return "", err
 	}
 	return string(pt), nil
+}
+
+// CreateAPIKey generates a new Bearer API key bound to accountID, storing only its SHA-256 hash.
+func (cp *ControlPlane) CreateAPIKey(ctx context.Context, accountID, description string) (APIKeyInfo, error) {
+	if err := tenant.ValidateID(accountID); err != nil {
+		return APIKeyInfo{}, err
+	}
+	rawToken := "air_live_" + randomPassword(32)
+	return cp.SeedAPIKey(ctx, accountID, rawToken, description)
+}
+
+// SeedAPIKey registers or updates a deterministic Bearer API key bound to accountID, storing only its SHA-256 hash.
+func (cp *ControlPlane) SeedAPIKey(ctx context.Context, accountID, rawToken, description string) (APIKeyInfo, error) {
+	if err := tenant.ValidateID(accountID); err != nil {
+		return APIKeyInfo{}, err
+	}
+	rawToken = strings.TrimSpace(rawToken)
+	if len(rawToken) < 16 {
+		return APIKeyInfo{}, errors.New("API key token must be at least 16 characters")
+	}
+	sum := sha256.Sum256([]byte(rawToken))
+	keyHash := hex.EncodeToString(sum[:])
+	keyID := "key_" + keyHash[:16]
+
+	_, err := cp.db.Exec(ctx, `
+		INSERT INTO api_keys (key_id, key_sha256, account_id, description, revoked_at)
+		VALUES ($1, $2, $3, $4, NULL)
+		ON CONFLICT (key_sha256) DO UPDATE
+		SET account_id = EXCLUDED.account_id,
+		    description = EXCLUDED.description,
+		    revoked_at = NULL
+	`, keyID, keyHash, accountID, description)
+	if err != nil {
+		return APIKeyInfo{}, err
+	}
+	return APIKeyInfo{
+		KeyID:       keyID,
+		AccountID:   accountID,
+		Token:       rawToken,
+		Description: description,
+	}, nil
+}
+
+// AuthenticateAPIKey verifies a raw Bearer token against non-revoked SHA-256 records in api_keys.
+func (cp *ControlPlane) AuthenticateAPIKey(ctx context.Context, rawToken string) (accountID string, keyID string, err error) {
+	rawToken = strings.TrimSpace(rawToken)
+	if rawToken == "" {
+		return "", "", ErrUnauthorized
+	}
+	sum := sha256.Sum256([]byte(rawToken))
+	keyHash := hex.EncodeToString(sum[:])
+
+	var revokedAt *time.Time
+	err = cp.db.QueryRow(ctx,
+		`SELECT key_id, account_id, revoked_at FROM api_keys WHERE key_sha256 = $1`,
+		keyHash,
+	).Scan(&keyID, &accountID, &revokedAt)
+	if errors.Is(err, pgx.ErrNoRows) || revokedAt != nil {
+		return "", "", ErrUnauthorized
+	}
+	if err != nil {
+		return "", "", err
+	}
+	return accountID, keyID, nil
+}
+
+// RevokeAPIKey marks an API key as revoked if it belongs to accountID.
+func (cp *ControlPlane) RevokeAPIKey(ctx context.Context, accountID, keyID string) error {
+	if err := tenant.ValidateID(accountID); err != nil {
+		return err
+	}
+	var owner string
+	err := cp.db.QueryRow(ctx, `SELECT account_id FROM api_keys WHERE key_id = $1`, keyID).Scan(&owner)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if owner != accountID {
+		return ErrForbidden
+	}
+	_, err = cp.db.Exec(ctx, `UPDATE api_keys SET revoked_at = now() WHERE key_id = $1`, keyID)
+	return err
 }
 
 func (cp *ControlPlane) Close() {

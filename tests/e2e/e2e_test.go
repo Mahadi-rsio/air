@@ -3,7 +3,9 @@ package e2e_test
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +21,7 @@ import (
 	"github.com/Mahadi-rsio/air/internal/crypto"
 	"github.com/Mahadi-rsio/air/internal/gateway"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestAIRv1_SingleCellEndToEndMilestones(t *testing.T) {
@@ -45,7 +48,6 @@ func TestAIRv1_SingleCellEndToEndMilestones(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 	defer func() {
-		// Clean up any surviving tenant PG processes at test end
 		for _, tid := range []string{"tenant_alpha", "tenant_beta", "tenant_crash"} {
 			_ = ag1.StopAndPurgeTenant(tid)
 		}
@@ -58,6 +60,15 @@ func TestAIRv1_SingleCellEndToEndMilestones(t *testing.T) {
 	}
 	defer cp.Close()
 
+	keyA, err := cp.CreateAPIKey(ctx, "acct_a", "acct_a primary key")
+	if err != nil {
+		t.Fatalf("CreateAPIKey acct_a: %v", err)
+	}
+	keyB, err := cp.CreateAPIKey(ctx, "acct_b", "acct_b primary key")
+	if err != nil {
+		t.Fatalf("CreateAPIKey acct_b: %v", err)
+	}
+
 	gw, err := gateway.NewGateway("127.0.0.1:0", cp)
 	if err != nil {
 		t.Fatalf("NewGateway: %v", err)
@@ -68,7 +79,7 @@ func TestAIRv1_SingleCellEndToEndMilestones(t *testing.T) {
 	defer httpSrv.Close()
 
 	// Milestone 1 & 2: Create a database through Control Plane HTTP API and receive credentials.
-	alpha := httpCreateDatabase(t, httpSrv.URL, "acct_a", "idem-alpha-1", "tenant_alpha")
+	alpha := httpCreateDatabase(t, httpSrv.URL, keyA.Token, "idem-alpha-1", "tenant_alpha")
 	if alpha.State != "ACTIVE" || alpha.Password == "" || alpha.Username != "app_user" || alpha.Database != "tenant_alpha" {
 		t.Fatalf("unexpected provision response: %+v", alpha)
 	}
@@ -140,13 +151,13 @@ func TestAIRv1_SingleCellEndToEndMilestones(t *testing.T) {
 	agCompeting.Close()
 
 	// Milestone 7: Create another tenant without cross-tenant access.
-	beta := httpCreateDatabase(t, httpSrv.URL, "acct_b", "idem-beta-1", "tenant_beta")
+	beta := httpCreateDatabase(t, httpSrv.URL, keyB.Token, "idem-beta-1", "tenant_beta")
 	if beta.Password == "" || beta.Password == alpha.Password {
 		t.Fatalf("unexpected beta credentials")
 	}
 	// Cross-account GET/DELETE must be rejected with 403 Forbidden.
 	req, _ := http.NewRequest(http.MethodGet, httpSrv.URL+"/v1/databases/tenant_beta", nil)
-	req.Header.Set("X-Account-ID", "acct_a")
+	req.Header.Set("Authorization", "Bearer "+keyA.Token)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -182,7 +193,7 @@ func TestAIRv1_SingleCellEndToEndMilestones(t *testing.T) {
 
 	// Milestone 8: Delete tenant_alpha without affecting tenant_beta.
 	delReq, _ := http.NewRequest(http.MethodDelete, httpSrv.URL+"/v1/databases/tenant_alpha", nil)
-	delReq.Header.Set("X-Account-ID", "acct_a")
+	delReq.Header.Set("Authorization", "Bearer "+keyA.Token)
 	delResp, err := http.DefaultClient.Do(delReq)
 	if err != nil {
 		t.Fatal(err)
@@ -231,7 +242,7 @@ func TestAIRv1_SingleCellEndToEndMilestones(t *testing.T) {
 		t.Fatalf("orphaned active directory remained for tenant_crash")
 	}
 	// Retry provisioning tenant_crash after recovery -> must succeed cleanly!
-	crashOK := httpCreateDatabase(t, httpSrv.URL, "acct_a", "idem-crash-2", "tenant_crash")
+	crashOK := httpCreateDatabase(t, httpSrv.URL, keyA.Token, "idem-crash-2", "tenant_crash")
 	if crashOK.State != "ACTIVE" {
 		t.Fatalf("expected ACTIVE after crash recovery retry, got %+v", crashOK)
 	}
@@ -239,15 +250,203 @@ func TestAIRv1_SingleCellEndToEndMilestones(t *testing.T) {
 	// Verify clean cleanup on agent stop for remaining tenants.
 	_ = ag2.StopAndPurgeTenant("tenant_beta")
 	_ = ag2.StopAndPurgeTenant("tenant_crash")
-	_ = time.Millisecond // keep time import used
+	_ = time.Millisecond
 }
 
-func httpCreateDatabase(t *testing.T, baseURL, accountID, idemKey, tenantID string) control.ProvisionResponse {
+func TestAIRv1_1_PhaseE_BearerAuthAndMandatoryGatewayTLS(t *testing.T) {
+	if _, err := os.Stat("/usr/lib/postgresql/17/bin/initdb"); err != nil {
+		t.Fatalf("PostgreSQL 17 is required for e2e tests: %v", err)
+	}
+
+	ctx := context.Background()
+	rootDir, err := os.MkdirTemp("/tmp", "air_v1_1_phase_e_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(rootDir)
+
+	metaDir := filepath.Join(rootDir, "meta")
+	keyPath := filepath.Join(rootDir, "master.key")
+	kms, err := crypto.LoadOrCreateEnvelopeKMS(keyPath)
+	if err != nil {
+		t.Fatalf("LoadOrCreateEnvelopeKMS: %v", err)
+	}
+
+	ag, err := cell.NewAgent(rootDir, "/usr/lib/postgresql/17/bin", kms)
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	defer func() {
+		_ = ag.StopAndPurgeTenant("tenant_tls")
+		ag.Close()
+	}()
+
+	cp, err := control.NewControlPlane(ctx, metaDir, "/usr/lib/postgresql/17/bin", 19842, ag, kms)
+	if err != nil {
+		t.Fatalf("NewControlPlane: %v", err)
+	}
+	defer cp.Close()
+
+	keyA, err := cp.SeedAPIKey(ctx, "acct_a", "air_live_bootstrap_secret_acct_a_01", "bootstrap acct_a")
+	if err != nil {
+		t.Fatalf("SeedAPIKey acct_a: %v", err)
+	}
+	keyB, err := cp.CreateAPIKey(ctx, "acct_b", "acct_b key")
+	if err != nil {
+		t.Fatalf("CreateAPIKey acct_b: %v", err)
+	}
+
+	httpSrv := httptest.NewServer(cp.HTTPHandler())
+	defer httpSrv.Close()
+
+	// 1. Missing Authorization header -> 401 Unauthorized (even if X-Account-ID is supplied)
+	body, _ := json.Marshal(map[string]string{"tenant_id": "tenant_tls"})
+	unauthReq, _ := http.NewRequest(http.MethodPost, httpSrv.URL+"/v1/databases", bytes.NewReader(body))
+	unauthReq.Header.Set("Content-Type", "application/json")
+	unauthReq.Header.Set("X-Account-ID", "acct_a")
+	unauthReq.Header.Set("Idempotency-Key", "idem-unauth-1")
+	unauthResp, err := http.DefaultClient.Do(unauthReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unauthResp.Body.Close()
+	if unauthResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on missing Bearer token, got %d", unauthResp.StatusCode)
+	}
+
+	// 2. Invalid Bearer token -> 401 Unauthorized
+	badTokenReq, _ := http.NewRequest(http.MethodPost, httpSrv.URL+"/v1/databases", bytes.NewReader(body))
+	badTokenReq.Header.Set("Content-Type", "application/json")
+	badTokenReq.Header.Set("Authorization", "Bearer air_live_invalid_token_value_12345")
+	badTokenReq.Header.Set("Idempotency-Key", "idem-unauth-2")
+	badTokenResp, err := http.DefaultClient.Do(badTokenReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = badTokenResp.Body.Close()
+	if badTokenResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on invalid Bearer token, got %d", badTokenResp.StatusCode)
+	}
+
+	// 3. Mismatched X-Account-ID header vs Bearer token account -> 403 Forbidden
+	spoofReq, _ := http.NewRequest(http.MethodPost, httpSrv.URL+"/v1/databases", bytes.NewReader(body))
+	spoofReq.Header.Set("Content-Type", "application/json")
+	spoofReq.Header.Set("Authorization", "Bearer "+keyA.Token)
+	spoofReq.Header.Set("X-Account-ID", "acct_b")
+	spoofReq.Header.Set("Idempotency-Key", "idem-spoof-1")
+	spoofResp, err := http.DefaultClient.Do(spoofReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = spoofResp.Body.Close()
+	if spoofResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 on mismatched X-Account-ID, got %d", spoofResp.StatusCode)
+	}
+
+	// 4. Provision tenant_tls with valid Bearer token for acct_a
+	prov := httpCreateDatabase(t, httpSrv.URL, keyA.Token, "idem-tls-1", "tenant_tls")
+	if prov.State != "ACTIVE" {
+		t.Fatalf("expected ACTIVE tenant_tls, got %+v", prov)
+	}
+
+	// 5. Cross-account key revocation attempt (acct_b trying to revoke acct_a's key) -> 403 Forbidden
+	crossRevokeReq, _ := http.NewRequest(http.MethodDelete, httpSrv.URL+"/v1/api-keys/"+keyA.KeyID, nil)
+	crossRevokeReq.Header.Set("Authorization", "Bearer "+keyB.Token)
+	crossRevokeResp, err := http.DefaultClient.Do(crossRevokeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = crossRevokeResp.Body.Close()
+	if crossRevokeResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 on cross-account key revocation, got %d", crossRevokeResp.StatusCode)
+	}
+
+	// 6. Start Gateway with RequireTLS: true
+	gwTLS, err := gateway.NewGatewayWithOptions("127.0.0.1:0", cp, gateway.GatewayOptions{
+		RequireTLS: true,
+	})
+	if err != nil {
+		t.Fatalf("NewGatewayWithOptions(RequireTLS): %v", err)
+	}
+	defer gwTLS.Close()
+
+	// Plaintext connection (sslmode=disable) MUST be rejected with SQLSTATE 28000
+	plainDSN := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", prov.Username, prov.Password, gwTLS.Addr(), prov.Database)
+	if c, cErr := pgx.Connect(ctx, plainDSN); cErr == nil {
+		_ = c.Close(ctx)
+		t.Fatalf("plaintext connection succeeded when RequireTLS=true!")
+	} else {
+		var pgErr *pgconn.PgError
+		if !errors.As(cErr, &pgErr) || pgErr.Code != "28000" {
+			t.Fatalf("expected SQLSTATE 28000 on plaintext connection when RequireTLS=true, got: %v", cErr)
+		}
+	}
+
+	// TLS connection with SNI matching tenant_tls.air.local MUST succeed
+	tlsCfg, err := pgx.ParseConfig(fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=require", prov.Username, prov.Password, gwTLS.Addr(), prov.Database))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	tlsCfg.TLSConfig = &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         "tenant_tls.air.local",
+		MinVersion:         tls.VersionTLS12,
+	}
+	tlsConn, err := pgx.ConnectConfig(ctx, tlsCfg)
+	if err != nil {
+		t.Fatalf("TLS pgx.ConnectConfig failed: %v", err)
+	}
+	var currentDB string
+	if err := tlsConn.QueryRow(ctx, `SELECT current_database()`).Scan(&currentDB); err != nil || currentDB != "tenant_tls" {
+		t.Fatalf("unexpected current_database over TLS: db=%q err=%v", currentDB, err)
+	}
+	_ = tlsConn.Close(ctx)
+
+	// TLS connection with spoofed SNI (other_tenant.air.local) vs startup database (tenant_tls) MUST fail with 28000
+	spoofTLS, err := pgx.ParseConfig(fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=require", prov.Username, prov.Password, gwTLS.Addr(), prov.Database))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	spoofTLS.TLSConfig = &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         "other_tenant.air.local",
+		MinVersion:         tls.VersionTLS12,
+	}
+	if c, cErr := pgx.ConnectConfig(ctx, spoofTLS); cErr == nil {
+		_ = c.Close(ctx)
+		t.Fatalf("SNI mismatch connection succeeded!")
+	}
+
+	// 7. Revoke acct_a's API key -> subsequent HTTP calls with keyA.Token must fail with 401 Unauthorized
+	revokeReq, _ := http.NewRequest(http.MethodDelete, httpSrv.URL+"/v1/api-keys/"+keyA.KeyID, nil)
+	revokeReq.Header.Set("Authorization", "Bearer "+keyA.Token)
+	revokeResp, err := http.DefaultClient.Do(revokeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = revokeResp.Body.Close()
+	if revokeResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on self key revocation, got %d", revokeResp.StatusCode)
+	}
+
+	postRevokeReq, _ := http.NewRequest(http.MethodGet, httpSrv.URL+"/v1/databases/tenant_tls", nil)
+	postRevokeReq.Header.Set("Authorization", "Bearer "+keyA.Token)
+	postRevokeResp, err := http.DefaultClient.Do(postRevokeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = postRevokeResp.Body.Close()
+	if postRevokeResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after API key revocation, got %d", postRevokeResp.StatusCode)
+	}
+}
+
+func httpCreateDatabase(t *testing.T, baseURL, bearerToken, idemKey, tenantID string) control.ProvisionResponse {
 	t.Helper()
 	body, _ := json.Marshal(map[string]string{"tenant_id": tenantID})
 	req, _ := http.NewRequest(http.MethodPost, baseURL+"/v1/databases", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Account-ID", accountID)
+	req.Header.Set("Authorization", "Bearer "+bearerToken)
 	req.Header.Set("Idempotency-Key", idemKey)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
