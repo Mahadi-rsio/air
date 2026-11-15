@@ -91,6 +91,9 @@ Close the authentication and transport security prerequisites from [16-updated-p
    - Add `--require-tls` (`AIR_REQUIRE_TLS`), `--tls-cert` (`AIR_TLS_CERT`), and `--tls-key` (`AIR_TLS_KEY`) to `config.Config`.
    - When `RequireTLS` is `true`, reject any client that sends a plaintext `StartupMessage` without first negotiating `SSLRequest` (`80877103`) with PostgreSQL `FATAL` (`28000`: `"SSL/TLS connection is required"`).
    - Enforce TLS 1.2+ (`tls.VersionTLS12`) minimum protocol version.
+4. **`supautils` v4.0.0 & `app_user` Defense-in-Depth Hardening ([agent.go](file:///workspaces/air/internal/cell/agent.go))**:
+   - Configure `supautils.superuser = 'postgres'`, `supautils.privileged_role = 'app_user'`, `supautils.privileged_extensions = 'pg_stat_statements,pg_trgm'`, `supautils.reserved_roles = 'postgres'`, `supautils.reserved_memberships = 'pg_read_server_files,pg_write_server_files,pg_execute_server_program,postgres'`, `supautils.restrict_extension_versions = 'error'`, and `temp_file_limit = 32MB`.
+   - Enforce `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT` on `app_user`, revoke `PUBLIC` access on `template1` and `postgres`, and reject TCP `postgres` connections in `pg_hba.conf`.
 
 #### Acceptance Gate
 - `go test -v -race -count=1 ./...` passes with new integration tests verifying:

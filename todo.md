@@ -170,8 +170,11 @@
 - [x] **Gateway Mandatory TLS & Certificate Loading ([internal/gateway/gateway.go](file:///workspaces/air/internal/gateway/gateway.go)):**
   - [x] Add `--require-tls` (`AIR_REQUIRE_TLS`), `--tls-cert` (`AIR_TLS_CERT`), and `--tls-key` (`AIR_TLS_KEY`) to `config.Config` and `gateway.GatewayOptions`.
   - [x] Reject non-TLS `StartupMessage` connections with `SQLSTATE 28000` (`"SSL/TLS connection is required"`) when `RequireTLS` is enabled.
+- [x] **`supautils` v4.0.0 & `app_user` Defense-in-Depth Hardening ([internal/cell/agent.go](file:///workspaces/air/internal/cell/agent.go)):**
+  - [x] Configure `supautils.superuser = 'postgres'`, `supautils.privileged_role = 'app_user'`, `supautils.privileged_extensions = 'pg_stat_statements,pg_trgm'`, `supautils.reserved_roles = 'postgres'`, `supautils.reserved_memberships = 'pg_read_server_files,pg_write_server_files,pg_execute_server_program,postgres'`, `supautils.restrict_extension_versions = 'error'`, and `temp_file_limit = 32MB`.
+  - [x] Enforce `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT` on `app_user`, revoke `PUBLIC` access on `template1` and `postgres`, and reject TCP `postgres` connections in `pg_hba.conf`.
 - [x] **Phase E Live PG17 Verification ([tests/e2e/e2e_test.go](file:///workspaces/air/tests/e2e/e2e_test.go)):**
-  - [x] Verified unauthenticated/revoked token (`401`), cross-account token isolation (`403`), and `sslmode=disable` rejection (`SQLSTATE 28000`) under `RequireTLS: true` (`TestAIRv1_1_PhaseE_BearerAuthAndMandatoryGatewayTLS` PASS with `go test -v -race -count=1 ./...`).
+  - [x] Verified unauthenticated/revoked token (`401`), cross-account token isolation (`403`), `sslmode=disable` rejection (`SQLSTATE 28000`) under `RequireTLS: true`, and full `supautils` user hardening (`TestAIRv1_1_PhaseE_BearerAuthAndMandatoryGatewayTLS` & `TestAIRv1_1_SupautilsUserHardening` PASS with `go test -v -race -count=1 ./...`).
 
 ---
 

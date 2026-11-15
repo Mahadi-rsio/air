@@ -441,6 +441,147 @@ func TestAIRv1_1_PhaseE_BearerAuthAndMandatoryGatewayTLS(t *testing.T) {
 	}
 }
 
+func TestAIRv1_1_SupautilsUserHardening(t *testing.T) {
+	if _, err := os.Stat("/usr/lib/postgresql/17/bin/initdb"); err != nil {
+		t.Fatalf("PostgreSQL 17 is required for e2e tests: %v", err)
+	}
+
+	ctx := context.Background()
+	rootDir, err := os.MkdirTemp("/tmp", "air_v1_1_supautils_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(rootDir)
+
+	metaDir := filepath.Join(rootDir, "meta")
+	keyPath := filepath.Join(rootDir, "master.key")
+	kms, err := crypto.LoadOrCreateEnvelopeKMS(keyPath)
+	if err != nil {
+		t.Fatalf("LoadOrCreateEnvelopeKMS: %v", err)
+	}
+
+	ag, err := cell.NewAgent(rootDir, "/usr/lib/postgresql/17/bin", kms)
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	defer func() {
+		_ = ag.StopAndPurgeTenant("tenant_hardened")
+		ag.Close()
+	}()
+
+	cp, err := control.NewControlPlane(ctx, metaDir, "/usr/lib/postgresql/17/bin", 19852, ag, kms)
+	if err != nil {
+		t.Fatalf("NewControlPlane: %v", err)
+	}
+	defer cp.Close()
+
+	keyA, err := cp.CreateAPIKey(ctx, "acct_sec", "security test key")
+	if err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+
+	gw, err := gateway.NewGateway("127.0.0.1:0", cp)
+	if err != nil {
+		t.Fatalf("NewGateway: %v", err)
+	}
+	defer gw.Close()
+
+	httpSrv := httptest.NewServer(cp.HTTPHandler())
+	defer httpSrv.Close()
+
+	prov := httpCreateDatabase(t, httpSrv.URL, keyA.Token, "idem-sec-1", "tenant_hardened")
+	dsn := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", prov.Username, prov.Password, gw.Addr(), prov.Database)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgx.Connect failed: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	// 1. Verify app_user role attributes are strictly least-privilege in pg_roles.
+	var rolSuper, rolCreateDB, rolCreateRole, rolReplication, rolBypassRLS, rolInherit bool
+	if err := conn.QueryRow(ctx, `
+		SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolinherit
+		FROM pg_roles WHERE rolname = 'app_user'
+	`).Scan(&rolSuper, &rolCreateDB, &rolCreateRole, &rolReplication, &rolBypassRLS, &rolInherit); err != nil {
+		t.Fatalf("query pg_roles for app_user: %v", err)
+	}
+	if rolSuper || rolCreateDB || rolCreateRole || rolReplication || rolBypassRLS || rolInherit {
+		t.Fatalf("app_user has excessive role flags: super=%v createdb=%v createrole=%v repl=%v bypassrls=%v inherit=%v",
+			rolSuper, rolCreateDB, rolCreateRole, rolReplication, rolBypassRLS, rolInherit)
+	}
+
+	// 2. Verify supautils allows app_user (privileged_role) to install allowlisted extensions (pg_trgm).
+	if _, err := conn.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS pg_trgm`); err != nil {
+		t.Fatalf("supautils failed to allow allowlisted CREATE EXTENSION pg_trgm for app_user: %v", err)
+	}
+	var sim float64
+	if err := conn.QueryRow(ctx, `SELECT similarity('postgres', 'postgresql')`).Scan(&sim); err != nil || sim <= 0 {
+		t.Fatalf("pg_trgm similarity check failed: sim=%v err=%v", sim, err)
+	}
+
+	// 3. Verify supautils blocks non-allowlisted superuser extensions (amcheck).
+	if _, err := conn.Exec(ctx, `CREATE EXTENSION amcheck`); !hasSQLState(err, "42501") {
+		t.Fatalf("expected SQLSTATE 42501 on non-allowlisted CREATE EXTENSION amcheck, got: %v", err)
+	}
+
+	// 4. Verify supautils.restrict_extension_versions = 'error' blocks explicit VERSION clause.
+	if _, err := conn.Exec(ctx, `CREATE EXTENSION pg_stat_statements VERSION '1.11'`); !hasSQLState(err, "42501") {
+		t.Fatalf("expected SQLSTATE 42501 on explicit EXTENSION VERSION clause, got: %v", err)
+	}
+
+	// 5. Verify supautils blocks reserved role modification, privileged_role self-alteration, and reserved memberships.
+	hardeningChecks := []struct {
+		name string
+		sql  string
+	}{
+		{"alter reserved role postgres", `ALTER ROLE postgres WITH PASSWORD 'hacked'`},
+		{"drop reserved role postgres", `DROP ROLE postgres`},
+		{"self-elevate app_user superuser", `ALTER ROLE app_user WITH SUPERUSER`},
+		{"self-elevate app_user createdb", `ALTER ROLE app_user WITH CREATEDB`},
+		{"grant pg_read_server_files", `GRANT pg_read_server_files TO app_user`},
+		{"grant pg_write_server_files", `GRANT pg_write_server_files TO app_user`},
+		{"grant pg_execute_server_program", `GRANT pg_execute_server_program TO app_user`},
+		{"copy to program RCE", `COPY (SELECT 1) TO PROGRAM 'id'`},
+		{"pg_read_file host escape", `SELECT pg_read_file('/etc/passwd')`},
+		{"alter system preload libraries", `ALTER SYSTEM SET shared_preload_libraries = ''`},
+	}
+	for _, tc := range hardeningChecks {
+		if _, err := conn.Exec(ctx, tc.sql); !hasSQLState(err, "42501") && !hasSQLState(err, "0A000") {
+			t.Fatalf("%s was not blocked with 42501/0A000: got %v", tc.name, err)
+		}
+	}
+
+	// 6. Verify direct TCP connection to cell port as superuser postgres is blocked by pg_hba.conf (28000).
+	directSuperDSN := fmt.Sprintf("postgres://postgres@127.0.0.1:%d/%s?sslmode=disable", prov.DirectPort, prov.Database)
+	if c, cErr := pgx.Connect(ctx, directSuperDSN); cErr == nil {
+		_ = c.Close(ctx)
+		t.Fatalf("direct TCP connection as postgres to cell port succeeded (pg_hba.conf failed to reject)!")
+	} else if !hasSQLState(cErr, "28000") {
+		t.Fatalf("expected SQLSTATE 28000 on direct TCP postgres connection, got: %v", cErr)
+	}
+
+	// 7. Verify temp_file_limit = 32MB contains runaway sort disk-spill bombs with SQLSTATE 53400.
+	_, _ = conn.Exec(ctx, `SET work_mem = '64kB'`)
+	_, spillErr := conn.Exec(ctx, `
+		SELECT count(*) FROM (
+			SELECT repeat(md5(g::text), 128) AS big_payload
+			FROM generate_series(1, 15000) g
+			ORDER BY big_payload
+		) sub
+	`)
+	if !hasSQLState(spillErr, "53400") {
+		t.Fatalf("expected SQLSTATE 53400 (configuration_limit_exceeded) on temp_file_limit spill, got: %v", spillErr)
+	}
+}
+
+func hasSQLState(err error, wantCode string) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == wantCode
+}
+
 func httpCreateDatabase(t *testing.T, baseURL, bearerToken, idemKey, tenantID string) control.ProvisionResponse {
 	t.Helper()
 	body, _ := json.Marshal(map[string]string{"tenant_id": tenantID})

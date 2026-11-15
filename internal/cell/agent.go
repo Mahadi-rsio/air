@@ -194,13 +194,20 @@ port = %d
 unix_socket_directories = '%s'
 max_connections = 100
 shared_buffers = 32MB
+work_mem = 4MB
+maintenance_work_mem = 16MB
+temp_file_limit = 32MB
 password_encryption = 'scram-sha-256'
 ssl = off
 logging_collector = off
 shared_preload_libraries = 'supautils'
+supautils.superuser = 'postgres'
+supautils.privileged_role = 'app_user'
 supautils.privileged_extensions = 'pg_stat_statements,pg_trgm'
-supautils.privileged_extensions_superuser = 'postgres'
+supautils.privileged_role_allowed_configs = 'session_replication_role'
 supautils.reserved_roles = 'postgres'
+supautils.reserved_memberships = 'pg_read_server_files,pg_write_server_files,pg_execute_server_program,postgres'
+supautils.restrict_extension_versions = 'error'
 `, port, sockDir)
 	if err := os.WriteFile(filepath.Join(pgData, "postgresql.conf"), []byte(conf), 0o600); err != nil {
 		return nil, err
@@ -208,7 +215,9 @@ supautils.reserved_roles = 'postgres'
 
 	hba := `
 local   all             postgres                                trust
+host    all             postgres        127.0.0.1/32            reject
 host    all             all             127.0.0.1/32            scram-sha-256
+host    replication     postgres        127.0.0.1/32            reject
 host    replication     all             127.0.0.1/32            scram-sha-256
 `
 	if err := os.WriteFile(filepath.Join(pgData, "pg_hba.conf"), []byte(strings.TrimSpace(hba)+"\n"), 0o600); err != nil {
@@ -234,13 +243,16 @@ host    replication     all             127.0.0.1/32            scram-sha-256
 	escapedPW := strings.ReplaceAll(appPassword, "'", "''")
 	quotedDB := pgx.Identifier{tenantID}.Sanitize()
 	sqlStmts := []string{
+		`SET password_encryption = 'scram-sha-256'`,
 		fmt.Sprintf(`DO $$ BEGIN
 			IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_user') THEN
-				CREATE ROLE app_user WITH LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+				CREATE ROLE app_user WITH LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
 			ELSE
-				ALTER ROLE app_user WITH PASSWORD '%s';
+				ALTER ROLE app_user WITH LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
 			END IF;
 		END $$;`, escapedPW, escapedPW),
+		`REVOKE CONNECT ON DATABASE template1 FROM PUBLIC`,
+		`REVOKE ALL ON DATABASE postgres FROM PUBLIC`,
 	}
 	for _, s := range sqlStmts {
 		if _, err := conn.Exec(ctx, s); err != nil {
@@ -258,6 +270,9 @@ host    replication     all             127.0.0.1/32            scram-sha-256
 		}
 	}
 	if _, err := conn.Exec(ctx, fmt.Sprintf(`REVOKE ALL ON DATABASE %s FROM PUBLIC`, quotedDB)); err != nil {
+		return nil, err
+	}
+	if _, err := conn.Exec(ctx, fmt.Sprintf(`GRANT ALL ON DATABASE %s TO app_user`, quotedDB)); err != nil {
 		return nil, err
 	}
 	return rt, nil
