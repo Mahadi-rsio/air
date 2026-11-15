@@ -28,3 +28,9 @@
    - Enforce mandatory TLS + control-plane token/JWT auth at [gateway.go](file:///workspaces/air/stage1/pkg/gateway/gateway.go) (disallow plaintext TCP tenant routing in production).
    - Wire `RunEncryptedBackupStep` in [pitr_dag.go](file:///workspaces/air/stage4/pkg/backup/pitr_dag.go) to atomically commit `TenantFenceManifest` via `PutManifestCAS`.
    - Enforce streaming tar entry validation / uncompressed byte caps (`archive/tar` + `zstd`) in `CombineAndReplayPITR` and complete a 72-hour multi-VM Fly.io Machine canary with delegated cgroupfs and external KMS.
+
+---
+
+## 3. Phase A Closure Note
+
+All 7 previously skipped live-PG17 tests in `stage1` and `stage4` have now been executed against PostgreSQL 17.12 + `supautils.so` and **all 18 tests passed with `-race -count=1` and 0 skips** (see [audit/15-fault-injection-results.md](file:///workspaces/air/audit/15-fault-injection-results.md)). Experimental `stage0`–`stage4` packages were moved to `stage_test/`, and the production-oriented single-cell foundation (`AIR v1`) was initiated at the repository root. General Availability remains `NO-GO` until the remaining GA prerequisites above (external API auth, HA metadata DB, mandatory TLS, CAS backup manifest wiring, streaming tar limits, and multi-VM canary) are completed.

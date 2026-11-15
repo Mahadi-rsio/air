@@ -98,3 +98,14 @@ ok  	air-stage4/pkg/wire	1.184s
 | `stage4/pkg/cell` | 3 | 1 | 0 |
 | `stage4/pkg/wire` | 1 | 1 | 0 |
 | **Total** | **11** | **7** | **0** |
+
+---
+
+## 3. Phase A Closure — Live PostgreSQL 17.12 Execution (Updated)
+
+After installing `postgresql-17` (`17.12-1.pgdg24.04+1`) and compiling/installing `supautils.so` into `/usr/lib/postgresql/17/lib/supautils.so`, all 7 previously skipped live-PG17 tests were executed with `-v -race -count=1` (and two runtime bugs uncovered by live execution — non-root `runuser` invocation and parallel `portSeq` collision — were fixed):
+
+- `(cd stage1 && go test -v -race -count=1 ./...)`: **9 PASS, 0 FAIL, 0 SKIP** (`pkg/cell`, `pkg/control`, `pkg/gateway`)
+- `(cd stage4 && go test -v -race -count=1 ./...)`: **9 PASS, 0 FAIL, 0 SKIP** (`pkg/backup`, `pkg/cell`, `pkg/wire`)
+
+Experimental Stage 0–4 packages were subsequently moved to `stage_test/`.
