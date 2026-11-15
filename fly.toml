@@ -10,6 +10,7 @@ primary_region = "iad"
   AIR_HTTP_ADDR = "0.0.0.0:8080"
   AIR_GATEWAY_ADDR = "0.0.0.0:5432"
   AIR_POOL_MODE = "true"
+  AIR_IDLE_TIMEOUT = "2m"
   AIR_BOOTSTRAP_ACCOUNT_ID = "acct_default"
   AIR_R2_ENDPOINT = "https://dcd4d8a920e7d7f054ba6565cd8db426.r2.cloudflarestorage.com"
   AIR_R2_BUCKET = "air-pg-backups"
@@ -23,9 +24,9 @@ primary_region = "iad"
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "off"
+  auto_stop_machines = "stop"
   auto_start_machines = true
-  min_machines_running = 1
+  min_machines_running = 0
 
   [[http_service.checks]]
     interval = "15s"
@@ -37,9 +38,9 @@ primary_region = "iad"
 [[services]]
   protocol = "tcp"
   internal_port = 5432
-  auto_stop_machines = "off"
+  auto_stop_machines = "stop"
   auto_start_machines = true
-  min_machines_running = 1
+  min_machines_running = 0
 
   [[services.ports]]
     port = 5432
