@@ -298,15 +298,17 @@ func (a *Agent) ReadoptRunningTenants() int {
 		if pid <= 0 || !verifyPostgresProcessIdentity(pid, pgData, pidPGData) {
 			continue
 		}
+		sysID := extractSystemIdentifier(pgData)
+		if sysID == "" {
+			continue
+		}
 		if meta, ok := readPIDMeta(tDir); ok {
 			if st, alive := readProcStartTime(pid); !alive || (meta.PID == pid && meta.StartTime != 0 && meta.StartTime != st) {
 				continue
 			}
-		}
-
-		sysID := extractSystemIdentifier(pgData)
-		if sysID == "" {
-			continue
+			if meta.SystemIdentifier != "" && meta.SystemIdentifier != sysID {
+				continue
+			}
 		}
 
 		a.tenantMu.Lock()
@@ -378,21 +380,19 @@ func readPostmasterPIDAndPort(pgData string) (int, int) {
 }
 
 func verifyPostgresProcessIdentity(pid int, expectedPGData, pidPGData string) bool {
-	if !isPostgresProcessAlive(pid) {
+	if !isPostgresProcessAlive(pid) || strings.TrimSpace(pidPGData) == "" {
 		return false
 	}
-	if pidPGData != "" {
-		cleanExp := filepath.Clean(expectedPGData)
-		cleanGot := filepath.Clean(pidPGData)
-		if realExp, err := filepath.EvalSymlinks(cleanExp); err == nil {
-			cleanExp = realExp
-		}
-		if realGot, err := filepath.EvalSymlinks(cleanGot); err == nil {
-			cleanGot = realGot
-		}
-		if cleanExp != cleanGot {
-			return false
-		}
+	cleanExp := filepath.Clean(expectedPGData)
+	cleanGot := filepath.Clean(pidPGData)
+	if realExp, err := filepath.EvalSymlinks(cleanExp); err == nil {
+		cleanExp = realExp
+	}
+	if realGot, err := filepath.EvalSymlinks(cleanGot); err == nil {
+		cleanGot = realGot
+	}
+	if cleanExp != cleanGot {
+		return false
 	}
 	if exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err == nil {
 		base := filepath.Base(strings.TrimSuffix(exe, " (deleted)"))
@@ -506,12 +506,17 @@ func killTenantCgroup(tenantID string) {
 	}
 	cgDir := filepath.Join("/sys/fs/cgroup", "air_tenant_"+tenantID)
 	_ = os.WriteFile(filepath.Join(cgDir, "cgroup.kill"), []byte("1"), 0o644)
+	var cgPIDs []int
 	if data, err := os.ReadFile(filepath.Join(cgDir, "cgroup.procs")); err == nil {
 		for _, line := range strings.Fields(string(data)) {
 			if p, err := strconv.Atoi(line); err == nil && p > 0 {
+				cgPIDs = append(cgPIDs, p)
 				_ = syscall.Kill(p, syscall.SIGKILL)
 			}
 		}
+	}
+	if len(cgPIDs) > 0 {
+		_ = waitForPIDsExit(cgPIDs, 2*time.Second)
 	}
 }
 
@@ -869,7 +874,13 @@ func (a *Agent) StartOrAdoptTenant(tenantID string, epoch int64) (*TenantRuntime
 	}
 
 	pid, port, pidPGData := readPostmasterDetails(pgData)
-	if pid > 0 && verifyPostgresProcessIdentity(pid, pgData, pidPGData) {
+	pidMatchesMeta := true
+	if meta, ok := readPIDMeta(activeBase); ok {
+		if st, alive := readProcStartTime(pid); !alive || (meta.PID == pid && meta.StartTime != 0 && meta.StartTime != st) {
+			pidMatchesMeta = false
+		}
+	}
+	if pid > 0 && pidMatchesMeta && verifyPostgresProcessIdentity(pid, pgData, pidPGData) {
 		if existing, ok := a.tenants[tenantID]; ok && existing.PID == pid {
 			a.dualStartBlock.Add(1)
 			return existing, nil
@@ -957,8 +968,8 @@ func (a *Agent) StopTenantClean(tenantID string, mode string) (string, error) {
 	}
 	if pid, _ := readPostmasterPIDAndPort(pgdata); pid > 0 && isPostgresProcessAlive(pid) {
 		SignalProcessTree(pid, syscall.SIGKILL)
-		killTenantCgroup(tenantID)
 	}
+	killTenantCgroup(tenantID)
 	state, sErr := a.ReadPgControlState(tenantID)
 	a.tenantMu.Lock()
 	if rt, ok := a.tenants[tenantID]; ok {
@@ -996,8 +1007,8 @@ func (a *Agent) StopAndPurgeTenant(tenantID string) error {
 		if isPostgresProcessAlive(pid) {
 			SignalProcessTree(pid, syscall.SIGKILL)
 		}
-		killTenantCgroup(tenantID)
 	}
+	killTenantCgroup(tenantID)
 	a.releaseFlockLocked(tenantID)
 	delete(a.tenants, tenantID)
 	delete(a.tenantPorts, tenantID)
@@ -1105,6 +1116,9 @@ func (a *Agent) WatchdogStatus() (fenced bool, killElapsedMs int64) {
 // =========================================================================
 
 func (a *Agent) SetTenantStorageQuota(tenantID string, quotaBytes int64) {
+	if ValidateTenantID(tenantID) != nil {
+		return
+	}
 	a.tenantMu.Lock()
 	a.tenantQuotas[tenantID] = quotaBytes
 	a.tenantMu.Unlock()
@@ -1337,7 +1351,23 @@ func WriteJSONHelper(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o600)
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // CopyStreamHelper copies from r to w.

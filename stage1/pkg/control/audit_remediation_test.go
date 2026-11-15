@@ -220,3 +220,44 @@ func TestRemediation_ProvisioningCrashConsistencyAndRecovery(t *testing.T) {
 		t.Fatalf("retry after crash recovery failed: err=%v resp=%+v", err, okResp)
 	}
 }
+
+func TestRemediation_ValidateTenantIDAndPasswordEncryptionUnit(t *testing.T) {
+	bad := []string{"", ".", "..", "../etc", "a/b", "a\\b", "a b", "bad;drop"}
+	for _, id := range bad {
+		if err := ValidateTenantID(id); !errors.Is(err, ErrInvalidTenantID) {
+			t.Fatalf("ValidateTenantID(%q) = %v, want ErrInvalidTenantID", id, err)
+		}
+	}
+	if err := ValidateTenantID("tenant_alpha-01"); err != nil {
+		t.Fatalf("valid tenantID rejected: %v", err)
+	}
+
+	kms, err := crypto.NewEnvelopeKMS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp := &ControlPlane{kms: kms}
+	enc, err := cp.encryptTenantPassword("tenant_alpha", "pw_secret_123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(enc, "pw_secret_123") {
+		t.Fatalf("encrypted password contains plaintext!")
+	}
+	dec, err := cp.decryptTenantPassword("tenant_alpha", enc)
+	if err != nil || dec != "pw_secret_123" {
+		t.Fatalf("decryptTenantPassword failed: dec=%q err=%v", dec, err)
+	}
+	// Cross-tenant decryption MUST fail AAD check
+	if _, err := cp.decryptTenantPassword("tenant_beta", enc); err == nil {
+		t.Fatalf("cross-tenant password decryption succeeded!")
+	}
+
+	// DeleteDatabase & IngestUsageBatch must reject invalid tenantIDs before touching DB
+	if err := cp.DeleteDatabase(context.Background(), "../escape", true); !errors.Is(err, ErrInvalidTenantID) {
+		t.Fatalf("DeleteDatabase accepted invalid tenantID: %v", err)
+	}
+	if _, err := cp.IngestUsageBatch(context.Background(), []UsageEventBatch{{TenantID: "../escape"}}); !errors.Is(err, ErrInvalidTenantID) {
+		t.Fatalf("IngestUsageBatch accepted invalid tenantID: %v", err)
+	}
+}

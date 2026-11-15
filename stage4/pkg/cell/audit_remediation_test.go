@@ -175,3 +175,62 @@ func TestRemediation_ProcessSupervision_NestedGrandchildKill(t *testing.T) {
 		}
 	}
 }
+
+func TestRemediation_FlockTwoAgentSimultaneousAndPIDReuseUnit(t *testing.T) {
+	volDir := t.TempDir()
+	kms, _ := crypto.NewEnvelopeKMS()
+	a1, err := NewAgent(volDir, 0, kms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a1.Close()
+
+	a2, err := NewAgent(volDir, 0, kms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a2.Close()
+
+	tDir, err := a1.safeTenantSubpath("tenants/active", "t_flock_unit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.MkdirAll(filepath.Join(tDir, "pgdata"), 0o700)
+	lockPath := filepath.Join(tDir, "agent.lock")
+
+	// Agent 1 acquires flock
+	a1.tenantMu.Lock()
+	if err := a1.acquireFlockLocked("t_flock_unit", lockPath); err != nil {
+		a1.tenantMu.Unlock()
+		t.Fatal(err)
+	}
+	a1.tenantMu.Unlock()
+
+	// Agent 2 MUST fail to acquire flock on same tenant
+	a2.tenantMu.Lock()
+	err = a2.acquireFlockLocked("t_flock_unit", lockPath)
+	a2.tenantMu.Unlock()
+	if err == nil {
+		t.Fatalf("Agent 2 acquired flock while Agent 1 held it!")
+	}
+
+	// verifyPostgresProcessIdentity must reject empty pidPGData (truncated postmaster.pid)
+	if verifyPostgresProcessIdentity(os.Getpid(), filepath.Join(tDir, "pgdata"), "") {
+		t.Fatalf("verifyPostgresProcessIdentity accepted empty pidPGData")
+	}
+
+	// readProcStartTime on current process must return alive=true and consistent start time
+	st1, alive := readProcStartTime(os.Getpid())
+	if !alive || st1 == 0 {
+		t.Fatalf("expected current process alive with non-zero start time, got alive=%v st=%d", alive, st1)
+	}
+
+	// WriteJSONHelper must write atomically without leaving .tmp
+	jsonPath := filepath.Join(tDir, "meta.json")
+	if err := WriteJSONHelper(jsonPath, map[string]string{"ok": "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(jsonPath + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("WriteJSONHelper left .tmp file behind")
+	}
+}

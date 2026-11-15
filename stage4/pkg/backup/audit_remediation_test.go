@@ -154,3 +154,118 @@ func TestRemediation_DrainWAL_FailClosedAndFaultInjection(t *testing.T) {
 		}
 	}
 }
+
+func TestRemediation_WALDurabilityUnit_FailClosedAndFaultInjection(t *testing.T) {
+	ctx := context.Background()
+	kms, _ := crypto.NewEnvelopeKMS()
+	tenantID := "t_wal_unit"
+	_, _ = kms.EnsureTenantDEK(tenantID)
+	spoolDir := t.TempDir()
+
+	// 1. Fail closed if R2 client is nil
+	if _, err := drainWALSpoolDirWithFault(ctx, kms, nil, "bucket", tenantID, 1, spoolDir, nil); !errors.Is(err, ErrR2ClientRequired) {
+		t.Fatalf("expected ErrR2ClientRequired, got %v", err)
+	}
+
+	// 2. Reject invalid WAL segment filename
+	badSeg := filepath.Join(spoolDir, "bad_wal_name.txt")
+	_ = os.WriteFile(badSeg, []byte("bad"), 0o600)
+	srv, s3c := newMockR2Server(t)
+	defer srv.Close()
+	if _, err := drainWALSpoolDirWithFault(ctx, kms, s3c, "test-bucket", tenantID, 1, spoolDir, nil); !errors.Is(err, ErrInvalidWALName) {
+		t.Fatalf("expected ErrInvalidWALName, got %v", err)
+	}
+	_ = os.Remove(badSeg)
+
+	// Populate valid WAL segments + timeline history in spoolDir
+	seg1 := "000000010000000000000001"
+	seg2 := "000000010000000000000002"
+	hist := "00000001.history"
+	_ = os.WriteFile(filepath.Join(spoolDir, seg1), []byte("wal-segment-1-payload"), 0o600)
+	_ = os.WriteFile(filepath.Join(spoolDir, seg2), []byte("wal-segment-2-payload"), 0o600)
+	_ = os.WriteFile(filepath.Join(spoolDir, hist), []byte("1\t0/1000000\tno recovery target\n"), 0o600)
+
+	// 3. Crash after R2 PutObject+HeadObject but BEFORE manifest commit -> local WAL MUST survive!
+	_, err := drainWALSpoolDirWithFault(ctx, kms, s3c, "test-bucket", tenantID, 1, spoolDir, func(stage, seg string) error {
+		if stage == "after_upload_before_manifest" {
+			return fmt.Errorf("injected crash before manifest")
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatalf("expected injected crash error")
+	}
+	if _, statErr := os.Stat(filepath.Join(spoolDir, seg1)); statErr != nil {
+		t.Fatalf("local WAL deleted despite crash before manifest commit!")
+	}
+
+	// 4. Crash after manifest commit but BEFORE local deletion -> manifest committed, local WAL survives!
+	_, err = drainWALSpoolDirWithFault(ctx, kms, s3c, "test-bucket", tenantID, 1, spoolDir, func(stage, seg string) error {
+		if stage == "after_manifest_before_delete" && seg == seg1 {
+			return fmt.Errorf("injected crash before local delete")
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatalf("expected injected crash error")
+	}
+	manifestPath := filepath.Join(spoolDir, "wal_upload_manifest.json")
+	m, err := loadWALManifest(manifestPath, tenantID)
+	if err != nil || m.Segments[seg1] == nil || m.Segments[seg1].Status != "VERIFIED_IN_R2" {
+		t.Fatalf("expected %s VERIFIED_IN_R2 in manifest, got err=%v seg=%+v", seg1, err, m.Segments[seg1])
+	}
+	if _, statErr := os.Stat(filepath.Join(spoolDir, seg1)); statErr != nil {
+		t.Fatalf("local WAL deleted despite crash before local delete!")
+	}
+
+	// 5. Retry cleanly -> finishes remaining segments (seg1 + seg2) & deletes local WAL only after manifest commit
+	uploaded, err := drainWALSpoolDirWithFault(ctx, kms, s3c, "test-bucket", tenantID, 1, spoolDir, nil)
+	if err != nil || len(uploaded) != 2 {
+		t.Fatalf("retry failed: err=%v uploaded=%d", err, len(uploaded))
+	}
+	m2, _ := loadWALManifest(manifestPath, tenantID)
+	for _, name := range []string{seg1, seg2, hist} {
+		if m2.Segments[name] == nil || m2.Segments[name].Status != "LOCAL_DELETED" {
+			t.Fatalf("segment %s expected LOCAL_DELETED, got %+v", name, m2.Segments[name])
+		}
+		if _, statErr := os.Stat(filepath.Join(spoolDir, name)); !os.IsNotExist(statErr) {
+			t.Fatalf("local WAL %s still exists after LOCAL_DELETED", name)
+		}
+	}
+}
+
+func TestRemediation_BackupValidationAndChainGuards(t *testing.T) {
+	ctx := context.Background()
+	volDir := t.TempDir()
+	kms, _ := crypto.NewEnvelopeKMS()
+	ag, err := cell.NewAgent(volDir, 0, kms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ag.Close()
+
+	// RunEncryptedBackupStep must fail closed on nil R2 client
+	if _, _, err := RunEncryptedBackupStep(ctx, ag, nil, "bucket", "t_1", "b_1", "", "FULL", ""); !errors.Is(err, ErrR2ClientRequired) {
+		t.Fatalf("RunEncryptedBackupStep expected ErrR2ClientRequired, got %v", err)
+	}
+
+	srv, s3c := newMockR2Server(t)
+	defer srv.Close()
+
+	// Invalid tenantID / bkpID must be rejected
+	if _, _, err := RunEncryptedBackupStep(ctx, ag, s3c, "bucket", "../escape", "b_1", "", "FULL", ""); err == nil {
+		t.Fatalf("RunEncryptedBackupStep accepted invalid tenantID")
+	}
+	if _, _, err := RunEncryptedBackupStep(ctx, ag, s3c, "bucket", "t_1", "../escape", "", "FULL", ""); err == nil {
+		t.Fatalf("RunEncryptedBackupStep accepted invalid bkpID")
+	}
+
+	// CombineAndReplayPITR must reject broken chain / epoch mismatch / invalid WAL filename
+	brokenChain := []*cell.BackupArtifact{
+		{BackupID: "b0", Type: "FULL", Epoch: 1},
+		{BackupID: "i1", ParentID: "b0", Type: "INCR", Epoch: 2},
+	}
+	if _, _, _, err := CombineAndReplayPITR(ctx, ag, s3c, "bucket", "t_1", brokenChain, nil, "", ""); err == nil {
+		t.Fatalf("CombineAndReplayPITR accepted epoch mismatch in backup chain")
+	}
+}

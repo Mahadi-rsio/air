@@ -411,14 +411,23 @@ func (cp *ControlPlane) RecoverProvisioningOperations(ctx context.Context) (int,
 
 	recovered := 0
 	for _, item := range list {
+		var cleanupErr error
 		if ValidateTenantID(item.tenantID) == nil && cp.agent != nil {
 			switch item.state {
 			case "CLAIMED":
 				cp.agent.RollbackClaim(item.tenantID)
 			case "ACTIVATING":
 				cp.agent.RollbackClaim(item.tenantID)
-				_ = cp.agent.StopAndPurgeTenant(item.tenantID)
+				cleanupErr = cp.agent.StopAndPurgeTenant(item.tenantID)
 			}
+		}
+		if cleanupErr != nil {
+			_, _ = cp.db.Exec(ctx, `
+				UPDATE provisioning_ops
+				SET state = 'ROLLBACK_FAILED', error_detail = $2, updated_at = now()
+				WHERE op_id = $1
+			`, item.opID, cleanupErr.Error())
+			continue
 		}
 		_, _ = cp.db.Exec(ctx, `DELETE FROM clusters WHERE tenant_id = $1 AND state = 'CLAIMING'`, item.tenantID)
 		_, _ = cp.db.Exec(ctx, `
@@ -516,11 +525,13 @@ func (cp *ControlPlane) ProvisionDatabase(ctx context.Context, idempotencyKey, t
 	}
 
 	rollbackOp := func(state string, cause error) error {
-		if state == "CLAIMED" || state == "ACTIVATING" {
-			cp.agent.RollbackClaim(tenantID)
-		}
-		if state == "ACTIVATING" {
-			_ = cp.agent.StopAndPurgeTenant(tenantID)
+		if cp.agent != nil {
+			if state == "CLAIMED" || state == "ACTIVATING" {
+				cp.agent.RollbackClaim(tenantID)
+			}
+			if state == "ACTIVATING" {
+				_ = cp.agent.StopAndPurgeTenant(tenantID)
+			}
 		}
 		_, _ = cp.db.Exec(ctx, `DELETE FROM clusters WHERE tenant_id = $1 AND state = 'CLAIMING'`, tenantID)
 		_, _ = cp.db.Exec(ctx, `UPDATE provisioning_ops SET state = 'ROLLED_BACK', error_detail = $2, updated_at = now() WHERE op_id = $1`, opID, cause.Error())
@@ -659,13 +670,19 @@ func (cp *ControlPlane) DeleteDatabase(ctx context.Context, tenantID string, imm
 		if err != nil {
 			return err
 		}
-		_ = cp.agent.StopTenantOnly(tenantID)
+		if cp.agent != nil {
+			_ = cp.agent.StopTenantOnly(tenantID)
+		}
 		_, _ = cp.db.Exec(ctx, `INSERT INTO audit_events (tenant_id, action, detail) VALUES ($1, 'SOFT_DELETE', '7-day grace window started; auth revoked; DEK retained')`, tenantID)
 		return nil
 	}
 
-	cp.kms.ShredDEK(tenantID)
-	_ = cp.agent.StopAndPurgeTenant(tenantID)
+	if cp.kms != nil {
+		cp.kms.ShredDEK(tenantID)
+	}
+	if cp.agent != nil {
+		_ = cp.agent.StopAndPurgeTenant(tenantID)
+	}
 	_, err := cp.db.Exec(ctx, `UPDATE clusters SET state = 'PURGED', epoch = epoch + 1, updated_at = now() WHERE tenant_id = $1`, tenantID)
 	_, _ = cp.db.Exec(ctx, `INSERT INTO audit_events (tenant_id, action, detail) VALUES ($1, 'CRYPTO_SHRED_PURGE', 'tenant DEK destroyed; local PGDATA purged')`, tenantID)
 	return err
@@ -674,6 +691,9 @@ func (cp *ControlPlane) DeleteDatabase(ctx context.Context, tenantID string, imm
 // IngestUsageBatch inserts Gateway RU usage windows idempotently using ON CONFLICT (idempotency_key) DO NOTHING.
 func (cp *ControlPlane) IngestUsageBatch(ctx context.Context, batch []UsageEventBatch) (inserted int, err error) {
 	for _, ev := range batch {
+		if err := ValidateTenantID(ev.TenantID); err != nil {
+			return inserted, err
+		}
 		tag, err := cp.db.Exec(ctx,
 			`INSERT INTO usage_ledger (idempotency_key, gateway_id, tenant_id, statements, rows_affected, bytes_out, wall_ms, ru_charged)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"air-stage4/pkg/cell"
+	"air-stage4/pkg/crypto"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -28,6 +29,7 @@ import (
 const (
 	pgBin            = "/usr/lib/postgresql/17/bin"
 	maxRestoreObjMiB = 2048
+	maxWALObjBytes   = 128 * 1024 * 1024
 )
 
 var (
@@ -112,6 +114,15 @@ func RunEncryptedBackupStep(
 	s3c *s3.Client,
 	bucket, tenantID, bkpID, parentID, bkpType, parentManifestPath string,
 ) (*cell.BackupArtifact, string, error) {
+	if s3c == nil || strings.TrimSpace(bucket) == "" {
+		return nil, "", ErrR2ClientRequired
+	}
+	if err := cell.ValidateTenantID(tenantID); err != nil {
+		return nil, "", err
+	}
+	if err := cell.ValidateTenantID(bkpID); err != nil {
+		return nil, "", fmt.Errorf("backup: invalid bkpID: %w", err)
+	}
 	rt, ok := agent.GetTenant(tenantID)
 	if !ok {
 		return nil, "", fmt.Errorf("tenant %s not active", tenantID)
@@ -248,12 +259,30 @@ func DrainAndEncryptWALSpoolToR2WithFault(
 	)
 	time.Sleep(300 * time.Millisecond)
 
-	entries, err := os.ReadDir(rt.WALSpoolDir)
+	return drainWALSpoolDirWithFault(ctx, agent.KMS(), s3c, bucket, tenantID, rt.Epoch, rt.WALSpoolDir, faultHook)
+}
+
+func drainWALSpoolDirWithFault(
+	ctx context.Context,
+	kms *crypto.EnvelopeKMS,
+	s3c *s3.Client,
+	bucket, tenantID string,
+	epoch int64,
+	walSpoolDir string,
+	faultHook func(stage, segName string) error,
+) ([]WALSegmentArtifact, error) {
+	if s3c == nil || strings.TrimSpace(bucket) == "" {
+		return nil, ErrR2ClientRequired
+	}
+	if err := cell.ValidateTenantID(tenantID); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(walSpoolDir)
 	if err != nil {
 		return nil, err
 	}
 
-	manifestPath := filepath.Join(rt.WALSpoolDir, "wal_upload_manifest.json")
+	manifestPath := filepath.Join(walSpoolDir, "wal_upload_manifest.json")
 	manifest, err := loadWALManifest(manifestPath, tenantID)
 	if err != nil {
 		return nil, err
@@ -278,7 +307,7 @@ func DrainAndEncryptWALSpoolToR2WithFault(
 
 	var uploaded []WALSegmentArtifact
 	for _, segName := range segNames {
-		segPath := filepath.Join(rt.WALSpoolDir, segName)
+		segPath := filepath.Join(walSpoolDir, segName)
 
 		// Resume check: if already VERIFIED_IN_R2 in durable manifest, verify remote HeadObject and finish local cleanup safely.
 		if prev, exists := manifest.Segments[segName]; exists && prev.Status == "VERIFIED_IN_R2" {
@@ -313,8 +342,8 @@ func DrainAndEncryptWALSpoolToR2WithFault(
 		if err != nil {
 			return uploaded, err
 		}
-		r2Key := fmt.Sprintf("stage4/tenants/%s/epoch_%06d/wal/%s.zst.enc", tenantID, rt.Epoch, segName)
-		cipherBytes, err := agent.KMS().EncryptObject(tenantID, rt.Epoch, r2Key, compressedBytes)
+		r2Key := fmt.Sprintf("stage4/tenants/%s/epoch_%06d/wal/%s.zst.enc", tenantID, epoch, segName)
+		cipherBytes, err := kms.EncryptObject(tenantID, epoch, r2Key, compressedBytes)
 		if err != nil {
 			return uploaded, err
 		}
@@ -336,6 +365,9 @@ func DrainAndEncryptWALSpoolToR2WithFault(
 		if err != nil || headOut.ContentLength == nil || *headOut.ContentLength != int64(len(cipherBytes)) {
 			return uploaded, fmt.Errorf("R2 HeadObject verification failed for %s: err=%v", r2Key, err)
 		}
+		if putOut.ETag != nil && headOut.ETag != nil && *putOut.ETag != *headOut.ETag {
+			return uploaded, fmt.Errorf("R2 HeadObject ETag mismatch for %s: put=%s head=%s", r2Key, *putOut.ETag, *headOut.ETag)
+		}
 
 		if faultHook != nil {
 			if err := faultHook("after_upload_before_manifest", segName); err != nil {
@@ -350,7 +382,7 @@ func DrainAndEncryptWALSpoolToR2WithFault(
 		art := &WALSegmentArtifact{
 			SegmentName: segName,
 			R2Key:       r2Key,
-			Epoch:       rt.Epoch,
+			Epoch:       epoch,
 			CipherBytes: len(cipherBytes),
 			PlainSHA256: plainSHA,
 			CipherETag:  etag,
@@ -393,6 +425,12 @@ func CombineAndReplayPITR(
 	targetLSN string,
 	verifyQuery string,
 ) (queryOut string, stagingHeadroomOK bool, amcheckOK bool, err error) {
+	if s3c == nil || strings.TrimSpace(bucket) == "" {
+		return "", false, false, ErrR2ClientRequired
+	}
+	if err := cell.ValidateTenantID(tenantID); err != nil {
+		return "", false, false, err
+	}
 	var totalCipherBytes uint64
 	for _, b := range chain {
 		totalCipherBytes += uint64(b.CipherBytes)
@@ -419,6 +457,12 @@ func CombineAndReplayPITR(
 		return "", stagingHeadroomOK, false, fmt.Errorf("invalid backup chain: must begin with FULL backup")
 	}
 	for i := 1; i < len(chain); i++ {
+		if chain[i].Type != "INCR" {
+			return "", stagingHeadroomOK, false, fmt.Errorf("invalid backup chain at %s: expected INCR, got %s", chain[i].BackupID, chain[i].Type)
+		}
+		if chain[i].Epoch != chain[0].Epoch {
+			return "", stagingHeadroomOK, false, fmt.Errorf("backup chain epoch mismatch at %s: got=%d expected=%d", chain[i].BackupID, chain[i].Epoch, chain[0].Epoch)
+		}
 		if chain[i].ParentID != chain[i-1].BackupID {
 			return "", stagingHeadroomOK, false, fmt.Errorf("broken backup chain at %s: parent=%s expected=%s", chain[i].BackupID, chain[i].ParentID, chain[i-1].BackupID)
 		}
@@ -486,6 +530,9 @@ func CombineAndReplayPITR(
 		return "", stagingHeadroomOK, false, err
 	}
 	for _, seg := range walSegments {
+		if !isValidWALFilename(seg.SegmentName) {
+			return "", stagingHeadroomOK, false, fmt.Errorf("%w: %q", ErrInvalidWALName, seg.SegmentName)
+		}
 		obj, err := s3c.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String(seg.R2Key),
@@ -493,10 +540,13 @@ func CombineAndReplayPITR(
 		if err != nil {
 			return "", stagingHeadroomOK, false, fmt.Errorf("get wal %s: %w", seg.R2Key, err)
 		}
-		cipherBytes, err := io.ReadAll(obj.Body)
+		cipherBytes, err := io.ReadAll(io.LimitReader(obj.Body, maxWALObjBytes+1))
 		_ = obj.Body.Close()
 		if err != nil {
 			return "", stagingHeadroomOK, false, err
+		}
+		if int64(len(cipherBytes)) > maxWALObjBytes {
+			return "", stagingHeadroomOK, false, fmt.Errorf("wal object %s exceeds %d byte limit", seg.R2Key, maxWALObjBytes)
 		}
 		zstBytes, err := agent.KMS().DecryptObject(tenantID, seg.Epoch, seg.R2Key, cipherBytes)
 		if err != nil {

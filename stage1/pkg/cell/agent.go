@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,6 +30,42 @@ import (
 )
 
 const pgBin = "/usr/lib/postgresql/17/bin"
+
+var (
+	validTenantIDRe    = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$`)
+	ErrInvalidTenantID = errors.New("cell: invalid tenant_id")
+	ErrPathEscape      = errors.New("cell: path escapes tenant root")
+)
+
+func ValidateTenantID(tenantID string) error {
+	if !validTenantIDRe.MatchString(tenantID) {
+		return fmt.Errorf("%w: %q", ErrInvalidTenantID, tenantID)
+	}
+	return nil
+}
+
+func (a *Agent) safeTenantSubpath(baseSubdir, tenantID string) (string, error) {
+	if err := ValidateTenantID(tenantID); err != nil {
+		return "", err
+	}
+	absVol, err := filepath.Abs(a.volDir)
+	if err != nil {
+		return "", err
+	}
+	baseDir := filepath.Clean(filepath.Join(absVol, baseSubdir))
+	if realBase, err := filepath.EvalSymlinks(baseDir); err == nil {
+		baseDir = realBase
+	}
+	target := filepath.Clean(filepath.Join(baseDir, tenantID))
+	rel, err := filepath.Rel(baseDir, target)
+	if err != nil || rel != tenantID || strings.Contains(rel, "..") || strings.ContainsRune(rel, filepath.Separator) {
+		return "", fmt.Errorf("%w: %q", ErrPathEscape, tenantID)
+	}
+	if fi, err := os.Lstat(target); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("%w: symlink not allowed at %s", ErrPathEscape, target)
+	}
+	return target, nil
+}
 
 type TenantRuntime struct {
 	TenantID         string `json:"tenant_id"`
@@ -138,18 +175,31 @@ func (a *Agent) ReadoptRunningTenants() int {
 	}
 	count := 0
 	for _, e := range entries {
-		if !e.IsDir() {
+		if !e.IsDir() || e.Type()&os.ModeSymlink != 0 {
 			continue
 		}
 		tenantID := e.Name()
-		tDir := filepath.Join(activeRoot, tenantID)
+		tDir, err := a.safeTenantSubpath("tenants/active", tenantID)
+		if err != nil {
+			continue
+		}
 		pgData := filepath.Join(tDir, "pgdata")
 		sockDir := filepath.Join(tDir, "sock")
 		pid, port := readPostmasterPIDAndPort(pgData)
 		if pid > 0 && isPostgresProcessAlive(pid) {
 			a.tenantMu.Lock()
-			_ = a.acquireFlockLocked(tenantID, filepath.Join(tDir, "agent.lock"))
+			if err := a.acquireFlockLocked(tenantID, filepath.Join(tDir, "agent.lock")); err != nil {
+				a.dualStartBlock.Add(1)
+				a.tenantMu.Unlock()
+				log.Printf("[cell-agent] readopt skipped for %s: %v", tenantID, err)
+				continue
+			}
 			sysID := extractSystemIdentifier(pgData)
+			if sysID == "" {
+				a.releaseFlockLocked(tenantID)
+				a.tenantMu.Unlock()
+				continue
+			}
 			if port >= int(a.portSeq.Load()) {
 				a.portSeq.Store(int32(port + 1))
 			}
@@ -311,7 +361,10 @@ type ClaimResult struct {
 
 // ClaimCluster pops a pre-warmed PGDATA from /vol/pool/ready (or falls back to bounded on-demand initdb).
 func (a *Agent) ClaimCluster(tenantID string) (*ClaimResult, error) {
-	claimDir := filepath.Join(a.volDir, "tenants/claiming", tenantID)
+	claimDir, err := a.safeTenantSubpath("tenants/claiming", tenantID)
+	if err != nil {
+		return nil, err
+	}
 	_ = os.RemoveAll(claimDir)
 
 	t0 := time.Now()
@@ -370,8 +423,14 @@ func (a *Agent) ClaimCluster(tenantID string) (*ClaimResult, error) {
 // ActivateCluster promotes /vol/tenants/claiming/{id} -> /vol/tenants/active/{id}/pgdata,
 // configures SCRAM-SHA-256 + supautils, starts PG17, and verifies SELECT 1 readiness.
 func (a *Agent) ActivateCluster(tenantID, appPassword string, epoch int64) (*TenantRuntime, error) {
-	claimDir := filepath.Join(a.volDir, "tenants/claiming", tenantID)
-	activeBase := filepath.Join(a.volDir, "tenants/active", tenantID)
+	claimDir, err := a.safeTenantSubpath("tenants/claiming", tenantID)
+	if err != nil {
+		return nil, err
+	}
+	activeBase, err := a.safeTenantSubpath("tenants/active", tenantID)
+	if err != nil {
+		return nil, err
+	}
 	pgData := filepath.Join(activeBase, "pgdata")
 	sockDir := filepath.Join(activeBase, "sock")
 
@@ -452,10 +511,13 @@ host    replication     all             127.0.0.1/32            trust
 
 // StartOrAdoptTenant ensures single-primary exclusivity via flock + postmaster.pid + /proc check (LI-3, EXP-A3).
 func (a *Agent) StartOrAdoptTenant(tenantID string, epoch int64) (*TenantRuntime, error) {
+	activeBase, err := a.safeTenantSubpath("tenants/active", tenantID)
+	if err != nil {
+		return nil, err
+	}
 	a.tenantMu.Lock()
 	defer a.tenantMu.Unlock()
 
-	activeBase := filepath.Join(a.volDir, "tenants/active", tenantID)
 	pgData := filepath.Join(activeBase, "pgdata")
 	sockDir := filepath.Join(activeBase, "sock")
 	lockPath := filepath.Join(activeBase, "agent.lock")
@@ -514,7 +576,11 @@ func (a *Agent) StartOrAdoptTenant(tenantID string, epoch int64) (*TenantRuntime
 
 // RollbackClaim removes an uncommitted /vol/tenants/claiming/{tenantID} directory.
 func (a *Agent) RollbackClaim(tenantID string) {
-	_ = os.RemoveAll(filepath.Join(a.volDir, "tenants/claiming", tenantID))
+	claimDir, err := a.safeTenantSubpath("tenants/claiming", tenantID)
+	if err != nil {
+		return
+	}
+	_ = os.RemoveAll(claimDir)
 }
 
 // ReconcileInventory purges any claiming/ or active/ directories not present in validActiveTenants (EXP-A3).
@@ -545,9 +611,12 @@ func (a *Agent) ReconcileInventory(validActiveTenants map[string]bool) (purged i
 }
 
 func (a *Agent) StopAndPurgeTenant(tenantID string) error {
+	activeBase, err := a.safeTenantSubpath("tenants/active", tenantID)
+	if err != nil {
+		return err
+	}
 	a.tenantMu.Lock()
 	defer a.tenantMu.Unlock()
-	activeBase := filepath.Join(a.volDir, "tenants/active", tenantID)
 	pgData := filepath.Join(activeBase, "pgdata")
 	if pid, _ := readPostmasterPIDAndPort(pgData); pid > 0 && isPostgresProcessAlive(pid) {
 		_, _ = runPostgresCmd(filepath.Join(pgBin, "pg_ctl"), "-D", pgData, "-m", "fast", "-w", "-t", "10", "stop")
@@ -558,9 +627,12 @@ func (a *Agent) StopAndPurgeTenant(tenantID string) error {
 }
 
 func (a *Agent) StopTenantOnly(tenantID string) error {
+	activeBase, err := a.safeTenantSubpath("tenants/active", tenantID)
+	if err != nil {
+		return err
+	}
 	a.tenantMu.Lock()
 	defer a.tenantMu.Unlock()
-	activeBase := filepath.Join(a.volDir, "tenants/active", tenantID)
 	pgData := filepath.Join(activeBase, "pgdata")
 	if pid, _ := readPostmasterPIDAndPort(pgData); pid > 0 && isPostgresProcessAlive(pid) {
 		_, err := runPostgresCmd(filepath.Join(pgBin, "pg_ctl"), "-D", pgData, "-m", "fast", "-w", "-t", "10", "stop")

@@ -162,15 +162,23 @@ func (g *Gateway) handleConn(rawConn net.Conn) {
 
 	params := parseStartupParams(body)
 	startupTenant, usePooler := extractTenantAndMode(sniHost, params)
-	if startupTenant == "" {
-		_ = writePGError(clientConn, "28000", "missing tenant identifier in SNI or StartupMessage")
+	if startupTenant == "" || control.ValidateTenantID(startupTenant) != nil {
+		_ = writePGError(clientConn, "28000", "missing or invalid tenant identifier in SNI or StartupMessage")
+		return
+	}
+
+	// Reject reserved superuser role at gateway so 127.0.0.1 trust pg_hba entries cannot be reached by clients.
+	reqUser := strings.TrimSpace(params["user"])
+	if reqUser == "" || strings.EqualFold(reqUser, "postgres") {
+		_ = writePGError(clientConn, "28000", "reserved superuser role not permitted through tenant gateway")
 		return
 	}
 
 	// 3. Cryptographic SNI == Startup tenant identity binding (SI-3, FMEA-17)
 	if sniHost != "" {
 		sniTenant := parseSNITenant(sniHost)
-		if sniTenant != "" && params["database"] != "" && params["database"] != "postgres" && sniTenant != params["database"] {
+		dbTenant := strings.TrimSuffix(params["database"], "-pooler")
+		if sniTenant != "" && dbTenant != "" && dbTenant != "postgres" && sniTenant != dbTenant {
 			g.sniSpoofsDrop.Add(1)
 			_ = writePGError(clientConn, "28000", fmt.Sprintf("SNI tenant (%s) does not match StartupMessage database tenant (%s)", sniTenant, params["database"]))
 			return

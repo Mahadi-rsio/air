@@ -13,6 +13,7 @@ import (
 	"air-stage4/pkg/crypto"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 func TestRemediation_DrainVetoOnBackendErrors(t *testing.T) {
@@ -75,6 +76,39 @@ func TestRemediation_DrainVetoOnBackendErrors(t *testing.T) {
 		t.Fatalf("expected ErrDrainVetoed on connection reset, got %v", err)
 	}
 	v3.Close()
+
+	// 4. Permission denied (PG ErrorResponse 42501)
+	permLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer permLn.Close()
+	go func() {
+		for {
+			c, aErr := permLn.Accept()
+			if aErr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				be := pgproto3.NewBackend(conn, conn)
+				_, _ = be.ReceiveStartupMessage()
+				be.Send(&pgproto3.ErrorResponse{
+					Severity: "FATAL",
+					Code:     "42501",
+					Message:  "permission denied for relation pg_prepared_xacts",
+				})
+				_ = be.Flush()
+			}(c)
+		}
+	}()
+	permPort := permLn.Addr().(*net.TCPAddr).Port
+	v4, _ := NewVirtualizer("127.0.0.1:0", "", permPort, "app_user", "postgres", "pw")
+	if err := v4.RequestDrain(300 * time.Millisecond); !errors.Is(err, ErrDrainVetoed) {
+		v4.Close()
+		t.Fatalf("expected ErrDrainVetoed on permission denied, got %v", err)
+	}
+	v4.Close()
 }
 
 func TestRemediation_BackendSessionStateIsolation(t *testing.T) {
