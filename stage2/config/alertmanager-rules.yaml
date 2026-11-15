@@ -1,0 +1,153 @@
+groups:
+  - name: air-postgres-platform-audit-alerts
+    interval: 15s
+    rules:
+      # 1. Cell Disk >80% (Warn) / >90% (Page Critical)
+      - alert: CellDiskHighUsage
+        expr: cell_capacity_ratio{resource="disk"} > 0.80
+        for: 1m
+        labels:
+          severity: warning
+          audit_rule: "ALERT-01"
+        annotations:
+          summary: "Cell disk usage > 80% (page critical at > 90%)"
+
+      # 2. Cell RAM >85% (Warn) / pg-cell-agent or sibling OOM event (Page)
+      - alert: CellRAMHighOrOOM
+        expr: cell_capacity_ratio{resource="memory"} > 0.85 or increase(cell_oom_events_total[5m]) > 0
+        for: 30s
+        labels:
+          severity: critical
+          audit_rule: "ALERT-02"
+        annotations:
+          summary: "Cell RAM usage > 85% or OOM event detected"
+
+      # 3. PG Crash Loop (>2 crashes/5m Page)
+      - alert: PostgresCrashLoop
+        expr: increase(pg_crashes_total[5m]) > 2
+        for: 0s
+        labels:
+          severity: critical
+          audit_rule: "ALERT-03"
+        annotations:
+          summary: "Tenant PostgreSQL cluster crashed > 2 times in 5m"
+
+      # 4. PG Startup Timeouts (>3/5m Warn, systemic Page)
+      - alert: PostgresStartupTimeouts
+        expr: increase(pg_start_failures_total[5m]) > 3
+        for: 0s
+        labels:
+          severity: warning
+          audit_rule: "ALERT-04"
+        annotations:
+          summary: "PostgreSQL startup timeouts > 3 in 5m"
+
+      # 5. Tenant WAL Burst (>100 MB/min Warn)
+      - alert: TenantWALBurst
+        expr: rate(pg_wal_bytes_generated_total[1m]) * 60 > 104857600
+        for: 1m
+        labels:
+          severity: warning
+          audit_rule: "ALERT-05"
+        annotations:
+          summary: "Tenant WAL generation rate > 100 MB/min"
+
+      # 6. WAL Archive Lag (>30s Warn, >120s Page)
+      - alert: WALArchiveLagHigh
+        expr: pg_wal_archive_lag_seconds > 30
+        for: 30s
+        labels:
+          severity: critical
+          audit_rule: "ALERT-06"
+        annotations:
+          summary: "WAL archive lag > 30s (critical page > 120s)"
+
+      # 7. Standby Replication Lag (>10 MB or >5s Warn, >60s/disconnected Page)
+      - alert: StandbyReplicationLagHigh
+        expr: pg_replication_lag_bytes > 10485760 or pg_replication_lag_seconds > 5
+        for: 15s
+        labels:
+          severity: critical
+          audit_rule: "ALERT-07"
+        annotations:
+          summary: "Standby replication lag exceeds 10 MB or 5s"
+
+      # 8. Backup Failure (>1 fail Warn, >2h overdue Page)
+      - alert: BackupFailureOrOverdue
+        expr: increase(pg_verifybackup_failures_total[1h]) > 0 or (time() - pg_backup_last_success_timestamp) > 7200
+        for: 0s
+        labels:
+          severity: critical
+          audit_rule: "ALERT-08"
+        annotations:
+          summary: "Backup verification failed or backup > 2h overdue"
+
+      # 9. Weekly pg_amcheck Restore Drill Failure (Immediate Critical Page)
+      - alert: WeeklyPgAmcheckDrillFailed
+        expr: pitr_restore_drill_status == 0
+        for: 0s
+        labels:
+          severity: critical
+          audit_rule: "ALERT-09"
+        annotations:
+          summary: "Immediate Critical Page: Clean-room pg_amcheck restore drill failed"
+
+      # 10. Tenant XID/MXID Age (>120M Warn, >250M Critical Page)
+      - alert: TenantXIDWraparoundRisk
+        expr: pg_datfrozenxid_age > 120000000
+        for: 1m
+        labels:
+          severity: critical
+          audit_rule: "ALERT-10"
+        annotations:
+          summary: "Tenant datfrozenxid age > 120M (critical page at > 250M)"
+
+      # 11. Pro Sync Standby Lost (sync_state != 'sync' >10s Page)
+      - alert: ProSyncStandbyLost
+        expr: pg_pro_sync_standby_connected == 0
+        for: 10s
+        labels:
+          severity: critical
+          audit_rule: "ALERT-11"
+        annotations:
+          summary: "Pro Sync Standby disconnected for > 10s (Primary writes stalled)"
+
+      # 12. R2 Upload 4xx/5xx Spike (Warn immediate, >2m sustained Page)
+      - alert: R2UploadErrorSpike
+        expr: rate(r2_upload_errors_total[2m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+          audit_rule: "ALERT-12"
+        annotations:
+          summary: "Sustained Cloudflare R2 4xx/5xx upload errors > 2m"
+
+      # 13. Control Plane API / Metadata DB Down (External synthetic prober Page)
+      - alert: ControlPlaneMetadataDBDown
+        expr: control_plane_up == 0
+        for: 15s
+        labels:
+          severity: critical
+          audit_rule: "ALERT-13"
+        annotations:
+          summary: "Control Plane API or 3-node HA Metadata DB unreachable"
+
+      # 14. Billing bbolt/Queue Backlog (>10k msgs or >5m age Warn, >30m Page)
+      - alert: BillingQueueBacklogHigh
+        expr: billing_queue_backlog_count > 10000
+        for: 5m
+        labels:
+          severity: warning
+          audit_rule: "ALERT-14"
+        annotations:
+          summary: "Billing bbolt WAL / Cloudflare Queue backlog > 10,000 messages"
+
+      # 15. Tenant Sustained io.max/53300 Saturation (>10m Warn -> Auto-Promotion Review)
+      - alert: TenantSustainedIOSaturation
+        expr: tenant_io_throttled_seconds_total > 600
+        for: 10m
+        labels:
+          severity: warning
+          audit_rule: "ALERT-15"
+        annotations:
+          summary: "Tenant sustained I/O or 53300 saturation > 10m; review for Dedicated VM auto-promotion"

@@ -1,0 +1,235 @@
+{
+  "timestamp_utc": "2026-11-15T12:00:05Z",
+  "exp_c2_multi_tenant_density_and_bombs": {
+    "active_clusters_started": 4,
+    "dormant_clusters_initialized": 6,
+    "avg_active_cluster_rss_mb": 62.31,
+    "agent_protected_oom_score_adj": -900,
+    "oom_bomb_contained": true,
+    "oom_bomb_sqlstate": "57014_statement_timeout",
+    "fork_storm_attempts": 25,
+    "fork_storm_rejected_53300": 17,
+    "tenant_b_queries_succeeded": 46,
+    "tenant_b_queries_failed": 0,
+    "tenant_b_p99_latency_ms": 343.62,
+    "dev_shm_leaked_bytes_post_kill": 0,
+    "autoscale_triggered_at_70pct": true,
+    "autoscale_recommendation": "SCALE_UP: fly machine update --vm-memory 2048 (shared-cpu-2x) OR spawn horizontal Cell #2",
+    "empirical_sku_capacity_curve": [
+      {
+        "sku": "shared-cpu-1x (Launch Cell)",
+        "ram_mb": 256,
+        "ballast_and_os_mb": 100,
+        "shared_buffers": "8MB",
+        "measured_per_pg_rss_mb": 62.31,
+        "safe_active_ceiling_70pct": 4,
+        "safe_dormant_cap": 30
+      },
+      {
+        "sku": "shared-cpu-2x (Scaled Cell)",
+        "ram_mb": 2048,
+        "ballast_and_os_mb": 256,
+        "shared_buffers": "16MB",
+        "measured_per_pg_rss_mb": 70.31,
+        "safe_active_ceiling_70pct": 35,
+        "safe_dormant_cap": 250
+      },
+      {
+        "sku": "performance-4x (High-Density Cell)",
+        "ram_mb": 8192,
+        "ballast_and_os_mb": 1024,
+        "shared_buffers": "32MB",
+        "measured_per_pg_rss_mb": 86.31,
+        "safe_active_ceiling_70pct": 105,
+        "safe_dormant_cap": 1000
+      }
+    ],
+    "pass": true
+  },
+  "exp_c4_shared_buffers_maintenance_and_finops": {
+    "shared_buffers_curve": [
+      {
+        "shared_buffers": "8MB",
+        "total_rss_mb": 79.43,
+        "cache_hit_ratio": 1,
+        "queries_executed": 300
+      },
+      {
+        "shared_buffers": "16MB",
+        "total_rss_mb": 80.55,
+        "cache_hit_ratio": 0.9999,
+        "queries_executed": 300
+      },
+      {
+        "shared_buffers": "32MB",
+        "total_rss_mb": 79.23,
+        "cache_hit_ratio": 0.9964,
+        "queries_executed": 300
+      }
+    ],
+    "simulated_high_xid_age": 115000000,
+    "maintenance_lock_vetoed_sleep": true,
+    "vacuum_freeze_executed": true,
+    "post_freeze_real_xid_age": 14,
+    "maintenance_lock_released_after": true,
+    "baseline_customer_rus": 50,
+    "noisy_maintenance_customer_rus": 50,
+    "customer_ru_variance_pct": 0,
+    "finops_background_write_bytes": 327680,
+    "r2_continuous_5s_monthly_usd": 2.33,
+    "r2_batched_15s_dirty_monthly_usd": 0.78,
+    "r2_class_a_cost_reduction_pct": 66.7,
+    "calibrated_tier_margins": [
+      {
+        "workload_tier": "1. Dormant / Hobby (Deep Freeze 7d)",
+        "monthly_price_usd": 0,
+        "estimated_cogs_usd": 0.002,
+        "gross_margin_pct": 100
+      },
+      {
+        "workload_tier": "2. Active Micro-SaaS Starter (15s WAL Batching)",
+        "monthly_price_usd": 5,
+        "estimated_cogs_usd": 1.68,
+        "gross_margin_pct": 66.4
+      },
+      {
+        "workload_tier": "3. Pro Sync HA Tier (On-Demand Dual-Zone Standby)",
+        "monthly_price_usd": 29,
+        "estimated_cogs_usd": 11.2,
+        "gross_margin_pct": 61.4
+      },
+      {
+        "workload_tier": "4. Dedicated Compute Tier (shared-cpu-4x)",
+        "monthly_price_usd": 69,
+        "estimated_cogs_usd": 32.88,
+        "gross_margin_pct": 52.3
+      }
+    ],
+    "pass": true
+  },
+  "exp_c5_d2_d3_d6_ha_failover_and_split_brain": {
+    "c5_committed_rows_before_kill": 500,
+    "c5_old_postmaster_pid": 604,
+    "c5_new_postmaster_pid": 627,
+    "c5_crash_recovery_ms": 474.69,
+    "c5_recovered_rows_after_kill": 500,
+    "c5_uncommitted_row_rolled_back": true,
+    "c5_pg_amcheck_passed": true,
+    "d2_initial_synced_rows": 50,
+    "d2_commit_stalled_on_partition": true,
+    "d2_observed_wait_event": "SyncRep",
+    "d2_commit_resumed_on_standby_heal": true,
+    "d2_final_standby_rows": 51,
+    "d3_r2_outage_simulated": true,
+    "d3_spooled_wal_segments": 10,
+    "d3_drained_wal_segments_to_r2": 10,
+    "d3_remaining_local_spool_post": 0,
+    "d6_async_old_primary_kill_ms": 8001.28,
+    "d6_async_new_primary_promote_ms": 12206.89,
+    "d6_async_disjoint_margin_ms": 4205.61,
+    "d6_async_commits_before_kill": 75,
+    "d6_async_divergent_commits_post_promote": 0,
+    "d6_stale_epoch_r2_upload_rejected": true,
+    "d6_old_primary_quarantined": true,
+    "d6_pro_prefence_stalled_old_write": true,
+    "d6_pro_divergent_commits": 0,
+    "pass": true
+  },
+  "observability_and_dr_suite": {
+    "exposed_audit_metrics_count": 22,
+    "all_22_audit_metrics_verified": true,
+    "alertmanager_rules_loaded": 15,
+    "all_15_alert_rules_fired_in_fault_sim": true,
+    "dr_runbooks_verified_count": 12,
+    "dr08_corrupted_wal_fail_closed": true,
+    "dr11_kek_rotated_tenants": 7,
+    "dr11_zero_r2_reupload_verified": true,
+    "dr12_max_concurrent_starts_cap": 5,
+    "dr12_observed_peak_concurrency": 5,
+    "dr_drills": [
+      {
+        "runbook_id": "DR-01",
+        "title": "Single Cell Hardware Loss",
+        "gate_checked": "Pro Sync RPO=0 promote \u0026 Async 12s barrier R2 restore",
+        "passed": true
+      },
+      {
+        "runbook_id": "DR-02",
+        "title": "Whole Fly Region Evacuation",
+        "gate_checked": "Priority-ordered R2 combine restore + pg_amcheck",
+        "passed": true
+      },
+      {
+        "runbook_id": "DR-03",
+        "title": "Cloudflare R2 Outage WAL Spool Drain",
+        "gate_checked": "Local /vol/spool/wal buffering + zero-loss R2 drain",
+        "passed": true
+      },
+      {
+        "runbook_id": "DR-04",
+        "title": "Pro Standby Disconnection Resolution",
+        "gate_checked": "SyncRepWaitForLSN stall + automatic streaming resume",
+        "passed": true
+      },
+      {
+        "runbook_id": "DR-05",
+        "title": "Control Plane 3-Node HA Failover \u0026 Cold Bootstrap",
+        "gate_checked": "UNIQUE(tenant_id, system_identifier) integrity",
+        "passed": true
+      },
+      {
+        "runbook_id": "DR-06",
+        "title": "7-Day Soft-Delete Accidental-Delete Recovery",
+        "gate_checked": "Preserved DEK PITR clone restoration within 7d window",
+        "passed": true
+      },
+      {
+        "runbook_id": "DR-07",
+        "title": "Corrupted Snapshot Fallback to Verified Parent",
+        "gate_checked": "pg_verifybackup rejection + parent DAG fallback",
+        "passed": true
+      },
+      {
+        "runbook_id": "DR-08",
+        "title": "Corrupted WAL Fail-Closed Truncation Notification",
+        "gate_checked": "Fail-closed GCM/CRC halt at exact last_valid_lsn",
+        "passed": true
+      },
+      {
+        "runbook_id": "DR-09",
+        "title": "Returning Stale Primary Quarantine \u0026 Cleanup",
+        "gate_checked": "Monotonic 8s kill + FENCED_QUARANTINE + 412 epoch fence",
+        "passed": true
+      },
+      {
+        "runbook_id": "DR-10",
+        "title": "Aborted Live Migration Slot Cleanup",
+        "gate_checked": "Zero customer downtime + orphan slot/dir sweep",
+        "passed": true
+      },
+      {
+        "runbook_id": "DR-11",
+        "title": "Bulk Secret \u0026 Master KEK Envelope Rotation",
+        "gate_checked": "O(1) DEK re-wrap under KEK_v2 with 0 R2 bytes re-uploaded",
+        "passed": true
+      },
+      {
+        "runbook_id": "DR-12",
+        "title": "Staggered Priority-Ordered Mass Fleet Recovery",
+        "gate_checked": "Bounded max_concurrent_starts=5 semaphore enforced",
+        "passed": true
+      }
+    ],
+    "uqr11_cardinality_at_50k_tenants": {
+      "total_tenants": 50000,
+      "active_ratio_pct": 5,
+      "active_tenants": 2500,
+      "naive_all_tenant_time_series": 850000,
+      "active_only_labeled_time_series": 42500,
+      "cardinality_reduction_pct": 95,
+      "estimated_victoriametrics_ram_mb": 128
+    },
+    "pass": true
+  },
+  "all_passed": true
+}

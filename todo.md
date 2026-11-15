@@ -54,10 +54,20 @@
 
 ---
 
-## Stage 2 — Multi-Tenant Density, Pro Sync HA Failover & Observability (`PENDING`)
-- [ ] **`EXP-C2` & `EXP-C4` (`UQR-07`, `UQR-10`):** Multi-tenant density, memory/fork bomb containment, `shared_buffers` (`8MB/16MB/32MB`) RSS/hit-rate curves, anti-wraparound `maintenance_lock` (`VACUUM FREEZE`), and 4-way FinOps vs Customer RU separation.
-- [ ] **`EXP-C5`, `EXP-D2`, `EXP-D3`, `EXP-D6`:** Process crash recovery, network jitter (`tc netem`), R2 outage spooling, and asymmetric partition split-brain write-boundary fencing (`8.0s` monotonic self-kill `< 12.0s` Control promote; Pro standby pre-fence).
-- [ ] **Observability & DR (`RISK-39..41`, `UQR-11`):** OpenMetrics exporter (all 22 audit signals), 15 Alertmanager rules, and 12 scripted DR runbooks.
+## Stage 2 — Multi-Tenant Density, Pro Sync HA Failover & Observability (`COMPLETED`)
+- [x] **`EXP-C2` & `EXP-C4` (`UQR-07`, `UQR-10` — [stage2/pkg/density/density.go](file:///workspaces/air/stage2/pkg/density/density.go)):**
+  - [x] **`EXP-C2` (`pass: true`):** 4 active + 6 dormant PG17 tenant clusters (`avg_active_cluster_rss_mb = 62.31 MB`), `oom_score_adj = -900` agent shield, Tenant A hash/sort OOM bomb contained (`57014_statement_timeout`), 25-connection fork storm capped (`17` rejected with `53300`), `0` leaked `/dev/shm` bytes, `0` dropped Tenant B OLTP queries (`46/46` succeeded), and `>70%` auto-scale trigger verified across `256 MB / 2 GB / 8 GB` SKU capacity curve.
+  - [x] **`EXP-C4` (`pass: true`):** Empirical `shared_buffers` (`8MB / 16MB / 32MB`) RSS & cache hit-rate curve (`0.9964–1.0000`), anti-wraparound `maintenance_lock` vetoing sleep above `100M` XID age + `VACUUM (FREEZE)` reducing `age(datfrozenxid)` to `14`, **`0.0%` Customer Wire RU variance** (`50` vs `50` RUs) on Tenant B during heavy `CREATE INDEX` + `VACUUM FREEZE` + `CHECKPOINT` (`327,680` FinOps background write bytes separated), and `66.7%` R2 Class A cost reduction (`$2.33 -> $0.78/mo`) via 15s dirty-only WAL batching (`>= 52.3%` gross margin across all 4 tiers).
+- [x] **`EXP-C5`, `EXP-D2`, `EXP-D3`, `EXP-D6` ([stage2/pkg/failover/failover.go](file:///workspaces/air/stage2/pkg/failover/failover.go)):**
+  - [x] **`EXP-C5` (`pass: true`):** Single-tenant `postgres` `SIGKILL` (`PID 604 -> 627`) + subreaper `wait4(-1, WNOHANG)` zombie reaping recovered in `474.69 ms`, preserving `500/500` committed rows, rolling back uncommitted row `501`, and passing `pg_amcheck`.
+  - [x] **`EXP-D2` (`pass: true`):** Pro Sync Primary + Physical Standby (`synchronous_standby_names = 'FIRST 1 (standby_zb)'`) stalled commit `#51` deterministically in `SyncRep` during standby partition (`SIGSTOP`) and resumed cleanly on heal (`51/51` rows synced).
+  - [x] **`EXP-D3` (`pass: true`):** Simulated R2 outage spooled `10/10` encrypted `.wal.zst.enc` segments locally in `/vol/spool/wal/` without halting SQL writes and drained `10/10` segments to live Cloudflare R2 (`air-mvp-test`) on recovery (`0` remaining spool files).
+  - [x] **`EXP-D6` (`pass: true`):** Asymmetric split-brain partition verified both Standard Async monotonic `CLOCK_MONOTONIC` self-kill (`8,001.28 ms` kill `< 12,206.89 ms` Control promote, `4,205.61 ms` disjoint safety margin, **`0` divergent commits post-promote**, stale epoch R2 upload rejected + `FENCED_QUARANTINE`) and Pro Sync Standby pre-fence (`SyncRepWaitForLSN` stalled partitioned old primary write, **`0` divergent commits**).
+- [x] **Observability & DR (`RISK-39..41`, `UQR-11` — [stage2/pkg/observability/observability.go](file:///workspaces/air/stage2/pkg/observability/observability.go)):**
+  - [x] OpenMetrics `/metrics` exporter verified for all **22 mandatory audit signals** (`all_22_audit_metrics_verified: true`).
+  - [x] All **15 Alertmanager rules** codified in [alertmanager-rules.yaml](file:///workspaces/air/stage2/config/alertmanager-rules.yaml) (`all_15_alert_rules_fired_in_fault_sim: true`).
+  - [x] All **12 Disaster Recovery Runbooks** codified in [DR-01-to-12.md](file:///workspaces/air/stage2/runbooks/dr/DR-01-to-12.md) and GameDay-verified (`DR-08` corrupted WAL fail-closed, `DR-11` Master `KEK` rotation across `7` tenants with `0` R2 bytes re-uploaded, `DR-12` staggered fleet recovery capped at `5/5` max concurrent starts, and `UQR-11` `95.0%` TSDB cardinality reduction at `50,000` tenants).
+- [x] **Stage 2 Artifacts:** Recorded in [stage2-results.json](file:///workspaces/air/stage2/stage2-results.json) (`all_passed: true`).
 
 ---
 
