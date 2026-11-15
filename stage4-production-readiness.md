@@ -534,3 +534,11 @@ All 9 acceptance gates (`GATE-01` through `GATE-09`) have been implemented in `/
 >
 > **Operational Conditions for General Availability (External Infrastructure Scope):**
 > - Execute a 72-hour continuous multi-VM canary burn-in on live Fly.io Machines (`shared-cpu-2x` / `performance-2x`) across two physical Fly regions (`iad` and `ord`) with external HashiCorp Vault / KMS integration before removing the Canary label for General Availability.
+
+---
+
+### 8.3 Critical Follow-up Audit Addendum (`FUP-P0-01`..`FUP-P0-04`, `FUP-P1-01`..`FUP-P1-04`)
+
+Following the initial Stage 4 report, an independent Critical Follow-up Audit ([09-critical-followup-findings.md](file:///workspaces/air/audit/09-critical-followup-findings.md)) identified and remediated 4 P0 and 4 P1 defects across [control.go](file:///workspaces/air/stage1/pkg/control/control.go), [agent.go](file:///workspaces/air/stage4/pkg/cell/agent.go), [pitr_dag.go](file:///workspaces/air/stage4/pkg/backup/pitr_dag.go), and [virtualizer.go](file:///workspaces/air/stage4/pkg/wire/virtualizer.go), all verified with `-race` and fault injection against live PostgreSQL 17.12 ([15-fault-injection-results.md](file:///workspaces/air/audit/15-fault-injection-results.md)).
+
+**Updated Verdict ([16-updated-production-verdict.md](file:///workspaces/air/audit/16-updated-production-verdict.md)):** `NO-GO FOR GENERAL AVAILABILITY` / `CONDITIONAL GO FOR CONTROLLED STAGING CANARY` — alongside the 72-hour multi-VM Fly.io canary, General Availability requires Control Plane metadata HA, mandatory TLS SNI + JWT authorization in [gateway.go](file:///workspaces/air/stage1/pkg/gateway/gateway.go), and atomic `PutManifestCAS` commit inside `RunEncryptedBackupStep()`.

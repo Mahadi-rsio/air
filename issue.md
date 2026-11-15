@@ -918,3 +918,19 @@ Following the completion of Stages 0, 1, 2, and 3, an independent Principal Data
 - [x] `S4-RISK-07` (P0 — WS 7): Self-Contained `WrappedDEKBundle` in R2 `manifest.json` for Zero-Shared-Memory Cross-Region DR (`iad -> ord`, `500/500` rows restored with `0` shared RAM bytes) and Online Versioned KEK Rotation (`kek-v1 -> kek-v2` with `0` R2 bytes re-uploaded in [live_migrator.go](file:///workspaces/air/stage4/pkg/migration/live_migrator.go)).
 - [x] `S4-RISK-08` (P0 — WS 8 & 10): Hardened `pgproto3` Wire Virtualizer (Client Password Authentication `28P01`, Least-Privilege `app_user`, Bidirectional `COPY FROM STDIN` `500` rows, Non-Blocking Mid-Pipeline `Flush ('H')`, `DISCARD ALL`, and `DEALLOCATE` + re-`PREPARE` in [virtualizer.go](file:///workspaces/air/stage4/pkg/wire/virtualizer.go)).
 - [x] `S4-RISK-09` (P1 — WS 9): Linux Kernel `/proc/<pid>/smaps_rollup` Proportional Set Size (`PSS = 38.46 MB` loaded) & Unique Set Size (`USS = 23.02 MB`) vs `VmRSS` (`152.13 MB`, `3.96x` overcount ratio) Measurement and Parameterized FinOps Sensitivity Matrix (`5%..50%` active ratios in [pss_finops.go](file:///workspaces/air/stage4/pkg/capacity/pss_finops.go)).
+
+---
+
+CRITICAL FOLLOW-UP AUDIT & REMEDIATION (`FUP-P0-01`..`FUP-P0-04`, `FUP-P1-01`..`FUP-P1-04` — `VERIFIED`)
+
+A second independent Principal Database Engineer audit ([09-critical-followup-findings.md](file:///workspaces/air/audit/09-critical-followup-findings.md)) reproduced and remediated 4 P0 and 4 P1 code/durability defects across `stage1/pkg/control/control.go` and `stage4/pkg/{cell,backup,wire}`, plus classified 11 additional risks:
+
+- [x] `FUP-P0-01`: Removed `os.RemoveAll(metaDir)` from `NewControlPlane()`; added `PG_VERSION` detection, `ErrMetadataCorrupted`, and `schema_migrations` (`v1`, `v2`) in [control.go](file:///workspaces/air/stage1/pkg/control/control.go).
+- [x] `FUP-P0-02`: Added `ValidateTenantID()` + `safeTenantSubpath()` symlink/traversal containment and eliminated shell interpolation in `StopTenantClean()` in [agent.go](file:///workspaces/air/stage4/pkg/cell/agent.go).
+- [x] `FUP-P0-03`: Enforced `acquireFlockLocked()` error rejection, `agent.pidmeta` (`starttime`/PGDATA/`exe`), and `SetEpochChecker()` in `ReadoptRunningTenants()` in [agent.go](file:///workspaces/air/stage4/pkg/cell/agent.go).
+- [x] `FUP-P0-04`: Scoped `ProvisionDatabase()` idempotency to `tenant_id` + `payload_hash` (`ErrIdempotencyConflict`), encrypted `app_password_enc`, and redacted `response_json` in [control.go](file:///workspaces/air/stage1/pkg/control/control.go).
+- [x] `FUP-P1-01`: Added `provisioning_ops` crash-recovery state machine and `RecoverProvisioningOperations()` in [control.go](file:///workspaces/air/stage1/pkg/control/control.go).
+- [x] `FUP-P1-02`: Made `DrainAndEncryptWALSpoolToR2WithFault()` fail closed on nil R2, verify `HeadObject`, and commit atomic `wal_upload_manifest.json` before local WAL deletion in [pitr_dag.go](file:///workspaces/air/stage4/pkg/backup/pitr_dag.go).
+- [x] `FUP-P1-03`: Added `collectProcessTree()`, cgroup v2 (`air_tenant_<id>`), and `waitForPIDsExit()` before `releaseFlockLocked()` in [agent.go](file:///workspaces/air/stage4/pkg/cell/agent.go).
+- [x] `FUP-P1-04`: Made `RequestDrain()` and `handleClient()` fail closed (`ErrDrainVetoed`) on backend errors and added cross-client `DISCARD ALL;` isolation in [virtualizer.go](file:///workspaces/air/stage4/pkg/wire/virtualizer.go).
+- [ ] **Remaining Open Items Before GA** ([16-updated-production-verdict.md](file:///workspaces/air/audit/16-updated-production-verdict.md)): Control Plane metadata HA, mandatory TLS SNI + JWT auth at [gateway.go](file:///workspaces/air/stage1/pkg/gateway/gateway.go), atomic `PutManifestCAS` commit inside `RunEncryptedBackupStep()`, and 72-hour multi-VM Fly.io canary.
