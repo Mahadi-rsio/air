@@ -2,10 +2,7 @@ app = "air-pg-server"
 primary_region = "iad"
 
 [build]
-  image = "ghcr.io/mahadi-rsio/air:v2.0.1"
-
-[experimental]
-  entrypoint = ["/bin/sh", "-c", "mkdir -p /var/lib/air && chown -R postgres:postgres /var/lib/air && exec gosu postgres /usr/local/bin/air-server"]
+  image = "ghcr.io/mahadi-rsio/air:v2.0.2"
 
 [env]
   AIR_DATA_DIR = "/var/lib/air"
@@ -14,6 +11,9 @@ primary_region = "iad"
   AIR_GATEWAY_ADDR = "0.0.0.0:5432"
   AIR_POOL_MODE = "true"
   AIR_BOOTSTRAP_ACCOUNT_ID = "acct_default"
+  AIR_R2_ENDPOINT = "https://dcd4d8a920e7d7f054ba6565cd8db426.r2.cloudflarestorage.com"
+  AIR_R2_BUCKET = "air-pg-backups"
+  AIR_R2_REGION = "auto"
 
 [mounts]
   source = "air_data"

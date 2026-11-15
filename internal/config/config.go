@@ -27,6 +27,11 @@ type Config struct {
 	PoolMode           bool
 	PoolMaxBackends    int
 	IdleTimeout        time.Duration
+	R2Endpoint         string
+	R2Bucket           string
+	R2AccessKeyID      string
+	R2SecretAccessKey  string
+	R2Region           string
 }
 
 // Default returns safe defaults rooted under dataDir.
@@ -44,6 +49,7 @@ func Default(dataDir string) Config {
 		GatewayAddr:        "127.0.0.1:5432",
 		BootstrapAccountID: "acct_default",
 		PoolMaxBackends:    16,
+		R2Region:           "auto",
 	}
 }
 
@@ -60,6 +66,11 @@ func Load(args []string) (Config, error) {
 	cfg.BootstrapAccountID = envOr("AIR_BOOTSTRAP_ACCOUNT_ID", cfg.BootstrapAccountID)
 	cfg.TLSCertPath = envOr("AIR_TLS_CERT", cfg.TLSCertPath)
 	cfg.TLSKeyPath = envOr("AIR_TLS_KEY", cfg.TLSKeyPath)
+	cfg.R2Endpoint = envOr("AIR_R2_ENDPOINT", cfg.R2Endpoint)
+	cfg.R2Bucket = envOr("AIR_R2_BUCKET", cfg.R2Bucket)
+	cfg.R2AccessKeyID = envOr("AIR_R2_ACCESS_KEY_ID", cfg.R2AccessKeyID)
+	cfg.R2SecretAccessKey = envOr("AIR_R2_SECRET_ACCESS_KEY", cfg.R2SecretAccessKey)
+	cfg.R2Region = envOr("AIR_R2_REGION", cfg.R2Region)
 	if v := strings.TrimSpace(os.Getenv("AIR_REQUIRE_TLS")); v != "" {
 		cfg.RequireTLS = v == "1" || strings.EqualFold(v, "true")
 	}
@@ -99,6 +110,11 @@ func Load(args []string) (Config, error) {
 	fs.BoolVar(&cfg.PoolMode, "pool-mode", cfg.PoolMode, "Enable transaction-mode connection pooling in the Gateway")
 	fs.IntVar(&cfg.PoolMaxBackends, "pool-max-backends", cfg.PoolMaxBackends, "Max pooled backend PostgreSQL connections per tenant")
 	fs.DurationVar(&cfg.IdleTimeout, "idle-timeout", cfg.IdleTimeout, "Idle duration before cooperative tenant scale-to-zero (0 disables)")
+	fs.StringVar(&cfg.R2Endpoint, "r2-endpoint", cfg.R2Endpoint, "S3/R2 endpoint URL for encrypted backups and fencing manifests")
+	fs.StringVar(&cfg.R2Bucket, "r2-bucket", cfg.R2Bucket, "S3/R2 bucket name for encrypted backups and fencing manifests")
+	fs.StringVar(&cfg.R2AccessKeyID, "r2-access-key-id", cfg.R2AccessKeyID, "S3/R2 access key ID")
+	fs.StringVar(&cfg.R2SecretAccessKey, "r2-secret-access-key", cfg.R2SecretAccessKey, "S3/R2 secret access key")
+	fs.StringVar(&cfg.R2Region, "r2-region", cfg.R2Region, "S3/R2 region (default: auto)")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}

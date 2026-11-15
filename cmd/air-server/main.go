@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -14,6 +15,9 @@ import (
 	"github.com/Mahadi-rsio/air/internal/control"
 	"github.com/Mahadi-rsio/air/internal/crypto"
 	"github.com/Mahadi-rsio/air/internal/gateway"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 func main() {
@@ -48,6 +52,10 @@ func main() {
 		log.Fatalf("init control plane: %v", err)
 	}
 	defer cp.Close()
+
+	if err := configureBackupStore(cp, cfg); err != nil {
+		log.Fatalf("init backup store: %v", err)
+	}
 
 	if cfg.BootstrapAPIKey != "" {
 		keyInfo, err := cp.SeedAPIKey(ctx, cfg.BootstrapAccountID, cfg.BootstrapAPIKey, "bootstrap")
@@ -99,4 +107,29 @@ func main() {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutCtx)
+}
+
+func configureBackupStore(cp *control.ControlPlane, cfg config.Config) error {
+	anySet := cfg.R2Endpoint != "" || cfg.R2Bucket != "" || cfg.R2AccessKeyID != "" || cfg.R2SecretAccessKey != ""
+	if !anySet {
+		return nil
+	}
+	if cfg.R2Endpoint == "" || cfg.R2Bucket == "" || cfg.R2AccessKeyID == "" || cfg.R2SecretAccessKey == "" {
+		return fmt.Errorf("incomplete R2 configuration: AIR_R2_ENDPOINT, AIR_R2_BUCKET, AIR_R2_ACCESS_KEY_ID, and AIR_R2_SECRET_ACCESS_KEY must all be set")
+	}
+	region := cfg.R2Region
+	if region == "" {
+		region = "auto"
+	}
+	awsCfg := aws.Config{
+		Region:      region,
+		Credentials: credentials.NewStaticCredentialsProvider(cfg.R2AccessKeyID, cfg.R2SecretAccessKey, ""),
+	}
+	s3c := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(cfg.R2Endpoint)
+		o.UsePathStyle = true
+	})
+	cp.SetBackupStore(s3c, cfg.R2Bucket)
+	log.Printf("[air-server] backup store enabled (bucket=%s, endpoint=%s, region=%s)", cfg.R2Bucket, cfg.R2Endpoint, region)
+	return nil
 }
