@@ -6,6 +6,13 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/gin-gonic/gin"
+)
+
+const (
+	accountIDContextKey = "air_account_id"
+	maxJSONBodyBytes    = 16 * 1024
 )
 
 type createDatabaseReq struct {
@@ -21,194 +28,150 @@ type restoreDatabaseReq struct {
 	VerifyQuery string `json:"verify_query"`
 }
 
-// HTTPHandler returns an http.Handler exposing the AIR Control Plane REST API:
+// HTTPHandler returns an http.Handler backed by Gin exposing the AIR Control Plane REST API:
 //   - GET    /healthz
-//   - POST   /v1/databases         (Header: Authorization: Bearer <token>, Idempotency-Key; Body: {"tenant_id": "..."})
-//   - GET    /v1/databases/{id}    (Header: Authorization: Bearer <token>)
-//   - DELETE /v1/databases/{id}    (Header: Authorization: Bearer <token>)
-//   - DELETE /v1/api-keys/{id}     (Header: Authorization: Bearer <token>)
+//   - POST   /v1/databases            (Header: Authorization: Bearer <token>, Idempotency-Key; Body: {"tenant_id": "..."})
+//   - GET    /v1/databases/:id        (Header: Authorization: Bearer <token>)
+//   - DELETE /v1/databases/:id        (Header: Authorization: Bearer <token>)
+//   - DELETE /v1/api-keys/:id         (Header: Authorization: Bearer <token>)
+//   - POST   /v1/databases/:id/backups (Header: Authorization: Bearer <token>)
+//   - POST   /v1/databases/:id/restore (Header: Authorization: Bearer <token>)
 func (cp *ControlPlane) HTTPHandler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		if err := cp.db.Ping(r.Context()); err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy", "error": err.Error()})
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Recovery())
+
+	r.GET("/healthz", func(c *gin.Context) {
+		if err := cp.db.Ping(c.Request.Context()); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unhealthy", "error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
-	mux.HandleFunc("POST /v1/databases", func(w http.ResponseWriter, r *http.Request) {
-		accountID, ok := cp.authenticateRequest(w, r)
-		if !ok {
-			return
-		}
-		idemKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
-		if idemKey == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key header is required"})
-			return
-		}
-		var req createDatabaseReq
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
-			return
-		}
-		resp, err := cp.ProvisionDatabase(r.Context(), accountID, idemKey, req.TenantID)
-		if err != nil {
-			switch {
-			case errors.Is(err, ErrIdempotencyConflict):
-				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
-			case errors.Is(err, ErrForbidden):
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
-			default:
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	v1 := r.Group("/v1", cp.authMiddleware())
+	{
+		v1.POST("/databases", func(c *gin.Context) {
+			idemKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+			if idemKey == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Idempotency-Key header is required"})
+				return
 			}
-			return
-		}
-		writeJSON(w, http.StatusCreated, resp)
-	})
-
-	mux.HandleFunc("GET /v1/databases/{id}", func(w http.ResponseWriter, r *http.Request) {
-		accountID, ok := cp.authenticateRequest(w, r)
-		if !ok {
-			return
-		}
-		info, err := cp.GetDatabase(r.Context(), accountID, r.PathValue("id"))
-		if err != nil {
-			switch {
-			case errors.Is(err, ErrNotFound):
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
-			case errors.Is(err, ErrForbidden):
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
-			default:
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			var req createDatabaseReq
+			if !decodeJSONBody(c, &req, false) {
+				return
 			}
-			return
-		}
-		writeJSON(w, http.StatusOK, info)
-	})
-
-	mux.HandleFunc("DELETE /v1/databases/{id}", func(w http.ResponseWriter, r *http.Request) {
-		accountID, ok := cp.authenticateRequest(w, r)
-		if !ok {
-			return
-		}
-		err := cp.DeleteDatabase(r.Context(), accountID, r.PathValue("id"))
-		if err != nil {
-			switch {
-			case errors.Is(err, ErrNotFound):
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
-			case errors.Is(err, ErrForbidden):
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
-			default:
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			resp, err := cp.ProvisionDatabase(c.Request.Context(), c.GetString(accountIDContextKey), idemKey, req.TenantID)
+			if err != nil {
+				writeControlError(c, err)
+				return
 			}
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "purged", "tenant_id": r.PathValue("id")})
-	})
+			c.JSON(http.StatusCreated, resp)
+		})
 
-	mux.HandleFunc("DELETE /v1/api-keys/{id}", func(w http.ResponseWriter, r *http.Request) {
-		accountID, ok := cp.authenticateRequest(w, r)
-		if !ok {
-			return
-		}
-		err := cp.RevokeAPIKey(r.Context(), accountID, r.PathValue("id"))
-		if err != nil {
-			switch {
-			case errors.Is(err, ErrNotFound):
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
-			case errors.Is(err, ErrForbidden):
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
-			default:
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		v1.GET("/databases/:id", func(c *gin.Context) {
+			info, err := cp.GetDatabase(c.Request.Context(), c.GetString(accountIDContextKey), c.Param("id"))
+			if err != nil {
+				writeControlError(c, err)
+				return
 			}
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "key_id": r.PathValue("id")})
-	})
+			c.JSON(http.StatusOK, info)
+		})
 
-	mux.HandleFunc("POST /v1/databases/{id}/backups", func(w http.ResponseWriter, r *http.Request) {
-		accountID, ok := cp.authenticateRequest(w, r)
-		if !ok {
-			return
-		}
-		var req triggerBackupReq
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
-			return
-		}
-		resp, err := cp.TriggerBackup(r.Context(), accountID, r.PathValue("id"), req.Type)
-		if err != nil {
-			switch {
-			case errors.Is(err, ErrNotFound):
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
-			case errors.Is(err, ErrForbidden):
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
-			case errors.Is(err, ErrBackupNotConfigured):
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-			default:
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		v1.DELETE("/databases/:id", func(c *gin.Context) {
+			id := c.Param("id")
+			if err := cp.DeleteDatabase(c.Request.Context(), c.GetString(accountIDContextKey), id); err != nil {
+				writeControlError(c, err)
+				return
 			}
-			return
-		}
-		writeJSON(w, http.StatusCreated, resp)
-	})
+			c.JSON(http.StatusOK, gin.H{"status": "purged", "tenant_id": id})
+		})
 
-	mux.HandleFunc("POST /v1/databases/{id}/restore", func(w http.ResponseWriter, r *http.Request) {
-		accountID, ok := cp.authenticateRequest(w, r)
-		if !ok {
-			return
-		}
-		var req restoreDatabaseReq
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
-			return
-		}
-		resp, err := cp.RestoreDatabase(r.Context(), accountID, r.PathValue("id"), req.TargetLSN, req.VerifyQuery)
-		if err != nil {
-			switch {
-			case errors.Is(err, ErrNotFound):
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
-			case errors.Is(err, ErrForbidden):
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
-			case errors.Is(err, ErrBackupNotConfigured):
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-			default:
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		v1.DELETE("/api-keys/:id", func(c *gin.Context) {
+			id := c.Param("id")
+			if err := cp.RevokeAPIKey(c.Request.Context(), c.GetString(accountIDContextKey), id); err != nil {
+				writeControlError(c, err)
+				return
 			}
-			return
-		}
-		writeJSON(w, http.StatusOK, resp)
-	})
+			c.JSON(http.StatusOK, gin.H{"status": "revoked", "key_id": id})
+		})
 
-	return mux
+		v1.POST("/databases/:id/backups", func(c *gin.Context) {
+			var req triggerBackupReq
+			if !decodeJSONBody(c, &req, true) {
+				return
+			}
+			resp, err := cp.TriggerBackup(c.Request.Context(), c.GetString(accountIDContextKey), c.Param("id"), req.Type)
+			if err != nil {
+				writeControlError(c, err)
+				return
+			}
+			c.JSON(http.StatusCreated, resp)
+		})
+
+		v1.POST("/databases/:id/restore", func(c *gin.Context) {
+			var req restoreDatabaseReq
+			if !decodeJSONBody(c, &req, true) {
+				return
+			}
+			resp, err := cp.RestoreDatabase(c.Request.Context(), c.GetString(accountIDContextKey), c.Param("id"), req.TargetLSN, req.VerifyQuery)
+			if err != nil {
+				writeControlError(c, err)
+				return
+			}
+			c.JSON(http.StatusOK, resp)
+		})
+	}
+
+	return r
 }
 
-func (cp *ControlPlane) authenticateRequest(w http.ResponseWriter, r *http.Request) (string, bool) {
-	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
-	if len(authHeader) < 8 || !strings.EqualFold(authHeader[:7], "Bearer ") {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": ErrUnauthorized.Error()})
-		return "", false
-	}
-	rawToken := strings.TrimSpace(authHeader[7:])
-	accountID, _, err := cp.AuthenticateAPIKey(r.Context(), rawToken)
-	if err != nil {
-		if errors.Is(err, ErrUnauthorized) {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
-		} else {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "authentication check failed"})
+func (cp *ControlPlane) authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := strings.TrimSpace(c.GetHeader("Authorization"))
+		if len(authHeader) < 8 || !strings.EqualFold(authHeader[:7], "Bearer ") {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": ErrUnauthorized.Error()})
+			return
 		}
-		return "", false
+		rawToken := strings.TrimSpace(authHeader[7:])
+		accountID, _, err := cp.AuthenticateAPIKey(c.Request.Context(), rawToken)
+		if err != nil {
+			if errors.Is(err, ErrUnauthorized) {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+			} else {
+				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "authentication check failed"})
+			}
+			return
+		}
+		if hdrAcct := strings.TrimSpace(c.GetHeader("X-Account-ID")); hdrAcct != "" && hdrAcct != accountID {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": ErrForbidden.Error()})
+			return
+		}
+		c.Set(accountIDContextKey, accountID)
+		c.Next()
 	}
-	if hdrAcct := strings.TrimSpace(r.Header.Get("X-Account-ID")); hdrAcct != "" && hdrAcct != accountID {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": ErrForbidden.Error()})
-		return "", false
-	}
-	return accountID, true
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+func decodeJSONBody(c *gin.Context, dst any, allowEOF bool) bool {
+	err := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, maxJSONBodyBytes)).Decode(dst)
+	if err != nil && (!allowEOF || !errors.Is(err, io.EOF)) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON body"})
+		return false
+	}
+	return true
+}
+
+func writeControlError(c *gin.Context, err error) {
+	status := http.StatusBadRequest
+	switch {
+	case errors.Is(err, ErrNotFound):
+		status = http.StatusNotFound
+	case errors.Is(err, ErrForbidden):
+		status = http.StatusForbidden
+	case errors.Is(err, ErrIdempotencyConflict):
+		status = http.StatusConflict
+	case errors.Is(err, ErrBackupNotConfigured):
+		status = http.StatusServiceUnavailable
+	}
+	c.JSON(status, gin.H{"error": err.Error()})
 }
