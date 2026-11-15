@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,13 @@ import (
 )
 
 const pgBin = "/usr/lib/postgresql/17/bin"
+
+var validTenantIDRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$`)
+
+var (
+	ErrInvalidTenantID = errors.New("cell: invalid tenant_id")
+	ErrPathEscape      = errors.New("cell: path escapes tenant root")
+)
 
 // max_concurrent_starts = 5 protects Cells from CPU/IOPS thrashing during wake storms.
 var wakeStartSemaphore = make(chan struct{}, 5)
@@ -87,6 +95,10 @@ type Agent struct {
 	lastLeaseAckMono time.Time
 	watchdogFenced   atomic.Bool
 	watchdogKillMs   atomic.Int64
+
+	// Control-plane epoch reconciliation & supervision
+	epochChecker func(tenantID string) (int64, error)
+	refillOnce   sync.Once
 }
 
 func NewAgent(volDir string, targetPoolSize int, kms *crypto.EnvelopeKMS) (*Agent, error) {
@@ -166,6 +178,100 @@ func (a *Agent) PurgeInterruptedStaging() int {
 	return purged
 }
 
+func ValidateTenantID(tenantID string) error {
+	if !validTenantIDRe.MatchString(tenantID) {
+		return fmt.Errorf("%w: %q", ErrInvalidTenantID, tenantID)
+	}
+	return nil
+}
+
+func (a *Agent) SetEpochChecker(fn func(tenantID string) (int64, error)) {
+	a.tenantMu.Lock()
+	a.epochChecker = fn
+	a.tenantMu.Unlock()
+}
+
+// safeTenantSubpath validates tenantID, ensures canonical containment under volDir/baseSubdir,
+// and rejects symlinks that escape the assigned root.
+func (a *Agent) safeTenantSubpath(baseSubdir, tenantID string) (string, error) {
+	if err := ValidateTenantID(tenantID); err != nil {
+		return "", err
+	}
+	absVol, err := filepath.Abs(a.volDir)
+	if err != nil {
+		return "", err
+	}
+	baseDir := filepath.Clean(filepath.Join(absVol, baseSubdir))
+	if realBase, err := filepath.EvalSymlinks(baseDir); err == nil {
+		baseDir = realBase
+	}
+	target := filepath.Clean(filepath.Join(baseDir, tenantID))
+	rel, err := filepath.Rel(baseDir, target)
+	if err != nil || rel != tenantID || strings.Contains(rel, "..") || strings.ContainsRune(rel, filepath.Separator) {
+		return "", fmt.Errorf("%w: %q", ErrPathEscape, tenantID)
+	}
+	if fi, err := os.Lstat(target); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("%w: symlink not allowed at %s", ErrPathEscape, target)
+		}
+	}
+	return target, nil
+}
+
+type pidMeta struct {
+	PID              int    `json:"pid"`
+	StartTime        uint64 `json:"start_time"`
+	SystemIdentifier string `json:"system_identifier"`
+	Epoch            int64  `json:"epoch"`
+	PGData           string `json:"pgdata"`
+}
+
+func readProcStartTime(pid int) (uint64, bool) {
+	statBytes, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, false
+	}
+	s := string(statBytes)
+	idx := strings.LastIndex(s, ")")
+	if idx == -1 || idx+2 >= len(s) {
+		return 0, false
+	}
+	fields := strings.Fields(s[idx+2:])
+	// fields[0] is state (field 3), so field 22 (starttime) is index 19.
+	if len(fields) <= 19 || fields[0] == "Z" || fields[0] == "X" {
+		return 0, false
+	}
+	st, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return st, true
+}
+
+func writePIDMeta(activeBase string, meta pidMeta) {
+	b, err := json.Marshal(meta)
+	if err != nil {
+		return
+	}
+	tmp := filepath.Join(activeBase, "agent.pidmeta.tmp")
+	dst := filepath.Join(activeBase, "agent.pidmeta")
+	if err := os.WriteFile(tmp, b, 0o600); err == nil {
+		_ = os.Rename(tmp, dst)
+	}
+}
+
+func readPIDMeta(activeBase string) (pidMeta, bool) {
+	var m pidMeta
+	b, err := os.ReadFile(filepath.Join(activeBase, "agent.pidmeta"))
+	if err != nil {
+		return m, false
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return m, false
+	}
+	return m, true
+}
+
 func (a *Agent) ReadoptRunningTenants() int {
 	activeRoot := filepath.Join(a.volDir, "tenants/active")
 	entries, err := os.ReadDir(activeRoot)
@@ -174,57 +280,127 @@ func (a *Agent) ReadoptRunningTenants() int {
 	}
 	count := 0
 	for _, e := range entries {
-		if !e.IsDir() {
+		if !e.IsDir() || e.Type()&os.ModeSymlink != 0 {
 			continue
 		}
 		tenantID := e.Name()
-		tDir := filepath.Join(activeRoot, tenantID)
+		tDir, err := a.safeTenantSubpath("tenants/active", tenantID)
+		if err != nil {
+			continue
+		}
 		pgData := filepath.Join(tDir, "pgdata")
 		sockDir := filepath.Join(tDir, "sock")
-		spoolDir := filepath.Join(a.volDir, "spool/wal", tenantID)
-		pid, port := readPostmasterPIDAndPort(pgData)
-		if pid > 0 && isPostgresProcessAlive(pid) {
-			a.tenantMu.Lock()
-			_ = a.acquireFlockLocked(tenantID, filepath.Join(tDir, "agent.lock"))
-			sysID := extractSystemIdentifier(pgData)
-			if port >= int(a.portSeq.Load()) {
-				a.portSeq.Store(int32(port + 1))
-			}
-			a.tenantPorts[tenantID] = port
-			a.tenants[tenantID] = &TenantRuntime{
-				TenantID:         tenantID,
-				SystemIdentifier: sysID,
-				Port:             port,
-				PID:              pid,
-				Epoch:            1,
-				Readopted:        true,
-				DataDir:          pgData,
-				SockDir:          sockDir,
-				WALSpoolDir:      spoolDir,
-			}
-			a.tenantMu.Unlock()
-			a.readoptedCount.Add(1)
-			count++
+		spoolDir, err := a.safeTenantSubpath("spool/wal", tenantID)
+		if err != nil {
+			continue
 		}
+		pid, port, pidPGData := readPostmasterDetails(pgData)
+		if pid <= 0 || !verifyPostgresProcessIdentity(pid, pgData, pidPGData) {
+			continue
+		}
+		if meta, ok := readPIDMeta(tDir); ok {
+			if st, alive := readProcStartTime(pid); !alive || (meta.PID == pid && meta.StartTime != 0 && meta.StartTime != st) {
+				continue
+			}
+		}
+
+		sysID := extractSystemIdentifier(pgData)
+		if sysID == "" {
+			continue
+		}
+
+		a.tenantMu.Lock()
+		if err := a.acquireFlockLocked(tenantID, filepath.Join(tDir, "agent.lock")); err != nil {
+			a.dualStartBlock.Add(1)
+			a.tenantMu.Unlock()
+			log.Printf("[cell-agent] readopt skipped for %s: %v", tenantID, err)
+			continue
+		}
+		localEpoch := int64(1)
+		if meta, ok := readPIDMeta(tDir); ok && meta.Epoch > 0 {
+			localEpoch = meta.Epoch
+		}
+		if a.epochChecker != nil {
+			authEpoch, eErr := a.epochChecker(tenantID)
+			if eErr != nil || authEpoch > localEpoch {
+				a.releaseFlockLocked(tenantID)
+				a.tenantMu.Unlock()
+				log.Printf("[cell-agent] readopt rejected for %s: stale epoch %d (auth=%d, err=%v)", tenantID, localEpoch, authEpoch, eErr)
+				continue
+			}
+		}
+		if port >= int(a.portSeq.Load()) {
+			a.portSeq.Store(int32(port + 1))
+		}
+		a.tenantPorts[tenantID] = port
+		a.tenants[tenantID] = &TenantRuntime{
+			TenantID:         tenantID,
+			SystemIdentifier: sysID,
+			Port:             port,
+			PID:              pid,
+			Epoch:            localEpoch,
+			Readopted:        true,
+			DataDir:          pgData,
+			SockDir:          sockDir,
+			WALSpoolDir:      spoolDir,
+		}
+		a.tenantMu.Unlock()
+		a.readoptedCount.Add(1)
+		count++
 	}
 	return count
 }
 
-func readPostmasterPIDAndPort(pgData string) (int, int) {
+func readPostmasterDetails(pgData string) (int, int, string) {
 	b, err := os.ReadFile(filepath.Join(pgData, "postmaster.pid"))
 	if err != nil {
-		return 0, 0
+		return 0, 0, ""
 	}
 	lines := strings.Split(string(b), "\n")
 	if len(lines) < 1 {
-		return 0, 0
+		return 0, 0, ""
 	}
 	pid, _ := strconv.Atoi(strings.TrimSpace(lines[0]))
+	var pidPGData string
+	if len(lines) >= 2 {
+		pidPGData = strings.TrimSpace(lines[1])
+	}
 	port := 0
 	if len(lines) >= 4 {
 		port, _ = strconv.Atoi(strings.TrimSpace(lines[3]))
 	}
+	return pid, port, pidPGData
+}
+
+func readPostmasterPIDAndPort(pgData string) (int, int) {
+	pid, port, _ := readPostmasterDetails(pgData)
 	return pid, port
+}
+
+func verifyPostgresProcessIdentity(pid int, expectedPGData, pidPGData string) bool {
+	if !isPostgresProcessAlive(pid) {
+		return false
+	}
+	if pidPGData != "" {
+		cleanExp := filepath.Clean(expectedPGData)
+		cleanGot := filepath.Clean(pidPGData)
+		if realExp, err := filepath.EvalSymlinks(cleanExp); err == nil {
+			cleanExp = realExp
+		}
+		if realGot, err := filepath.EvalSymlinks(cleanGot); err == nil {
+			cleanGot = realGot
+		}
+		if cleanExp != cleanGot {
+			return false
+		}
+	}
+	if exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err == nil {
+		base := filepath.Base(strings.TrimSuffix(exe, " (deleted)"))
+		if !strings.Contains(base, "postgres") {
+			return false
+		}
+	}
+	return true
 }
 
 func isPostgresProcessAlive(pid int) bool {
@@ -237,16 +413,8 @@ func isPostgresProcessAlive(pid int) bool {
 			break
 		}
 	}
-	statBytes, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
+	if _, ok := readProcStartTime(pid); !ok {
 		return false
-	}
-	s := string(statBytes)
-	if idx := strings.LastIndex(s, ")"); idx != -1 && idx+2 < len(s) {
-		fields := strings.Fields(s[idx+2:])
-		if len(fields) > 0 && (fields[0] == "Z" || fields[0] == "X") {
-			return false
-		}
 	}
 	commBytes, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
 	if err != nil {
@@ -256,11 +424,11 @@ func isPostgresProcessAlive(pid int) bool {
 	return strings.Contains(comm, "postgres")
 }
 
-// SignalProcessTree sends sig to both the postmaster and all its child processes.
-func SignalProcessTree(rootPID int, sig syscall.Signal) {
+func collectProcessTree(rootPID int) []int {
 	if rootPID <= 0 {
-		return
+		return nil
 	}
+	childrenOf := make(map[int][]int)
 	entries, err := os.ReadDir("/proc")
 	if err == nil {
 		for _, e := range entries {
@@ -268,7 +436,7 @@ func SignalProcessTree(rootPID int, sig syscall.Signal) {
 				continue
 			}
 			pid, err := strconv.Atoi(e.Name())
-			if err != nil || pid == rootPID {
+			if err != nil {
 				continue
 			}
 			statBytes, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
@@ -281,14 +449,85 @@ func SignalProcessTree(rootPID int, sig syscall.Signal) {
 				rest := strings.Fields(s[idx+2:])
 				if len(rest) >= 2 {
 					ppid, _ := strconv.Atoi(rest[1])
-					if ppid == rootPID {
-						_ = syscall.Kill(pid, sig)
-					}
+					childrenOf[ppid] = append(childrenOf[ppid], pid)
 				}
 			}
 		}
 	}
-	_ = syscall.Kill(rootPID, sig)
+	var result []int
+	seen := map[int]bool{rootPID: true}
+	queue := []int{rootPID}
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+		result = append(result, curr)
+		for _, ch := range childrenOf[curr] {
+			if !seen[ch] {
+				seen[ch] = true
+				queue = append(queue, ch)
+			}
+		}
+	}
+	return result
+}
+
+func waitForPIDsExit(pids []int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		anyAlive := false
+		for _, p := range pids {
+			if _, ok := readProcStartTime(p); ok {
+				anyAlive = true
+				break
+			}
+		}
+		if !anyAlive {
+			return true
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	return false
+}
+
+func movePIDToTenantCgroup(tenantID string, pid int) {
+	if pid <= 0 || ValidateTenantID(tenantID) != nil {
+		return
+	}
+	cgDir := filepath.Join("/sys/fs/cgroup", "air_tenant_"+tenantID)
+	if err := os.MkdirAll(cgDir, 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(cgDir, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o644)
+}
+
+func killTenantCgroup(tenantID string) {
+	if ValidateTenantID(tenantID) != nil {
+		return
+	}
+	cgDir := filepath.Join("/sys/fs/cgroup", "air_tenant_"+tenantID)
+	_ = os.WriteFile(filepath.Join(cgDir, "cgroup.kill"), []byte("1"), 0o644)
+	if data, err := os.ReadFile(filepath.Join(cgDir, "cgroup.procs")); err == nil {
+		for _, line := range strings.Fields(string(data)) {
+			if p, err := strconv.Atoi(line); err == nil && p > 0 {
+				_ = syscall.Kill(p, syscall.SIGKILL)
+			}
+		}
+	}
+}
+
+// SignalProcessTree sends sig to the postmaster and ALL recursive descendants (children, grandchildren, workers).
+func SignalProcessTree(rootPID int, sig syscall.Signal) {
+	if rootPID <= 0 {
+		return
+	}
+	pids := collectProcessTree(rootPID)
+	// Signal descendants first, then rootPID.
+	for i := len(pids) - 1; i >= 0; i-- {
+		_ = syscall.Kill(pids[i], sig)
+	}
+	if sig == syscall.SIGKILL {
+		_ = waitForPIDsExit(pids, 2*time.Second)
+	}
 	for {
 		reaped, _ := syscall.Wait4(-1, nil, syscall.WNOHANG, nil)
 		if reaped <= 0 {
@@ -334,7 +573,9 @@ func (a *Agent) PrewarmPool(count int) error {
 			return err
 		}
 	}
-	go a.backgroundRefillLoop()
+	a.refillOnce.Do(func() {
+		go a.backgroundRefillLoop()
+	})
 	return nil
 }
 
@@ -408,7 +649,10 @@ type ClaimResult struct {
 }
 
 func (a *Agent) ClaimCluster(tenantID string) (*ClaimResult, error) {
-	claimDir := filepath.Join(a.volDir, "tenants/claiming", tenantID)
+	claimDir, err := a.safeTenantSubpath("tenants/claiming", tenantID)
+	if err != nil {
+		return nil, err
+	}
 	_ = os.RemoveAll(claimDir)
 
 	t0 := time.Now()
@@ -462,6 +706,14 @@ func (a *Agent) ClaimCluster(tenantID string) (*ClaimResult, error) {
 	}, nil
 }
 
+func (a *Agent) RollbackClaim(tenantID string) {
+	claimDir, err := a.safeTenantSubpath("tenants/claiming", tenantID)
+	if err != nil {
+		return
+	}
+	_ = os.RemoveAll(claimDir)
+}
+
 // allocOrReusePort returns the tenant's existing assigned port or allocates a new one once (S4-RISK-05).
 func (a *Agent) allocOrReusePort(tenantID string) int {
 	a.tenantMu.Lock()
@@ -477,11 +729,20 @@ func (a *Agent) allocOrReusePort(tenantID string) int {
 // ActivateCluster promotes claiming -> active, configures continuous WAL archiving (archive_mode = on),
 // supautils v4.0.0, temp_file_limit, wal_level = logical, and least-privilege app_user with SCRAM-SHA-256.
 func (a *Agent) ActivateCluster(tenantID, appPassword string, epoch int64) (*TenantRuntime, error) {
-	claimDir := filepath.Join(a.volDir, "tenants/claiming", tenantID)
-	activeBase := filepath.Join(a.volDir, "tenants/active", tenantID)
+	claimDir, err := a.safeTenantSubpath("tenants/claiming", tenantID)
+	if err != nil {
+		return nil, err
+	}
+	activeBase, err := a.safeTenantSubpath("tenants/active", tenantID)
+	if err != nil {
+		return nil, err
+	}
 	pgData := filepath.Join(activeBase, "pgdata")
 	sockDir := filepath.Join(activeBase, "sock")
-	walSpoolDir := filepath.Join(a.volDir, "spool/wal", tenantID)
+	walSpoolDir, err := a.safeTenantSubpath("spool/wal", tenantID)
+	if err != nil {
+		return nil, err
+	}
 
 	if err := os.MkdirAll(sockDir, 0o755); err != nil {
 		return nil, err
@@ -586,13 +847,20 @@ GRANT ALL ON SCHEMA public TO app_user;
 }
 
 func (a *Agent) StartOrAdoptTenant(tenantID string, epoch int64) (*TenantRuntime, error) {
+	activeBase, err := a.safeTenantSubpath("tenants/active", tenantID)
+	if err != nil {
+		return nil, err
+	}
+	walSpoolDir, err := a.safeTenantSubpath("spool/wal", tenantID)
+	if err != nil {
+		return nil, err
+	}
+
 	a.tenantMu.Lock()
 	defer a.tenantMu.Unlock()
 
-	activeBase := filepath.Join(a.volDir, "tenants/active", tenantID)
 	pgData := filepath.Join(activeBase, "pgdata")
 	sockDir := filepath.Join(activeBase, "sock")
-	walSpoolDir := filepath.Join(a.volDir, "spool/wal", tenantID)
 	lockPath := filepath.Join(activeBase, "agent.lock")
 
 	if err := a.acquireFlockLocked(tenantID, lockPath); err != nil {
@@ -600,15 +868,19 @@ func (a *Agent) StartOrAdoptTenant(tenantID string, epoch int64) (*TenantRuntime
 		return nil, err
 	}
 
-	pid, port := readPostmasterPIDAndPort(pgData)
-	if pid > 0 && isPostgresProcessAlive(pid) {
+	pid, port, pidPGData := readPostmasterDetails(pgData)
+	if pid > 0 && verifyPostgresProcessIdentity(pid, pgData, pidPGData) {
 		if existing, ok := a.tenants[tenantID]; ok && existing.PID == pid {
 			a.dualStartBlock.Add(1)
 			return existing, nil
 		}
+		sysID := extractSystemIdentifier(pgData)
+		st, _ := readProcStartTime(pid)
+		writePIDMeta(activeBase, pidMeta{PID: pid, StartTime: st, SystemIdentifier: sysID, Epoch: epoch, PGData: pgData})
+		movePIDToTenantCgroup(tenantID, pid)
 		rt := &TenantRuntime{
 			TenantID:         tenantID,
-			SystemIdentifier: extractSystemIdentifier(pgData),
+			SystemIdentifier: sysID,
 			Port:             port,
 			PID:              pid,
 			Epoch:            epoch,
@@ -635,10 +907,14 @@ func (a *Agent) StartOrAdoptTenant(tenantID string, epoch int64) (*TenantRuntime
 		return nil, fmt.Errorf("pg_ctl start failed: %w (%s)", err, out)
 	}
 	newPID, newPort := readPostmasterPIDAndPort(pgData)
+	sysID := extractSystemIdentifier(pgData)
+	st, _ := readProcStartTime(newPID)
+	writePIDMeta(activeBase, pidMeta{PID: newPID, StartTime: st, SystemIdentifier: sysID, Epoch: epoch, PGData: pgData})
+	movePIDToTenantCgroup(tenantID, newPID)
 	a.tenantPorts[tenantID] = newPort
 	rt := &TenantRuntime{
 		TenantID:         tenantID,
-		SystemIdentifier: extractSystemIdentifier(pgData),
+		SystemIdentifier: sysID,
 		Port:             newPort,
 		PID:              newPID,
 		Epoch:            epoch,
@@ -667,26 +943,33 @@ func (a *Agent) StopTenantClean(tenantID string, mode string) (string, error) {
 	if mode == "" {
 		mode = "smart"
 	}
-	pgdata := filepath.Join(a.volDir, "tenants/active", tenantID, "pgdata")
-	cmd := exec.Command("su", "-", "postgres", "-c",
-		fmt.Sprintf("/usr/lib/postgresql/17/bin/pg_ctl -D %s -m %s -w -t 20 stop", pgdata, mode))
-	out, err := cmd.CombinedOutput()
+	if mode != "smart" && mode != "fast" && mode != "immediate" {
+		return "", fmt.Errorf("invalid stop mode: %q", mode)
+	}
+	activeBase, err := a.safeTenantSubpath("tenants/active", tenantID)
+	if err != nil {
+		return "", err
+	}
+	pgdata := filepath.Join(activeBase, "pgdata")
+	out, err := runPostgresCmd(filepath.Join(pgBin, "pg_ctl"), "-D", pgdata, "-m", mode, "-w", "-t", "20", "stop")
 	if err != nil && mode == "smart" {
-		cmdFast := exec.Command("su", "-", "postgres", "-c",
-			fmt.Sprintf("/usr/lib/postgresql/17/bin/pg_ctl -D %s -m fast -w -t 15 stop", pgdata))
-		_, _ = cmdFast.CombinedOutput()
+		_, _ = runPostgresCmd(filepath.Join(pgBin, "pg_ctl"), "-D", pgdata, "-m", "fast", "-w", "-t", "15", "stop")
+	}
+	if pid, _ := readPostmasterPIDAndPort(pgdata); pid > 0 && isPostgresProcessAlive(pid) {
+		SignalProcessTree(pid, syscall.SIGKILL)
+		killTenantCgroup(tenantID)
 	}
 	state, sErr := a.ReadPgControlState(tenantID)
 	a.tenantMu.Lock()
 	if rt, ok := a.tenants[tenantID]; ok {
 		rt.PID = 0
 	}
-	// CRITICAL REMEDIATION (S4-RISK-05): Close and unlock agent.lock FD when cluster stops!
+	// Release flock ONLY after postmaster and children are confirmed stopped!
 	a.releaseFlockLocked(tenantID)
 	a.tenantMu.Unlock()
 
 	if sErr != nil {
-		return "", fmt.Errorf("stop clean (%v: %s) state check: %w", err, string(out), sErr)
+		return "", fmt.Errorf("stop clean (%v: %s) state check: %w", err, out, sErr)
 	}
 	return state, nil
 }
@@ -697,24 +980,39 @@ func (a *Agent) StopTenantOnly(tenantID string) error {
 }
 
 func (a *Agent) StopAndPurgeTenant(tenantID string) error {
+	activeBase, err := a.safeTenantSubpath("tenants/active", tenantID)
+	if err != nil {
+		return err
+	}
+	walSpoolDir, err := a.safeTenantSubpath("spool/wal", tenantID)
+	if err != nil {
+		return err
+	}
 	a.tenantMu.Lock()
 	defer a.tenantMu.Unlock()
-	activeBase := filepath.Join(a.volDir, "tenants/active", tenantID)
 	pgData := filepath.Join(activeBase, "pgdata")
 	if pid, _ := readPostmasterPIDAndPort(pgData); pid > 0 && isPostgresProcessAlive(pid) {
 		_, _ = runPostgresCmd(filepath.Join(pgBin, "pg_ctl"), "-D", pgData, "-m", "fast", "-w", "-t", "10", "stop")
+		if isPostgresProcessAlive(pid) {
+			SignalProcessTree(pid, syscall.SIGKILL)
+		}
+		killTenantCgroup(tenantID)
 	}
 	a.releaseFlockLocked(tenantID)
 	delete(a.tenants, tenantID)
 	delete(a.tenantPorts, tenantID)
 	delete(a.tenantPasswords, tenantID)
 	delete(a.tenantQuotas, tenantID)
-	_ = os.RemoveAll(filepath.Join(a.volDir, "spool/wal", tenantID))
+	_ = os.RemoveAll(walSpoolDir)
 	return os.RemoveAll(activeBase)
 }
 
 func (a *Agent) ReadPgControlState(tenantID string) (string, error) {
-	pgdata := filepath.Join(a.volDir, "tenants/active", tenantID, "pgdata")
+	activeBase, err := a.safeTenantSubpath("tenants/active", tenantID)
+	if err != nil {
+		return "", err
+	}
+	pgdata := filepath.Join(activeBase, "pgdata")
 	out, err := exec.Command("/usr/lib/postgresql/17/bin/pg_controldata", pgdata).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("pg_controldata failed: %v (%s)", err, string(out))
@@ -787,7 +1085,10 @@ func (a *Agent) fenceAllLocalPrimaries() {
 	defer a.tenantMu.Unlock()
 	for id, rt := range a.tenants {
 		if rt.PID > 0 {
+			pids := collectProcessTree(rt.PID)
 			SignalProcessTree(rt.PID, syscall.SIGKILL)
+			killTenantCgroup(id)
+			_ = waitForPIDsExit(pids, 2*time.Second)
 			rt.PID = 0
 		}
 		rt.Quarantined = true
@@ -811,18 +1112,31 @@ func (a *Agent) SetTenantStorageQuota(tenantID string, quotaBytes int64) {
 
 // MeasureTenantDiskBytes calculates physical disk usage of a tenant's PGDATA + WAL spool.
 func (a *Agent) MeasureTenantDiskBytes(tenantID string) (int64, error) {
-	activeBase := filepath.Join(a.volDir, "tenants/active", tenantID)
+	activeBase, err := a.safeTenantSubpath("tenants/active", tenantID)
+	if err != nil {
+		return 0, err
+	}
+	walSpoolDir, err := a.safeTenantSubpath("spool/wal", tenantID)
+	if err != nil {
+		return 0, err
+	}
 	var total int64
-	err := filepath.WalkDir(activeBase, func(_ string, d fs.DirEntry, err error) error {
-		if err != nil || d == nil || d.IsDir() {
+	for _, root := range []string{activeBase, walSpoolDir} {
+		_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+			if err != nil || d == nil || d.IsDir() {
+				return nil
+			}
+			if info, iErr := d.Info(); iErr == nil {
+				if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Blocks > 0 {
+					total += st.Blocks * 512
+				} else {
+					total += info.Size()
+				}
+			}
 			return nil
-		}
-		if info, iErr := d.Info(); iErr == nil {
-			total += info.Size()
-		}
-		return nil
-	})
-	return total, err
+		})
+	}
+	return total, nil
 }
 
 // EnforceTenantQuotaOnce checks whether tenantID exceeds its storage quota and immediately flips

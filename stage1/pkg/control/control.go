@@ -3,12 +3,16 @@ package control
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,10 +21,18 @@ import (
 	"air-stage1/pkg/cell"
 	"air-stage1/pkg/crypto"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const pgBin = "/usr/lib/postgresql/17/bin"
+
+var (
+	ErrInvalidTenantID     = errors.New("control: invalid tenant_id")
+	ErrIdempotencyConflict = errors.New("control: idempotency key conflict (different tenant or payload)")
+	ErrMetadataCorrupted   = errors.New("control: metadata database corrupted; refusing destructive reset")
+	validTenantIDRe        = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$`)
+)
 
 type ProvisionResponse struct {
 	TenantID         string  `json:"tenant_id"`
@@ -48,19 +60,51 @@ type UsageEventBatch struct {
 	RUCharged      int64  `json:"ru_charged"`
 }
 
-type ControlPlane struct {
-	metaDir  string
-	metaPort int
-	db       *pgxpool.Pool
-	agent    *cell.Agent
-	kms      *crypto.EnvelopeKMS
-	keyMu    sync.Mutex
-	keyLocks map[string]*sync.Mutex
+type refLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
-// NewControlPlane initializes a dedicated PostgreSQL 17 Metadata DB on metaDir and connects via pgxpool.
+type ControlPlane struct {
+	metaDir   string
+	metaPort  int
+	db        *pgxpool.Pool
+	agent     *cell.Agent
+	kms       *crypto.EnvelopeKMS
+	keyMu     sync.Mutex
+	keyLocks  map[string]*refLock
+	faultMu   sync.RWMutex
+	faultHook func(stage string) error
+}
+
+// ValidateTenantID enforces strict alphanumeric/hyphen/underscore naming to prevent traversal.
+func ValidateTenantID(tenantID string) error {
+	if !validTenantIDRe.MatchString(tenantID) {
+		return fmt.Errorf("%w: %q", ErrInvalidTenantID, tenantID)
+	}
+	return nil
+}
+
+// SetFaultHook installs a deterministic fault-injection callback for crash-recovery testing.
+func (cp *ControlPlane) SetFaultHook(hook func(stage string) error) {
+	cp.faultMu.Lock()
+	cp.faultHook = hook
+	cp.faultMu.Unlock()
+}
+
+func (cp *ControlPlane) checkFault(stage string) error {
+	cp.faultMu.RLock()
+	h := cp.faultHook
+	cp.faultMu.RUnlock()
+	if h != nil {
+		return h(stage)
+	}
+	return nil
+}
+
+// NewControlPlane safely initializes or reopens a dedicated PostgreSQL 17 Metadata DB on metaDir,
+// applies versioned schema migrations, and reconciles any interrupted provisioning operations.
 func NewControlPlane(ctx context.Context, metaDir string, metaPort int, agent *cell.Agent, kms *crypto.EnvelopeKMS) (*ControlPlane, error) {
-	_ = os.RemoveAll(metaDir)
 	pgData := filepath.Join(metaDir, "pgdata")
 	sockDir := filepath.Join(metaDir, "sock")
 	if err := os.MkdirAll(sockDir, 0o755); err != nil {
@@ -71,11 +115,13 @@ func NewControlPlane(ctx context.Context, metaDir string, metaPort int, agent *c
 	}
 	_ = exec.Command("chown", "-R", "postgres:postgres", metaDir).Run()
 
-	if out, err := runPostgres(filepath.Join(pgBin, "initdb"), "-D", pgData, "-U", "postgres", "--auth=trust", "--no-instructions"); err != nil {
-		return nil, fmt.Errorf("control metadata initdb: %w (%s)", err, out)
-	}
-
-	conf := fmt.Sprintf(`
+	pgVersionPath := filepath.Join(pgData, "PG_VERSION")
+	_, statErr := os.Stat(pgVersionPath)
+	if os.IsNotExist(statErr) {
+		if out, err := runPostgres(filepath.Join(pgBin, "initdb"), "-D", pgData, "-U", "postgres", "--auth=trust", "--no-instructions"); err != nil {
+			return nil, fmt.Errorf("control metadata initdb: %w (%s)", err, out)
+		}
+		conf := fmt.Sprintf(`
 listen_addresses = '127.0.0.1'
 port = %d
 unix_socket_directories = '%s'
@@ -84,13 +130,17 @@ shared_buffers = '16MB'
 fsync = on
 logging_collector = off
 `, metaPort, sockDir)
-	if err := os.WriteFile(filepath.Join(pgData, "postgresql.conf"), []byte(conf), 0o600); err != nil {
-		return nil, err
+		if err := os.WriteFile(filepath.Join(pgData, "postgresql.conf"), []byte(conf), 0o600); err != nil {
+			return nil, err
+		}
+		_ = exec.Command("chown", "-R", "postgres:postgres", metaDir).Run()
+	} else if statErr != nil {
+		return nil, fmt.Errorf("%w: stat PG_VERSION: %v", ErrMetadataCorrupted, statErr)
 	}
-	_ = exec.Command("chown", "-R", "postgres:postgres", metaDir).Run()
 
-	if out, err := runPostgres(filepath.Join(pgBin, "pg_ctl"), "-D", pgData, "-l", filepath.Join(metaDir, "meta.log"), "-w", "-t", "20", "start"); err != nil {
-		return nil, fmt.Errorf("control metadata start: %w (%s)", err, out)
+	// Start PostgreSQL if not already running; handle stale postmaster.pid safely without wiping metaDir.
+	if err := ensureMetaPostgresRunning(pgData, filepath.Join(metaDir, "meta.log")); err != nil {
+		return nil, err
 	}
 
 	dsn := fmt.Sprintf("postgres://postgres@127.0.0.1:%d/postgres?sslmode=disable&pool_max_conns=50", metaPort)
@@ -98,9 +148,82 @@ logging_collector = off
 	if err != nil {
 		return nil, err
 	}
+	if err := db.Ping(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("%w: metadata DB ping failed: %v", ErrMetadataCorrupted, err)
+	}
 
-	schemaSQL := `
-CREATE TABLE clusters (
+	if err := applySchemaMigrations(ctx, db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("control schema migration: %w", err)
+	}
+
+	cp := &ControlPlane{
+		metaDir:  metaDir,
+		metaPort: metaPort,
+		db:       db,
+		agent:    agent,
+		kms:      kms,
+		keyLocks: make(map[string]*refLock),
+	}
+
+	if _, err := cp.RecoverProvisioningOperations(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("control recovery: %w", err)
+	}
+
+	return cp, nil
+}
+
+func ensureMetaPostgresRunning(pgData, logPath string) error {
+	if out, err := runPostgres(filepath.Join(pgBin, "pg_ctl"), "-D", pgData, "status"); err == nil && strings.Contains(out, "server is running") {
+		return nil
+	}
+	if out, err := runPostgres(filepath.Join(pgBin, "pg_ctl"), "-D", pgData, "-l", logPath, "-w", "-t", "20", "start"); err != nil {
+		// Check for stale postmaster.pid after unclean crash where the old PID is no longer alive.
+		pidBytes, rErr := os.ReadFile(filepath.Join(pgData, "postmaster.pid"))
+		if rErr == nil {
+			lines := strings.Split(string(pidBytes), "\n")
+			if len(lines) > 0 {
+				if pid, pErr := strconv.Atoi(strings.TrimSpace(lines[0])); pErr == nil && pid > 0 {
+					if _, statErr := os.Stat(fmt.Sprintf("/proc/%d", pid)); os.IsNotExist(statErr) {
+						_ = os.Remove(filepath.Join(pgData, "postmaster.pid"))
+						if out2, err2 := runPostgres(filepath.Join(pgBin, "pg_ctl"), "-D", pgData, "-l", logPath, "-w", "-t", "20", "start"); err2 == nil {
+							return nil
+						} else {
+							return fmt.Errorf("%w: pg_ctl start after stale pid cleanup failed: %v (%s)", ErrMetadataCorrupted, err2, out2)
+						}
+					}
+				}
+			}
+		}
+		return fmt.Errorf("%w: control metadata start failed: %v (%s)", ErrMetadataCorrupted, err, out)
+	}
+	return nil
+}
+
+func applySchemaMigrations(ctx context.Context, db *pgxpool.Pool) error {
+	if _, err := db.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version INT PRIMARY KEY,
+			description TEXT NOT NULL,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+	`); err != nil {
+		return err
+	}
+
+	type migration struct {
+		version int
+		desc    string
+		sql     string
+	}
+	migrations := []migration{
+		{
+			version: 1,
+			desc:    "baseline control plane tables",
+			sql: `
+CREATE TABLE IF NOT EXISTS clusters (
 	tenant_id TEXT PRIMARY KEY,
 	system_identifier TEXT NOT NULL UNIQUE,
 	state TEXT NOT NULL,
@@ -111,7 +234,7 @@ CREATE TABLE clusters (
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE idempotency_records (
+CREATE TABLE IF NOT EXISTS idempotency_records (
 	idempotency_key TEXT PRIMARY KEY,
 	tenant_id TEXT NOT NULL,
 	status TEXT NOT NULL,
@@ -119,7 +242,7 @@ CREATE TABLE idempotency_records (
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE usage_ledger (
+CREATE TABLE IF NOT EXISTS usage_ledger (
 	idempotency_key TEXT PRIMARY KEY,
 	gateway_id TEXT NOT NULL,
 	tenant_id TEXT NOT NULL,
@@ -131,96 +254,329 @@ CREATE TABLE usage_ledger (
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE audit_events (
+CREATE TABLE IF NOT EXISTS audit_events (
 	id BIGSERIAL PRIMARY KEY,
 	tenant_id TEXT NOT NULL,
 	action TEXT NOT NULL,
 	detail TEXT NOT NULL,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-`
-	if _, err := db.Exec(ctx, schemaSQL); err != nil {
-		return nil, fmt.Errorf("control schema init: %w", err)
+`,
+		},
+		{
+			version: 2,
+			desc:    "tenant-scoped idempotency with payload hash, encrypted password column, and durable provisioning state machine",
+			sql: `
+ALTER TABLE clusters ADD COLUMN IF NOT EXISTS app_password_enc TEXT NOT NULL DEFAULT '';
+ALTER TABLE clusters ADD COLUMN IF NOT EXISTS op_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE clusters ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+ALTER TABLE idempotency_records ADD COLUMN IF NOT EXISTS payload_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE idempotency_records ADD COLUMN IF NOT EXISTS error_detail TEXT NOT NULL DEFAULT '';
+ALTER TABLE idempotency_records ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+CREATE TABLE IF NOT EXISTS provisioning_ops (
+	op_id TEXT PRIMARY KEY,
+	tenant_id TEXT NOT NULL,
+	idempotency_key TEXT NOT NULL,
+	state TEXT NOT NULL,
+	claim_source TEXT NOT NULL DEFAULT '',
+	system_identifier TEXT NOT NULL DEFAULT '',
+	error_detail TEXT NOT NULL DEFAULT '',
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_provisioning_ops_inflight ON provisioning_ops (state) WHERE state IN ('REQUESTED', 'CLAIMED', 'ACTIVATING');
+`,
+		},
 	}
 
-	return &ControlPlane{
-		metaDir:  metaDir,
-		metaPort: metaPort,
-		db:       db,
-		agent:    agent,
-		kms:      kms,
-		keyLocks: make(map[string]*sync.Mutex),
-	}, nil
+	for _, m := range migrations {
+		var exists bool
+		err := db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, m.version).Scan(&exists)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, m.sql); err != nil {
+			_ = tx.Rollback(ctx)
+			return fmt.Errorf("migration v%d (%s): %w", m.version, m.desc, err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version, description) VALUES ($1, $2)`, m.version, m.desc); err != nil {
+			_ = tx.Rollback(ctx)
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (cp *ControlPlane) lockForKey(k string) *sync.Mutex {
+// SchemaVersion returns the highest applied migration version.
+func (cp *ControlPlane) SchemaVersion(ctx context.Context) (int, error) {
+	var ver int
+	err := cp.db.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&ver)
+	return ver, err
+}
+
+func (cp *ControlPlane) acquireKeyLock(k string) func() {
 	cp.keyMu.Lock()
-	defer cp.keyMu.Unlock()
-	m, ok := cp.keyLocks[k]
+	rl, ok := cp.keyLocks[k]
 	if !ok {
-		m = &sync.Mutex{}
-		cp.keyLocks[k] = m
+		rl = &refLock{}
+		cp.keyLocks[k] = rl
 	}
-	return m
+	rl.refs++
+	cp.keyMu.Unlock()
+
+	rl.mu.Lock()
+	return func() {
+		rl.mu.Unlock()
+		cp.keyMu.Lock()
+		rl.refs--
+		if rl.refs <= 0 {
+			delete(cp.keyLocks, k)
+		}
+		cp.keyMu.Unlock()
+	}
 }
 
-// ProvisionDatabase executes idempotent two-phase cluster provisioning (Flow 1, ADR-001, EXP-A2).
+func computeProvisionPayloadHash(tenantID string) string {
+	sum := sha256.Sum256([]byte("provision:v1:" + tenantID))
+	return hex.EncodeToString(sum[:])
+}
+
+func (cp *ControlPlane) encryptTenantPassword(tenantID, plaintext string) (string, error) {
+	if cp.kms == nil {
+		return "", errors.New("control: KMS unavailable for password encryption")
+	}
+	if _, err := cp.kms.EnsureTenantDEK(tenantID); err != nil {
+		return "", err
+	}
+	ct, err := cp.kms.EncryptObject(tenantID, 0, "control/app_password", []byte(plaintext))
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(ct), nil
+}
+
+func (cp *ControlPlane) decryptTenantPassword(tenantID, encB64 string) (string, error) {
+	if encB64 == "" {
+		return "", nil
+	}
+	if cp.kms == nil {
+		return "", errors.New("control: KMS unavailable for password decryption")
+	}
+	raw, err := base64.StdEncoding.DecodeString(encB64)
+	if err != nil {
+		return "", err
+	}
+	pt, err := cp.kms.DecryptObject(tenantID, 0, "control/app_password", raw)
+	if err != nil {
+		return "", err
+	}
+	return string(pt), nil
+}
+
+// RecoverProvisioningOperations deterministically rolls back or reconciles any in-flight
+// provisioning operations left in REQUESTED, CLAIMED, or ACTIVATING state after a crash.
+func (cp *ControlPlane) RecoverProvisioningOperations(ctx context.Context) (int, error) {
+	rows, err := cp.db.Query(ctx, `
+		SELECT op_id, tenant_id, idempotency_key, state
+		FROM provisioning_ops
+		WHERE state IN ('REQUESTED', 'CLAIMED', 'ACTIVATING')
+		ORDER BY created_at ASC
+	`)
+	if err != nil {
+		return 0, err
+	}
+	type inflight struct {
+		opID, tenantID, idempKey, state string
+	}
+	var list []inflight
+	for rows.Next() {
+		var item inflight
+		if err := rows.Scan(&item.opID, &item.tenantID, &item.idempKey, &item.state); err == nil {
+			list = append(list, item)
+		}
+	}
+	rows.Close()
+
+	recovered := 0
+	for _, item := range list {
+		if ValidateTenantID(item.tenantID) == nil && cp.agent != nil {
+			switch item.state {
+			case "CLAIMED":
+				cp.agent.RollbackClaim(item.tenantID)
+			case "ACTIVATING":
+				cp.agent.RollbackClaim(item.tenantID)
+				_ = cp.agent.StopAndPurgeTenant(item.tenantID)
+			}
+		}
+		_, _ = cp.db.Exec(ctx, `DELETE FROM clusters WHERE tenant_id = $1 AND state = 'CLAIMING'`, item.tenantID)
+		_, _ = cp.db.Exec(ctx, `
+			UPDATE provisioning_ops
+			SET state = 'ROLLED_BACK', error_detail = 'recovered after crash', updated_at = now()
+			WHERE op_id = $1
+		`, item.opID)
+		_, _ = cp.db.Exec(ctx, `
+			UPDATE idempotency_records
+			SET status = 'FAILED', error_detail = 'interrupted provisioning rolled back on recovery', updated_at = now()
+			WHERE idempotency_key = $1 AND tenant_id = $2 AND status = 'IN_PROGRESS'
+		`, item.idempKey, item.tenantID)
+		_, _ = cp.db.Exec(ctx, `
+			INSERT INTO audit_events (tenant_id, action, detail)
+			VALUES ($1, 'PROVISION_RECOVERED', $2)
+		`, item.tenantID, fmt.Sprintf("op=%s prior_state=%s action=ROLLED_BACK", item.opID, item.state))
+		recovered++
+	}
+	return recovered, nil
+}
+
+// ProvisionDatabase executes crash-consistent, tenant-scoped idempotent cluster provisioning.
 func (cp *ControlPlane) ProvisionDatabase(ctx context.Context, idempotencyKey, tenantID string) (*ProvisionResponse, error) {
+	if err := ValidateTenantID(tenantID); err != nil {
+		return nil, err
+	}
 	if idempotencyKey == "" {
 		idempotencyKey = "auto:" + tenantID
 	}
+	payloadHash := computeProvisionPayloadHash(tenantID)
 
-	// Serialize concurrent identical Idempotency-Key calls so duplicates never double-provision
-	kl := cp.lockForKey(idempotencyKey)
-	kl.Lock()
-	defer kl.Unlock()
+	// Serialize per-key AND per-tenant so concurrent provisions/deletes for the same tenant cannot race.
+	unlockKey := cp.acquireKeyLock("k:" + idempotencyKey)
+	defer unlockKey()
+	unlockTenant := cp.acquireKeyLock("t:" + tenantID)
+	defer unlockTenant()
 
-	// 1. Check existing idempotency record
-	var status, respJSON string
-	err := cp.db.QueryRow(ctx, `SELECT status, COALESCE(response_json, '') FROM idempotency_records WHERE idempotency_key = $1`, idempotencyKey).Scan(&status, &respJSON)
-	if err == nil && status == "COMPLETED" && respJSON != "" {
-		var cached ProvisionResponse
-		if jsonErr := json.Unmarshal([]byte(respJSON), &cached); jsonErr == nil {
-			cached.IdempotentReplay = true
-			return &cached, nil
+	// 1. Check existing idempotency record with strict tenant + payload hash verification.
+	var recTenant, recStatus, recHash, respJSON string
+	err := cp.db.QueryRow(ctx,
+		`SELECT tenant_id, status, COALESCE(payload_hash, ''), COALESCE(response_json, '')
+		 FROM idempotency_records WHERE idempotency_key = $1`,
+		idempotencyKey,
+	).Scan(&recTenant, &recStatus, &recHash, &respJSON)
+	if err == nil {
+		if recTenant != tenantID {
+			return nil, fmt.Errorf("%w: key belongs to another tenant", ErrIdempotencyConflict)
 		}
+		if recHash != "" && recHash != payloadHash {
+			return nil, fmt.Errorf("%w: payload mismatch for existing key", ErrIdempotencyConflict)
+		}
+		if recStatus == "COMPLETED" && respJSON != "" {
+			var cached ProvisionResponse
+			if jsonErr := json.Unmarshal([]byte(respJSON), &cached); jsonErr == nil {
+				if cached.TenantID != tenantID {
+					return nil, fmt.Errorf("%w: cached response tenant mismatch", ErrIdempotencyConflict)
+				}
+				// Re-hydrate tenant's own encrypted password if redacted in idempotency JSON.
+				if cached.AppPassword == "[REDACTED]" || cached.AppPassword == "" {
+					var encPW string
+					if qErr := cp.db.QueryRow(ctx, `SELECT COALESCE(app_password_enc, '') FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&encPW); qErr == nil && encPW != "" {
+						if dec, dErr := cp.decryptTenantPassword(tenantID, encPW); dErr == nil {
+							cached.AppPassword = dec
+						}
+					}
+				}
+				cached.IdempotentReplay = true
+				return &cached, nil
+			}
+		}
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
 	}
 
 	t0 := time.Now()
-	_, _ = cp.db.Exec(ctx, `INSERT INTO idempotency_records (idempotency_key, tenant_id, status) VALUES ($1, $2, 'IN_PROGRESS') ON CONFLICT (idempotency_key) DO NOTHING`, idempotencyKey, tenantID)
+	opBytes := make([]byte, 8)
+	_, _ = rand.Read(opBytes)
+	opID := "op_" + hex.EncodeToString(opBytes)
 
-	// 2. Claim cluster from Cell Agent (pre-warmed pool or bounded on-demand initdb fallback)
-	claim, err := cp.agent.ClaimCluster(tenantID)
-	if err != nil {
+	// Record REQUESTED in durable state machine and IN_PROGRESS in idempotency table.
+	if _, err := cp.db.Exec(ctx, `
+		INSERT INTO idempotency_records (idempotency_key, tenant_id, status, payload_hash, updated_at)
+		VALUES ($1, $2, 'IN_PROGRESS', $3, now())
+		ON CONFLICT (idempotency_key) DO UPDATE
+		SET status = 'IN_PROGRESS', payload_hash = EXCLUDED.payload_hash, updated_at = now()
+		WHERE idempotency_records.tenant_id = $2 AND idempotency_records.status IN ('FAILED', 'IN_PROGRESS')
+	`, idempotencyKey, tenantID, payloadHash); err != nil {
+		return nil, err
+	}
+	if _, err := cp.db.Exec(ctx, `
+		INSERT INTO provisioning_ops (op_id, tenant_id, idempotency_key, state)
+		VALUES ($1, $2, $3, 'REQUESTED')
+	`, opID, tenantID, idempotencyKey); err != nil {
 		return nil, err
 	}
 
+	rollbackOp := func(state string, cause error) error {
+		if state == "CLAIMED" || state == "ACTIVATING" {
+			cp.agent.RollbackClaim(tenantID)
+		}
+		if state == "ACTIVATING" {
+			_ = cp.agent.StopAndPurgeTenant(tenantID)
+		}
+		_, _ = cp.db.Exec(ctx, `DELETE FROM clusters WHERE tenant_id = $1 AND state = 'CLAIMING'`, tenantID)
+		_, _ = cp.db.Exec(ctx, `UPDATE provisioning_ops SET state = 'ROLLED_BACK', error_detail = $2, updated_at = now() WHERE op_id = $1`, opID, cause.Error())
+		_, _ = cp.db.Exec(ctx, `UPDATE idempotency_records SET status = 'FAILED', error_detail = $2, updated_at = now() WHERE idempotency_key = $1 AND tenant_id = $3`, idempotencyKey, cause.Error(), tenantID)
+		return cause
+	}
+
+	if err := cp.checkFault("after_requested"); err != nil {
+		return nil, rollbackOp("REQUESTED", err)
+	}
+
+	// 2. Claim cluster from Cell Agent
+	claim, err := cp.agent.ClaimCluster(tenantID)
+	if err != nil {
+		return nil, rollbackOp("REQUESTED", err)
+	}
+	_, _ = cp.db.Exec(ctx, `UPDATE provisioning_ops SET state = 'CLAIMED', claim_source = $2, system_identifier = $3, updated_at = now() WHERE op_id = $1`, opID, claim.Source, claim.SystemIdentifier)
+
+	if err := cp.checkFault("after_claim"); err != nil {
+		return nil, rollbackOp("CLAIMED", err)
+	}
+
 	passBytes := make([]byte, 16)
-	_, _ = rand.Read(passBytes)
+	if _, err := rand.Read(passBytes); err != nil {
+		return nil, rollbackOp("CLAIMED", err)
+	}
 	appPassword := "pw_" + hex.EncodeToString(passBytes)
 
-	if _, err := cp.kms.EnsureTenantDEK(tenantID); err != nil {
-		cp.agent.RollbackClaim(tenantID)
-		return nil, err
+	encPassword, err := cp.encryptTenantPassword(tenantID, appPassword)
+	if err != nil {
+		return nil, rollbackOp("CLAIMED", err)
 	}
 
 	// 3. Commit UNIQUE(tenant_id) and UNIQUE(system_identifier) in Control Metadata DB BEFORE promoting directory!
 	_, err = cp.db.Exec(ctx,
-		`INSERT INTO clusters (tenant_id, system_identifier, state, epoch, port, claim_source, app_password)
-		 VALUES ($1, $2, 'CLAIMING', 1, 0, $3, $4)`,
-		tenantID, claim.SystemIdentifier, claim.Source, appPassword,
+		`INSERT INTO clusters (tenant_id, system_identifier, state, epoch, port, claim_source, app_password, app_password_enc, op_id)
+		 VALUES ($1, $2, 'CLAIMING', 1, 0, $3, '[ENCRYPTED]', $4, $5)`,
+		tenantID, claim.SystemIdentifier, claim.Source, encPassword, opID,
 	)
 	if err != nil {
-		cp.agent.RollbackClaim(tenantID)
-		return nil, fmt.Errorf("control db unique identity lock rejected claim: %w", err)
+		return nil, rollbackOp("CLAIMED", fmt.Errorf("control db unique identity lock rejected claim: %w", err))
+	}
+	_, _ = cp.db.Exec(ctx, `UPDATE provisioning_ops SET state = 'ACTIVATING', updated_at = now() WHERE op_id = $1`, opID)
+
+	if err := cp.checkFault("after_db_claim"); err != nil {
+		return nil, rollbackOp("ACTIVATING", err)
 	}
 
-	// 4. Activate cluster on Cell (SCRAM-SHA-256 + supautils + SELECT 1 readiness check + PgBouncer reload)
+	// 4. Activate cluster on Cell (SCRAM-SHA-256 + supautils + SELECT 1 readiness check)
 	rt, err := cp.agent.ActivateCluster(tenantID, appPassword, 1)
 	if err != nil {
-		_, _ = cp.db.Exec(ctx, `DELETE FROM clusters WHERE tenant_id = $1`, tenantID)
-		cp.agent.RollbackClaim(tenantID)
-		return nil, fmt.Errorf("activate cluster failed: %w", err)
+		return nil, rollbackOp("ACTIVATING", fmt.Errorf("activate cluster failed: %w", err))
+	}
+
+	if err := cp.checkFault("after_activate"); err != nil {
+		return nil, rollbackOp("ACTIVATING", err)
 	}
 
 	totalMs := float64(time.Since(t0).Microseconds()) / 1000.0
@@ -238,26 +594,68 @@ func (cp *ControlPlane) ProvisionDatabase(ctx context.Context, idempotencyKey, t
 		TotalLatencyMs:   totalMs,
 		IdempotentReplay: false,
 	}
-	b, _ := json.Marshal(resp)
 
-	_, _ = cp.db.Exec(ctx, `UPDATE clusters SET state = 'ACTIVE', port = $2 WHERE tenant_id = $1`, tenantID, rt.Port)
-	_, _ = cp.db.Exec(ctx, `UPDATE idempotency_records SET status = 'COMPLETED', response_json = $2 WHERE idempotency_key = $1`, idempotencyKey, string(b))
-	_, _ = cp.db.Exec(ctx, `INSERT INTO audit_events (tenant_id, action, detail) VALUES ($1, 'PROVISION', $2)`, tenantID, fmt.Sprintf("sysid=%s source=%s", claim.SystemIdentifier, claim.Source))
+	// Store redacted response JSON so plaintext app_password is never persisted in idempotency_records.
+	redacted := *resp
+	redacted.AppPassword = "[REDACTED]"
+	b, _ := json.Marshal(&redacted)
+
+	tx, err := cp.db.Begin(ctx)
+	if err != nil {
+		return nil, rollbackOp("ACTIVATING", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE clusters SET state = 'ACTIVE', port = $2, updated_at = now() WHERE tenant_id = $1`, tenantID, rt.Port); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, rollbackOp("ACTIVATING", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE provisioning_ops SET state = 'ACTIVE', updated_at = now() WHERE op_id = $1`, opID); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, rollbackOp("ACTIVATING", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE idempotency_records SET status = 'COMPLETED', response_json = $2, updated_at = now() WHERE idempotency_key = $1 AND tenant_id = $3`, idempotencyKey, string(b), tenantID); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, rollbackOp("ACTIVATING", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO audit_events (tenant_id, action, detail) VALUES ($1, 'PROVISION', $2)`, tenantID, fmt.Sprintf("op=%s sysid=%s source=%s", opID, claim.SystemIdentifier, claim.Source)); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, rollbackOp("ACTIVATING", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, rollbackOp("ACTIVATING", err)
+	}
 
 	return resp, nil
 }
 
-// GetTenantAuth fetches the tenant's state, epoch, Direct Port, PgBouncer addr, and SCRAM password for Gateway routing.
+// GetTenantAuth fetches the tenant's state, epoch, Direct Port, and decrypted SCRAM password for Gateway routing.
 func (cp *ControlPlane) GetTenantAuth(ctx context.Context, tenantID string) (state string, epoch int64, directPort int, appPassword string, err error) {
-	err = cp.db.QueryRow(ctx, `SELECT state, epoch, port, app_password FROM clusters WHERE tenant_id = $1`, tenantID).
-		Scan(&state, &epoch, &directPort, &appPassword)
+	if err = ValidateTenantID(tenantID); err != nil {
+		return
+	}
+	var legacyPW, encPW string
+	err = cp.db.QueryRow(ctx, `SELECT state, epoch, port, app_password, COALESCE(app_password_enc, '') FROM clusters WHERE tenant_id = $1`, tenantID).
+		Scan(&state, &epoch, &directPort, &legacyPW, &encPW)
+	if err != nil {
+		return
+	}
+	if encPW != "" {
+		appPassword, err = cp.decryptTenantPassword(tenantID, encPW)
+		return
+	}
+	appPassword = legacyPW
 	return
 }
 
-// DeleteDatabase implements Flow 12: 7-day Soft Delete (revoking auth, stopping PG, keeping DEK) vs Immediate Hard Purge (crypto-shredding DEK).
+// DeleteDatabase implements Flow 12: 7-day Soft Delete vs Immediate Hard Purge (crypto-shredding DEK).
 func (cp *ControlPlane) DeleteDatabase(ctx context.Context, tenantID string, immediate bool) error {
+	if err := ValidateTenantID(tenantID); err != nil {
+		return err
+	}
+	unlockTenant := cp.acquireKeyLock("t:" + tenantID)
+	defer unlockTenant()
+
 	if !immediate {
-		_, err := cp.db.Exec(ctx, `UPDATE clusters SET state = 'SOFT_DELETED', epoch = epoch + 1 WHERE tenant_id = $1`, tenantID)
+		_, err := cp.db.Exec(ctx, `UPDATE clusters SET state = 'SOFT_DELETED', epoch = epoch + 1, updated_at = now() WHERE tenant_id = $1`, tenantID)
 		if err != nil {
 			return err
 		}
@@ -266,15 +664,14 @@ func (cp *ControlPlane) DeleteDatabase(ctx context.Context, tenantID string, imm
 		return nil
 	}
 
-	// Hard purge: instant GDPR crypto-shredding of tenant DEK prior to directory/R2 sweep (SI-4, Flow 12)
 	cp.kms.ShredDEK(tenantID)
 	_ = cp.agent.StopAndPurgeTenant(tenantID)
-	_, err := cp.db.Exec(ctx, `UPDATE clusters SET state = 'PURGED', epoch = epoch + 1 WHERE tenant_id = $1`, tenantID)
+	_, err := cp.db.Exec(ctx, `UPDATE clusters SET state = 'PURGED', epoch = epoch + 1, updated_at = now() WHERE tenant_id = $1`, tenantID)
 	_, _ = cp.db.Exec(ctx, `INSERT INTO audit_events (tenant_id, action, detail) VALUES ($1, 'CRYPTO_SHRED_PURGE', 'tenant DEK destroyed; local PGDATA purged')`, tenantID)
 	return err
 }
 
-// IngestUsageBatch inserts Gateway RU usage windows idempotently using ON CONFLICT (idempotency_key) DO NOTHING (FMEA-23).
+// IngestUsageBatch inserts Gateway RU usage windows idempotently using ON CONFLICT (idempotency_key) DO NOTHING.
 func (cp *ControlPlane) IngestUsageBatch(ctx context.Context, batch []UsageEventBatch) (inserted int, err error) {
 	for _, ev := range batch {
 		tag, err := cp.db.Exec(ctx,
@@ -300,7 +697,7 @@ func (cp *ControlPlane) GetTenantUsageSummary(ctx context.Context, tenantID stri
 	return
 }
 
-// ReconcileOnce compares Control Metadata DB truth against live Cell directories and purges any orphans (EXP-A3).
+// ReconcileOnce compares Control Metadata DB truth against live Cell directories and purges any orphans.
 func (cp *ControlPlane) ReconcileOnce(ctx context.Context) (int, error) {
 	rows, err := cp.db.Query(ctx, `SELECT tenant_id FROM clusters WHERE state IN ('ACTIVE', 'SOFT_DELETED')`)
 	if err != nil {

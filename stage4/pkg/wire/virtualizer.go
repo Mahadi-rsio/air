@@ -36,8 +36,9 @@ type PreparedDef struct {
 }
 
 type BackendConn struct {
-	conn net.Conn
-	fe   *pgproto3.Frontend
+	conn         net.Conn
+	fe           *pgproto3.Frontend
+	lastClientID uint64
 }
 
 func (b *BackendConn) Close() {
@@ -58,9 +59,11 @@ type Virtualizer struct {
 
 	idlePool []*BackendConn
 	stmtSeq  atomic.Uint64
+	clientSeq atomic.Uint64
 
-	drainReqCh  chan chan error
-	activeConns sync.WaitGroup
+	drainReqCh        chan chan error
+	activeConns       sync.WaitGroup
+	activeClientCount atomic.Int64
 }
 
 func NewVirtualizer(listenAddr, backendSockDir string, backendPort int, backendUser, backendDB, expectedPass string) (*Virtualizer, error) {
@@ -135,12 +138,29 @@ func (v *Virtualizer) RequestDrain(timeout time.Duration) error {
 	defer cancel()
 
 	unmigratable, err := v.checkBackendUnmigratableState(ctx)
-	if err == nil && unmigratable > 0 {
+	if err != nil {
+		return fmt.Errorf("%w: backend state unknown: %v", ErrDrainVetoed, err)
+	}
+	if unmigratable > 0 {
 		return fmt.Errorf("%w (count=%d)", ErrDrainVetoed, unmigratable)
 	}
 
+	if v.activeClientCount.Load() == 0 {
+		v.mu.Lock()
+		for _, b := range v.idlePool {
+			b.Close()
+		}
+		v.idlePool = nil
+		v.mu.Unlock()
+		return nil
+	}
+
 	reply := make(chan error, 1)
-	v.drainReqCh <- reply
+	select {
+	case v.drainReqCh <- reply:
+	case <-time.After(timeout):
+		return ErrDrainTimeout
+	}
 	select {
 	case err := <-reply:
 		return err
@@ -149,12 +169,19 @@ func (v *Virtualizer) RequestDrain(timeout time.Duration) error {
 	}
 }
 
-func (v *Virtualizer) acquireBackend() (*BackendConn, error) {
+func (v *Virtualizer) acquireBackend(clientID uint64) (*BackendConn, error) {
 	v.mu.Lock()
 	if len(v.idlePool) > 0 {
 		b := v.idlePool[len(v.idlePool)-1]
 		v.idlePool = v.idlePool[:len(v.idlePool)-1]
 		v.mu.Unlock()
+		if b.lastClientID != clientID {
+			if err := execSimpleInternal(b, "DISCARD ALL;"); err != nil {
+				b.Close()
+				return v.acquireBackend(clientID)
+			}
+			b.lastClientID = clientID
+		}
 		return b, nil
 	}
 	sockDir := v.backendSockDir
@@ -198,7 +225,7 @@ func (v *Virtualizer) acquireBackend() (*BackendConn, error) {
 		case *pgproto3.AuthenticationOk:
 		case *pgproto3.ParameterStatus, *pgproto3.BackendKeyData:
 		case *pgproto3.ReadyForQuery:
-			return &BackendConn{conn: c, fe: fe}, nil
+			return &BackendConn{conn: c, fe: fe, lastClientID: clientID}, nil
 		case *pgproto3.ErrorResponse:
 			_ = c.Close()
 			return nil, fmt.Errorf("backend startup error: %s", m.Message)
@@ -211,6 +238,11 @@ func (v *Virtualizer) releaseBackend(b *BackendConn) {
 		return
 	}
 	v.mu.Lock()
+	if len(v.idlePool) >= 64 {
+		v.mu.Unlock()
+		b.Close()
+		return
+	}
 	v.idlePool = append(v.idlePool, b)
 	v.mu.Unlock()
 }
@@ -222,8 +254,10 @@ func (v *Virtualizer) acceptLoop() {
 			return
 		}
 		v.activeConns.Add(1)
+		v.activeClientCount.Add(1)
 		go func(conn net.Conn) {
 			defer v.activeConns.Done()
+			defer v.activeClientCount.Add(-1)
 			v.handleClient(conn)
 		}(c)
 	}
@@ -231,6 +265,7 @@ func (v *Virtualizer) acceptLoop() {
 
 func (v *Virtualizer) handleClient(clientConn net.Conn) {
 	defer clientConn.Close()
+	clientID := v.clientSeq.Add(1)
 	be := pgproto3.NewBackend(clientConn, clientConn)
 
 	startupMsg, err := be.ReceiveStartupMessage()
@@ -335,7 +370,9 @@ func (v *Virtualizer) handleClient(clientConn net.Conn) {
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				cnt, err := v.checkBackendUnmigratableState(ctx)
 				cancel()
-				if err == nil && cnt > 0 {
+				if err != nil {
+					reply <- fmt.Errorf("%w: backend state unknown: %v", ErrDrainVetoed, err)
+				} else if cnt > 0 {
 					reply <- fmt.Errorf("%w (count=%d)", ErrDrainVetoed, cnt)
 				} else {
 					if currentBackend != nil {
@@ -375,7 +412,7 @@ func (v *Virtualizer) handleClient(clientConn net.Conn) {
 		}
 
 		if currentBackend == nil {
-			b, err := v.acquireBackend()
+			b, err := v.acquireBackend(clientID)
 			if err != nil {
 				be.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "08006", Message: err.Error()})
 				be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})

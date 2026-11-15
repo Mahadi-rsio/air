@@ -3,11 +3,16 @@ package backup
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,13 +25,82 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const pgBin = "/usr/lib/postgresql/17/bin"
+const (
+	pgBin            = "/usr/lib/postgresql/17/bin"
+	maxRestoreObjMiB = 2048
+)
+
+var (
+	ErrR2ClientRequired = errors.New("backup: R2 client and bucket are required (fail-closed)")
+	ErrInvalidWALName   = errors.New("backup: invalid WAL segment or timeline history name")
+	walSegmentRe        = regexp.MustCompile(`^[0-9A-F]{24}$`)
+	walHistoryRe        = regexp.MustCompile(`^[0-9A-F]{8}\.history$`)
+)
 
 type WALSegmentArtifact struct {
 	SegmentName string `json:"segment_name"`
 	R2Key       string `json:"r2_key"`
 	Epoch       int64  `json:"epoch"`
 	CipherBytes int    `json:"cipher_bytes"`
+	PlainSHA256 string `json:"plain_sha256,omitempty"`
+	CipherETag  string `json:"cipher_etag,omitempty"`
+	Status      string `json:"status,omitempty"` // PENDING, UPLOADED_UNVERIFIED, VERIFIED_IN_R2, LOCAL_DELETED
+}
+
+type WALUploadManifest struct {
+	TenantID  string                          `json:"tenant_id"`
+	UpdatedAt string                          `json:"updated_at"`
+	Segments  map[string]*WALSegmentArtifact `json:"segments"`
+}
+
+func isValidWALFilename(name string) bool {
+	return walSegmentRe.MatchString(name) || walHistoryRe.MatchString(name)
+}
+
+func loadWALManifest(path, tenantID string) (*WALUploadManifest, error) {
+	m := &WALUploadManifest{
+		TenantID: tenantID,
+		Segments: make(map[string]*WALSegmentArtifact),
+	}
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return m, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(b, m); err != nil {
+		return nil, fmt.Errorf("corrupt wal_upload_manifest.json: %w", err)
+	}
+	if m.Segments == nil {
+		m.Segments = make(map[string]*WALSegmentArtifact)
+	}
+	return m, nil
+}
+
+func saveWALManifestAtomic(path string, m *WALUploadManifest) error {
+	m.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // RunEncryptedBackupStep executes pg_basebackup (FULL or INCR), verifies pg_available_wal_summaries()
@@ -134,13 +208,31 @@ func RunEncryptedBackupStep(
 }
 
 // DrainAndEncryptWALSpoolToR2 forces a WAL switch on the live cluster, compresses all spooled
-// WAL files in /vol/spool/wal/<tenant> with zstd, encrypts them with AES-256-GCM-AAD, and uploads them to R2.
+// WAL files in /vol/spool/wal/<tenant> with zstd, encrypts them with AES-256-GCM-AAD,
+// verifies remote upload to R2 via HeadObject, commits a durable manifest, and ONLY then deletes local WAL.
 func DrainAndEncryptWALSpoolToR2(
 	ctx context.Context,
 	agent *cell.Agent,
 	s3c *s3.Client,
 	bucket, tenantID string,
 ) ([]WALSegmentArtifact, error) {
+	return DrainAndEncryptWALSpoolToR2WithFault(ctx, agent, s3c, bucket, tenantID, nil)
+}
+
+// DrainAndEncryptWALSpoolToR2WithFault allows injecting deterministic faults at upload/manifest/delete boundaries.
+func DrainAndEncryptWALSpoolToR2WithFault(
+	ctx context.Context,
+	agent *cell.Agent,
+	s3c *s3.Client,
+	bucket, tenantID string,
+	faultHook func(stage, segName string) error,
+) ([]WALSegmentArtifact, error) {
+	if s3c == nil || strings.TrimSpace(bucket) == "" {
+		return nil, ErrR2ClientRequired
+	}
+	if err := cell.ValidateTenantID(tenantID); err != nil {
+		return nil, err
+	}
 	rt, ok := agent.GetTenant(tenantID)
 	if !ok {
 		return nil, fmt.Errorf("tenant %s not active", tenantID)
@@ -160,44 +252,129 @@ func DrainAndEncryptWALSpoolToR2(
 	if err != nil {
 		return nil, err
 	}
-	var uploaded []WALSegmentArtifact
+
+	manifestPath := filepath.Join(rt.WALSpoolDir, "wal_upload_manifest.json")
+	manifest, err := loadWALManifest(manifestPath, tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	var segNames []string
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		segName := e.Name()
+		name := e.Name()
+		if name == "wal_upload_manifest.json" || name == "wal_upload_manifest.json.tmp" || strings.HasSuffix(name, ".zst") {
+			continue
+		}
+		if !isValidWALFilename(name) {
+			return nil, fmt.Errorf("%w: %q", ErrInvalidWALName, name)
+		}
+		segNames = append(segNames, name)
+	}
+	// Sort in deterministic timeline + LSN order
+	sort.Strings(segNames)
+
+	var uploaded []WALSegmentArtifact
+	for _, segName := range segNames {
 		segPath := filepath.Join(rt.WALSpoolDir, segName)
+
+		// Resume check: if already VERIFIED_IN_R2 in durable manifest, verify remote HeadObject and finish local cleanup safely.
+		if prev, exists := manifest.Segments[segName]; exists && prev.Status == "VERIFIED_IN_R2" {
+			headOut, hErr := s3c.HeadObject(ctx, &s3.HeadObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(prev.R2Key),
+			})
+			if hErr == nil && headOut.ContentLength != nil && *headOut.ContentLength == int64(prev.CipherBytes) {
+				_ = os.Remove(segPath)
+				prev.Status = "LOCAL_DELETED"
+				if err := saveWALManifestAtomic(manifestPath, manifest); err != nil {
+					return uploaded, err
+				}
+				uploaded = append(uploaded, *prev)
+				continue
+			}
+		}
+
+		rawWAL, err := os.ReadFile(segPath)
+		if err != nil {
+			return uploaded, err
+		}
+		plainSum := sha256.Sum256(rawWAL)
+		plainSHA := hex.EncodeToString(plainSum[:])
+
 		zstPath := segPath + ".zst"
 		if out, err := exec.Command("zstd", "-q", "-f", segPath, "-o", zstPath).CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("zstd compress wal %s: %w (%s)", segName, err, string(out))
+			return uploaded, fmt.Errorf("zstd compress wal %s: %w (%s)", segName, err, string(out))
 		}
 		compressedBytes, err := os.ReadFile(zstPath)
 		_ = os.Remove(zstPath)
 		if err != nil {
-			return nil, err
+			return uploaded, err
 		}
 		r2Key := fmt.Sprintf("stage4/tenants/%s/epoch_%06d/wal/%s.zst.enc", tenantID, rt.Epoch, segName)
 		cipherBytes, err := agent.KMS().EncryptObject(tenantID, rt.Epoch, r2Key, compressedBytes)
 		if err != nil {
-			return nil, err
+			return uploaded, err
 		}
-		if s3c != nil {
-			_, err := s3c.PutObject(ctx, &s3.PutObjectInput{
-				Bucket: aws.String(bucket),
-				Key:    aws.String(r2Key),
-				Body:   bytes.NewReader(cipherBytes),
-			})
-			if err != nil {
-				return nil, fmt.Errorf("R2 PutObject WAL %s: %w", r2Key, err)
+
+		putOut, err := s3c.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(r2Key),
+			Body:   bytes.NewReader(cipherBytes),
+		})
+		if err != nil {
+			return uploaded, fmt.Errorf("R2 PutObject WAL %s: %w", r2Key, err)
+		}
+
+		// Verify remote object existence and exact byte length via HeadObject before committing manifest!
+		headOut, err := s3c.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(r2Key),
+		})
+		if err != nil || headOut.ContentLength == nil || *headOut.ContentLength != int64(len(cipherBytes)) {
+			return uploaded, fmt.Errorf("R2 HeadObject verification failed for %s: err=%v", r2Key, err)
+		}
+
+		if faultHook != nil {
+			if err := faultHook("after_upload_before_manifest", segName); err != nil {
+				return uploaded, err
 			}
 		}
-		_ = os.Remove(segPath)
-		uploaded = append(uploaded, WALSegmentArtifact{
+
+		etag := ""
+		if putOut.ETag != nil {
+			etag = *putOut.ETag
+		}
+		art := &WALSegmentArtifact{
 			SegmentName: segName,
 			R2Key:       r2Key,
 			Epoch:       rt.Epoch,
 			CipherBytes: len(cipherBytes),
-		})
+			PlainSHA256: plainSHA,
+			CipherETag:  etag,
+			Status:      "VERIFIED_IN_R2",
+		}
+		manifest.Segments[segName] = art
+		if err := saveWALManifestAtomic(manifestPath, manifest); err != nil {
+			return uploaded, fmt.Errorf("commit durable WAL manifest: %w", err)
+		}
+
+		if faultHook != nil {
+			if err := faultHook("after_manifest_before_delete", segName); err != nil {
+				return uploaded, err
+			}
+		}
+
+		if err := os.Remove(segPath); err != nil {
+			return uploaded, err
+		}
+		art.Status = "LOCAL_DELETED"
+		if err := saveWALManifestAtomic(manifestPath, manifest); err != nil {
+			return uploaded, err
+		}
+		uploaded = append(uploaded, *art)
 	}
 	return uploaded, nil
 }
@@ -237,8 +414,18 @@ func CombineAndReplayPITR(
 	}
 	defer func() { _ = os.RemoveAll(restoreRoot) }()
 
-	// 1. Download, decrypt, and unpack each backup layer in chain (B0, I1, I2)
+	// 1. Validate backup chain parent-child linkage and download bounded objects
+	if len(chain) == 0 || chain[0].Type != "FULL" {
+		return "", stagingHeadroomOK, false, fmt.Errorf("invalid backup chain: must begin with FULL backup")
+	}
+	for i := 1; i < len(chain); i++ {
+		if chain[i].ParentID != chain[i-1].BackupID {
+			return "", stagingHeadroomOK, false, fmt.Errorf("broken backup chain at %s: parent=%s expected=%s", chain[i].BackupID, chain[i].ParentID, chain[i-1].BackupID)
+		}
+	}
+
 	var unpackedDirs []string
+	maxObjBytes := int64(maxRestoreObjMiB) * 1024 * 1024
 	for i, art := range chain {
 		obj, err := s3c.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(bucket),
@@ -247,10 +434,13 @@ func CombineAndReplayPITR(
 		if err != nil {
 			return "", stagingHeadroomOK, false, fmt.Errorf("get backup %s: %w", art.R2Key, err)
 		}
-		cipherBytes, err := io.ReadAll(obj.Body)
+		cipherBytes, err := io.ReadAll(io.LimitReader(obj.Body, maxObjBytes+1))
 		_ = obj.Body.Close()
 		if err != nil {
 			return "", stagingHeadroomOK, false, err
+		}
+		if int64(len(cipherBytes)) > maxObjBytes {
+			return "", stagingHeadroomOK, false, fmt.Errorf("backup object %s exceeds %d MiB limit", art.R2Key, maxRestoreObjMiB)
 		}
 		plainBytes, err := agent.KMS().DecryptObject(tenantID, art.Epoch, art.R2Key, cipherBytes)
 		if err != nil {
@@ -262,7 +452,7 @@ func CombineAndReplayPITR(
 		if err := os.WriteFile(tarZst, plainBytes, 0o600); err != nil {
 			return "", stagingHeadroomOK, false, err
 		}
-		if out, err := exec.Command("tar", "--zstd", "-xf", tarZst, "-C", partDir).CombinedOutput(); err != nil {
+		if out, err := exec.Command("tar", "--zstd", "--no-same-owner", "--no-same-permissions", "-xf", tarZst, "-C", partDir).CombinedOutput(); err != nil {
 			return "", stagingHeadroomOK, false, fmt.Errorf("untar part_%d: %w (%s)", i, err, string(out))
 		}
 		_ = os.Remove(tarZst)
