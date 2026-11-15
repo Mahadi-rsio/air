@@ -751,8 +751,14 @@ func (cp *ControlPlane) Close() {
 }
 
 func runPostgres(bin string, args ...string) (string, error) {
-	fullArgs := append([]string{"-u", "postgres", "--", bin}, args...)
-	out, err := exec.Command("runuser", fullArgs...).CombinedOutput()
+	var out []byte
+	var err error
+	if os.Geteuid() == 0 {
+		fullArgs := append([]string{"-u", "postgres", "--", bin}, args...)
+		out, err = exec.Command("runuser", fullArgs...).CombinedOutput()
+	} else {
+		out, err = exec.Command(bin, args...).CombinedOutput()
+	}
 	return strings.TrimSpace(string(out)), err
 }
 

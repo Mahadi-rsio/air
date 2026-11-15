@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -148,7 +149,7 @@ func NewAgent(volDir string, targetPoolSize int, kms *crypto.EnvelopeKMS) (*Agen
 		kms:              kms,
 		lastLeaseAckMono: time.Now(), // Go time.Time carries CLOCK_MONOTONIC reading
 	}
-	a.portSeq.Store(17000)
+	a.portSeq.Store(int32(17000 + (os.Getpid()%500)*20))
 
 	a.PurgeInterruptedStaging()
 	a.ReadoptRunningTenants()
@@ -719,12 +720,21 @@ func (a *Agent) RollbackClaim(tenantID string) {
 	_ = os.RemoveAll(claimDir)
 }
 
-// allocOrReusePort returns the tenant's existing assigned port or allocates a new one once (S4-RISK-05).
+// allocOrReusePort returns the tenant's existing assigned port or allocates a new free one once (S4-RISK-05).
 func (a *Agent) allocOrReusePort(tenantID string) int {
 	a.tenantMu.Lock()
 	defer a.tenantMu.Unlock()
 	if p, ok := a.tenantPorts[tenantID]; ok && p > 0 {
 		return p
+	}
+	for i := 0; i < 200; i++ {
+		p := int(a.portSeq.Add(1))
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err == nil {
+			_ = ln.Close()
+			a.tenantPorts[tenantID] = p
+			return p
+		}
 	}
 	p := int(a.portSeq.Add(1))
 	a.tenantPorts[tenantID] = p
@@ -1302,8 +1312,13 @@ func RunPostgresCmd(bin string, args ...string) (string, error) {
 }
 
 func runPostgresCmd(bin string, args ...string) (string, error) {
-	fullArgs := append([]string{"-u", "postgres", "--", bin}, args...)
-	cmd := exec.Command("runuser", fullArgs...)
+	var cmd *exec.Cmd
+	if os.Geteuid() == 0 {
+		fullArgs := append([]string{"-u", "postgres", "--", bin}, args...)
+		cmd = exec.Command("runuser", fullArgs...)
+	} else {
+		cmd = exec.Command(bin, args...)
+	}
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out

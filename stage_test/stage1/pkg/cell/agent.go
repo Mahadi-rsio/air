@@ -979,8 +979,13 @@ func extractSystemIdentifier(pgData string) string {
 }
 
 func runPostgresCmd(bin string, args ...string) (string, error) {
-	fullArgs := append([]string{"-u", "postgres", "--", bin}, args...)
-	cmd := exec.Command("runuser", fullArgs...)
+	var cmd *exec.Cmd
+	if os.Geteuid() == 0 {
+		fullArgs := append([]string{"-u", "postgres", "--", bin}, args...)
+		cmd = exec.Command("runuser", fullArgs...)
+	} else {
+		cmd = exec.Command(bin, args...)
+	}
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
