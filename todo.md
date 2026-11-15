@@ -178,32 +178,32 @@
 
 ---
 
-## Phase F — Encrypted WAL Durability, CAS-Fenced Backups & Streaming-Safe PITR (`AIR v1.2` — `PENDING`)
+## Phase F — Encrypted WAL Durability, CAS-Fenced Backups & Streaming-Safe PITR (`AIR v1.2` — `COMPLETED`)
 
-- [ ] **Promote `internal/fencing` & `internal/backup`:**
-  - [ ] Port `TenantFenceManifest`, `ReadManifestWithETag`, `PutManifestCAS` (`If-None-Match` / `If-Match` HTTP 412), and `StartLeaseWatchdog` (`CLOCK_MONOTONIC`) into `internal/fencing`.
-  - [ ] Port `DrainAndEncryptWALSpoolToR2WithFault`, `RunEncryptedBackupStep`, `CombineAndReplayPITR`, and `GarbageCollectBackupDAG` into `internal/backup`.
-- [ ] **Wire `RunEncryptedBackupStep` to `PutManifestCAS`:**
-  - [ ] Atomically commit backup metadata and `WrappedDEKBundle` via `PutManifestCAS`, aborting on `ErrStaleFencingEpoch` or HTTP 412 `ErrCASPrecondition`.
-- [ ] **Streaming `archive/tar` Validation & Uncompressed Byte Caps in `CombineAndReplayPITR`:**
-  - [ ] Extract backup tarballs via Go `archive/tar` + `io.LimitReader` (enforcing per-entry and total uncompressed byte caps).
-  - [ ] Reject path traversal (`..`, leading `/`), symlinks, hardlinks, device nodes, and FIFOs (`0700` dirs / `0600` files).
-- [ ] **Control Plane Backup & Restore Endpoints ([internal/control/http.go](file:///workspaces/air/internal/control/http.go)):**
-  - [ ] Expose `POST /v1/databases/{id}/backups` and `POST /v1/databases/{id}/restore`.
-- [ ] **Phase F Live PG17 Verification:**
-  - [ ] Verify Full (`B0`) + Incremental (`I1`) backup + WAL archive + LSN PITR recovery, stale-epoch CAS rejection, and malicious tar rejection with `go test -v -race -count=1 ./...`.
+- [x] **Promote `internal/fencing` & `internal/backup`:**
+  - [x] Port `TenantFenceManifest`, `ReadManifestWithETag`, `PutManifestCAS` (`If-None-Match` / `If-Match` HTTP 412), and `StartLeaseWatchdog` (`CLOCK_MONOTONIC`) into `internal/fencing`.
+  - [x] Port `DrainAndEncryptWALSpoolToR2WithFault`, `RunEncryptedBackupStep`, `CombineAndReplayPITR`, and `GarbageCollectBackupDAG` into `internal/backup`.
+- [x] **Wire `RunEncryptedBackupStep` to `PutManifestCAS`:**
+  - [x] Atomically commit backup metadata and `WrappedDEKBundle` via `PutManifestCAS`, aborting on `ErrStaleFencingEpoch` or HTTP 412 `ErrCASPrecondition`.
+- [x] **Streaming `archive/tar` Validation & Uncompressed Byte Caps in `CombineAndReplayPITR`:**
+  - [x] Extract backup tarballs via Go `archive/tar` + `io.LimitReader` (enforcing per-entry and total uncompressed byte caps).
+  - [x] Reject path traversal (`..`, leading `/`), symlinks, hardlinks, device nodes, and FIFOs (`0700` dirs / `0600` files).
+- [x] **Control Plane Backup & Restore Endpoints ([internal/control/http.go](file:///workspaces/air/internal/control/http.go)):**
+  - [x] Expose `POST /v1/databases/{id}/backups` and `POST /v1/databases/{id}/restore`.
+- [x] **Phase F Live PG17 Verification:**
+  - [x] Verify Full (`B0`) + Incremental (`I1`) backup + WAL archive + LSN PITR recovery, stale-epoch CAS rejection, and malicious tar rejection with `go test -v -race -count=1 ./...`.
 
 ---
 
-## Phase G — Per-Tenant `cgroup v2` Resource Isolation & External HA Metadata DB (`AIR v1.3` — `PENDING`)
+## Phase G — Per-Tenant `cgroup v2` Resource Isolation & External HA Metadata DB (`AIR v1.3` — `COMPLETED`)
 
-- [ ] **Per-Tenant `cgroup v2` Supervision ([internal/cell/agent.go](file:///workspaces/air/internal/cell/agent.go)):**
-  - [ ] Configure per-tenant `cgroup v2` slice (`air_tenant_<id>`) with `memory.high`, `memory.max`, `memory.swap.max = 0`, `cpu.max`, and `pids.max` when delegated cgroupfs is writable.
-  - [ ] Enforce `cgroup.kill = 1` + recursive `/proc` descendant reaping (`collectProcessTree`) + `waitForPIDsExit` before `releaseFlockLocked`.
-- [ ] **External HA Metadata PostgreSQL Support ([internal/config/config.go](file:///workspaces/air/internal/config/config.go) & [internal/control/control.go](file:///workspaces/air/internal/control/control.go)):**
-  - [ ] Add `--meta-dsn` (`AIR_META_DSN`) so `NewControlPlane` can use an external HA PostgreSQL cluster without bootstrapping a local single-node `MetaDir`.
-- [ ] **Phase G Live PG17 Verification:**
-  - [ ] Verify external `MetaDSN` Control Plane operation and descendant process termination / cgroup lifecycle with `go test -v -race -count=1 ./...`.
+- [x] **Per-Tenant `cgroup v2` Supervision ([internal/cell/agent.go](file:///workspaces/air/internal/cell/agent.go)):**
+  - [x] Configure per-tenant `cgroup v2` slice (`air_tenant_<id>`) with `memory.high`, `memory.max`, `memory.swap.max = 0`, `cpu.max`, and `pids.max` when delegated cgroupfs is writable.
+  - [x] Enforce `cgroup.kill = 1` + recursive `/proc` descendant reaping (`collectProcessTree`) + `waitForPIDsExit` before `releaseFlockLocked`.
+- [x] **External HA Metadata PostgreSQL Support ([internal/config/config.go](file:///workspaces/air/internal/config/config.go) & [internal/control/control.go](file:///workspaces/air/internal/control/control.go)):**
+  - [x] Add `--meta-dsn` (`AIR_META_DSN`) so `NewControlPlane` can use an external HA PostgreSQL cluster without bootstrapping a local single-node `MetaDir`.
+- [x] **Phase G Live PG17 Verification:**
+  - [x] Verify external `MetaDSN` Control Plane operation and descendant process termination / cgroup lifecycle with `go test -v -race -count=1 ./...`.
 
 ---
 
