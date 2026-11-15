@@ -1,0 +1,265 @@
+package e2e_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Mahadi-rsio/air/internal/cell"
+	"github.com/Mahadi-rsio/air/internal/control"
+	"github.com/Mahadi-rsio/air/internal/crypto"
+	"github.com/Mahadi-rsio/air/internal/gateway"
+	"github.com/jackc/pgx/v5"
+)
+
+func TestAIRv1_SingleCellEndToEndMilestones(t *testing.T) {
+	if _, err := os.Stat("/usr/lib/postgresql/17/bin/initdb"); err != nil {
+		t.Fatalf("PostgreSQL 17 is required for e2e tests: %v", err)
+	}
+
+	ctx := context.Background()
+	rootDir, err := os.MkdirTemp("/tmp", "air_v1_e2e_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(rootDir)
+
+	metaDir := filepath.Join(rootDir, "meta")
+	keyPath := filepath.Join(rootDir, "master.key")
+	kms, err := crypto.LoadOrCreateEnvelopeKMS(keyPath)
+	if err != nil {
+		t.Fatalf("LoadOrCreateEnvelopeKMS: %v", err)
+	}
+
+	ag1, err := cell.NewAgent(rootDir, "/usr/lib/postgresql/17/bin", kms)
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	defer func() {
+		// Clean up any surviving tenant PG processes at test end
+		for _, tid := range []string{"tenant_alpha", "tenant_beta", "tenant_crash"} {
+			_ = ag1.StopAndPurgeTenant(tid)
+		}
+		ag1.Close()
+	}()
+
+	cp, err := control.NewControlPlane(ctx, metaDir, "/usr/lib/postgresql/17/bin", 19832, ag1, kms)
+	if err != nil {
+		t.Fatalf("NewControlPlane: %v", err)
+	}
+	defer cp.Close()
+
+	gw, err := gateway.NewGateway("127.0.0.1:0", cp)
+	if err != nil {
+		t.Fatalf("NewGateway: %v", err)
+	}
+	defer gw.Close()
+
+	httpSrv := httptest.NewServer(cp.HTTPHandler())
+	defer httpSrv.Close()
+
+	// Milestone 1 & 2: Create a database through Control Plane HTTP API and receive credentials.
+	alpha := httpCreateDatabase(t, httpSrv.URL, "acct_a", "idem-alpha-1", "tenant_alpha")
+	if alpha.State != "ACTIVE" || alpha.Password == "" || alpha.Username != "app_user" || alpha.Database != "tenant_alpha" {
+		t.Fatalf("unexpected provision response: %+v", alpha)
+	}
+
+	// Milestone 3 & 4: Connect with standard PostgreSQL clients (pgx + psql) through Gateway and execute SQL + transactions.
+	alphaDSN := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", alpha.Username, alpha.Password, gw.Addr(), alpha.Database)
+	conn, err := pgx.Connect(ctx, alphaDSN)
+	if err != nil {
+		t.Fatalf("pgx.Connect through gateway failed: %v", err)
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `CREATE TABLE items (id INT PRIMARY KEY, label TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO items (id, label) VALUES (1, 'durable-row')`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit tx: %v", err)
+	}
+	_ = conn.Close(ctx)
+
+	// Verify standard `psql` CLI also works end-to-end.
+	if psqlPath, lookErr := exec.LookPath("psql"); lookErr == nil {
+		out, err := exec.Command(psqlPath, alphaDSN, "-tAc", "SELECT label FROM items WHERE id = 1").CombinedOutput()
+		if err != nil || strings.TrimSpace(string(out)) != "durable-row" {
+			t.Fatalf("psql query failed: err=%v out=%q", err, string(out))
+		}
+	}
+
+	// Milestone 5: Restart PostgreSQL without losing data.
+	if _, err := ag1.RestartTenant("tenant_alpha"); err != nil {
+		t.Fatalf("RestartTenant: %v", err)
+	}
+	conn2, err := pgx.Connect(ctx, alphaDSN)
+	if err != nil {
+		t.Fatalf("reconnect after PG restart failed: %v", err)
+	}
+	var gotLabel string
+	if err := conn2.QueryRow(ctx, `SELECT label FROM items WHERE id = 1`).Scan(&gotLabel); err != nil || gotLabel != "durable-row" {
+		t.Fatalf("data lost across PG restart: label=%q err=%v", gotLabel, err)
+	}
+	_ = conn2.Close(ctx)
+
+	// Milestone 6: Restart the Agent without losing tenant ownership (and verify concurrent agent cannot steal flock).
+	ag1.Close()
+	ag2, err := cell.NewAgent(rootDir, "/usr/lib/postgresql/17/bin", kms)
+	if err != nil {
+		t.Fatalf("restarted NewAgent: %v", err)
+	}
+	defer ag2.Close()
+
+	rt, ok := ag2.GetTenant("tenant_alpha")
+	if !ok || rt.State != "ACTIVE" {
+		t.Fatalf("restarted agent did not readopt tenant_alpha: ok=%v rt=%+v", ok, rt)
+	}
+	// A competing agent on the same volDir MUST NOT readopt while ag2 holds agent.lock.
+	agCompeting, err := cell.NewAgent(rootDir, "/usr/lib/postgresql/17/bin", kms)
+	if err != nil {
+		t.Fatalf("competing NewAgent: %v", err)
+	}
+	if _, stolen := agCompeting.GetTenant("tenant_alpha"); stolen {
+		agCompeting.Close()
+		t.Fatalf("competing agent illegally readopted tenant_alpha while ag2 held flock")
+	}
+	agCompeting.Close()
+
+	// Milestone 7: Create another tenant without cross-tenant access.
+	beta := httpCreateDatabase(t, httpSrv.URL, "acct_b", "idem-beta-1", "tenant_beta")
+	if beta.Password == "" || beta.Password == alpha.Password {
+		t.Fatalf("unexpected beta credentials")
+	}
+	// Cross-account GET/DELETE must be rejected with 403 Forbidden.
+	req, _ := http.NewRequest(http.MethodGet, httpSrv.URL+"/v1/databases/tenant_beta", nil)
+	req.Header.Set("X-Account-ID", "acct_a")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 on cross-account GET, got %d", resp.StatusCode)
+	}
+
+	// Cross-tenant DB login via Gateway with alpha's password on beta's DB must fail SCRAM authentication.
+	badDSN := fmt.Sprintf("postgres://app_user:%s@%s/%s?sslmode=disable", alpha.Password, gw.Addr(), "tenant_beta")
+	if c, cErr := pgx.Connect(ctx, badDSN); cErr == nil {
+		_ = c.Close(ctx)
+		t.Fatalf("cross-tenant credential succeeded on tenant_beta!")
+	}
+	// Reserved superuser `postgres` must be rejected by Gateway.
+	pgUserDSN := fmt.Sprintf("postgres://postgres@%s/%s?sslmode=disable", gw.Addr(), "tenant_beta")
+	if c, cErr := pgx.Connect(ctx, pgUserDSN); cErr == nil {
+		_ = c.Close(ctx)
+		t.Fatalf("reserved superuser postgres was allowed through gateway!")
+	}
+
+	// Write a row into tenant_beta before deleting tenant_alpha.
+	betaDSN := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", beta.Username, beta.Password, gw.Addr(), beta.Database)
+	betaConn, err := pgx.Connect(ctx, betaDSN)
+	if err != nil {
+		t.Fatalf("connect beta: %v", err)
+	}
+	if _, err := betaConn.Exec(ctx, `CREATE TABLE beta_tbl (v TEXT); INSERT INTO beta_tbl VALUES ('still-alive')`); err != nil {
+		t.Fatalf("beta write: %v", err)
+	}
+	_ = betaConn.Close(ctx)
+
+	// Milestone 8: Delete tenant_alpha without affecting tenant_beta.
+	delReq, _ := http.NewRequest(http.MethodDelete, httpSrv.URL+"/v1/databases/tenant_alpha", nil)
+	delReq.Header.Set("X-Account-ID", "acct_a")
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = delResp.Body.Close()
+	if delResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE tenant_alpha, got %d", delResp.StatusCode)
+	}
+	if _, err := os.Stat(filepath.Join(rootDir, "tenants/active/tenant_alpha")); !os.IsNotExist(err) {
+		t.Fatalf("tenant_alpha directory survived deletion")
+	}
+	if c, cErr := pgx.Connect(ctx, alphaDSN); cErr == nil {
+		_ = c.Close(ctx)
+		t.Fatalf("deleted tenant_alpha still accepted connections")
+	}
+	// Verify tenant_beta is completely unaffected.
+	betaConn2, err := pgx.Connect(ctx, betaDSN)
+	if err != nil {
+		t.Fatalf("tenant_beta affected by tenant_alpha deletion: %v", err)
+	}
+	var betaVal string
+	if err := betaConn2.QueryRow(ctx, `SELECT v FROM beta_tbl`).Scan(&betaVal); err != nil || betaVal != "still-alive" {
+		t.Fatalf("tenant_beta data check failed: val=%q err=%v", betaVal, err)
+	}
+	_ = betaConn2.Close(ctx)
+
+	// Milestone 9: Recover interrupted provisioning safely.
+	cp.SetFaultHook(func(stage string) error {
+		if stage == "after_claimed" {
+			return fmt.Errorf("simulated crash after claim")
+		}
+		return nil
+	})
+	if _, err := cp.ProvisionDatabase(ctx, "acct_a", "idem-crash-1", "tenant_crash"); err == nil {
+		t.Fatalf("expected simulated crash error")
+	}
+	cp.SetFaultHook(nil)
+
+	if _, err := cp.RecoverProvisioningOperations(ctx); err != nil {
+		t.Fatalf("RecoverProvisioningOperations: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(rootDir, "tenants/claiming/tenant_crash")); !os.IsNotExist(err) {
+		t.Fatalf("orphaned claiming directory remained for tenant_crash")
+	}
+	if _, err := os.Stat(filepath.Join(rootDir, "tenants/active/tenant_crash")); !os.IsNotExist(err) {
+		t.Fatalf("orphaned active directory remained for tenant_crash")
+	}
+	// Retry provisioning tenant_crash after recovery -> must succeed cleanly!
+	crashOK := httpCreateDatabase(t, httpSrv.URL, "acct_a", "idem-crash-2", "tenant_crash")
+	if crashOK.State != "ACTIVE" {
+		t.Fatalf("expected ACTIVE after crash recovery retry, got %+v", crashOK)
+	}
+
+	// Verify clean cleanup on agent stop for remaining tenants.
+	_ = ag2.StopAndPurgeTenant("tenant_beta")
+	_ = ag2.StopAndPurgeTenant("tenant_crash")
+	_ = time.Millisecond // keep time import used
+}
+
+func httpCreateDatabase(t *testing.T, baseURL, accountID, idemKey, tenantID string) control.ProvisionResponse {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"tenant_id": tenantID})
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/v1/databases", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Account-ID", accountID)
+	req.Header.Set("Idempotency-Key", idemKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/databases: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /v1/databases status=%d", resp.StatusCode)
+	}
+	var out control.ProvisionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	return out
+}
