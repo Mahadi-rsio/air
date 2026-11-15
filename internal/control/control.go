@@ -18,9 +18,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mahadi-rsio/air/internal/backup"
 	"github.com/Mahadi-rsio/air/internal/cell"
 	"github.com/Mahadi-rsio/air/internal/crypto"
+	"github.com/Mahadi-rsio/air/internal/fencing"
 	"github.com/Mahadi-rsio/air/internal/tenant"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -33,6 +36,7 @@ var (
 	ErrForbidden           = errors.New("forbidden: database belongs to another account")
 	ErrUnauthorized        = errors.New("unauthorized: missing, invalid, or revoked API key")
 	ErrCorruptedMetadata   = errors.New("corrupted metadata directory: refusing destructive reset")
+	ErrBackupNotConfigured = errors.New("backup store is not configured")
 )
 
 type APIKeyInfo struct {
@@ -86,6 +90,8 @@ type ControlPlane struct {
 	provMu       sync.Mutex
 	faultHook    func(stage string) error
 	gatewayPort  int
+	s3Client     *s3.Client
+	backupBucket string
 }
 
 // NewControlPlane initializes a ControlPlane backed by a local single-node PG17 MetaDir.
@@ -219,6 +225,19 @@ func (cp *ControlPlane) SetFaultHook(fn func(stage string) error) {
 
 func (cp *ControlPlane) SetGatewayPort(port int) {
 	cp.gatewayPort = port
+}
+
+func (cp *ControlPlane) SetBackupStore(s3c *s3.Client, bucket string) {
+	cp.provMu.Lock()
+	cp.s3Client = s3c
+	cp.backupBucket = strings.TrimSpace(bucket)
+	cp.provMu.Unlock()
+}
+
+func (cp *ControlPlane) backupStore() (*s3.Client, string) {
+	cp.provMu.Lock()
+	defer cp.provMu.Unlock()
+	return cp.s3Client, cp.backupBucket
 }
 
 func (cp *ControlPlane) runMigrations(ctx context.Context) error {
@@ -655,6 +674,225 @@ func (cp *ControlPlane) DeleteDatabase(ctx context.Context, accountID, tenantID 
 	}
 	_, err = cp.db.Exec(ctx, `UPDATE clusters SET state = 'PURGED', direct_port = 0, app_password_enc = '', wrapped_dek = '', updated_at = now() WHERE tenant_id = $1`, tenantID)
 	return err
+}
+
+type BackupResponse struct {
+	TenantID            string `json:"tenant_id"`
+	BackupID            string `json:"backup_id"`
+	ParentID            string `json:"parent_id,omitempty"`
+	Type                string `json:"type"`
+	R2Key               string `json:"r2_key"`
+	Epoch               int64  `json:"epoch"`
+	CipherBytes         int    `json:"cipher_bytes"`
+	WALSegmentsArchived int    `json:"wal_segments_archived"`
+}
+
+type RestoreResponse struct {
+	TenantID            string `json:"tenant_id"`
+	TargetLSN           string `json:"target_lsn,omitempty"`
+	RestoredBackups     int    `json:"restored_backups"`
+	WALSegmentsReplayed int    `json:"wal_segments_replayed"`
+	StagingHeadroomOK   bool   `json:"staging_headroom_ok"`
+	AmcheckOK           bool   `json:"amcheck_ok"`
+	VerifyQueryOutput   string `json:"verify_query_output,omitempty"`
+}
+
+// TriggerBackup executes an encrypted FULL or INCR backup + WAL spool drain for an active tenant.
+func (cp *ControlPlane) TriggerBackup(ctx context.Context, accountID, tenantID, backupType string) (*BackupResponse, error) {
+	if err := tenant.ValidateAccountID(accountID); err != nil {
+		return nil, err
+	}
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return nil, err
+	}
+	var owner, state string
+	err := cp.db.QueryRow(ctx, `SELECT account_id, state FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&owner, &state)
+	if errors.Is(err, pgx.ErrNoRows) || state == "PURGED" {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if owner != accountID {
+		return nil, ErrForbidden
+	}
+	if state != "ACTIVE" {
+		return nil, fmt.Errorf("tenant %s is not ACTIVE (state=%s)", tenantID, state)
+	}
+	if cp.agent == nil {
+		return nil, errors.New("cell agent is not configured")
+	}
+	s3c, bucket := cp.backupStore()
+	if s3c == nil || bucket == "" {
+		return nil, ErrBackupNotConfigured
+	}
+
+	bkpType := strings.ToUpper(strings.TrimSpace(backupType))
+	if bkpType == "" {
+		bkpType = "FULL"
+	}
+	if bkpType != "FULL" && bkpType != "INCR" && bkpType != "WAL" {
+		return nil, fmt.Errorf("unsupported backup type %q (must be FULL, INCR, or WAL)", backupType)
+	}
+
+	var art *fencing.BackupArtifact
+	if bkpType != "WAL" {
+		var parentID, parentManifestPath string
+		if bkpType == "INCR" {
+			manifest, _, mErr := fencing.ReadManifestWithETag(ctx, s3c, bucket, tenantID)
+			if mErr == nil && manifest != nil && len(manifest.Backups) > 0 {
+				last := manifest.Backups[len(manifest.Backups)-1]
+				parentID = last.BackupID
+				if bkpBase, sErr := tenant.SafeSubpath(cp.agent.VolDir(), "backups", tenantID); sErr == nil {
+					candidate := filepath.Join(bkpBase, last.BackupID, "backup_manifest")
+					if _, stErr := os.Stat(candidate); stErr == nil {
+						parentManifestPath = candidate
+					}
+				}
+			}
+			if parentID == "" || parentManifestPath == "" {
+				bkpType = "FULL"
+				parentID = ""
+				parentManifestPath = ""
+			}
+		}
+
+		bkpID := fmt.Sprintf("bkp_%d", time.Now().UnixNano())
+		art, _, err = backup.RunEncryptedBackupStep(ctx, cp.agent, s3c, bucket, tenantID, bkpID, parentID, bkpType, parentManifestPath)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	walSegs, err := backup.DrainAndEncryptWALSpoolToR2(ctx, cp.agent, s3c, bucket, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	if len(walSegs) > 0 {
+		manifest, etag, mErr := fencing.ReadManifestWithETag(ctx, s3c, bucket, tenantID)
+		if mErr == nil && manifest != nil {
+			seen := make(map[string]bool, len(manifest.WALSegments))
+			for _, k := range manifest.WALSegments {
+				seen[k] = true
+			}
+			for _, w := range walSegs {
+				if !seen[w.R2Key] {
+					manifest.WALSegments = append(manifest.WALSegments, w.R2Key)
+					seen[w.R2Key] = true
+				}
+			}
+			if _, casErr := fencing.PutManifestCAS(ctx, s3c, bucket, manifest, etag); casErr != nil {
+				return nil, casErr
+			}
+		}
+	}
+
+	resp := &BackupResponse{
+		TenantID:            tenantID,
+		Type:                bkpType,
+		WALSegmentsArchived: len(walSegs),
+	}
+	if art != nil {
+		resp.BackupID = art.BackupID
+		resp.ParentID = art.ParentID
+		resp.Type = art.Type
+		resp.R2Key = art.R2Key
+		resp.Epoch = art.Epoch
+		resp.CipherBytes = art.CipherBytes
+	}
+	return resp, nil
+}
+
+// RestoreDatabase executes CombineAndReplayPITR for a tenant up to targetLSN (or latest WAL).
+func (cp *ControlPlane) RestoreDatabase(ctx context.Context, accountID, tenantID, targetLSN, verifyQuery string) (*RestoreResponse, error) {
+	if err := tenant.ValidateAccountID(accountID); err != nil {
+		return nil, err
+	}
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return nil, err
+	}
+	var owner, state string
+	err := cp.db.QueryRow(ctx, `SELECT account_id, state FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&owner, &state)
+	if errors.Is(err, pgx.ErrNoRows) || state == "PURGED" {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if owner != accountID {
+		return nil, ErrForbidden
+	}
+	if cp.agent == nil {
+		return nil, errors.New("cell agent is not configured")
+	}
+	s3c, bucket := cp.backupStore()
+	if s3c == nil || bucket == "" {
+		return nil, ErrBackupNotConfigured
+	}
+
+	manifest, _, err := fencing.ReadManifestWithETag(ctx, s3c, bucket, tenantID)
+	if err != nil {
+		if fencing.IsNotFoundErr(err) {
+			return nil, fmt.Errorf("%w: no backup manifest for tenant %s", ErrNotFound, tenantID)
+		}
+		return nil, err
+	}
+	if len(manifest.Backups) == 0 {
+		return nil, fmt.Errorf("%w: manifest has no backups for tenant %s", ErrNotFound, tenantID)
+	}
+
+	// Build latest FULL -> INCR chain from manifest.Backups
+	lastFullIdx := -1
+	for i := len(manifest.Backups) - 1; i >= 0; i-- {
+		if manifest.Backups[i].Type == "FULL" {
+			lastFullIdx = i
+			break
+		}
+	}
+	if lastFullIdx < 0 {
+		return nil, fmt.Errorf("no FULL backup found in manifest for tenant %s", tenantID)
+	}
+	var chain []*fencing.BackupArtifact
+	first := manifest.Backups[lastFullIdx]
+	chain = append(chain, &first)
+	for i := lastFullIdx + 1; i < len(manifest.Backups); i++ {
+		cand := manifest.Backups[i]
+		if cand.Type == "INCR" && cand.ParentID == chain[len(chain)-1].BackupID {
+			c := cand
+			chain = append(chain, &c)
+		}
+	}
+
+	var walSegs []backup.WALSegmentArtifact
+	for _, r2Key := range manifest.WALSegments {
+		segName := strings.TrimSuffix(filepath.Base(r2Key), ".zst.enc")
+		walSegs = append(walSegs, backup.WALSegmentArtifact{
+			SegmentName: segName,
+			R2Key:       r2Key,
+			Epoch:       chain[0].Epoch,
+		})
+	}
+
+	if strings.TrimSpace(verifyQuery) == "" {
+		verifyQuery = "SELECT 1;"
+	}
+	qOut, headroomOK, amcheckOK, err := backup.CombineAndReplayPITRWithOptions(
+		ctx, cp.agent, s3c, bucket, tenantID, tenantID,
+		chain, walSegs, targetLSN, verifyQuery, backup.TarExtractLimits{},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &RestoreResponse{
+		TenantID:            tenantID,
+		TargetLSN:           targetLSN,
+		RestoredBackups:     len(chain),
+		WALSegmentsReplayed: len(walSegs),
+		StagingHeadroomOK:   headroomOK,
+		AmcheckOK:           amcheckOK,
+		VerifyQueryOutput:   qOut,
+	}, nil
 }
 
 // GetTenantRoute is used by the PostgreSQL Gateway to resolve active tenant backend port.

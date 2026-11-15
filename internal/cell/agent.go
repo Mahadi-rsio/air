@@ -28,10 +28,13 @@ type TenantRuntime struct {
 	Port             int    `json:"port"`
 	PID              int    `json:"pid"`
 	PGData           string `json:"pg_data"`
+	SockDir          string `json:"sock_dir,omitempty"`
+	WALSpoolDir      string `json:"wal_spool_dir,omitempty"`
 	SystemIdentifier string `json:"system_identifier"`
 	FencingEpoch     int64  `json:"fencing_epoch"`
 	State            string `json:"state"`
 	CgroupPath       string `json:"cgroup_path,omitempty"`
+	Quarantined      bool   `json:"quarantined,omitempty"`
 }
 
 // CgroupLimits defines per-tenant cgroup v2 resource constraints.
@@ -75,6 +78,13 @@ type Agent struct {
 	tenantPorts  map[string]int
 	lockFDs      map[string]*os.File
 	epochChecker func(tenantID string) (int64, error)
+
+	stopCh           chan struct{}
+	stopOnce         sync.Once
+	leaseMu          sync.Mutex
+	lastLeaseAckMono time.Time
+	watchdogFenced   atomic.Bool
+	watchdogKillMs   atomic.Int64
 }
 
 func NewAgent(volDir, pgBinDir string, kms *crypto.EnvelopeKMS) (*Agent, error) {
@@ -84,6 +94,8 @@ func NewAgent(volDir, pgBinDir string, kms *crypto.EnvelopeKMS) (*Agent, error) 
 	for _, sub := range []string{
 		"tenants/claiming",
 		"tenants/active",
+		"spool/wal",
+		"backups",
 		"tmp",
 	} {
 		if err := os.MkdirAll(filepath.Join(volDir, sub), 0o755); err != nil {
@@ -91,14 +103,16 @@ func NewAgent(volDir, pgBinDir string, kms *crypto.EnvelopeKMS) (*Agent, error) 
 		}
 	}
 	a := &Agent{
-		volDir:       volDir,
-		pgBin:        pgBinDir,
-		kms:          kms,
-		cgroupRoot:   "/sys/fs/cgroup",
-		cgroupLimits: DefaultCgroupLimits(),
-		tenants:      make(map[string]*TenantRuntime),
-		tenantPorts:  make(map[string]int),
-		lockFDs:      make(map[string]*os.File),
+		volDir:           volDir,
+		pgBin:            pgBinDir,
+		kms:              kms,
+		cgroupRoot:       "/sys/fs/cgroup",
+		cgroupLimits:     DefaultCgroupLimits(),
+		tenants:          make(map[string]*TenantRuntime),
+		tenantPorts:      make(map[string]int),
+		lockFDs:          make(map[string]*os.File),
+		stopCh:           make(chan struct{}),
+		lastLeaseAckMono: time.Now(),
 	}
 	a.portSeq.Store(int32(18000 + (os.Getpid()%400)*20))
 	a.ReadoptRunningTenants()
@@ -227,6 +241,13 @@ func (a *Agent) ActivateCluster(tenantID, appPassword string, epoch int64) (*Ten
 	if err := os.MkdirAll(sockDir, 0o755); err != nil {
 		return nil, err
 	}
+	walSpoolDir, err := tenant.SafeSubpath(a.volDir, "spool/wal", tenantID)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(walSpoolDir, 0o700); err != nil {
+		return nil, err
+	}
 	port := a.allocOrReusePort(tenantID)
 
 	conf := fmt.Sprintf(`listen_addresses = '127.0.0.1'
@@ -238,6 +259,10 @@ work_mem = 4MB
 maintenance_work_mem = 16MB
 temp_file_limit = 32MB
 password_encryption = 'scram-sha-256'
+wal_level = replica
+summarize_wal = on
+archive_mode = on
+archive_command = 'cp %%p %s/%%f'
 ssl = off
 logging_collector = off
 shared_preload_libraries = 'supautils'
@@ -248,13 +273,14 @@ supautils.privileged_role_allowed_configs = 'session_replication_role'
 supautils.reserved_roles = 'postgres'
 supautils.reserved_memberships = 'pg_read_server_files,pg_write_server_files,pg_execute_server_program,postgres'
 supautils.restrict_extension_versions = 'error'
-`, port, sockDir)
+`, port, sockDir, walSpoolDir)
 	if err := os.WriteFile(filepath.Join(pgData, "postgresql.conf"), []byte(conf), 0o600); err != nil {
 		return nil, err
 	}
 
 	hba := `
 local   all             postgres                                trust
+local   replication     postgres                                trust
 host    all             postgres        127.0.0.1/32            reject
 host    all             all             127.0.0.1/32            scram-sha-256
 host    replication     postgres        127.0.0.1/32            reject
@@ -371,11 +397,14 @@ func (a *Agent) StartOrAdoptTenant(tenantID string, epoch int64) (*TenantRuntime
 		FencingEpoch:     epoch,
 	})
 
+	walSpoolDir, _ := tenant.SafeSubpath(a.volDir, "spool/wal", tenantID)
 	rt := &TenantRuntime{
 		TenantID:         tenantID,
 		Port:             port,
 		PID:              pid,
 		PGData:           pgData,
+		SockDir:          sockDir,
+		WALSpoolDir:      walSpoolDir,
 		SystemIdentifier: sysID,
 		FencingEpoch:     epoch,
 		State:            "ACTIVE",
@@ -499,12 +528,14 @@ func (a *Agent) ReadoptRunningTenants() int {
 		}
 
 		cgPath, _ := a.setupTenantCgroupV2(tid, pid)
-
+		walSpoolDir, _ := tenant.SafeSubpath(a.volDir, "spool/wal", tid)
 		rt := &TenantRuntime{
 			TenantID:         tid,
 			Port:             port,
 			PID:              pid,
 			PGData:           pgData,
+			SockDir:          sockDir,
+			WALSpoolDir:      walSpoolDir,
 			SystemIdentifier: sysID,
 			FencingEpoch:     meta.FencingEpoch,
 			State:            "ACTIVE",
@@ -580,11 +611,117 @@ func (a *Agent) GetTenant(tenantID string) (*TenantRuntime, bool) {
 // Close releases agent flock handles cleanly without destroying running tenant PostgreSQL processes
 // so a restarted Cell Agent can readopt running tenants.
 func (a *Agent) Close() {
+	a.stopOnce.Do(func() { close(a.stopCh) })
 	a.tenantMu.Lock()
 	defer a.tenantMu.Unlock()
 	for tid := range a.lockFDs {
 		a.releaseFlockLocked(tid)
 	}
+}
+
+func (a *Agent) VolDir() string          { return a.volDir }
+func (a *Agent) PGBin() string           { return a.pgBin }
+func (a *Agent) KMS() *crypto.EnvelopeKMS { return a.kms }
+
+func (a *Agent) RunPostgresCmd(bin string, args ...string) (string, error) {
+	return a.runPostgresCmd(bin, args...)
+}
+
+// RenewLeaseAck updates the monotonic lease acknowledgement timestamp.
+func (a *Agent) RenewLeaseAck() {
+	a.leaseMu.Lock()
+	a.lastLeaseAckMono = time.Now()
+	a.leaseMu.Unlock()
+}
+
+// WatchdogStatus returns whether the monotonic lease watchdog has self-fenced and when it fired.
+func (a *Agent) WatchdogStatus() (fenced bool, killElapsedMs int64) {
+	return a.watchdogFenced.Load(), a.watchdogKillMs.Load()
+}
+
+// FenceAllLocalPrimaries immediately terminates all local tenant PostgreSQL primaries and marks them quarantined.
+func (a *Agent) FenceAllLocalPrimaries() {
+	a.tenantMu.Lock()
+	defer a.tenantMu.Unlock()
+	for id, rt := range a.tenants {
+		if rt.PID > 0 {
+			_ = syscall.Kill(rt.PID, syscall.SIGKILL)
+			_ = waitProcessGone(rt.PID, 2*time.Second)
+			rt.PID = 0
+		}
+		rt.Quarantined = true
+		rt.State = "FENCED"
+		a.releaseFlockLocked(id)
+	}
+}
+
+// StartLeaseWatchdog runs a high-frequency CLOCK_MONOTONIC timer loop inside the Cell Agent.
+// If time.Since(lastLeaseAckMono) >= selfFenceDeadline, it immediately self-fences all local primaries.
+func (a *Agent) StartLeaseWatchdog(ctx context.Context, selfFenceDeadline time.Duration) {
+	a.RenewLeaseAck()
+	tStart := time.Now()
+	go func() {
+		ticker := time.NewTicker(25 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-a.stopCh:
+				return
+			case <-ticker.C:
+				a.leaseMu.Lock()
+				elapsed := time.Since(a.lastLeaseAckMono)
+				a.leaseMu.Unlock()
+				if elapsed >= selfFenceDeadline && !a.watchdogFenced.Load() {
+					a.watchdogFenced.Store(true)
+					a.watchdogKillMs.Store(time.Since(tStart).Milliseconds())
+					a.FenceAllLocalPrimaries()
+					return
+				}
+			}
+		}
+	}()
+}
+
+// VerifyWALSummaryContinuity queries pg_available_wal_summaries() on the live cluster to confirm
+// PG17 WAL summaries are present before running pg_basebackup --incremental.
+func (a *Agent) VerifyWALSummaryContinuity(ctx context.Context, tenantID string) (int, error) {
+	rt, ok := a.GetTenant(tenantID)
+	if !ok {
+		return 0, fmt.Errorf("tenant %s not active", tenantID)
+	}
+	connStr := fmt.Sprintf("host=%s port=%d user=postgres dbname=postgres", rt.SockDir, rt.Port)
+	if rt.SockDir == "" {
+		connStr = fmt.Sprintf("postgres://postgres@127.0.0.1:%d/postgres?sslmode=disable", rt.Port)
+	}
+	conn, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close(ctx)
+
+	_, _ = conn.Exec(ctx, "CHECKPOINT;")
+	var summaryCount int
+	for attempt := 0; attempt < 20; attempt++ {
+		_ = conn.QueryRow(ctx, "SELECT count(*) FROM pg_available_wal_summaries();").Scan(&summaryCount)
+		if summaryCount > 0 {
+			return summaryCount, nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return summaryCount, nil
+}
+
+// VerifyCombineStagingHeadroom enforces the >= 2.2x free staging space requirement before pg_combinebackup.
+func (a *Agent) VerifyCombineStagingHeadroom(estimatedClusterBytes uint64) (freeBytes uint64, requiredBytes uint64, ok bool, err error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(a.volDir, &stat); err != nil {
+		return 0, 0, false, err
+	}
+	freeBytes = stat.Bavail * uint64(stat.Bsize)
+	requiredBytes = uint64(float64(estimatedClusterBytes) * 2.2)
+	return freeBytes, requiredBytes, freeBytes >= requiredBytes, nil
 }
 
 func (a *Agent) waitReady(sockDir string, port int, timeout time.Duration) error {

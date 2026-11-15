@@ -3,12 +3,22 @@ package control
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 )
 
 type createDatabaseReq struct {
 	TenantID string `json:"tenant_id"`
+}
+
+type triggerBackupReq struct {
+	Type string `json:"type"`
+}
+
+type restoreDatabaseReq struct {
+	TargetLSN   string `json:"target_lsn"`
+	VerifyQuery string `json:"verify_query"`
 }
 
 // HTTPHandler returns an http.Handler exposing the AIR Control Plane REST API:
@@ -115,6 +125,60 @@ func (cp *ControlPlane) HTTPHandler() http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "key_id": r.PathValue("id")})
+	})
+
+	mux.HandleFunc("POST /v1/databases/{id}/backups", func(w http.ResponseWriter, r *http.Request) {
+		accountID, ok := cp.authenticateRequest(w, r)
+		if !ok {
+			return
+		}
+		var req triggerBackupReq
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+			return
+		}
+		resp, err := cp.TriggerBackup(r.Context(), accountID, r.PathValue("id"), req.Type)
+		if err != nil {
+			switch {
+			case errors.Is(err, ErrNotFound):
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			case errors.Is(err, ErrForbidden):
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			case errors.Is(err, ErrBackupNotConfigured):
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			default:
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			}
+			return
+		}
+		writeJSON(w, http.StatusCreated, resp)
+	})
+
+	mux.HandleFunc("POST /v1/databases/{id}/restore", func(w http.ResponseWriter, r *http.Request) {
+		accountID, ok := cp.authenticateRequest(w, r)
+		if !ok {
+			return
+		}
+		var req restoreDatabaseReq
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+			return
+		}
+		resp, err := cp.RestoreDatabase(r.Context(), accountID, r.PathValue("id"), req.TargetLSN, req.VerifyQuery)
+		if err != nil {
+			switch {
+			case errors.Is(err, ErrNotFound):
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			case errors.Is(err, ErrForbidden):
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			case errors.Is(err, ErrBackupNotConfigured):
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			default:
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, resp)
 	})
 
 	return mux

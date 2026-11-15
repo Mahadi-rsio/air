@@ -20,6 +20,14 @@ var (
 	ErrAADMismatch = errors.New("crypto: AES-256-GCM authentication failed")
 )
 
+// WrappedDEKBundle is persisted inside R2 manifest.json so a recovery cell
+// can unwrap the tenant DEK using the master KEK.
+type WrappedDEKBundle struct {
+	TenantID   string `json:"tenant_id"`
+	KeyVersion string `json:"key_version"`
+	WrappedDEK string `json:"wrapped_dek"`
+}
+
 // EnvelopeKMS manages a 256-bit master KEK and per-tenant 256-bit DEKs wrapped with AES-256-GCM.
 type EnvelopeKMS struct {
 	mu          sync.RWMutex
@@ -109,6 +117,24 @@ func (k *EnvelopeKMS) LoadWrappedDEK(tenantID, wrappedB64 string) error {
 	k.wrappedDEKs[tenantID] = raw
 	k.mu.Unlock()
 	return nil
+}
+
+// ExportWrappedDEKBundle ensures a tenant DEK exists and returns it as a self-contained WrappedDEKBundle.
+func (k *EnvelopeKMS) ExportWrappedDEKBundle(tenantID string) (WrappedDEKBundle, error) {
+	wrappedB64, err := k.EnsureTenantDEK(tenantID)
+	if err != nil {
+		return WrappedDEKBundle{}, err
+	}
+	return WrappedDEKBundle{
+		TenantID:   tenantID,
+		KeyVersion: "kek-v1",
+		WrappedDEK: wrappedB64,
+	}, nil
+}
+
+// ImportWrappedDEKBundle loads a WrappedDEKBundle into the KMS after verifying its KEK unwrap.
+func (k *EnvelopeKMS) ImportWrappedDEKBundle(b WrappedDEKBundle) error {
+	return k.LoadWrappedDEK(b.TenantID, b.WrappedDEK)
 }
 
 // UnwrapDEK unwraps the tenant's 256-bit DEK.
