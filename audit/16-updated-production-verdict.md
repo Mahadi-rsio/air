@@ -31,6 +31,12 @@
 
 ---
 
-## 3. Phase A Closure Note
+## 3. Phase A–E Closure Note
 
-All 7 previously skipped live-PG17 tests in `stage1` and `stage4` have now been executed against PostgreSQL 17.12 + `supautils.so` and **all 18 tests passed with `-race -count=1` and 0 skips** (see [audit/15-fault-injection-results.md](file:///workspaces/air/audit/15-fault-injection-results.md)). Experimental `stage0`–`stage4` packages were moved to `stage_test/`, and the production-oriented single-cell foundation (`AIR v1`) was initiated at the repository root. General Availability remains `NO-GO` until the remaining GA prerequisites above (external API auth, HA metadata DB, mandatory TLS, CAS backup manifest wiring, streaming tar limits, and multi-VM canary) are completed.
+1. **Phase A (Live PG17 Remediation & Archival)**: All 7 previously skipped live-PG17 tests in `stage_test/stage1` and `stage_test/stage4` were executed against PostgreSQL 17.12 + `supautils.so` and **all 18 tests passed with `-race -count=1` and 0 skips** (see [audit/15-fault-injection-results.md](file:///workspaces/air/audit/15-fault-injection-results.md)). Experimental `stage0`–`stage4` packages were moved to `stage_test/`.
+2. **Phases B–D (`AIR v1.0` Single-Cell Foundation)**: Implemented root module (`cmd/air-server`, `internal/{config,tenant,crypto,cell,control,gateway}`, `migrations/001_initial_schema.sql`) and verified all 9 end-to-end milestones in `TestAIRv1_SingleCellEndToEndMilestones`.
+3. **Phase E (`AIR v1.1` Bearer Auth, Mandatory TLS & `supautils` User Hardening)**:
+   - Added `migrations/002_api_keys.sql` and Control Plane Bearer API key authentication (`401`/`403` enforcement).
+   - Added `--require-tls` mandatory TLS enforcement (`SQLSTATE 28000` on plaintext connections) in `internal/gateway/gateway.go`.
+   - Enforced full `supautils` v4.0.0 user hardening (`supautils.superuser`, `supautils.privileged_role = 'app_user'`, `supautils.privileged_extensions`, `supautils.reserved_roles`, `supautils.reserved_memberships`, `supautils.restrict_extension_versions = 'error'`, `temp_file_limit = 32MB`, and `pg_hba.conf` TCP `postgres` reject), verified by `TestAIRv1_1_PhaseE_BearerAuthAndMandatoryGatewayTLS` and `TestAIRv1_1_SupautilsUserHardening`.
+4. **Remaining Roadmap (Phases F–H in [phase.md](file:///workspaces/air/phase.md))**: General Availability remains gated on completing Phase F (CAS-fenced backups & streaming-safe PITR in root `internal/backup`), Phase G (per-tenant `cgroup v2` & external HA metadata DSN), and Phase H (transaction-mode connection pooler & cooperative scale-to-zero).

@@ -109,3 +109,32 @@ After installing `postgresql-17` (`17.12-1.pgdg24.04+1`) and compiling/installin
 - `(cd stage4 && go test -v -race -count=1 ./...)`: **9 PASS, 0 FAIL, 0 SKIP** (`pkg/backup`, `pkg/cell`, `pkg/wire`)
 
 Experimental Stage 0–4 packages were subsequently moved to `stage_test/`.
+
+---
+
+## 4. Phase D & Phase E — Root `AIR v1.1` End-to-End & `supautils` Hardening Verification
+
+### Command
+```bash
+go test -v -race -count=1 ./...
+```
+
+### Actual Output (Observed)
+```text
+?   	github.com/Mahadi-rsio/air/cmd/air-server	[no test files]
+?   	github.com/Mahadi-rsio/air/internal/cell	[no test files]
+?   	github.com/Mahadi-rsio/air/internal/config	[no test files]
+?   	github.com/Mahadi-rsio/air/internal/control	[no test files]
+?   	github.com/Mahadi-rsio/air/internal/crypto	[no test files]
+?   	github.com/Mahadi-rsio/air/internal/gateway	[no test files]
+?   	github.com/Mahadi-rsio/air/internal/tenant	[no test files]
+=== RUN   TestAIRv1_SingleCellEndToEndMilestones
+2026/11/15 15:43:39 [cell-agent] readopt skipped for tenant_alpha: agent.lock flock busy for tenant_alpha: resource temporarily unavailable
+--- PASS: TestAIRv1_SingleCellEndToEndMilestones (5.47s)
+=== RUN   TestAIRv1_1_PhaseE_BearerAuthAndMandatoryGatewayTLS
+--- PASS: TestAIRv1_1_PhaseE_BearerAuthAndMandatoryGatewayTLS (2.10s)
+=== RUN   TestAIRv1_1_SupautilsUserHardening
+--- PASS: TestAIRv1_1_SupautilsUserHardening (2.23s)
+PASS
+ok  	github.com/Mahadi-rsio/air/tests/e2e	10.818s
+```
