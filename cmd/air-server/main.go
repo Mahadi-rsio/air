@@ -36,7 +36,14 @@ func main() {
 	}
 	defer ag.Close()
 
-	cp, err := control.NewControlPlane(ctx, cfg.MetaDir, cfg.PGBinDir, cfg.MetaPort, ag, kms)
+	cp, err := control.NewControlPlaneWithConfig(ctx, control.ControlPlaneConfig{
+		MetaDir:  cfg.MetaDir,
+		MetaDSN:  cfg.MetaDSN,
+		PGBinDir: cfg.PGBinDir,
+		MetaPort: cfg.MetaPort,
+		Agent:    ag,
+		KMS:      kms,
+	})
 	if err != nil {
 		log.Fatalf("init control plane: %v", err)
 	}

@@ -12,6 +12,7 @@ import (
 type Config struct {
 	DataDir            string
 	MetaDir            string
+	MetaDSN            string
 	MasterKeyPath      string
 	PGBinDir           string
 	MetaPort           int
@@ -45,6 +46,7 @@ func Default(dataDir string) Config {
 func Load(args []string) (Config, error) {
 	cfg := Default(envOr("AIR_DATA_DIR", "/tmp/air-data"))
 	cfg.MetaDir = envOr("AIR_META_DIR", cfg.MetaDir)
+	cfg.MetaDSN = envOr("AIR_META_DSN", cfg.MetaDSN)
 	cfg.MasterKeyPath = envOr("AIR_MASTER_KEY_PATH", cfg.MasterKeyPath)
 	cfg.PGBinDir = envOr("AIR_PG_BIN_DIR", cfg.PGBinDir)
 	cfg.HTTPAddr = envOr("AIR_HTTP_ADDR", cfg.HTTPAddr)
@@ -65,6 +67,7 @@ func Load(args []string) (Config, error) {
 	fs := flag.NewFlagSet("air-server", flag.ContinueOnError)
 	fs.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "Root directory for AIR persistent tenant and metadata storage")
 	fs.StringVar(&cfg.MetaDir, "meta-dir", cfg.MetaDir, "Metadata PostgreSQL directory")
+	fs.StringVar(&cfg.MetaDSN, "meta-dsn", cfg.MetaDSN, "Optional external HA PostgreSQL DSN for Control Plane metadata (disables local meta-dir)")
 	fs.StringVar(&cfg.MasterKeyPath, "master-key-path", cfg.MasterKeyPath, "Path to 32-byte master KEK file")
 	fs.StringVar(&cfg.PGBinDir, "pg-bin-dir", cfg.PGBinDir, "Path to PostgreSQL 17 bin directory")
 	fs.IntVar(&cfg.MetaPort, "meta-port", cfg.MetaPort, "TCP port for internal Control Plane metadata PostgreSQL instance")

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,6 +31,27 @@ type TenantRuntime struct {
 	SystemIdentifier string `json:"system_identifier"`
 	FencingEpoch     int64  `json:"fencing_epoch"`
 	State            string `json:"state"`
+	CgroupPath       string `json:"cgroup_path,omitempty"`
+}
+
+// CgroupLimits defines per-tenant cgroup v2 resource constraints.
+type CgroupLimits struct {
+	MemoryHigh string
+	MemoryMax  string
+	SwapMax    string
+	CPUMax     string
+	PIDsMax    string
+}
+
+// DefaultCgroupLimits returns default per-tenant cgroup v2 limits for PostgreSQL 17 cells.
+func DefaultCgroupLimits() CgroupLimits {
+	return CgroupLimits{
+		MemoryHigh: "536870912",     // 512 MiB
+		MemoryMax:  "1073741824",    // 1 GiB
+		SwapMax:    "0",             // disable swap
+		CPUMax:     "100000 100000", // 1.0 vCPU quota per 100ms period
+		PIDsMax:    "256",
+	}
 }
 
 type agentPIDMeta struct {
@@ -45,6 +67,8 @@ type Agent struct {
 	volDir       string
 	pgBin        string
 	kms          *crypto.EnvelopeKMS
+	cgroupRoot   string
+	cgroupLimits CgroupLimits
 	portSeq      atomic.Int32
 	tenantMu     sync.RWMutex
 	tenants      map[string]*TenantRuntime
@@ -67,16 +91,32 @@ func NewAgent(volDir, pgBinDir string, kms *crypto.EnvelopeKMS) (*Agent, error) 
 		}
 	}
 	a := &Agent{
-		volDir:      volDir,
-		pgBin:       pgBinDir,
-		kms:         kms,
-		tenants:     make(map[string]*TenantRuntime),
-		tenantPorts: make(map[string]int),
-		lockFDs:     make(map[string]*os.File),
+		volDir:       volDir,
+		pgBin:        pgBinDir,
+		kms:          kms,
+		cgroupRoot:   "/sys/fs/cgroup",
+		cgroupLimits: DefaultCgroupLimits(),
+		tenants:      make(map[string]*TenantRuntime),
+		tenantPorts:  make(map[string]int),
+		lockFDs:      make(map[string]*os.File),
 	}
 	a.portSeq.Store(int32(18000 + (os.Getpid()%400)*20))
 	a.ReadoptRunningTenants()
 	return a, nil
+}
+
+// SetCgroupRoot overrides the cgroup v2 mount root (primarily for isolated unit testing).
+func (a *Agent) SetCgroupRoot(root string) {
+	a.tenantMu.Lock()
+	a.cgroupRoot = root
+	a.tenantMu.Unlock()
+}
+
+// SetCgroupLimits overrides the default per-tenant cgroup v2 resource limits.
+func (a *Agent) SetCgroupLimits(limits CgroupLimits) {
+	a.tenantMu.Lock()
+	a.cgroupLimits = limits
+	a.tenantMu.Unlock()
 }
 
 func (a *Agent) SetEpochChecker(fn func(tenantID string) (int64, error)) {
@@ -319,6 +359,8 @@ func (a *Agent) StartOrAdoptTenant(tenantID string, epoch int64) (*TenantRuntime
 		return nil, fmt.Errorf("tenant %s readiness check failed: %w", tenantID, err)
 	}
 
+	cgPath, _ := a.setupTenantCgroupV2(tenantID, pid)
+
 	sysID := a.readSystemIdentifier(pgData)
 	startTime, _ := readProcStartTime(pid)
 	_ = writeJSONAtomic(filepath.Join(activeBase, "agent.pidmeta"), agentPIDMeta{
@@ -337,6 +379,7 @@ func (a *Agent) StartOrAdoptTenant(tenantID string, epoch int64) (*TenantRuntime
 		SystemIdentifier: sysID,
 		FencingEpoch:     epoch,
 		State:            "ACTIVE",
+		CgroupPath:       cgPath,
 	}
 	a.tenantMu.Lock()
 	a.tenants[tenantID] = rt
@@ -455,6 +498,8 @@ func (a *Agent) ReadoptRunningTenants() int {
 			continue
 		}
 
+		cgPath, _ := a.setupTenantCgroupV2(tid, pid)
+
 		rt := &TenantRuntime{
 			TenantID:         tid,
 			Port:             port,
@@ -463,6 +508,7 @@ func (a *Agent) ReadoptRunningTenants() int {
 			SystemIdentifier: sysID,
 			FencingEpoch:     meta.FencingEpoch,
 			State:            "ACTIVE",
+			CgroupPath:       cgPath,
 		}
 		a.tenantMu.Lock()
 		a.tenants[tid] = rt
@@ -473,7 +519,7 @@ func (a *Agent) ReadoptRunningTenants() int {
 	return count
 }
 
-// StopTenantClean stops PG17 cleanly and verifies process exit before releasing flock, keeping data on disk.
+// StopTenantClean stops PG17 cleanly and verifies process tree exit + cgroup teardown before releasing flock, keeping data on disk.
 func (a *Agent) StopTenantClean(tenantID string) error {
 	activeBase, err := tenant.SafeSubpath(a.volDir, "tenants/active", tenantID)
 	if err != nil {
@@ -482,9 +528,8 @@ func (a *Agent) StopTenantClean(tenantID string) error {
 	pgData := filepath.Join(activeBase, "pgdata")
 	pid, _, _ := readPostmasterDetails(pgData)
 	_, _ = a.runPostgresCmd(filepath.Join(a.pgBin, "pg_ctl"), "-D", pgData, "-m", "fast", "-w", "-t", "10", "stop")
-	if pid > 1 && !waitProcessGone(pid, 3*time.Second) {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
-		waitProcessGone(pid, 2*time.Second)
+	if kErr := a.killAndRemoveTenantCgroupV2(tenantID, pid); kErr != nil {
+		return kErr
 	}
 	a.tenantMu.Lock()
 	delete(a.tenants, tenantID)
@@ -493,7 +538,7 @@ func (a *Agent) StopTenantClean(tenantID string) error {
 	return nil
 }
 
-// StopAndPurgeTenant terminates the tenant PG17 process, verifies termination, releases flock, and deletes data.
+// StopAndPurgeTenant terminates the tenant PG17 process tree and cgroup, verifies termination, releases flock, and deletes data.
 func (a *Agent) StopAndPurgeTenant(tenantID string) error {
 	claimDir, err := tenant.SafeSubpath(a.volDir, "tenants/claiming", tenantID)
 	if err != nil {
@@ -507,12 +552,9 @@ func (a *Agent) StopAndPurgeTenant(tenantID string) error {
 	pid, _, _ := readPostmasterDetails(pgData)
 	if _, statErr := os.Stat(pgData); statErr == nil {
 		_, _ = a.runPostgresCmd(filepath.Join(a.pgBin, "pg_ctl"), "-D", pgData, "-m", "immediate", "-w", "-t", "10", "stop")
-		if pid > 1 && !waitProcessGone(pid, 3*time.Second) {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
-			if !waitProcessGone(pid, 2*time.Second) {
-				return fmt.Errorf("process %d for tenant %s survived SIGKILL", pid, tenantID)
-			}
-		}
+	}
+	if kErr := a.killAndRemoveTenantCgroupV2(tenantID, pid); kErr != nil {
+		return kErr
 	}
 
 	a.tenantMu.Lock()
@@ -608,4 +650,130 @@ func writeJSONAtomic(path string, v any) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// setupTenantCgroupV2 creates/configures air_tenant_<id> under cgroupRoot and attaches pid (+ descendants).
+// If cgroupfs is not writable/delegated, it logs clearly and degrades gracefully without failing startup.
+func (a *Agent) setupTenantCgroupV2(tenantID string, pid int) (string, bool) {
+	if pid <= 1 || tenant.ValidateID(tenantID) != nil {
+		return "", false
+	}
+	a.tenantMu.RLock()
+	root := a.cgroupRoot
+	limits := a.cgroupLimits
+	a.tenantMu.RUnlock()
+	if root == "" {
+		return "", false
+	}
+
+	cgDir := filepath.Join(root, "air_tenant_"+tenantID)
+	if err := os.MkdirAll(cgDir, 0o755); err != nil {
+		log.Printf("[cell-agent] cgroup v2 unavailable for %s (%s): %v (degrading gracefully)", tenantID, cgDir, err)
+		return "", false
+	}
+
+	limitFiles := []struct {
+		name string
+		val  string
+	}{
+		{"memory.high", limits.MemoryHigh},
+		{"memory.max", limits.MemoryMax},
+		{"memory.swap.max", limits.SwapMax},
+		{"cpu.max", limits.CPUMax},
+		{"pids.max", limits.PIDsMax},
+	}
+	for _, lf := range limitFiles {
+		if lf.val == "" {
+			continue
+		}
+		p := filepath.Join(cgDir, lf.name)
+		if err := os.WriteFile(p, []byte(lf.val), 0o644); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("[cell-agent] cgroup v2 limit %s=%q failed for %s: %v", lf.name, lf.val, tenantID, err)
+		}
+	}
+
+	pids := collectProcessTree(pid)
+	if len(pids) == 0 {
+		pids = []int{pid}
+	}
+	procsPath := filepath.Join(cgDir, "cgroup.procs")
+	attachedRoot := false
+	for _, p := range pids {
+		if err := os.WriteFile(procsPath, []byte(strconv.Itoa(p)), 0o644); err == nil {
+			if p == pid {
+				attachedRoot = true
+			}
+		} else if p == pid {
+			log.Printf("[cell-agent] cgroup v2 attach pid %d failed for %s: %v (degrading gracefully)", pid, tenantID, err)
+		}
+	}
+	if !attachedRoot {
+		return "", false
+	}
+	return cgDir, true
+}
+
+// killAndRemoveTenantCgroupV2 enforces atomic cgroup.kill + recursive /proc tree SIGKILL + waitForPIDsExit,
+// then removes the tenant cgroup slice directory.
+func (a *Agent) killAndRemoveTenantCgroupV2(tenantID string, rootPID int) error {
+	if tenant.ValidateID(tenantID) != nil {
+		return nil
+	}
+	a.tenantMu.RLock()
+	root := a.cgroupRoot
+	a.tenantMu.RUnlock()
+
+	seen := make(map[int]bool)
+	var allPIDs []int
+	addPID := func(p int) {
+		if p > 1 && !seen[p] {
+			seen[p] = true
+			allPIDs = append(allPIDs, p)
+		}
+	}
+
+	treePIDs := collectProcessTree(rootPID)
+	for _, p := range treePIDs {
+		addPID(p)
+	}
+
+	var cgDir string
+	cgExists := false
+	if root != "" {
+		cgDir = filepath.Join(root, "air_tenant_"+tenantID)
+		if _, err := os.Stat(cgDir); err == nil {
+			cgExists = true
+			_ = os.WriteFile(filepath.Join(cgDir, "cgroup.kill"), []byte("1"), 0o644)
+			if data, err := os.ReadFile(filepath.Join(cgDir, "cgroup.procs")); err == nil {
+				for _, field := range strings.Fields(string(data)) {
+					if p, err := strconv.Atoi(field); err == nil && p > 1 {
+						addPID(p)
+						_ = syscall.Kill(p, syscall.SIGKILL)
+					}
+				}
+			}
+		}
+	}
+
+	// Signal descendants first, then rootPID (also covers degraded non-cgroup mode).
+	for i := len(treePIDs) - 1; i >= 0; i-- {
+		if isProcessAlive(treePIDs[i]) {
+			_ = syscall.Kill(treePIDs[i], syscall.SIGKILL)
+		}
+	}
+
+	if len(allPIDs) > 0 && !waitForPIDsExit(allPIDs, 3*time.Second) {
+		return fmt.Errorf("tenant %s process tree %v survived SIGKILL", tenantID, allPIDs)
+	}
+
+	if cgExists {
+		for i := 0; i < 10; i++ {
+			err := os.Remove(cgDir)
+			if err == nil || errors.Is(err, os.ErrNotExist) {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	return nil
 }

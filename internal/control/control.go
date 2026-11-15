@@ -63,69 +63,110 @@ type DatabaseInfo struct {
 	State            string `json:"state"`
 }
 
-// ControlPlane manages durable PG17 metadata, schema migrations, provisioning state machine, and tenant routing.
-type ControlPlane struct {
-	metaDir     string
-	pgBin       string
-	metaPort    int
-	db          *pgxpool.Pool
-	agent       *cell.Agent
-	kms         *crypto.EnvelopeKMS
-	provMu      sync.Mutex
-	faultHook   func(stage string) error
-	gatewayPort int
+// ControlPlaneConfig configures ControlPlane metadata storage (either external HA MetaDSN or local MetaDir).
+type ControlPlaneConfig struct {
+	MetaDir  string
+	MetaDSN  string
+	PGBinDir string
+	MetaPort int
+	Agent    *cell.Agent
+	KMS      *crypto.EnvelopeKMS
 }
 
+// ControlPlane manages durable PG17 metadata, schema migrations, provisioning state machine, and tenant routing.
+type ControlPlane struct {
+	metaDir      string
+	metaDSN      string
+	externalMeta bool
+	pgBin        string
+	metaPort     int
+	db           *pgxpool.Pool
+	agent        *cell.Agent
+	kms          *crypto.EnvelopeKMS
+	provMu       sync.Mutex
+	faultHook    func(stage string) error
+	gatewayPort  int
+}
+
+// NewControlPlane initializes a ControlPlane backed by a local single-node PG17 MetaDir.
 func NewControlPlane(ctx context.Context, metaDir, pgBinDir string, metaPort int, ag *cell.Agent, kms *crypto.EnvelopeKMS) (*ControlPlane, error) {
+	return NewControlPlaneWithConfig(ctx, ControlPlaneConfig{
+		MetaDir:  metaDir,
+		PGBinDir: pgBinDir,
+		MetaPort: metaPort,
+		Agent:    ag,
+		KMS:      kms,
+	})
+}
+
+// NewControlPlaneWithConfig initializes a ControlPlane using either an external HA PostgreSQL DSN (cfg.MetaDSN)
+// or a self-managed local PG17 instance in cfg.MetaDir when cfg.MetaDSN is empty.
+func NewControlPlaneWithConfig(ctx context.Context, cfg ControlPlaneConfig) (*ControlPlane, error) {
+	pgBinDir := cfg.PGBinDir
 	if pgBinDir == "" {
 		pgBinDir = "/usr/lib/postgresql/17/bin"
 	}
-	if err := os.MkdirAll(metaDir, 0o755); err != nil {
-		return nil, err
-	}
-	pgData := filepath.Join(metaDir, "pgdata")
-	sockDir := filepath.Join(metaDir, "sock")
-	if err := os.MkdirAll(sockDir, 0o755); err != nil {
-		return nil, err
-	}
 
-	// Safe existing-database detection: never os.RemoveAll(metaDir).
-	pgVersionPath := filepath.Join(pgData, "PG_VERSION")
-	if _, err := os.Stat(pgVersionPath); os.IsNotExist(err) {
-		if entries, rErr := os.ReadDir(pgData); rErr == nil && len(entries) > 0 {
-			return nil, fmt.Errorf("%w: %s has files without PG_VERSION", ErrCorruptedMetadata, pgData)
+	metaDSN := strings.TrimSpace(cfg.MetaDSN)
+	externalMeta := metaDSN != ""
+	dsn := metaDSN
+
+	if !externalMeta {
+		if cfg.MetaDir == "" {
+			return nil, errors.New("control metadata requires either MetaDSN or MetaDir")
 		}
-		if err := os.MkdirAll(pgData, 0o700); err != nil {
+		if err := os.MkdirAll(cfg.MetaDir, 0o755); err != nil {
 			return nil, err
 		}
-		if out, err := runPostgres(pgBinDir, "initdb", "-D", pgData, "-U", "postgres", "--auth=trust", "--data-checksums", "--no-instructions"); err != nil {
-			return nil, fmt.Errorf("control metadata initdb: %w (%s)", err, out)
-		}
-		conf := fmt.Sprintf("listen_addresses = '127.0.0.1'\nport = %d\nunix_socket_directories = '%s'\nmax_connections = 100\nshared_buffers = 32MB\nssl = off\n", metaPort, sockDir)
-		if err := os.WriteFile(filepath.Join(pgData, "postgresql.conf"), []byte(conf), 0o600); err != nil {
+		pgData := filepath.Join(cfg.MetaDir, "pgdata")
+		sockDir := filepath.Join(cfg.MetaDir, "sock")
+		if err := os.MkdirAll(sockDir, 0o755); err != nil {
 			return nil, err
 		}
-	} else if err != nil {
-		return nil, err
-	} else {
-		// Ensure port/sockDir in postgresql.conf match current runtime settings cleanly.
-		conf := fmt.Sprintf("listen_addresses = '127.0.0.1'\nport = %d\nunix_socket_directories = '%s'\nmax_connections = 100\nshared_buffers = 32MB\nssl = off\n", metaPort, sockDir)
-		if err := os.WriteFile(filepath.Join(pgData, "postgresql.conf"), []byte(conf), 0o600); err != nil {
+
+		// Safe existing-database detection: never os.RemoveAll(metaDir).
+		pgVersionPath := filepath.Join(pgData, "PG_VERSION")
+		if _, err := os.Stat(pgVersionPath); os.IsNotExist(err) {
+			if entries, rErr := os.ReadDir(pgData); rErr == nil && len(entries) > 0 {
+				return nil, fmt.Errorf("%w: %s has files without PG_VERSION", ErrCorruptedMetadata, pgData)
+			}
+			if err := os.MkdirAll(pgData, 0o700); err != nil {
+				return nil, err
+			}
+			if out, err := runPostgres(pgBinDir, "initdb", "-D", pgData, "-U", "postgres", "--auth=trust", "--data-checksums", "--no-instructions"); err != nil {
+				return nil, fmt.Errorf("control metadata initdb: %w (%s)", err, out)
+			}
+			conf := fmt.Sprintf("listen_addresses = '127.0.0.1'\nport = %d\nunix_socket_directories = '%s'\nmax_connections = 100\nshared_buffers = 32MB\nssl = off\n", cfg.MetaPort, sockDir)
+			if err := os.WriteFile(filepath.Join(pgData, "postgresql.conf"), []byte(conf), 0o600); err != nil {
+				return nil, err
+			}
+		} else if err != nil {
 			return nil, err
+		} else {
+			// Ensure port/sockDir in postgresql.conf match current runtime settings cleanly.
+			conf := fmt.Sprintf("listen_addresses = '127.0.0.1'\nport = %d\nunix_socket_directories = '%s'\nmax_connections = 100\nshared_buffers = 32MB\nssl = off\n", cfg.MetaPort, sockDir)
+			if err := os.WriteFile(filepath.Join(pgData, "postgresql.conf"), []byte(conf), 0o600); err != nil {
+				return nil, err
+			}
 		}
+
+		if _, err := os.Stat(filepath.Join(pgData, "postmaster.pid")); err != nil {
+			logFile := filepath.Join(cfg.MetaDir, "control-pg.log")
+			if out, err := runPostgres(pgBinDir, "pg_ctl", "-D", pgData, "-l", logFile, "-w", "-t", "15", "start"); err != nil {
+				return nil, fmt.Errorf("control metadata start: %w (%s)", err, out)
+			}
+		}
+
+		dsn = fmt.Sprintf("postgres://postgres@127.0.0.1:%d/postgres?sslmode=disable", cfg.MetaPort)
 	}
 
-	if _, err := os.Stat(filepath.Join(pgData, "postmaster.pid")); err != nil {
-		logFile := filepath.Join(metaDir, "control-pg.log")
-		if out, err := runPostgres(pgBinDir, "pg_ctl", "-D", pgData, "-l", logFile, "-w", "-t", "15", "start"); err != nil {
-			return nil, fmt.Errorf("control metadata start: %w (%s)", err, out)
-		}
-	}
-
-	dsn := fmt.Sprintf("postgres://postgres@127.0.0.1:%d/postgres?sslmode=disable", metaPort)
 	var pool *pgxpool.Pool
 	var lastErr error
 	for i := 0; i < 40; i++ {
+		if ctx.Err() != nil {
+			lastErr = ctx.Err()
+			break
+		}
 		pool, lastErr = pgxpool.New(ctx, dsn)
 		if lastErr == nil {
 			if pingErr := pool.Ping(ctx); pingErr == nil {
@@ -143,12 +184,14 @@ func NewControlPlane(ctx context.Context, metaDir, pgBinDir string, metaPort int
 	}
 
 	cp := &ControlPlane{
-		metaDir:  metaDir,
-		pgBin:    pgBinDir,
-		metaPort: metaPort,
-		db:       pool,
-		agent:    ag,
-		kms:      kms,
+		metaDir:      cfg.MetaDir,
+		metaDSN:      metaDSN,
+		externalMeta: externalMeta,
+		pgBin:        pgBinDir,
+		metaPort:     cfg.MetaPort,
+		db:           pool,
+		agent:        cfg.Agent,
+		kms:          cfg.KMS,
 	}
 	if err := cp.runMigrations(ctx); err != nil {
 		pool.Close()
@@ -158,8 +201,8 @@ func NewControlPlane(ctx context.Context, metaDir, pgBinDir string, metaPort int
 		pool.Close()
 		return nil, err
 	}
-	if ag != nil {
-		ag.SetEpochChecker(func(tenantID string) (int64, error) {
+	if cfg.Agent != nil {
+		cfg.Agent.SetEpochChecker(func(tenantID string) (int64, error) {
 			var epoch int64
 			err := cp.db.QueryRow(context.Background(), `SELECT fencing_epoch FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&epoch)
 			return epoch, err
@@ -737,8 +780,10 @@ func (cp *ControlPlane) Close() {
 	if cp.db != nil {
 		cp.db.Close()
 	}
-	pgData := filepath.Join(cp.metaDir, "pgdata")
-	_, _ = runPostgres(cp.pgBin, "pg_ctl", "-D", pgData, "-m", "fast", "-w", "-t", "10", "stop")
+	if !cp.externalMeta && cp.metaDir != "" {
+		pgData := filepath.Join(cp.metaDir, "pgdata")
+		_, _ = runPostgres(cp.pgBin, "pg_ctl", "-D", pgData, "-m", "fast", "-w", "-t", "10", "stop")
+	}
 }
 
 func runPostgres(pgBin, binName string, args ...string) (string, error) {
