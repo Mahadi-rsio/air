@@ -76,13 +76,15 @@ func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materiali
 	}
 
 	fileName := fmt.Sprintf("%s_%06d_%016x_%016x.layer", prefix, seq, minLSN, maxLSN)
-	r2Key := fmt.Sprintf("tenants/%s/timeline_%d/layers/%s", tenantID, epoch, fileName)
+	logicalKey := fmt.Sprintf("tenants/%s/timeline_%d/layers/%s", tenantID, epoch, fileName)
 	meta := LayerMeta{
 		TenantID: tenantID,
 		Epoch:    epoch,
 		Kind:     kind,
+		Seq:      seq,
 		FileName: fileName,
-		R2Key:    r2Key,
+		R2Key:    logicalKey,
+		AADKey:   logicalKey,
 		StartLSN: minLSN,
 		EndLSN:   maxLSN,
 	}
@@ -91,8 +93,10 @@ func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materiali
 		return nil, err
 	}
 
-	t.mu.Lock()
-	// Rebuild layers slice keeping non-compacted layers plus the new compacted layer.
+	t.manifestMu.Lock()
+	defer t.manifestMu.Unlock()
+
+	t.mu.RLock()
 	l0Set := make(map[string]struct{}, len(l0s))
 	for _, lm := range l0s {
 		l0Set[lm.R2Key] = struct{}{}
@@ -104,6 +108,16 @@ func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materiali
 		}
 	}
 	updated = append(updated, written)
+	curSeq := t.layerSeq
+	t.mu.RUnlock()
+
+	if t.store != nil {
+		if err := t.store.PublishLayerManifest(ctx, tenantID, epoch, updated, curSeq); err != nil {
+			return nil, err
+		}
+	}
+
+	t.mu.Lock()
 	t.layers = updated
 	t.mu.Unlock()
 
@@ -137,7 +151,7 @@ func (t *Timeline) readAllRecords(ctx context.Context, meta LayerMeta) ([]LayerR
 			return nil, err
 		}
 		if meta.Encrypted {
-			raw, err = t.store.kms.DecryptObject(meta.TenantID, meta.Epoch, fmt.Sprintf("%s#e%d", meta.R2Key, i), raw)
+			raw, err = t.store.kms.DecryptObject(meta.TenantID, meta.Epoch, fmt.Sprintf("%s#e%d", meta.aadKey(), i), raw)
 			if err != nil {
 				return nil, err
 			}

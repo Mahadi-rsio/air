@@ -95,3 +95,25 @@ Fast length-prefixed binary protocol over Unix domain socket (`/var/lib/air/page
 | **Phase 2: Layer Files & WAL-Redo** | `internal/pageserver/layers.go`, `walredo.go`, `readpath.go` | Flush L0 layers encrypted to R2; implement `GetPage@LSN` with stateless PG17 WAL-redo worker; verify page-exact parity vs `pg_checksums` / `psql`. |
 | **Phase 3: Compaction, Image Layers & LRU Cache** | `internal/pageserver/compactor.go`, `cache.go` | L0 → L1 + Image Layer compaction; HTTP `Range` reads from R2; bounded LRU disk cache on `/var/lib/air`. |
 | **Phase 4: Control Plane & Scale-to-Zero Integration** | `internal/control/control.go`, `cmd/air-server/main.go` | Start Pageserver inside `air-server`; flush In-Memory Layer to R2 on `SuspendTenant`; remove full-tarball `HydrateTenantPGDataFromR2` on wake. |
+
+---
+
+## 4. Content-Addressed Upload (CAU) for Immutable Layers
+
+Implemented in `internal/pageserver/cau.go`, `layers.go`, `readpath.go`, `compactor.go`, and `server.go`:
+
+- **Canonical Key Format (Tenant-Scoped):**
+  `tenants/{tenant_id}/layers/sha256/{first_two_hex}/{full_sha256}`
+  Computed via streaming SHA-256 (`StreamSHA256`, 64 KiB buffer) over the finalized immutable layer file bytes without loading large files into memory.
+- **Idempotent & Concurrency-Safe Upload (`LayerStore.UploadLayerFile`):**
+  1. Verifies the local file is a finalized regular file with a valid `LayerFooter`.
+  2. Checks R2 via `HeadObject` (`ChecksumMode: ENABLED`) and verifies `Content-Length` and `ChecksumSHA256` / `x-amz-meta-air-sha256` (falling back to streaming `GetObject` if checksum metadata is absent). Reuses existing verified objects with 0 layer bytes transferred.
+  3. Uploads missing objects via single-part `PutObject` or streaming `MultipartUpload` (`> 16 MiB`, 8 MiB parts, `AbortMultipartUpload` on failure) using `If-None-Match: *` conditional creation. On `412 PreconditionFailed`, re-verifies the existing remote object before reusing.
+  4. Runs post-upload `HeadObject` verification before returning a durable `LayerMeta`.
+- **Metadata Publication Ordering:**
+  `FlushInMemory`, `CompactIfNeeded`, and `BootstrapTenantFromPGData` publish `tenants/{tenant_id}/timeline_{epoch}/layer_manifest.json` (via ETag CAS) **only after** the CAU object is uploaded and verified, and update in-memory `Timeline.layers` only after manifest publication succeeds.
+- **Backward Compatibility & KMS AAD:**
+  - `ListLayersFromR2` loads `layer_manifest.json` and merges any legacy `tenants/{tenant_id}/timeline_{epoch}/layers/*.layer` objects.
+  - `LayerMeta.AADKey` preserves the logical key for `EnvelopeKMS` decryption on CAU layers, while legacy layers fall back to `R2Key`.
+- **GC Safety:**
+  Automatic deletion of content-addressed objects is intentionally disabled until a tenant-wide reference-aware mark-and-sweep GC (tracking all manifest versions and in-progress upload grace periods) is implemented.

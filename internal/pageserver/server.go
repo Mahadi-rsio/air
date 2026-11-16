@@ -270,13 +270,14 @@ func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID str
 		return nil, nil
 	}
 	fileName := fmt.Sprintf("img_bootstrap_%016x.layer", initLSN)
-	r2Key := fmt.Sprintf("tenants/%s/timeline_%d/layers/%s", tenantID, epoch, fileName)
+	logicalKey := fmt.Sprintf("tenants/%s/timeline_%d/layers/%s", tenantID, epoch, fileName)
 	meta := LayerMeta{
 		TenantID: tenantID,
 		Epoch:    epoch,
 		Kind:     LayerKindImage,
 		FileName: fileName,
-		R2Key:    r2Key,
+		R2Key:    logicalKey,
+		AADKey:   logicalKey,
 		StartLSN: initLSN,
 		EndLSN:   initLSN,
 	}
@@ -284,7 +285,9 @@ func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID str
 	if err != nil {
 		return nil, err
 	}
-	tl.AddLayer(written)
+	if err := tl.PublishNewLayer(ctx, written); err != nil {
+		return nil, err
+	}
 	return &written, nil
 }
 

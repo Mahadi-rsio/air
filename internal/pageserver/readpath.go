@@ -10,8 +10,9 @@ import (
 
 // Timeline manages the 2D (Key, LSN) storage state for a single tenant.
 type Timeline struct {
-	mu          sync.RWMutex
-	tenantID    string
+	mu            sync.RWMutex
+	manifestMu    sync.Mutex
+	tenantID      string
 	epoch       int64
 	lastLSN     uint64
 	inMem       *InMemoryLayer
@@ -201,6 +202,27 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 	}
 }
 
+// PublishNewLayer publishes meta to the durable timeline layer manifest before making it visible in t.layers.
+func (t *Timeline) PublishNewLayer(ctx context.Context, meta LayerMeta) error {
+	t.manifestMu.Lock()
+	defer t.manifestMu.Unlock()
+
+	t.mu.RLock()
+	next := make([]LayerMeta, len(t.layers)+1)
+	copy(next, t.layers)
+	next[len(t.layers)] = meta
+	seq := t.layerSeq
+	t.mu.RUnlock()
+
+	if t.store != nil {
+		if err := t.store.PublishLayerManifest(ctx, t.tenantID, t.epoch, next, seq); err != nil {
+			return err
+		}
+	}
+	t.AddLayer(meta)
+	return nil
+}
+
 // FlushInMemory freezes the current InMemoryLayer and writes it as an immutable L0 layer.
 func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 	t.mu.Lock()
@@ -218,13 +240,15 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 	t.mu.Unlock()
 
 	fileName := fmt.Sprintf("l0_%06d_%016x_%016x.layer", seq, startLSN, endLSN)
-	r2Key := fmt.Sprintf("tenants/%s/timeline_%d/layers/%s", tenantID, epoch, fileName)
+	logicalKey := fmt.Sprintf("tenants/%s/timeline_%d/layers/%s", tenantID, epoch, fileName)
 	meta := LayerMeta{
 		TenantID: tenantID,
 		Epoch:    epoch,
 		Kind:     LayerKindL0,
+		Seq:      seq,
 		FileName: fileName,
-		R2Key:    r2Key,
+		R2Key:    logicalKey,
+		AADKey:   logicalKey,
 		StartLSN: startLSN,
 		EndLSN:   endLSN,
 	}
@@ -240,9 +264,15 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 		return nil, err
 	}
 
-	t.mu.Lock()
-	t.layers = append(t.layers, written)
-	t.mu.Unlock()
+	if err := t.PublishNewLayer(ctx, written); err != nil {
+		// Restore in-memory entries on manifest publication failure.
+		t.mu.Lock()
+		for _, r := range recs {
+			t.inMem.Put(r.Key, r.Delta)
+		}
+		t.mu.Unlock()
+		return nil, err
+	}
 	return &written, nil
 }
 

@@ -3,20 +3,27 @@ package pageserver
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Mahadi-rsio/air/internal/crypto"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 const (
@@ -162,17 +169,28 @@ type LayerFooter struct {
 
 // LayerMeta describes an immutable layer file in the LayerMap.
 type LayerMeta struct {
-	TenantID  string
-	Epoch     int64
-	Kind      LayerKind
-	FileName  string
-	R2Key     string
-	StartKey  Key
-	EndKey    Key
-	StartLSN  uint64
-	EndLSN    uint64
-	FileSize  int64
-	Encrypted bool
+	TenantID          string    `json:"tenant_id"`
+	Epoch             int64     `json:"epoch"`
+	Kind              LayerKind `json:"kind"`
+	Seq               uint64    `json:"seq,omitempty"`
+	FileName          string    `json:"file_name"`
+	R2Key             string    `json:"r2_key"`
+	SHA256            string    `json:"sha256,omitempty"`
+	AADKey            string    `json:"aad_key,omitempty"`
+	StartKey          Key       `json:"start_key"`
+	EndKey            Key       `json:"end_key"`
+	StartLSN          uint64    `json:"start_lsn"`
+	EndLSN            uint64    `json:"end_lsn"`
+	FileSize          int64     `json:"file_size"`
+	Encrypted         bool      `json:"encrypted"`
+	RemotelyAvailable bool      `json:"remotely_available,omitempty"`
+}
+
+func (m LayerMeta) aadKey() string {
+	if m.AADKey != "" {
+		return m.AADKey
+	}
+	return m.R2Key
 }
 
 // EncodeLayerBytes serializes sorted LayerRecords into our range-readable immutable layer format.
@@ -320,7 +338,7 @@ func DecodeLayerIndex(raw []byte, meta LayerMeta, count uint32, kms *crypto.Enve
 			return nil, errors.New("pageserver: encrypted layer requires KMS")
 		}
 		var err error
-		data, err = kms.DecryptObject(meta.TenantID, meta.Epoch, meta.R2Key+"#idx", raw)
+		data, err = kms.DecryptObject(meta.TenantID, meta.Epoch, meta.aadKey()+"#idx", raw)
 		if err != nil {
 			return nil, err
 		}
@@ -349,66 +367,432 @@ type layerDownload struct {
 
 // LayerStore persists and range-reads immutable layer files across local disk and R2.
 type LayerStore struct {
-	localDir   string
-	s3c        *s3.Client
-	bucket     string
-	kms        *crypto.EnvelopeKMS
-	cache      *DiskCache
-	idxMu      sync.RWMutex
-	indexCache map[string][]LayerIndexEntry
-	dlMu       sync.Mutex
-	dlFlight   map[string]*layerDownload
+	localDir           string
+	s3c                *s3.Client
+	bucket             string
+	kms                *crypto.EnvelopeKMS
+	cache              *DiskCache
+	multipartThreshold int64
+	multipartPartSize  int64
+	idxMu              sync.RWMutex
+	indexCache         map[string][]LayerIndexEntry
+	dlMu               sync.Mutex
+	dlFlight           map[string]*layerDownload
+	metricsMu          sync.Mutex
+	lastMetrics        UploadMetrics
 }
 
 // NewLayerStore creates a LayerStore backed by localDir, optional S3/R2, optional KMS, and optional DiskCache.
 func NewLayerStore(localDir string, s3c *s3.Client, bucket string, kms *crypto.EnvelopeKMS, cache *DiskCache) *LayerStore {
 	return &LayerStore{
-		localDir:   localDir,
-		s3c:        s3c,
-		bucket:     bucket,
-		kms:        kms,
-		cache:      cache,
-		indexCache: make(map[string][]LayerIndexEntry),
-		dlFlight:   make(map[string]*layerDownload),
+		localDir:           localDir,
+		s3c:                s3c,
+		bucket:             bucket,
+		kms:                kms,
+		cache:              cache,
+		multipartThreshold: DefaultMultipartThreshold,
+		multipartPartSize:  DefaultMultipartPartSize,
+		indexCache:         make(map[string][]LayerIndexEntry),
+		dlFlight:           make(map[string]*layerDownload),
 	}
 }
 
-// WriteLayer encodes recs into an immutable layer file, caches locally, and uploads to R2 if configured.
+// SetMultipartConfig overrides the multipart upload threshold and part size (for testing/tuning).
+func (s *LayerStore) SetMultipartConfig(threshold, partSize int64) {
+	if threshold > 0 {
+		s.multipartThreshold = threshold
+	}
+	if partSize > 0 {
+		s.multipartPartSize = partSize
+	}
+}
+
+// LastUploadMetrics returns the metrics captured by the most recent CAU upload.
+func (s *LayerStore) LastUploadMetrics() UploadMetrics {
+	s.metricsMu.Lock()
+	defer s.metricsMu.Unlock()
+	return s.lastMetrics
+}
+
+func (s *LayerStore) recordMetrics(m UploadMetrics) {
+	s.metricsMu.Lock()
+	s.lastMetrics = m
+	s.metricsMu.Unlock()
+}
+
+// WriteLayer encodes recs into an immutable layer file, finalizes it atomically on disk,
+// and uploads it to R2 using content-addressed storage if configured.
 func (s *LayerStore) WriteLayer(ctx context.Context, meta LayerMeta, recs []LayerRecord) (LayerMeta, error) {
-	data, err := EncodeLayerBytes(meta.TenantID, meta.Epoch, meta.R2Key, meta.Kind, meta.EndLSN, recs, s.kms)
+	meta.Encrypted = s.kms != nil
+	if meta.Encrypted && meta.AADKey == "" {
+		if meta.R2Key != "" {
+			meta.AADKey = meta.R2Key
+		} else {
+			meta.AADKey = fmt.Sprintf("tenants/%s/timeline_%d/layers/%s", meta.TenantID, meta.Epoch, meta.FileName)
+		}
+	}
+
+	data, err := EncodeLayerBytes(meta.TenantID, meta.Epoch, meta.aadKey(), meta.Kind, meta.EndLSN, recs, s.kms)
 	if err != nil {
 		return meta, err
 	}
 	meta.FileSize = int64(len(data))
-	meta.Encrypted = s.kms != nil
 	if len(recs) > 0 {
 		meta.StartKey = recs[0].Key
 		meta.EndKey = recs[len(recs)-1].Key
 	}
 
+	var localPath string
+	var cleanupTemp bool
 	if s.localDir != "" {
-		localPath := filepath.Join(s.localDir, meta.TenantID, meta.FileName)
+		localPath = filepath.Join(s.localDir, meta.TenantID, meta.FileName)
 		if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
 			return meta, err
 		}
-		if err := os.WriteFile(localPath, data, 0o600); err != nil {
+		tmp := localPath + ".tmp"
+		if err := os.WriteFile(tmp, data, 0o600); err != nil {
 			return meta, err
 		}
-	}
-	if s.cache != nil {
-		_ = s.cache.Put(meta.R2Key, data)
-	}
-	if s.s3c != nil && s.bucket != "" {
-		_, err := s.s3c.PutObject(ctx, &s3.PutObjectInput{
-			Bucket: aws.String(s.bucket),
-			Key:    aws.String(meta.R2Key),
-			Body:   bytes.NewReader(data),
-		})
+		if err := os.Rename(tmp, localPath); err != nil {
+			_ = os.Remove(tmp)
+			return meta, err
+		}
+	} else if s.s3c != nil && s.bucket != "" {
+		tmpFile, err := os.CreateTemp("", "air-layer-*.layer")
 		if err != nil {
 			return meta, err
 		}
+		localPath = tmpFile.Name()
+		cleanupTemp = true
+		if _, err := tmpFile.Write(data); err != nil {
+			_ = tmpFile.Close()
+			_ = os.Remove(localPath)
+			return meta, err
+		}
+		if err := tmpFile.Close(); err != nil {
+			_ = os.Remove(localPath)
+			return meta, err
+		}
+	}
+	if cleanupTemp {
+		defer os.Remove(localPath)
+	}
+
+	if s.s3c != nil && s.bucket != "" {
+		meta, err = s.UploadLayerFile(ctx, meta, localPath)
+		if err != nil {
+			return meta, err
+		}
+	} else {
+		sum := sha256.Sum256(data)
+		meta.SHA256 = hex.EncodeToString(sum[:])
+		if cauKey, kErr := ContentAddressedLayerKey(meta.TenantID, meta.SHA256); kErr == nil {
+			meta.R2Key = cauKey
+		}
+	}
+
+	if s.cache != nil {
+		_ = s.cache.Put(meta.R2Key, data)
 	}
 	return meta, nil
+}
+
+// UploadLayerFile performs an idempotent, integrity-verified Content-Addressed Upload (CAU)
+// of a finalized immutable local layer file to R2 without loading the file into memory.
+func (s *LayerStore) UploadLayerFile(ctx context.Context, meta LayerMeta, localPath string) (LayerMeta, error) {
+	totalStart := time.Now()
+	var metrics UploadMetrics
+
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return meta, fmt.Errorf("%w: %v", ErrLayerNotFinalized, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() < int64(LayerFooterSize) {
+		return meta, fmt.Errorf("%w: size=%d", ErrLayerNotFinalized, info.Size())
+	}
+
+	f, err := os.Open(localPath)
+	if err != nil {
+		return meta, err
+	}
+	defer f.Close()
+
+	// Verify the layer file has a valid finalized footer before hashing/uploading.
+	var footerBuf [LayerFooterSize]byte
+	if _, err := f.ReadAt(footerBuf[:], info.Size()-int64(LayerFooterSize)); err != nil {
+		return meta, fmt.Errorf("%w: read footer: %v", ErrLayerNotFinalized, err)
+	}
+	if _, err := DecodeLayerFooter(footerBuf[:]); err != nil {
+		return meta, fmt.Errorf("%w: %v", ErrLayerNotFinalized, err)
+	}
+
+	hashStart := time.Now()
+	sha256Hex, size, err := StreamSHA256(f)
+	metrics.HashDuration = time.Since(hashStart)
+	if err != nil {
+		return meta, err
+	}
+	sha256B64, err := sha256HexToBase64(sha256Hex)
+	if err != nil {
+		return meta, err
+	}
+
+	cauKey, err := ContentAddressedLayerKey(meta.TenantID, sha256Hex)
+	if err != nil {
+		return meta, err
+	}
+
+	meta.SHA256 = sha256Hex
+	meta.FileSize = size
+	meta.R2Key = cauKey
+	metrics.R2Key = cauKey
+	metrics.SHA256 = sha256Hex
+	metrics.FileSize = size
+
+	if s.s3c == nil || s.bucket == "" {
+		metrics.TotalDuration = time.Since(totalStart)
+		s.recordMetrics(metrics)
+		return meta, nil
+	}
+
+	// Step 4: Check whether the content-addressed object already exists in R2.
+	dedupStart := time.Now()
+	exists, err := s.verifyRemoteObject(ctx, cauKey, size, sha256Hex, sha256B64, &metrics)
+	metrics.DedupCheckDuration = time.Since(dedupStart)
+	if err != nil {
+		return meta, err
+	}
+	if exists {
+		metrics.Deduplicated = true
+		metrics.TotalDuration = time.Since(totalStart)
+		s.recordMetrics(metrics)
+		meta.RemotelyAvailable = true
+		return meta, nil
+	}
+
+	// Step 6: Upload the layer (single-part or multipart) with conditional creation when supported.
+	uploadStart := time.Now()
+	raced, err := s.uploadContentAddressed(ctx, f, cauKey, size, sha256Hex, sha256B64, &metrics)
+	metrics.UploadDuration = time.Since(uploadStart)
+	if err != nil {
+		return meta, err
+	}
+	if raced {
+		metrics.Deduplicated = true
+	}
+
+	// Step 7: Verify the uploaded (or raced) remote object before returning durable reference.
+	verifyStart := time.Now()
+	verified, err := s.verifyRemoteObject(ctx, cauKey, size, sha256Hex, sha256B64, &metrics)
+	metrics.VerifyDuration = time.Since(verifyStart)
+	if err != nil {
+		return meta, err
+	}
+	if !verified {
+		return meta, fmt.Errorf("%w: %s", ErrRemoteObjectMissing, cauKey)
+	}
+
+	metrics.TotalDuration = time.Since(totalStart)
+	s.recordMetrics(metrics)
+	meta.RemotelyAvailable = true
+	return meta, nil
+}
+
+func (s *LayerStore) verifyRemoteObject(ctx context.Context, key string, expectedSize int64, expectedSHA256Hex, expectedSHA256B64 string, metrics *UploadMetrics) (bool, error) {
+	metrics.HeadRequests++
+	headOut, err := s.s3c.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket:       aws.String(s.bucket),
+		Key:          aws.String(key),
+		ChecksumMode: types.ChecksumModeEnabled,
+	})
+	if err != nil {
+		if isNotFoundS3Err(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	if headOut.ContentLength == nil || *headOut.ContentLength != expectedSize {
+		got := int64(-1)
+		if headOut.ContentLength != nil {
+			got = *headOut.ContentLength
+		}
+		return false, fmt.Errorf("%w: key=%s got=%d want=%d", ErrLayerSizeMismatch, key, got, expectedSize)
+	}
+
+	verifiedChecksum := false
+	if headOut.ChecksumSHA256 != nil && *headOut.ChecksumSHA256 != "" {
+		if *headOut.ChecksumSHA256 != expectedSHA256B64 {
+			return false, fmt.Errorf("%w: key=%s provider checksum mismatch", ErrLayerChecksumMismatch, key)
+		}
+		verifiedChecksum = true
+	}
+	if metaSHA, ok := headOut.Metadata[metaKeySHA256]; ok && metaSHA != "" {
+		if strings.ToLower(metaSHA) != expectedSHA256Hex {
+			return false, fmt.Errorf("%w: key=%s metadata sha256=%s want=%s", ErrLayerChecksumMismatch, key, metaSHA, expectedSHA256Hex)
+		}
+		verifiedChecksum = true
+	}
+
+	if !verifiedChecksum {
+		// Provider returned neither ChecksumSHA256 nor air-sha256 metadata; stream-hash remote object directly.
+		resp, getErr := s.s3c.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(key),
+		})
+		if getErr != nil {
+			return false, getErr
+		}
+		gotSHA, gotSize, hashErr := StreamSHA256(resp.Body)
+		_ = resp.Body.Close()
+		if hashErr != nil {
+			return false, hashErr
+		}
+		if gotSize != expectedSize {
+			return false, fmt.Errorf("%w: key=%s streamed=%d want=%d", ErrLayerSizeMismatch, key, gotSize, expectedSize)
+		}
+		if gotSHA != expectedSHA256Hex {
+			return false, fmt.Errorf("%w: key=%s streamed sha256=%s want=%s", ErrLayerChecksumMismatch, key, gotSHA, expectedSHA256Hex)
+		}
+	}
+
+	return true, nil
+}
+
+func (s *LayerStore) uploadContentAddressed(ctx context.Context, f *os.File, key string, size int64, sha256Hex, sha256B64 string, metrics *UploadMetrics) (raced bool, err error) {
+	objMeta := map[string]string{
+		metaKeySHA256: sha256Hex,
+		metaKeySize:   strconv.FormatInt(size, 10),
+	}
+
+	if size <= s.multipartThreshold {
+		metrics.PutRequests++
+		_, err := s.s3c.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:            aws.String(s.bucket),
+			Key:               aws.String(key),
+			Body:              io.NewSectionReader(f, 0, size),
+			ContentLength:     aws.Int64(size),
+			ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
+			ChecksumSHA256:    aws.String(sha256B64),
+			Metadata:          objMeta,
+			IfNoneMatch:       aws.String("*"),
+		})
+		if err != nil {
+			if isPreconditionS3Err(err) {
+				return true, nil
+			}
+			return false, err
+		}
+		metrics.BytesTransferred += size
+		return false, nil
+	}
+
+	// Multipart upload for large layers using streaming io.NewSectionReader per part.
+	createOut, err := s.s3c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket:            aws.String(s.bucket),
+		Key:               aws.String(key),
+		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
+		Metadata:          objMeta,
+	})
+	if err != nil {
+		return false, err
+	}
+	uploadID := aws.ToString(createOut.UploadId)
+	abortUpload := func() {
+		if uploadID == "" {
+			return
+		}
+		abortCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_, _ = s.s3c.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
+			Bucket:   aws.String(s.bucket),
+			Key:      aws.String(key),
+			UploadId: aws.String(uploadID),
+		})
+	}
+
+	partSize := s.multipartPartSize
+	if partSize <= 0 {
+		partSize = DefaultMultipartPartSize
+	}
+	var completedParts []types.CompletedPart
+	var partNum int32 = 1
+	for off := int64(0); off < size; off += partSize {
+		n := partSize
+		if off+n > size {
+			n = size - off
+		}
+		metrics.PutRequests++
+		metrics.MultipartParts++
+		partOut, partErr := s.s3c.UploadPart(ctx, &s3.UploadPartInput{
+			Bucket:        aws.String(s.bucket),
+			Key:           aws.String(key),
+			UploadId:      aws.String(uploadID),
+			PartNumber:    aws.Int32(partNum),
+			Body:          io.NewSectionReader(f, off, n),
+			ContentLength: aws.Int64(n),
+		})
+		if partErr != nil {
+			abortUpload()
+			return false, partErr
+		}
+		metrics.BytesTransferred += n
+		completedParts = append(completedParts, types.CompletedPart{
+			ETag:       partOut.ETag,
+			PartNumber: aws.Int32(partNum),
+		})
+		partNum++
+	}
+
+	_, compErr := s.s3c.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(s.bucket),
+		Key:      aws.String(key),
+		UploadId: aws.String(uploadID),
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: completedParts,
+		},
+		IfNoneMatch: aws.String("*"),
+	})
+	if compErr != nil {
+		abortUpload()
+		if isPreconditionS3Err(compErr) {
+			return true, nil
+		}
+		return false, compErr
+	}
+	return false, nil
+}
+
+func isNotFoundS3Err(err error) bool {
+	if err == nil {
+		return false
+	}
+	var nsk *types.NoSuchKey
+	if errors.As(err, &nsk) {
+		return true
+	}
+	var nf *types.NotFound
+	if errors.As(err, &nf) {
+		return true
+	}
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusNotFound {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "NoSuchKey") || strings.Contains(msg, "404") || strings.Contains(msg, "NotFound")
+}
+
+func isPreconditionS3Err(err error) bool {
+	if err == nil {
+		return false
+	}
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusPreconditionFailed {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "412") || strings.Contains(msg, "PreconditionFailed")
 }
 
 const layerCacheChunkSize int64 = 4 * 1024 * 1024 // 4 MiB chunks for Neon-style on-demand R2 caching
@@ -443,7 +827,34 @@ func (s *LayerStore) readRangeLocalOrR2Direct(ctx context.Context, meta LayerMet
 		return nil, err
 	}
 	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	if err := validateRangeResponseSize(resp.ContentRange, meta.FileSize); err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) != length {
+		return nil, fmt.Errorf("%w: range read got=%d want=%d", ErrLayerSizeMismatch, len(data), length)
+	}
+	return data, nil
+}
+
+func validateRangeResponseSize(contentRange *string, expectedTotal int64) error {
+	if expectedTotal <= 0 || contentRange == nil {
+		return nil
+	}
+	// Format: "bytes start-end/total" or "bytes start-end/*"
+	if idx := strings.LastIndexByte(*contentRange, '/'); idx >= 0 {
+		totStr := (*contentRange)[idx+1:]
+		if totStr == "*" {
+			return nil
+		}
+		if tot, err := strconv.ParseInt(totStr, 10, 64); err == nil && tot != expectedTotal {
+			return fmt.Errorf("%w: remote total=%d want=%d", ErrLayerSizeMismatch, tot, expectedTotal)
+		}
+	}
+	return nil
 }
 
 func (s *LayerStore) ensureChunkCached(ctx context.Context, meta LayerMeta, chunkIdx int64) (string, error) {
@@ -492,12 +903,19 @@ func (s *LayerStore) ensureChunkCached(ctx context.Context, meta LayerMeta, chun
 	if getErr != nil {
 		err = getErr
 	} else {
-		data, readErr := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if readErr != nil {
-			err = readErr
+		if vrErr := validateRangeResponseSize(resp.ContentRange, meta.FileSize); vrErr != nil {
+			_ = resp.Body.Close()
+			err = vrErr
 		} else {
-			err = s.cache.Put(chunkKey, data)
+			data, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if readErr != nil {
+				err = readErr
+			} else if int64(len(data)) != chunkEnd-chunkStart {
+				err = fmt.Errorf("%w: chunk %d got=%d want=%d", ErrLayerSizeMismatch, chunkIdx, len(data), chunkEnd-chunkStart)
+			} else {
+				err = s.cache.Put(chunkKey, data)
+			}
 		}
 	}
 
@@ -642,7 +1060,7 @@ func (s *LayerStore) LookupKeyInLayer(ctx context.Context, meta LayerMeta, key K
 			return nil, err
 		}
 		if meta.Encrypted {
-			raw, err = s.kms.DecryptObject(meta.TenantID, meta.Epoch, fmt.Sprintf("%s#e%d", meta.R2Key, i), raw)
+			raw, err = s.kms.DecryptObject(meta.TenantID, meta.Epoch, fmt.Sprintf("%s#e%d", meta.aadKey(), i), raw)
 			if err != nil {
 				return nil, err
 			}
@@ -656,14 +1074,224 @@ func (s *LayerStore) LookupKeyInLayer(ctx context.Context, meta LayerMeta, key K
 	return out, nil
 }
 
-// ListLayersFromR2 lists and parses immutable layer metadata for a tenant timeline from R2.
+// DownloadLayer streams a layer from R2 to dstPath (or verifies in-memory if dstPath == ""),
+// verifying expected byte size and SHA-256 checksum (when known or content-addressed) before committing.
+func (s *LayerStore) DownloadLayer(ctx context.Context, meta LayerMeta, dstPath string) error {
+	if s.s3c == nil || s.bucket == "" {
+		return fmt.Errorf("pageserver: R2 not configured for %s", meta.R2Key)
+	}
+	expectedSHA := meta.SHA256
+	if expectedSHA == "" && IsContentAddressedLayerKey(meta.R2Key) {
+		parts := strings.Split(meta.R2Key, "/")
+		expectedSHA = parts[len(parts)-1]
+	}
+
+	resp, err := s.s3c.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(meta.R2Key),
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var dstFile *os.File
+	var tmpPath string
+	if dstPath != "" {
+		if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+			return err
+		}
+		tmpPath = dstPath + ".tmp"
+		dstFile, err = os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if dstFile != nil {
+				_ = dstFile.Close()
+				_ = os.Remove(tmpPath)
+			}
+		}()
+	}
+
+	h := sha256.New()
+	var w io.Writer = h
+	if dstFile != nil {
+		w = io.MultiWriter(h, dstFile)
+	}
+	buf := make([]byte, streamHashBufSize)
+	n, err := io.CopyBuffer(w, resp.Body, buf)
+	if err != nil {
+		return err
+	}
+	if meta.FileSize > 0 && n != meta.FileSize {
+		return fmt.Errorf("%w: downloaded=%d want=%d", ErrLayerSizeMismatch, n, meta.FileSize)
+	}
+	gotSHA := hex.EncodeToString(h.Sum(nil))
+	if expectedSHA != "" && gotSHA != strings.ToLower(expectedSHA) {
+		return fmt.Errorf("%w: downloaded sha256=%s want=%s", ErrLayerChecksumMismatch, gotSHA, expectedSHA)
+	}
+
+	if dstFile != nil {
+		if err := dstFile.Close(); err != nil {
+			return err
+		}
+		dstFile = nil
+		if err := os.Rename(tmpPath, dstPath); err != nil {
+			_ = os.Remove(tmpPath)
+			return err
+		}
+	}
+	return nil
+}
+
+// PublishLayerManifest atomically persists the timeline's layer manifest to local disk (if configured)
+// and R2 (using ETag CAS when updating an existing manifest).
+func (s *LayerStore) PublishLayerManifest(ctx context.Context, tenantID string, epoch int64, layers []LayerMeta, maxSeq uint64) error {
+	manifest := TimelineLayerManifest{
+		TenantID:  tenantID,
+		Epoch:     epoch,
+		Version:   1,
+		MaxSeq:    maxSeq,
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Layers:    layers,
+	}
+	body, err := json.MarshalIndent(&manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	if s.localDir != "" {
+		localManifest := filepath.Join(s.localDir, tenantID, fmt.Sprintf("timeline_%d_layer_manifest.json", epoch))
+		if err := os.MkdirAll(filepath.Dir(localManifest), 0o755); err != nil {
+			return err
+		}
+		tmp := localManifest + ".tmp"
+		if err := os.WriteFile(tmp, body, 0o600); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, localManifest); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
+	}
+
+	if s.s3c == nil || s.bucket == "" {
+		return nil
+	}
+
+	key := LayerManifestR2Key(tenantID, epoch)
+	for attempt := 0; attempt < 3; attempt++ {
+		var expectedETag string
+		headOut, headErr := s.s3c.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(key),
+		})
+		if headErr != nil {
+			if !isNotFoundS3Err(headErr) {
+				return headErr
+			}
+		} else if headOut.ETag != nil {
+			expectedETag = *headOut.ETag
+		}
+
+		putIn := &s3.PutObjectInput{
+			Bucket:      aws.String(s.bucket),
+			Key:         aws.String(key),
+			Body:        bytes.NewReader(body),
+			ContentType: aws.String("application/json"),
+		}
+		if expectedETag == "" {
+			putIn.IfNoneMatch = aws.String("*")
+		} else {
+			putIn.IfMatch = aws.String(expectedETag)
+		}
+		if _, err := s.s3c.PutObject(ctx, putIn); err != nil {
+			if isPreconditionS3Err(err) && attempt < 2 {
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("pageserver: manifest publish CAS conflict for %s", key)
+}
+
+// LoadLayerManifest loads the published TimelineLayerManifest from R2 (or local disk if R2 is not configured).
+func (s *LayerStore) LoadLayerManifest(ctx context.Context, tenantID string, epoch int64) (*TimelineLayerManifest, error) {
+	if s.s3c != nil && s.bucket != "" {
+		key := LayerManifestR2Key(tenantID, epoch)
+		out, err := s.s3c.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(key),
+		})
+		if err != nil {
+			if isNotFoundS3Err(err) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		raw, readErr := io.ReadAll(io.LimitReader(out.Body, 16*1024*1024))
+		_ = out.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		var m TimelineLayerManifest
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return nil, err
+		}
+		return &m, nil
+	}
+	if s.localDir != "" {
+		localManifest := filepath.Join(s.localDir, tenantID, fmt.Sprintf("timeline_%d_layer_manifest.json", epoch))
+		raw, err := os.ReadFile(localManifest)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		var m TimelineLayerManifest
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return nil, err
+		}
+		return &m, nil
+	}
+	return nil, nil
+}
+
+// ListLayersFromR2 loads published content-addressed layers from the timeline manifest
+// and merges any legacy layers stored under tenants/{tenant}/timeline_{epoch}/layers/.
 func (s *LayerStore) ListLayersFromR2(ctx context.Context, tenantID string, epoch int64) ([]LayerMeta, uint64, error) {
 	if s.s3c == nil || s.bucket == "" {
 		return nil, 0, nil
 	}
-	prefix := fmt.Sprintf("tenants/%s/timeline_%d/layers/", tenantID, epoch)
+
 	var layers []LayerMeta
 	var maxSeq uint64
+	seen := make(map[string]struct{})
+
+	manifest, err := s.LoadLayerManifest(ctx, tenantID, epoch)
+	if err != nil {
+		return nil, 0, err
+	}
+	if manifest != nil {
+		if manifest.MaxSeq > maxSeq {
+			maxSeq = manifest.MaxSeq
+		}
+		for _, lm := range manifest.Layers {
+			if lm.Seq > maxSeq {
+				maxSeq = lm.Seq
+			}
+			seen[lm.R2Key] = struct{}{}
+			if lm.FileName != "" {
+				seen[lm.FileName] = struct{}{}
+			}
+			layers = append(layers, lm)
+		}
+	}
+
+	prefix := fmt.Sprintf("tenants/%s/timeline_%d/layers/", tenantID, epoch)
 	var token *string
 	for {
 		out, err := s.s3c.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
@@ -679,6 +1307,12 @@ func (s *LayerStore) ListLayersFromR2(ctx context.Context, tenantID string, epoc
 				continue
 			}
 			fileName := strings.TrimPrefix(*obj.Key, prefix)
+			if _, ok := seen[*obj.Key]; ok {
+				continue
+			}
+			if _, ok := seen[fileName]; ok {
+				continue
+			}
 			kind, seq, startLSN, endLSN, ok := parseLayerFileName(fileName)
 			if !ok {
 				continue
@@ -687,15 +1321,17 @@ func (s *LayerStore) ListLayersFromR2(ctx context.Context, tenantID string, epoc
 				maxSeq = seq
 			}
 			layers = append(layers, LayerMeta{
-				TenantID:  tenantID,
-				Epoch:     epoch,
-				Kind:      kind,
-				FileName:  fileName,
-				R2Key:     *obj.Key,
-				StartLSN:  startLSN,
-				EndLSN:    endLSN,
-				FileSize:  *obj.Size,
-				Encrypted: s.kms != nil,
+				TenantID:          tenantID,
+				Epoch:             epoch,
+				Kind:              kind,
+				Seq:               seq,
+				FileName:          fileName,
+				R2Key:             *obj.Key,
+				StartLSN:          startLSN,
+				EndLSN:            endLSN,
+				FileSize:          *obj.Size,
+				Encrypted:         s.kms != nil,
+				RemotelyAvailable: true,
 			})
 		}
 		if !aws.ToBool(out.IsTruncated) || out.NextContinuationToken == nil {
