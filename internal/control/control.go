@@ -79,6 +79,8 @@ type ControlPlaneConfig struct {
 	KMS            *crypto.EnvelopeKMS
 	R2Primary      bool
 	EvictOnSuspend bool
+	InternalToken  string
+	BackendHost    string
 }
 
 // ControlPlane manages durable PG17 metadata, schema migrations, provisioning state machine, and tenant routing.
@@ -98,6 +100,8 @@ type ControlPlane struct {
 	backupBucket     string
 	r2Primary        bool
 	evictOnSuspend   bool
+	internalToken    string
+	backendHost      string
 	pageserver       *pageserver.Pageserver
 	psMu             sync.RWMutex
 	wakeGroup        singleflight.Group
@@ -221,6 +225,8 @@ func NewControlPlaneWithConfig(ctx context.Context, cfg ControlPlaneConfig) (*Co
 		kms:            cfg.KMS,
 		r2Primary:      cfg.R2Primary,
 		evictOnSuspend: cfg.EvictOnSuspend,
+		internalToken:  cfg.InternalToken,
+		backendHost:    strings.TrimSpace(cfg.BackendHost),
 		lastActivity:   make(map[string]time.Time),
 	}
 	if err := cp.runMigrations(ctx); err != nil {

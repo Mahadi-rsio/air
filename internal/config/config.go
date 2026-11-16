@@ -19,6 +19,11 @@ type Config struct {
 	MetaPort           int
 	HTTPAddr           string
 	GatewayAddr        string
+	GatewayAdminAddr   string
+	GatewayAdminURL    string
+	ControlPlaneURL    string
+	InternalToken      string
+	BackendHost        string
 	BootstrapAPIKey    string
 	BootstrapAccountID string
 	RequireTLS         bool
@@ -52,6 +57,8 @@ func Default(dataDir string) Config {
 		MetaPort:           15432,
 		HTTPAddr:           "127.0.0.1:8080",
 		GatewayAddr:        "127.0.0.1:5432",
+		GatewayAdminAddr:   "127.0.0.1:8081",
+		ControlPlaneURL:    "http://127.0.0.1:8080",
 		BootstrapAccountID: "acct_default",
 		PoolMaxBackends:    16,
 		R2Region:           "auto",
@@ -69,6 +76,11 @@ func Load(args []string) (Config, error) {
 	cfg.PGBinDir = envOr("AIR_PG_BIN_DIR", cfg.PGBinDir)
 	cfg.HTTPAddr = envOr("AIR_HTTP_ADDR", cfg.HTTPAddr)
 	cfg.GatewayAddr = envOr("AIR_GATEWAY_ADDR", cfg.GatewayAddr)
+	cfg.GatewayAdminAddr = envOr("AIR_GATEWAY_ADMIN_ADDR", cfg.GatewayAdminAddr)
+	cfg.GatewayAdminURL = envOr("AIR_GATEWAY_ADMIN_URL", cfg.GatewayAdminURL)
+	cfg.ControlPlaneURL = envOr("AIR_CONTROL_PLANE_URL", cfg.ControlPlaneURL)
+	cfg.InternalToken = envOr("AIR_INTERNAL_TOKEN", cfg.InternalToken)
+	cfg.BackendHost = envOr("AIR_BACKEND_HOST", cfg.BackendHost)
 	cfg.BootstrapAPIKey = envOr("AIR_BOOTSTRAP_API_KEY", cfg.BootstrapAPIKey)
 	cfg.BootstrapAccountID = envOr("AIR_BOOTSTRAP_ACCOUNT_ID", cfg.BootstrapAccountID)
 	cfg.TLSCertPath = envOr("AIR_TLS_CERT", cfg.TLSCertPath)
@@ -124,6 +136,11 @@ func Load(args []string) (Config, error) {
 	fs.IntVar(&cfg.MetaPort, "meta-port", cfg.MetaPort, "TCP port for internal Control Plane metadata PostgreSQL instance")
 	fs.StringVar(&cfg.HTTPAddr, "http-addr", cfg.HTTPAddr, "Control Plane HTTP API listen address")
 	fs.StringVar(&cfg.GatewayAddr, "gateway-addr", cfg.GatewayAddr, "PostgreSQL wire-protocol gateway listen address")
+	fs.StringVar(&cfg.GatewayAdminAddr, "gateway-admin-addr", cfg.GatewayAdminAddr, "Gateway internal admin HTTP listen address (healthz and drain)")
+	fs.StringVar(&cfg.GatewayAdminURL, "gateway-admin-url", cfg.GatewayAdminURL, "Optional Gateway admin HTTP base URL used by air-server for cooperative pool draining")
+	fs.StringVar(&cfg.ControlPlaneURL, "control-plane-url", cfg.ControlPlaneURL, "Control Plane HTTP base URL used by air-gateway")
+	fs.StringVar(&cfg.InternalToken, "internal-token", cfg.InternalToken, "Shared secret token for internal air-gateway <-> air-server HTTP APIs")
+	fs.StringVar(&cfg.BackendHost, "backend-host", cfg.BackendHost, "Backend PostgreSQL host returned/used for remote gateway routing (defaults to 127.0.0.1)")
 	fs.StringVar(&cfg.BootstrapAPIKey, "bootstrap-api-key", cfg.BootstrapAPIKey, "Optional bootstrap Bearer API key to seed on startup")
 	fs.StringVar(&cfg.BootstrapAccountID, "bootstrap-account-id", cfg.BootstrapAccountID, "Account ID bound to --bootstrap-api-key")
 	fs.BoolVar(&cfg.RequireTLS, "require-tls", cfg.RequireTLS, "Require SSL/TLS negotiation on all Gateway client connections")

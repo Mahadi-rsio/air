@@ -10,15 +10,18 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/Mahadi-rsio/air/internal/control"
+	"github.com/Mahadi-rsio/air/internal/cell"
 	"github.com/Mahadi-rsio/air/internal/tenant"
 )
 
@@ -27,6 +30,24 @@ const (
 	sslRequestCode         = 80877103
 )
 
+// TenantRoute describes the resolved backend endpoint and credentials for a tenant database.
+type TenantRoute struct {
+	TenantID    string `json:"tenant_id"`
+	State       string `json:"state"`
+	Host        string `json:"host,omitempty"`
+	Port        int    `json:"port"`
+	SockDir     string `json:"sock_dir,omitempty"`
+	AppPassword string `json:"app_password,omitempty"`
+}
+
+// RouteResolver resolves tenant routing, wakes suspended databases, and reports client activity
+// to the Control Plane.
+type RouteResolver interface {
+	GetTenantRouteAndCredentials(ctx context.Context, tenantID string) (TenantRoute, error)
+	WakeTenant(ctx context.Context, tenantID string) (TenantRoute, error)
+	TouchTenantActivity(tenantID string)
+}
+
 // GatewayOptions configures TLS enforcement, optional custom certificate loading, and transaction-mode pooling on the Gateway.
 type GatewayOptions struct {
 	RequireTLS      bool
@@ -34,6 +55,7 @@ type GatewayOptions struct {
 	TLSKeyPath      string
 	PoolMode        bool
 	PoolMaxBackends int
+	InternalToken   string
 }
 
 // Gateway is the AIR PostgreSQL wire-protocol gateway.
@@ -46,17 +68,21 @@ type Gateway struct {
 	requireTLS      bool
 	poolMode        bool
 	poolMaxBackends int
-	cp              *control.ControlPlane
+	internalToken   string
+	router          RouteResolver
 	bufPool         sync.Pool
 	poolsMu         sync.Mutex
 	pools           map[string]*TenantPool
 }
 
-func NewGateway(listenAddr string, cp *control.ControlPlane) (*Gateway, error) {
-	return NewGatewayWithOptions(listenAddr, cp, GatewayOptions{})
+func NewGateway(listenAddr string, router RouteResolver) (*Gateway, error) {
+	return NewGatewayWithOptions(listenAddr, router, GatewayOptions{})
 }
 
-func NewGatewayWithOptions(listenAddr string, cp *control.ControlPlane, opts GatewayOptions) (*Gateway, error) {
+func NewGatewayWithOptions(listenAddr string, router RouteResolver, opts GatewayOptions) (*Gateway, error) {
+	if router == nil {
+		return nil, fmt.Errorf("gateway requires a non-nil RouteResolver")
+	}
 	var (
 		tlsCfg *tls.Config
 		err    error
@@ -91,7 +117,8 @@ func NewGatewayWithOptions(listenAddr string, cp *control.ControlPlane, opts Gat
 		requireTLS:      opts.RequireTLS,
 		poolMode:        opts.PoolMode,
 		poolMaxBackends: maxBackends,
-		cp:              cp,
+		internalToken:   opts.InternalToken,
+		router:          router,
 		pools:           make(map[string]*TenantPool),
 		bufPool: sync.Pool{
 			New: func() any {
@@ -128,16 +155,74 @@ func (g *Gateway) RequestTenantDrain(tenantID string, timeout time.Duration) err
 	return p.RequestDrain(timeout)
 }
 
-func (g *Gateway) getOrCreatePool(tenantID, sockDir string, port int, appPassword string) *TenantPool {
+// AdminHandler returns an HTTP handler exposing health and cooperative drain endpoints for the Control Plane.
+func (g *Gateway) AdminHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+	mux.HandleFunc("/internal/v1/tenants/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if g.internalToken != "" && !authorizedInternalRequest(r, g.internalToken) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		path := strings.TrimPrefix(r.URL.Path, "/internal/v1/tenants/")
+		if !strings.HasSuffix(path, "/drain") {
+			http.NotFound(w, r)
+			return
+		}
+		tenantID := strings.TrimSuffix(path, "/drain")
+		if err := tenant.ValidateID(tenantID); err != nil {
+			http.Error(w, "invalid tenant id", http.StatusBadRequest)
+			return
+		}
+		timeout := 2 * time.Second
+		if raw := strings.TrimSpace(r.URL.Query().Get("timeout")); raw != "" {
+			if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+				timeout = d
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := g.RequestTenantDrain(tenantID, timeout); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, cell.ErrDrainVetoed) {
+				status = http.StatusConflict
+			}
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "drained", "tenant_id": tenantID})
+	})
+	return mux
+}
+
+func authorizedInternalRequest(r *http.Request, expected string) bool {
+	if tok := strings.TrimSpace(r.Header.Get("X-Air-Internal-Token")); tok != "" && tok == expected {
+		return true
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(auth) > 7 && strings.EqualFold(auth[:7], "Bearer ") && strings.TrimSpace(auth[7:]) == expected {
+		return true
+	}
+	return false
+}
+
+func (g *Gateway) getOrCreatePool(tenantID, host, sockDir string, port int, appPassword string) *TenantPool {
 	g.poolsMu.Lock()
 	defer g.poolsMu.Unlock()
 	if p, ok := g.pools[tenantID]; ok {
-		p.updateEndpoint(sockDir, port, appPassword)
+		p.updateEndpoint(host, sockDir, port, appPassword)
 		return p
 	}
-	p := newTenantPool(tenantID, sockDir, port, appPassword, g.poolMaxBackends)
-	p.setWakeFn(func(ctx context.Context) (int, string, string, error) {
-		return g.cp.WakeTenant(ctx, tenantID)
+	p := newTenantPool(tenantID, host, sockDir, port, appPassword, g.poolMaxBackends)
+	p.setWakeFn(func(ctx context.Context) (TenantRoute, error) {
+		return g.router.WakeTenant(ctx, tenantID)
 	})
 	g.pools[tenantID] = p
 	return p
@@ -228,43 +313,44 @@ func (g *Gateway) handleConn(rawConn net.Conn) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	state, directPort, sockDir, appPassword, err := g.cp.GetTenantRouteAndCredentials(ctx, startupTenant)
+	route, err := g.router.GetTenantRouteAndCredentials(ctx, startupTenant)
 	cancel()
 	if err != nil {
 		_ = writePGError(clientConn, "3D000", fmt.Sprintf("tenant database %q not found", startupTenant))
 		return
 	}
-	if state == "SUSPENDED" {
+	if route.State == "SUSPENDED" {
 		wakeCtx, wakeCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		wPort, wSock, wPass, wakeErr := g.cp.WakeTenant(wakeCtx, startupTenant)
+		wRoute, wakeErr := g.router.WakeTenant(wakeCtx, startupTenant)
 		wakeCancel()
 		if wakeErr != nil {
 			_ = writePGError(clientConn, "57P03", fmt.Sprintf("tenant database %q wake failed: %v", startupTenant, wakeErr))
 			return
 		}
-		state = "ACTIVE"
-		directPort = wPort
-		sockDir = wSock
-		if wPass != "" {
-			appPassword = wPass
+		if wRoute.AppPassword == "" {
+			wRoute.AppPassword = route.AppPassword
+		}
+		route = wRoute
+		if route.State == "" {
+			route.State = "ACTIVE"
 		}
 	}
-	if state != "ACTIVE" || directPort <= 0 {
-		_ = writePGError(clientConn, "57P03", fmt.Sprintf("tenant database %q is in state %s", startupTenant, state))
+	if route.State != "ACTIVE" || route.Port <= 0 {
+		_ = writePGError(clientConn, "57P03", fmt.Sprintf("tenant database %q is in state %s", startupTenant, route.State))
 		return
 	}
-	g.cp.TouchTenantActivity(startupTenant)
+	g.router.TouchTenantActivity(startupTenant)
 
 	if g.poolMode {
 		_ = clientConn.SetDeadline(time.Time{})
-		pool := g.getOrCreatePool(startupTenant, sockDir, directPort, appPassword)
-		pool.serveClient(clientConn, reqUser, appPassword, func() {
-			g.cp.TouchTenantActivity(startupTenant)
+		pool := g.getOrCreatePool(startupTenant, route.Host, route.SockDir, route.Port, route.AppPassword)
+		pool.serveClient(clientConn, reqUser, route.AppPassword, func() {
+			g.router.TouchTenantActivity(startupTenant)
 		})
 		return
 	}
 
-	backendConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", directPort), 2*time.Second)
+	backendConn, err := dialBackendConn(route.Host, route.SockDir, route.Port)
 	if err != nil {
 		_ = writePGError(clientConn, "08006", "failed to dial cell backend")
 		return

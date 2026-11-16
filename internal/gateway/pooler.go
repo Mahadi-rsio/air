@@ -6,6 +6,7 @@ import (
 	"net"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,13 +55,14 @@ type TenantPool struct {
 	maxBackends int
 
 	mu          sync.Mutex
+	host        string
 	sockDir     string
 	port        int
 	backendUser string
 	appPassword string
 	idlePool    []*backendConn
 	sem         chan struct{}
-	wakeFn      func(ctx context.Context) (port int, sockDir string, appPassword string, err error)
+	wakeFn      func(ctx context.Context) (TenantRoute, error)
 
 	stmtSeq       atomic.Uint64
 	clientSeq     atomic.Uint64
@@ -68,13 +70,14 @@ type TenantPool struct {
 	activeTxCount atomic.Int64
 }
 
-func newTenantPool(tenantID, sockDir string, port int, appPassword string, maxBackends int) *TenantPool {
+func newTenantPool(tenantID, host, sockDir string, port int, appPassword string, maxBackends int) *TenantPool {
 	if maxBackends <= 0 {
 		maxBackends = 16
 	}
 	return &TenantPool{
 		tenantID:    tenantID,
 		maxBackends: maxBackends,
+		host:        host,
 		sockDir:     sockDir,
 		port:        port,
 		backendUser: "app_user",
@@ -83,23 +86,24 @@ func newTenantPool(tenantID, sockDir string, port int, appPassword string, maxBa
 	}
 }
 
-func (p *TenantPool) setWakeFn(fn func(ctx context.Context) (int, string, string, error)) {
+func (p *TenantPool) setWakeFn(fn func(ctx context.Context) (TenantRoute, error)) {
 	p.mu.Lock()
 	p.wakeFn = fn
 	p.mu.Unlock()
 }
 
-func (p *TenantPool) updateEndpoint(sockDir string, port int, appPassword string) {
+func (p *TenantPool) updateEndpoint(host, sockDir string, port int, appPassword string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if appPassword != "" {
 		p.appPassword = appPassword
 	}
-	if p.port != port || p.sockDir != sockDir {
+	if p.host != host || p.port != port || p.sockDir != sockDir {
 		for _, b := range p.idlePool {
 			b.Close()
 		}
 		p.idlePool = nil
+		p.host = host
 		p.sockDir = sockDir
 		p.port = port
 	}
@@ -148,14 +152,18 @@ func (p *TenantPool) acquireBackend(clientID uint64) (*backendConn, error) {
 	return b, nil
 }
 
-func dialBackendConn(sockDir string, port int) (net.Conn, error) {
-	if sockDir != "" {
+func dialBackendConn(host, sockDir string, port int) (net.Conn, error) {
+	isLocal := host == "" || host == "127.0.0.1" || host == "localhost"
+	if sockDir != "" && isLocal {
 		sockPath := filepath.Join(sockDir, fmt.Sprintf(".s.PGSQL.%d", port))
 		if c, err := net.DialTimeout("unix", sockPath, 5*time.Second); err == nil {
 			return c, nil
 		}
 	}
-	return net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), 5*time.Second)
 }
 
 func (p *TenantPool) acquireBackendLocked(clientID uint64) (*backendConn, error) {
@@ -177,6 +185,7 @@ func (p *TenantPool) acquireBackendLocked(clientID uint64) (*backendConn, error)
 		}
 		return b, nil
 	}
+	host := p.host
 	sockDir := p.sockDir
 	port := p.port
 	user := p.backendUser
@@ -185,8 +194,8 @@ func (p *TenantPool) acquireBackendLocked(clientID uint64) (*backendConn, error)
 	wakeFn := p.wakeFn
 	p.mu.Unlock()
 
-	dialAndStartup := func(sd string, prt int, pass string) (*backendConn, error) {
-		c, dialErr := dialBackendConn(sd, prt)
+	dialAndStartup := func(h, sd string, prt int, pass string) (*backendConn, error) {
+		c, dialErr := dialBackendConn(h, sd, prt)
 		if dialErr != nil {
 			return nil, dialErr
 		}
@@ -198,19 +207,20 @@ func (p *TenantPool) acquireBackendLocked(clientID uint64) (*backendConn, error)
 		return b, nil
 	}
 
-	b, err := dialAndStartup(sockDir, port, appPass)
+	b, err := dialAndStartup(host, sockDir, port, appPass)
 	if err != nil && wakeFn != nil {
 		wakeCtx, wakeCancel := context.WithTimeout(context.Background(), 20*time.Second)
-		wPort, wSock, wPass, wakeErr := wakeFn(wakeCtx)
+		wRoute, wakeErr := wakeFn(wakeCtx)
 		wakeCancel()
-		if wakeErr == nil && wPort > 0 {
-			p.updateEndpoint(wSock, wPort, wPass)
+		if wakeErr == nil && wRoute.Port > 0 {
+			p.updateEndpoint(wRoute.Host, wRoute.SockDir, wRoute.Port, wRoute.AppPassword)
 			p.mu.Lock()
+			host = p.host
 			sockDir = p.sockDir
 			port = p.port
 			appPass = p.appPassword
 			p.mu.Unlock()
-			b, err = dialAndStartup(sockDir, port, appPass)
+			b, err = dialAndStartup(host, sockDir, port, appPass)
 		}
 	}
 	if err != nil {

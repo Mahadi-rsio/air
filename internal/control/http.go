@@ -1,13 +1,20 @@
 package control
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
+	"github.com/Mahadi-rsio/air/internal/cell"
+	"github.com/Mahadi-rsio/air/internal/tenant"
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 )
 
 const (
@@ -123,7 +130,123 @@ func (cp *ControlPlane) HTTPHandler() http.Handler {
 		})
 	}
 
+	internal := r.Group("/internal/v1", cp.internalAuthMiddleware())
+	{
+		internal.GET("/tenants/:id/route", func(c *gin.Context) {
+			id := c.Param("id")
+			state, port, sockDir, appPass, err := cp.GetTenantRouteAndCredentials(c.Request.Context(), id)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					c.JSON(http.StatusNotFound, gin.H{"error": "tenant not found"})
+					return
+				}
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{
+				"tenant_id":    id,
+				"state":        state,
+				"host":         cp.backendHost,
+				"port":         port,
+				"sock_dir":     sockDir,
+				"app_password": appPass,
+			})
+		})
+
+		internal.POST("/tenants/:id/wake", func(c *gin.Context) {
+			id := c.Param("id")
+			port, sockDir, appPass, err := cp.WakeTenant(c.Request.Context(), id)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					c.JSON(http.StatusNotFound, gin.H{"error": "tenant not found"})
+					return
+				}
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+				return
+			}
+			cp.TouchTenantActivity(id)
+			c.JSON(http.StatusOK, gin.H{
+				"tenant_id":    id,
+				"state":        "ACTIVE",
+				"host":         cp.backendHost,
+				"port":         port,
+				"sock_dir":     sockDir,
+				"app_password": appPass,
+			})
+		})
+
+		internal.POST("/tenants/:id/activity", func(c *gin.Context) {
+			id := c.Param("id")
+			if err := tenant.ValidateID(id); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cp.TouchTenantActivity(id)
+			c.Status(http.StatusNoContent)
+		})
+	}
+
 	return r
+}
+
+func (cp *ControlPlane) internalAuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if cp.internalToken == "" {
+			c.Next()
+			return
+		}
+		tok := strings.TrimSpace(c.GetHeader("X-Air-Internal-Token"))
+		if tok == "" {
+			authHeader := strings.TrimSpace(c.GetHeader("Authorization"))
+			if len(authHeader) > 7 && strings.EqualFold(authHeader[:7], "Bearer ") {
+				tok = strings.TrimSpace(authHeader[7:])
+			}
+		}
+		if tok != cp.internalToken {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": ErrUnauthorized.Error()})
+			return
+		}
+		c.Next()
+	}
+}
+
+// NewHTTPPoolDrainFn returns a cooperative pool drain callback that calls air-gateway's admin HTTP API.
+func NewHTTPPoolDrainFn(gatewayAdminURL, internalToken string) func(tenantID string, timeout time.Duration) error {
+	base := strings.TrimRight(strings.TrimSpace(gatewayAdminURL), "/")
+	if base == "" {
+		return nil
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	return func(tenantID string, timeout time.Duration) error {
+		if timeout <= 0 {
+			timeout = 2 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout+2*time.Second)
+		defer cancel()
+		endpoint := fmt.Sprintf("%s/internal/v1/tenants/%s/drain?timeout=%s", base, url.PathEscape(tenantID), url.QueryEscape(timeout.String()))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+		if err != nil {
+			return err
+		}
+		if internalToken != "" {
+			req.Header.Set("X-Air-Internal-Token", internalToken)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}()
+		if resp.StatusCode == http.StatusOK {
+			return nil
+		}
+		if resp.StatusCode == http.StatusConflict {
+			return fmt.Errorf("%w: gateway vetoed drain", cell.ErrDrainVetoed)
+		}
+		return fmt.Errorf("gateway drain failed with status %d", resp.StatusCode)
+	}
 }
 
 func (cp *ControlPlane) authMiddleware() gin.HandlerFunc {

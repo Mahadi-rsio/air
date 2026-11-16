@@ -15,7 +15,6 @@ import (
 	"github.com/Mahadi-rsio/air/internal/config"
 	"github.com/Mahadi-rsio/air/internal/control"
 	"github.com/Mahadi-rsio/air/internal/crypto"
-	"github.com/Mahadi-rsio/air/internal/gateway"
 	"github.com/Mahadi-rsio/air/internal/pageserver"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -51,6 +50,8 @@ func main() {
 		KMS:            kms,
 		R2Primary:      cfg.R2Primary,
 		EvictOnSuspend: cfg.EvictOnSuspend,
+		InternalToken:  cfg.InternalToken,
+		BackendHost:    cfg.BackendHost,
 	})
 	if err != nil {
 		log.Fatalf("init control plane: %v", err)
@@ -100,23 +101,17 @@ func main() {
 		log.Printf("[air-server] recovered %d interrupted provisioning operations", recovered)
 	}
 
-	gw, err := gateway.NewGatewayWithOptions(cfg.GatewayAddr, cp, gateway.GatewayOptions{
-		RequireTLS:      cfg.RequireTLS,
-		TLSCertPath:     cfg.TLSCertPath,
-		TLSKeyPath:      cfg.TLSKeyPath,
-		PoolMode:        cfg.PoolMode,
-		PoolMaxBackends: cfg.PoolMaxBackends,
-	})
-	if err != nil {
-		log.Fatalf("init gateway: %v", err)
-	}
-	defer gw.Close()
-
 	cp.StartColdOffloadWorker(ctx, 2)
 	log.Printf("[air-server] async R2 cold-offload queue started (workers=2, evict_on_suspend=%v)", cfg.EvictOnSuspend)
 
+	var poolDrainFn func(tenantID string, timeout time.Duration) error
+	if cfg.GatewayAdminURL != "" {
+		poolDrainFn = control.NewHTTPPoolDrainFn(cfg.GatewayAdminURL, cfg.InternalToken)
+		log.Printf("[air-server] cooperative gateway drain enabled (gateway_admin_url=%s)", cfg.GatewayAdminURL)
+	}
+
 	if cfg.IdleTimeout > 0 {
-		cp.StartIdleReaper(ctx, cfg.IdleTimeout, 0, gw.RequestTenantDrain)
+		cp.StartIdleReaper(ctx, cfg.IdleTimeout, 0, poolDrainFn)
 		log.Printf("[air-server] cooperative scale-to-zero enabled (idle_timeout=%s)", cfg.IdleTimeout)
 	}
 
@@ -126,7 +121,7 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
-		log.Printf("[air-server] Control Plane HTTP listening on %s, PG Gateway listening on %s (require_tls=%v)", cfg.HTTPAddr, gw.Addr(), cfg.RequireTLS)
+		log.Printf("[air-server] Control Plane HTTP listening on %s", cfg.HTTPAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("http serve: %v", err)
 		}

@@ -1,0 +1,231 @@
+#pragma once
+
+#include "discovery.hpp"
+#include "pg_wire.hpp"
+#include "pooler.hpp"
+
+#include <arpa/inet.h>
+#include <atomic>
+#include <netdb.h>
+#include <sstream>
+#include <string>
+#include <sys/socket.h>
+#include <thread>
+#include <unistd.h>
+
+namespace air::gw {
+
+inline int listen_tcp_addr(const std::string& addr_str) {
+    auto colon = addr_str.rfind(':');
+    if (colon == std::string::npos) return -1;
+    std::string host = addr_str.substr(0, colon);
+    std::string port = addr_str.substr(colon + 1);
+    if (host.empty()) host = "0.0.0.0";
+
+    struct addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    struct addrinfo* res = nullptr;
+    if (::getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res) {
+        return -1;
+    }
+    int fd = -1;
+    for (auto* p = res; p != nullptr; p = p->ai_next) {
+        fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (fd < 0) continue;
+        int opt = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        if (::bind(fd, p->ai_addr, p->ai_addrlen) == 0 && ::listen(fd, 128) == 0) {
+            break;
+        }
+        ::close(fd);
+        fd = -1;
+    }
+    ::freeaddrinfo(res);
+    return fd;
+}
+
+class AdminHTTPServer {
+public:
+    AdminHTTPServer(std::string addr, std::string internal_token,
+                    TenantDiscovery& discovery, PoolManager& pools)
+        : addr_(std::move(addr)),
+          internal_token_(std::move(internal_token)),
+          discovery_(discovery),
+          pools_(pools) {}
+
+    ~AdminHTTPServer() { stop(); }
+
+    bool start() {
+        if (addr_.empty()) return true;
+        listen_fd_ = listen_tcp_addr(addr_);
+        if (listen_fd_ < 0) return false;
+        running_.store(true);
+        worker_ = std::thread([this]() { accept_loop(); });
+        return true;
+    }
+
+    void stop() {
+        running_.store(false);
+        if (listen_fd_ >= 0) {
+            ::shutdown(listen_fd_, SHUT_RDWR);
+            ::close(listen_fd_);
+            listen_fd_ = -1;
+        }
+        if (worker_.joinable()) worker_.join();
+    }
+
+private:
+    std::string addr_;
+    std::string internal_token_;
+    TenantDiscovery& discovery_;
+    PoolManager& pools_;
+    int listen_fd_ = -1;
+    std::atomic<bool> running_{false};
+    std::thread worker_;
+
+    void accept_loop() {
+        while (running_.load()) {
+            int cfd = ::accept(listen_fd_, nullptr, nullptr);
+            if (cfd < 0) {
+                if (!running_.load()) break;
+                continue;
+            }
+            std::thread([this, cfd]() { handle_http(cfd); }).detach();
+        }
+    }
+
+    static void send_http(int fd, int code, const std::string& status, const std::string& body) {
+        std::ostringstream oss;
+        oss << "HTTP/1.1 " << code << " " << status << "\r\n"
+            << "Content-Type: application/json\r\n"
+            << "Content-Length: " << body.size() << "\r\n"
+            << "Connection: close\r\n\r\n"
+            << body;
+        std::string resp = oss.str();
+        size_t off = 0;
+        while (off < resp.size()) {
+            ssize_t n = ::send(fd, resp.data() + off, resp.size() - off, MSG_NOSIGNAL);
+            if (n <= 0) break;
+            off += static_cast<size_t>(n);
+        }
+    }
+
+    void handle_http(int fd) {
+        struct timeval tv{3, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        char buf[4096];
+        ssize_t n = ::recv(fd, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) {
+            ::close(fd);
+            return;
+        }
+        buf[n] = '\0';
+        std::string req(buf, static_cast<size_t>(n));
+        std::istringstream iss(req);
+        std::string method, target;
+        iss >> method >> target;
+
+        std::string path = target;
+        std::string query;
+        if (auto qpos = target.find('?'); qpos != std::string::npos) {
+            path = target.substr(0, qpos);
+            query = target.substr(qpos + 1);
+        }
+
+        if (method == "GET" && path == "/healthz") {
+            send_http(fd, 200, "OK", R"({"status":"ok"})");
+            ::close(fd);
+            return;
+        }
+
+        auto is_authorized = [&]() -> bool {
+            if (internal_token_.empty()) return true;
+            std::istringstream hs(req);
+            std::string line;
+            std::getline(hs, line);
+            while (std::getline(hs, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty()) break;
+                auto col = line.find(':');
+                if (col == std::string::npos) continue;
+                std::string k = trim_ascii(line.substr(0, col));
+                std::string v = trim_ascii(line.substr(col + 1));
+                if (iequals(k, "X-Air-Internal-Token") && v == internal_token_) return true;
+                if (iequals(k, "Authorization") && v.size() > 7 &&
+                    iequals(v.substr(0, 7), "Bearer ") && trim_ascii(v.substr(7)) == internal_token_) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        if (method == "GET" && path == "/internal/v1/tenants") {
+            if (!is_authorized()) {
+                send_http(fd, 401, "Unauthorized", R"({"error":"unauthorized"})");
+                ::close(fd);
+                return;
+            }
+            auto list = discovery_.list_cached();
+            std::ostringstream out;
+            out << "{\"tenants\":[";
+            for (size_t i = 0; i < list.size(); ++i) {
+                if (i > 0) out << ",";
+                out << "{\"tenant_id\":\"" << list[i].tenant_id
+                    << "\",\"state\":\"" << list[i].state
+                    << "\",\"port\":" << list[i].port << "}";
+            }
+            out << "]}";
+            send_http(fd, 200, "OK", out.str());
+            ::close(fd);
+            return;
+        }
+
+        const std::string prefix = "/internal/v1/tenants/";
+        const std::string suffix = "/drain";
+        if (method == "POST" &&
+            path.rfind(prefix, 0) == 0 &&
+            path.size() > prefix.size() + suffix.size() &&
+            path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            if (!is_authorized()) {
+                send_http(fd, 401, "Unauthorized", R"({"error":"unauthorized"})");
+                ::close(fd);
+                return;
+            }
+            std::string tenant_id = path.substr(prefix.size(), path.size() - prefix.size() - suffix.size());
+            if (!validate_tenant_id(tenant_id)) {
+                send_http(fd, 400, "Bad Request", R"({"error":"invalid tenant id"})");
+                ::close(fd);
+                return;
+            }
+            int timeout_ms = 2000;
+            if (auto tpos = query.find("timeout="); tpos != std::string::npos) {
+                std::string tval = query.substr(tpos + 8);
+                auto amp = tval.find('&');
+                if (amp != std::string::npos) tval = tval.substr(0, amp);
+                try {
+                    if (tval.size() > 2 && tval.substr(tval.size() - 2) == "ms") {
+                        timeout_ms = std::stoi(tval.substr(0, tval.size() - 2));
+                    } else if (!tval.empty() && tval.back() == 's') {
+                        timeout_ms = std::stoi(tval.substr(0, tval.size() - 1)) * 1000;
+                    }
+                } catch (...) {}
+            }
+            std::string err;
+            if (!pools_.request_drain(tenant_id, timeout_ms, err)) {
+                send_http(fd, 409, "Conflict", std::string(R"({"error":")") + err + R"("})");
+                ::close(fd);
+                return;
+            }
+            send_http(fd, 200, "OK", std::string(R"({"status":"drained","tenant_id":")") + tenant_id + R"("})");
+            ::close(fd);
+            return;
+        }
+
+        send_http(fd, 404, "Not Found", R"({"error":"not found"})");
+        ::close(fd);
+    }
+};
+
+} // namespace air::gw
