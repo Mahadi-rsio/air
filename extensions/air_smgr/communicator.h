@@ -20,6 +20,17 @@ extern bool air_ps_get_pages(const char *socket_path,
 							 char *errbuf,
 							 size_t errbuf_len);
 
+extern bool air_ps_put_pages(const char *socket_path,
+							 const char *tenant_id,
+							 RelFileLocator rlocator,
+							 ForkNumber forknum,
+							 BlockNumber blocknum,
+							 BlockNumber nblocks,
+							 XLogRecPtr lsn,
+							 const void **buffers,
+							 char *errbuf,
+							 size_t errbuf_len);
+
 extern bool air_ps_get_rel_size(const char *socket_path,
 								const char *tenant_id,
 								RelFileLocator rlocator,

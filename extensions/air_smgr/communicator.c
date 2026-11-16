@@ -304,3 +304,90 @@ air_ps_get_rel_exists(const char *socket_path,
 	*exists_out = (resp.status == AIR_PS_STATUS_OK && resp.nblocks_or_val != 0);
 	return true;
 }
+
+bool
+air_ps_put_pages(const char *socket_path,
+				 const char *tenant_id,
+				 RelFileLocator rlocator,
+				 ForkNumber forknum,
+				 BlockNumber blocknum,
+				 BlockNumber nblocks,
+				 XLogRecPtr lsn,
+				 const void **buffers,
+				 char *errbuf,
+				 size_t errbuf_len)
+{
+	BlockNumber sent = 0;
+
+	while (sent < nblocks)
+	{
+		BlockNumber chunk = nblocks - sent;
+
+		if (chunk > 128)
+			chunk = 128;
+
+		AirPsReqHeader req;
+		AirPsRespHeader resp;
+
+		fill_req_header(&req, AIR_PS_OP_PUT_PAGE_BATCH, tenant_id, rlocator,
+						forknum, blocknum + sent, chunk, lsn);
+
+		bool		ok = false;
+
+		for (int attempt = 0; attempt < 2; attempt++)
+		{
+			int			fd = ensure_connected(socket_path, errbuf, errbuf_len);
+
+			if (fd < 0)
+				return false;
+
+			if (!write_full(fd, &req, sizeof(req)))
+			{
+				int			saved = errno;
+
+				air_communicator_close();
+				if (attempt == 0)
+					continue;
+				snprintf(errbuf, errbuf_len, "pageserver put write header failed: %s", strerror(saved));
+				return false;
+			}
+
+			bool		w_ok = true;
+
+			for (BlockNumber i = 0; i < chunk; i++)
+			{
+				if (!write_full(fd, buffers[sent + i], AIR_PAGE_SIZE))
+				{
+					w_ok = false;
+					break;
+				}
+			}
+
+			if (!w_ok || !read_full(fd, &resp, sizeof(resp)))
+			{
+				int			saved = errno;
+
+				air_communicator_close();
+				if (attempt == 0)
+					continue;
+				snprintf(errbuf, errbuf_len, "pageserver put I/O failed: %s", strerror(saved));
+				return false;
+			}
+
+			if (resp.magic != AIR_PS_MAGIC || resp.version != AIR_PS_VERSION || resp.status != AIR_PS_STATUS_OK)
+			{
+				air_communicator_close();
+				snprintf(errbuf, errbuf_len, "pageserver put failed (status=%u)", resp.status);
+				return false;
+			}
+
+			ok = true;
+			break;
+		}
+
+		if (!ok)
+			return false;
+		sent += chunk;
+	}
+	return true;
+}

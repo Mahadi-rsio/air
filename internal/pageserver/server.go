@@ -155,6 +155,15 @@ func (p *Pageserver) GetDBSize(ctx context.Context, tenantID string, spcOID, dbO
 	return tl.GetDBSize(ctx, spcOID, dbOID, lsn)
 }
 
+// PutPageBatch implements Service.
+func (p *Pageserver) PutPageBatch(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, startBlock, nblocks uint32, lsn uint64, pages []byte) error {
+	tl, err := p.getTimeline(tenantID)
+	if err != nil {
+		return err
+	}
+	return tl.PutPageBatch(ctx, spcOID, dbOID, relNumber, forkNum, startBlock, nblocks, lsn, pages)
+}
+
 // BootstrapTenantFromPGData imports an existing PGDATA base/ and global/ directory into an Image layer at initLSN.
 func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID string, epoch int64, pgDataDir string, initLSN uint64) (*LayerMeta, error) {
 	if initLSN == 0 {

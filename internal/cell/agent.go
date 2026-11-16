@@ -141,6 +141,15 @@ func (a *Agent) TenantPGDataDir(tenantID string) (string, error) {
 	return filepath.Join(activeBase, "pgdata"), nil
 }
 
+// TenantClaimingPGDataDir returns the validated claiming PGDATA directory path for tenantID.
+func (a *Agent) TenantClaimingPGDataDir(tenantID string) (string, error) {
+	claimBase, err := tenant.SafeSubpath(a.volDir, "tenants/claiming", tenantID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(claimBase, "pgdata"), nil
+}
+
 func NewAgent(volDir, pgBinDir string, kms *crypto.EnvelopeKMS) (*Agent, error) {
 	if pgBinDir == "" {
 		pgBinDir = "/usr/lib/postgresql/17/bin"

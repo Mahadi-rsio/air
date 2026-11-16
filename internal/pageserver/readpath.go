@@ -261,8 +261,14 @@ func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byt
 	}
 
 	// Sort all collected deltas by LSN ascending and keep only from last FPI onward.
-	sort.Slice(collected, func(i, j int) bool {
-		return collected[i].LSN < collected[j].LSN
+	sort.SliceStable(collected, func(i, j int) bool {
+		if collected[i].LSN != collected[j].LSN {
+			return collected[i].LSN < collected[j].LSN
+		}
+		// If a flushed page image and a WAL delta share the same LSN, order the image after the delta.
+		iImg := (collected[i].Flags & EntryFlagPageImage) != 0
+		jImg := (collected[j].Flags & EntryFlagPageImage) != 0
+		return !iImg && jImg
 	})
 	startIdx := 0
 	for i := len(collected) - 1; i >= 0; i-- {
@@ -298,6 +304,46 @@ func (t *Timeline) GetPageBatch(ctx context.Context, spcOID, dbOID, relNumber ui
 		count++
 	}
 	return out, count, nil
+}
+
+// PutPageBatch ingests materialized 8192-byte pages flushed by air_smgr into the InMemoryLayer.
+func (t *Timeline) PutPageBatch(_ context.Context, spcOID, dbOID, relNumber uint32, forkNum uint8, startBlock, nblocks uint32, lsn uint64, pages []byte) error {
+	if len(pages) != int(nblocks)*PageSize {
+		return fmt.Errorf("pageserver: PutPageBatch size mismatch: got %d want %d", len(pages), int(nblocks)*PageSize)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	useLSN := lsn
+	if useLSN == 0 {
+		useLSN = t.lastLSN
+		if useLSN == 0 {
+			useLSN = 1
+		}
+	}
+	for i := uint32(0); i < nblocks; i++ {
+		blk := startBlock + i
+		off := int(i) * PageSize
+		cp := make([]byte, PageSize)
+		copy(cp, pages[off:off+PageSize])
+		key := RelBlockKey(spcOID, dbOID, relNumber, forkNum, blk)
+		t.inMem.Put(key, WALDelta{
+			LSN:       useLSN,
+			Flags:     EntryFlagPageImage,
+			PageImage: cp,
+		})
+	}
+	sizeKey := RelSizeKey(spcOID, dbOID, relNumber, forkNum)
+	endBlk := startBlock + nblocks
+	if cur := t.relSizes[sizeKey]; endBlk > cur {
+		t.relSizes[sizeKey] = endBlk
+		t.inMem.Put(sizeKey, WALDelta{
+			LSN:     useLSN,
+			Flags:   EntryFlagRelSize,
+			RelSize: endBlk,
+		})
+	}
+	return nil
 }
 
 // GetRelSize returns the number of blocks in a relation fork as of lsn.

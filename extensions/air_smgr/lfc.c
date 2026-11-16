@@ -25,6 +25,19 @@ typedef struct AirLfcSlot
 	bool		refbit;
 } AirLfcSlot;
 
+#define AIR_RELMETA_CAP 16384
+
+typedef struct AirRelMeta
+{
+	Oid			spcOid;
+	Oid			dbOid;
+	RelFileNumber relNumber;
+	ForkNumber	forkNum;
+	BlockNumber nblocks;
+	uint8		status;			/* 0=empty, 1=exists, 2=unlinked */
+	bool		exact;
+} AirRelMeta;
+
 typedef struct AirLfcShmemState
 {
 	LWLock	   *lock;
@@ -33,6 +46,7 @@ typedef struct AirLfcShmemState
 	uint32		clock_hand;
 	int32	   *buckets;
 	AirLfcSlot *slots;
+	AirRelMeta *relmeta;
 } AirLfcShmemState;
 
 static AirLfcShmemState *lfc_state = NULL;
@@ -65,6 +79,7 @@ lfc_shmem_size(uint32 max_slots, uint32 num_buckets)
 
 	sz = add_size(sz, MAXALIGN(mul_size(num_buckets, sizeof(int32))));
 	sz = add_size(sz, MAXALIGN(mul_size(max_slots, sizeof(AirLfcSlot))));
+	sz = add_size(sz, MAXALIGN(mul_size(AIR_RELMETA_CAP, sizeof(AirRelMeta))));
 	return sz;
 }
 
@@ -130,6 +145,7 @@ air_lfc_shmem_startup(int lfc_max_mb)
 		char	   *base = (char *) lfc_state;
 		Size		hdr_sz = MAXALIGN(sizeof(AirLfcShmemState));
 		Size		bkt_sz = MAXALIGN(mul_size(num_buckets, sizeof(int32)));
+		Size		slot_sz = MAXALIGN(mul_size(max_slots, sizeof(AirLfcSlot)));
 
 		lfc_state->lock = &(GetNamedLWLockTranche("air_smgr_lfc"))->lock;
 		lfc_state->max_slots = max_slots;
@@ -137,6 +153,7 @@ air_lfc_shmem_startup(int lfc_max_mb)
 		lfc_state->clock_hand = 0;
 		lfc_state->buckets = (int32 *) (base + hdr_sz);
 		lfc_state->slots = (AirLfcSlot *) (base + hdr_sz + bkt_sz);
+		lfc_state->relmeta = (AirRelMeta *) (base + hdr_sz + bkt_sz + slot_sz);
 
 		for (uint32 i = 0; i < num_buckets; i++)
 			lfc_state->buckets[i] = -1;
@@ -145,6 +162,7 @@ air_lfc_shmem_startup(int lfc_max_mb)
 			lfc_state->slots[i].valid = false;
 			lfc_state->slots[i].next_slot = -1;
 		}
+		memset(lfc_state->relmeta, 0, mul_size(AIR_RELMETA_CAP, sizeof(AirRelMeta)));
 	}
 	LWLockRelease(AddinShmemInitLock);
 }
@@ -372,4 +390,169 @@ air_lfc_invalidate_rel(RelFileLocator rlocator,
 		}
 	}
 	LWLockRelease(lfc_state->lock);
+}
+
+static uint32
+relmeta_hash(RelFileLocator rlocator, ForkNumber forknum)
+{
+	uint64		h = ((uint64) rlocator.spcOid * 0x9e3779b97f4a7c15ULL) ^
+	((uint64) rlocator.dbOid * 0xbf58476d1ce4e5b9ULL) ^
+	((uint64) rlocator.relNumber * 0x94d049bb133111ebULL) ^
+	((uint64) forknum << 32);
+
+	h ^= h >> 30;
+	h *= 0xbf58476d1ce4e5b9ULL;
+	h ^= h >> 27;
+	return (uint32) (h & (AIR_RELMETA_CAP - 1));
+}
+
+static AirRelMeta *
+find_or_alloc_relmeta_locked(RelFileLocator rlocator, ForkNumber forknum, bool create)
+{
+	uint32		idx = relmeta_hash(rlocator, forknum);
+
+	for (uint32 probe = 0; probe < AIR_RELMETA_CAP; probe++)
+	{
+		AirRelMeta *m = &lfc_state->relmeta[(idx + probe) & (AIR_RELMETA_CAP - 1)];
+
+		if (m->status == 0)
+		{
+			if (!create)
+				return NULL;
+			m->spcOid = rlocator.spcOid;
+			m->dbOid = rlocator.dbOid;
+			m->relNumber = rlocator.relNumber;
+			m->forkNum = forknum;
+			m->nblocks = 0;
+			m->status = 1;
+			m->exact = false;
+			return m;
+		}
+		if (m->spcOid == rlocator.spcOid &&
+			m->dbOid == rlocator.dbOid &&
+			m->relNumber == rlocator.relNumber &&
+			m->forkNum == forknum)
+			return m;
+	}
+	return NULL;
+}
+
+void
+air_relmeta_set_create(RelFileLocator rlocator, ForkNumber forknum)
+{
+	AirRelMeta *m;
+
+	if (!lfc_state)
+		return;
+	LWLockAcquire(lfc_state->lock, LW_EXCLUSIVE);
+	m = find_or_alloc_relmeta_locked(rlocator, forknum, true);
+	if (m)
+	{
+		m->status = 1;
+		m->nblocks = 0;
+		m->exact = false;
+	}
+	LWLockRelease(lfc_state->lock);
+}
+
+void
+air_relmeta_extend(RelFileLocator rlocator, ForkNumber forknum, BlockNumber min_nblocks)
+{
+	AirRelMeta *m;
+
+	if (!lfc_state)
+		return;
+	LWLockAcquire(lfc_state->lock, LW_EXCLUSIVE);
+	m = find_or_alloc_relmeta_locked(rlocator, forknum, true);
+	if (m)
+	{
+		if (m->status != 1)
+		{
+			m->status = 1;
+			m->nblocks = min_nblocks;
+		}
+		else if (m->nblocks < min_nblocks)
+		{
+			m->nblocks = min_nblocks;
+		}
+		m->exact = false;
+	}
+	LWLockRelease(lfc_state->lock);
+}
+
+void
+air_relmeta_truncate(RelFileLocator rlocator, ForkNumber forknum, BlockNumber nblocks)
+{
+	AirRelMeta *m;
+
+	if (!lfc_state)
+		return;
+	LWLockAcquire(lfc_state->lock, LW_EXCLUSIVE);
+	m = find_or_alloc_relmeta_locked(rlocator, forknum, true);
+	if (m)
+	{
+		m->status = 1;
+		m->nblocks = nblocks;
+		m->exact = true;
+	}
+	LWLockRelease(lfc_state->lock);
+}
+
+void
+air_relmeta_unlink(RelFileLocator rlocator, ForkNumber forknum)
+{
+	if (!lfc_state)
+		return;
+	LWLockAcquire(lfc_state->lock, LW_EXCLUSIVE);
+	if (forknum == InvalidForkNumber)
+	{
+		for (uint32 i = 0; i < AIR_RELMETA_CAP; i++)
+		{
+			AirRelMeta *m = &lfc_state->relmeta[i];
+
+			if (m->status != 0 &&
+				m->spcOid == rlocator.spcOid &&
+				m->dbOid == rlocator.dbOid &&
+				m->relNumber == rlocator.relNumber)
+			{
+				m->status = 2;
+				m->nblocks = 0;
+				m->exact = true;
+			}
+		}
+	}
+	else
+	{
+		AirRelMeta *m = find_or_alloc_relmeta_locked(rlocator, forknum, true);
+
+		if (m)
+		{
+			m->status = 2;
+			m->nblocks = 0;
+			m->exact = true;
+		}
+	}
+	LWLockRelease(lfc_state->lock);
+}
+
+bool
+air_relmeta_lookup(RelFileLocator rlocator, ForkNumber forknum,
+				   bool *exists_out, BlockNumber *nblocks_out, bool *exact_out)
+{
+	AirRelMeta *m;
+	bool		found = false;
+
+	if (!lfc_state)
+		return false;
+	LWLockAcquire(lfc_state->lock, LW_SHARED);
+	m = find_or_alloc_relmeta_locked(rlocator, forknum, false);
+	if (m && m->status != 0)
+	{
+		*exists_out = (m->status == 1);
+		*nblocks_out = m->nblocks;
+		*exact_out = m->exact;
+		found = true;
+	}
+	LWLockRelease(lfc_state->lock);
+	return found;
 }

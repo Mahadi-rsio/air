@@ -269,6 +269,25 @@ func parsePGLSN(s string) (uint64, error) {
 	return (uint64(hi) << 32) | uint64(lo), nil
 }
 
+func (cp *ControlPlane) readPGControlLSN(pgDataDir string) uint64 {
+	pgCtrl := filepath.Join(cp.pgBin, "pg_controldata")
+	out, err := exec.Command(pgCtrl, pgDataDir).Output()
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, "Latest checkpoint location:") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				if lsn, pErr := parsePGLSN(parts[1]); pErr == nil {
+					return lsn
+				}
+			}
+		}
+	}
+	return 0
+}
+
 func (cp *ControlPlane) ensurePageserverBootstrapAndWAL(ctx context.Context, tenantID string, rt *cell.TenantRuntime) error {
 	ps := cp.getPageserver()
 	if ps == nil || rt == nil {
@@ -615,6 +634,32 @@ func (cp *ControlPlane) ProvisionDatabase(ctx context.Context, accountID, idempo
 	if _, err := cp.db.Exec(ctx, `UPDATE provisioning_ops SET state = 'ACTIVATING', updated_at = now() WHERE op_id = $1`, opID); err != nil {
 		cp.rollbackOp(ctx, opID, tenantID, err)
 		return nil, err
+	}
+
+	if ps := cp.getPageserver(); ps != nil {
+		var pgDataDir string
+		if activeDir, pdErr := cp.agent.TenantPGDataDir(tenantID); pdErr == nil {
+			if _, statErr := os.Stat(filepath.Join(activeDir, "PG_VERSION")); statErr == nil {
+				pgDataDir = activeDir
+			}
+		}
+		if pgDataDir == "" {
+			if claimDir, pdErr := cp.agent.TenantClaimingPGDataDir(tenantID); pdErr == nil {
+				if _, statErr := os.Stat(filepath.Join(claimDir, "PG_VERSION")); statErr == nil {
+					pgDataDir = claimDir
+				}
+			}
+		}
+		if pgDataDir != "" {
+			initLSN := cp.readPGControlLSN(pgDataDir)
+			if initLSN == 0 {
+				initLSN = 1
+			}
+			if _, bErr := ps.BootstrapTenantFromPGData(ctx, tenantID, 1, pgDataDir, initLSN); bErr != nil {
+				cp.rollbackOp(ctx, opID, tenantID, bErr)
+				return nil, bErr
+			}
+		}
 	}
 
 	rt, err := cp.agent.ActivateCluster(tenantID, appPW, 1)

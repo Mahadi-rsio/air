@@ -5,6 +5,8 @@
 #include "access/xlog.h"
 #include "access/xlogrecovery.h"
 #include "storage/bufmgr.h"
+#include "storage/bufpage.h"
+#include "storage/checksum.h"
 #include "storage/ipc.h"
 #include "storage/smgr.h"
 #include "utils/guc.h"
@@ -76,9 +78,8 @@ static void
 air_create(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 {
 	/* Relation creation is recorded via WAL; no local base/ file needed. */
-	(void) reln;
-	(void) forknum;
 	(void) isRedo;
+	air_relmeta_set_create(reln->smgr_rlocator.locator, forknum);
 }
 
 static bool
@@ -86,6 +87,12 @@ air_exists(SMgrRelation reln, ForkNumber forknum)
 {
 	char		errbuf[256];
 	bool		exists = false;
+	BlockNumber local_nblocks = 0;
+	bool		local_exact = false;
+
+	if (air_relmeta_lookup(reln->smgr_rlocator.locator, forknum,
+						   &exists, &local_nblocks, &local_exact))
+		return exists;
 
 	if (!air_ps_get_rel_exists(air_pageserver_socket,
 							   air_tenant_id,
@@ -107,20 +114,38 @@ air_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
 	(void) isRedo;
 	air_lfc_invalidate_rel(rlocator.locator, forknum, 0);
+	air_relmeta_unlink(rlocator.locator, forknum);
 }
 
 static void
 air_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   const void *buffer, bool skipFsync)
 {
+	XLogRecPtr	lsn = current_write_lsn();
+	char		errbuf[256];
+
 	(void) skipFsync;
 	air_lfc_insert(air_lfc_dir,
 				   air_tenant_id,
 				   reln->smgr_rlocator.locator,
 				   forknum,
 				   blocknum,
-				   current_write_lsn(),
+				   lsn,
 				   buffer);
+	air_relmeta_extend(reln->smgr_rlocator.locator, forknum, blocknum + 1);
+	if (!air_ps_put_pages(air_pageserver_socket,
+						  air_tenant_id,
+						  reln->smgr_rlocator.locator,
+						  forknum,
+						  blocknum,
+						  1,
+						  lsn,
+						  &buffer,
+						  errbuf,
+						  sizeof(errbuf)))
+		ereport(ERROR,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("air_smgr extend failed: %s", errbuf)));
 }
 
 static void
@@ -147,6 +172,10 @@ air_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 					   blocknum + (BlockNumber) i,
 					   lsn,
 					   zero_block.data);
+
+	if (nblocks > 0)
+		air_relmeta_extend(reln->smgr_rlocator.locator, forknum,
+						   blocknum + (BlockNumber) nblocks);
 }
 
 static bool
@@ -214,6 +243,9 @@ air_readv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 						 errmsg("air_smgr readv failed: %s", errbuf)));
 
 			for (BlockNumber j = 0; j < run_len; j++)
+			{
+				PageSetChecksumInplace((Page) buffers[run_start + j],
+									   blocknum + run_start + j);
 				air_lfc_insert(air_lfc_dir,
 							   air_tenant_id,
 							   reln->smgr_rlocator.locator,
@@ -221,6 +253,7 @@ air_readv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 							   blocknum + run_start + j,
 							   lsn,
 							   buffers[run_start + j]);
+			}
 
 			i = run_start + run_len;
 			if (i < nblocks)
@@ -234,6 +267,7 @@ air_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   const void **buffers, BlockNumber nblocks, bool skipFsync)
 {
 	XLogRecPtr	lsn = current_write_lsn();
+	char		errbuf[256];
 
 	(void) skipFsync;
 
@@ -245,6 +279,24 @@ air_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 					   blocknum + i,
 					   lsn,
 					   buffers[i]);
+
+	if (nblocks > 0)
+	{
+		air_relmeta_extend(reln->smgr_rlocator.locator, forknum, blocknum + nblocks);
+		if (!air_ps_put_pages(air_pageserver_socket,
+							  air_tenant_id,
+							  reln->smgr_rlocator.locator,
+							  forknum,
+							  blocknum,
+							  nblocks,
+							  lsn,
+							  buffers,
+							  errbuf,
+							  sizeof(errbuf)))
+			ereport(ERROR,
+					(errcode(ERRCODE_IO_ERROR),
+					 errmsg("air_smgr writev failed: %s", errbuf)));
+	}
 }
 
 static void
@@ -261,6 +313,20 @@ air_nblocks(SMgrRelation reln, ForkNumber forknum)
 {
 	BlockNumber nblocks = 0;
 	char		errbuf[256];
+	bool		local_found = false;
+	bool		local_exists = false;
+	BlockNumber local_nblocks = 0;
+	bool		local_exact = false;
+
+	local_found = air_relmeta_lookup(reln->smgr_rlocator.locator, forknum,
+									 &local_exists, &local_nblocks, &local_exact);
+	if (local_found)
+	{
+		if (!local_exists)
+			return 0;
+		if (local_exact)
+			return local_nblocks;
+	}
 
 	if (!air_ps_get_rel_size(air_pageserver_socket,
 							 air_tenant_id,
@@ -274,6 +340,9 @@ air_nblocks(SMgrRelation reln, ForkNumber forknum)
 				(errcode(ERRCODE_IO_ERROR),
 				 errmsg("air_smgr nblocks failed: %s", errbuf)));
 
+	if (local_found && local_exists && nblocks < local_nblocks)
+		nblocks = local_nblocks;
+
 	return nblocks;
 }
 
@@ -282,6 +351,7 @@ air_truncate(SMgrRelation reln, ForkNumber forknum, BlockNumber old_blocks, Bloc
 {
 	(void) old_blocks;
 	air_lfc_invalidate_rel(reln->smgr_rlocator.locator, forknum, nblocks);
+	air_relmeta_truncate(reln->smgr_rlocator.locator, forknum, nblocks);
 }
 
 static void

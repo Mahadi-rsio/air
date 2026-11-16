@@ -65,6 +65,8 @@ jobs:
             type=semver,pattern={{major}}
             type=sha,prefix=sha-
             type=raw,value=latest
+            type=raw,value=pageserver
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push Docker image to GHCR
         uses: docker/build-push-action@v6

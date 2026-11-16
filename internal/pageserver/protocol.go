@@ -32,6 +32,7 @@ const (
 	OpGetRelExists uint16 = 3
 	OpGetDBSize    uint16 = 4
 	OpGetPageBatch uint16 = 5
+	OpPutPageBatch uint16 = 6
 )
 
 // Wire response statuses matching AirPsStatus in protocol.h.
@@ -228,6 +229,7 @@ type Service interface {
 	GetRelSize(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) (uint32, error)
 	GetRelExists(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) (bool, error)
 	GetDBSize(ctx context.Context, tenantID string, spcOID, dbOID uint32, lsn uint64) (uint64, error)
+	PutPageBatch(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, startBlock, nblocks uint32, lsn uint64, pages []byte) error
 }
 
 // UnixServer serves the binary air_smgr protocol over an AF_UNIX stream socket.
@@ -407,6 +409,20 @@ func (s *UnixServer) handleConn(ctx context.Context, conn net.Conn) {
 				status = StatusError
 			} else {
 				u64Val = sz
+			}
+		case OpPutPageBatch:
+			n := req.NBlocks
+			if n == 0 || int(n) > MaxBatchBlocks {
+				return
+			}
+			inBuf := make([]byte, int(n)*PageSize)
+			if _, err := io.ReadFull(conn, inBuf); err != nil {
+				return
+			}
+			if err := s.svc.PutPageBatch(ctx, req.TenantID, req.SpcOID, req.DbOID, req.RelNumber, req.ForkNum, req.BlockNum, n, req.LSN, inBuf); err != nil {
+				status = StatusError
+			} else {
+				nblocksOrVal = n
 			}
 		default:
 			status = StatusError

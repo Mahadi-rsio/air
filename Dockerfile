@@ -18,7 +18,7 @@ FROM debian:bookworm-slim AS pg-builder
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl bzip2 patch git build-essential pkg-config \
-    bison flex libreadline-dev zlib1g-dev libssl-dev libxml2-dev uuid-dev \
+    bison flex libreadline-dev zlib1g-dev libssl-dev libxml2-dev uuid-dev libossp-uuid-dev \
     && curl -fsSL --retry 5 --retry-all-errors https://ftp.postgresql.org/pub/source/v17.12/postgresql-17.12.tar.bz2 -o /tmp/pg17.tar.bz2 \
     && tar -xjf /tmp/pg17.tar.bz2 -C /tmp \
     && rm -f /tmp/pg17.tar.bz2
