@@ -33,6 +33,7 @@ type Config struct {
 	R2SecretAccessKey  string
 	R2Region           string
 	R2Primary          bool
+	EvictOnSuspend     bool
 	PageserverEnabled  bool
 	PageserverSocket   string
 	PageserverCacheMB  int
@@ -92,6 +93,9 @@ func Load(args []string) (Config, error) {
 	if v := strings.TrimSpace(os.Getenv("AIR_R2_PRIMARY")); v != "" {
 		cfg.R2Primary = v == "1" || strings.EqualFold(v, "true")
 	}
+	if v := strings.TrimSpace(os.Getenv("AIR_EVICT_ON_SUSPEND")); v != "" {
+		cfg.EvictOnSuspend = v == "1" || strings.EqualFold(v, "true")
+	}
 	if v := strings.TrimSpace(os.Getenv("AIR_POOL_MODE")); v != "" {
 		cfg.PoolMode = v == "1" || strings.EqualFold(v, "true")
 	}
@@ -134,6 +138,7 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&cfg.R2SecretAccessKey, "r2-secret-access-key", cfg.R2SecretAccessKey, "S3/R2 secret access key")
 	fs.StringVar(&cfg.R2Region, "r2-region", cfg.R2Region, "S3/R2 region (default: auto)")
 	fs.BoolVar(&cfg.R2Primary, "r2-primary", cfg.R2Primary, "Use R2 as primary durable storage and evict local pgdata on suspend")
+	fs.BoolVar(&cfg.EvictOnSuspend, "evict-on-suspend", cfg.EvictOnSuspend, "Evict local tenant pgdata cache after cold data is safely uploaded to R2")
 	fs.BoolVar(&cfg.PageserverEnabled, "pageserver", cfg.PageserverEnabled, "Enable in-process AIR Pageserver over Unix socket")
 	fs.StringVar(&cfg.PageserverSocket, "pageserver-socket", cfg.PageserverSocket, "Unix socket path for AIR Pageserver")
 	fs.IntVar(&cfg.PageserverCacheMB, "pageserver-cache-mb", cfg.PageserverCacheMB, "Bounded LRU disk cache size in MB for Pageserver")

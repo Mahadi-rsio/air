@@ -2,7 +2,7 @@ app = "air-pg-server"
 primary_region = "iad"
 
 [build]
-  image = "ghcr.io/mahadi-rsio/air:v2.0.13"
+  image = "ghcr.io/mahadi-rsio/air:v2.0.14"
 
 [env]
   AIR_DATA_DIR = "/var/lib/air"
@@ -10,12 +10,13 @@ primary_region = "iad"
   AIR_HTTP_ADDR = "0.0.0.0:8080"
   AIR_GATEWAY_ADDR = "0.0.0.0:5432"
   AIR_POOL_MODE = "true"
-  AIR_IDLE_TIMEOUT = "2m"
+  AIR_IDLE_TIMEOUT = "45s"
   AIR_BOOTSTRAP_ACCOUNT_ID = "acct_default"
   AIR_R2_ENDPOINT = "https://dcd4d8a920e7d7f054ba6565cd8db426.r2.cloudflarestorage.com"
   AIR_R2_BUCKET = "air-pg-backups"
   AIR_R2_REGION = "auto"
   AIR_R2_PRIMARY = "true"
+  AIR_EVICT_ON_SUSPEND = "true"
   AIR_PAGESERVER_ENABLED = "true"
 
 [mounts]

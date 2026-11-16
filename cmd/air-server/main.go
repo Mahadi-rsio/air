@@ -43,13 +43,14 @@ func main() {
 	defer ag.Close()
 
 	cp, err := control.NewControlPlaneWithConfig(ctx, control.ControlPlaneConfig{
-		MetaDir:   cfg.MetaDir,
-		MetaDSN:   cfg.MetaDSN,
-		PGBinDir:  cfg.PGBinDir,
-		MetaPort:  cfg.MetaPort,
-		Agent:     ag,
-		KMS:       kms,
-		R2Primary: cfg.R2Primary,
+		MetaDir:        cfg.MetaDir,
+		MetaDSN:        cfg.MetaDSN,
+		PGBinDir:       cfg.PGBinDir,
+		MetaPort:       cfg.MetaPort,
+		Agent:          ag,
+		KMS:            kms,
+		R2Primary:      cfg.R2Primary,
+		EvictOnSuspend: cfg.EvictOnSuspend,
 	})
 	if err != nil {
 		log.Fatalf("init control plane: %v", err)
@@ -110,6 +111,9 @@ func main() {
 		log.Fatalf("init gateway: %v", err)
 	}
 	defer gw.Close()
+
+	cp.StartColdOffloadWorker(ctx, 2)
+	log.Printf("[air-server] async R2 cold-offload queue started (workers=2, evict_on_suspend=%v)", cfg.EvictOnSuspend)
 
 	if cfg.IdleTimeout > 0 {
 		cp.StartIdleReaper(ctx, cfg.IdleTimeout, 0, gw.RequestTenantDrain)

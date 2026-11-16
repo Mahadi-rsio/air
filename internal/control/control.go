@@ -71,41 +71,48 @@ type DatabaseInfo struct {
 
 // ControlPlaneConfig configures ControlPlane metadata storage (either external HA MetaDSN or local MetaDir).
 type ControlPlaneConfig struct {
-	MetaDir   string
-	MetaDSN   string
-	PGBinDir  string
-	MetaPort  int
-	Agent     *cell.Agent
-	KMS       *crypto.EnvelopeKMS
-	R2Primary bool
+	MetaDir        string
+	MetaDSN        string
+	PGBinDir       string
+	MetaPort       int
+	Agent          *cell.Agent
+	KMS            *crypto.EnvelopeKMS
+	R2Primary      bool
+	EvictOnSuspend bool
 }
 
 // ControlPlane manages durable PG17 metadata, schema migrations, provisioning state machine, and tenant routing.
 type ControlPlane struct {
-	metaDir      string
-	metaDSN      string
-	externalMeta bool
-	pgBin        string
-	metaPort     int
-	db           *pgxpool.Pool
-	agent        *cell.Agent
-	kms          *crypto.EnvelopeKMS
-	provMu       sync.Mutex
-	faultHook    func(stage string) error
-	gatewayPort  int
-	s3Client     *s3.Client
-	backupBucket string
-	r2Primary    bool
-	pageserver   *pageserver.Pageserver
-	psMu         sync.RWMutex
-	wakeGroup    singleflight.Group
-	tenantLocksMu sync.Mutex
-	tenantLocks   map[string]*sync.Mutex
-	activityMu   sync.Mutex
-	lastActivity map[string]time.Time
-	walMu        sync.Mutex
-	walReceivers map[string]context.CancelFunc
-	walDone      map[string]chan struct{}
+	metaDir          string
+	metaDSN          string
+	externalMeta     bool
+	pgBin            string
+	metaPort         int
+	db               *pgxpool.Pool
+	agent            *cell.Agent
+	kms              *crypto.EnvelopeKMS
+	provMu           sync.Mutex
+	faultHook        func(stage string) error
+	gatewayPort      int
+	s3Client         *s3.Client
+	backupBucket     string
+	r2Primary        bool
+	evictOnSuspend   bool
+	pageserver       *pageserver.Pageserver
+	psMu             sync.RWMutex
+	wakeGroup        singleflight.Group
+	tenantLocksMu    sync.Mutex
+	tenantLocks      map[string]*sync.Mutex
+	activityMu       sync.Mutex
+	lastActivity     map[string]time.Time
+	walMu            sync.Mutex
+	walReceivers     map[string]context.CancelFunc
+	walDone          map[string]chan struct{}
+	coldMu           sync.Mutex
+	coldQueueStarted bool
+	coldPending      map[string]bool
+	coldQueueCh      chan string
+	coldRetryDelay   time.Duration
 }
 
 // NewControlPlane initializes a ControlPlane backed by a local single-node PG17 MetaDir.
@@ -204,16 +211,17 @@ func NewControlPlaneWithConfig(ctx context.Context, cfg ControlPlaneConfig) (*Co
 	}
 
 	cp := &ControlPlane{
-		metaDir:      cfg.MetaDir,
-		metaDSN:      metaDSN,
-		externalMeta: externalMeta,
-		pgBin:        pgBinDir,
-		metaPort:     cfg.MetaPort,
-		db:           pool,
-		agent:        cfg.Agent,
-		kms:          cfg.KMS,
-		r2Primary:    cfg.R2Primary,
-		lastActivity: make(map[string]time.Time),
+		metaDir:        cfg.MetaDir,
+		metaDSN:        metaDSN,
+		externalMeta:   externalMeta,
+		pgBin:          pgBinDir,
+		metaPort:       cfg.MetaPort,
+		db:             pool,
+		agent:          cfg.Agent,
+		kms:            cfg.KMS,
+		r2Primary:      cfg.R2Primary,
+		evictOnSuspend: cfg.EvictOnSuspend,
+		lastActivity:   make(map[string]time.Time),
 	}
 	if err := cp.runMigrations(ctx); err != nil {
 		pool.Close()
@@ -748,6 +756,7 @@ func (cp *ControlPlane) ProvisionDatabase(ctx context.Context, accountID, idempo
 	if err := cp.ensurePageserverBootstrapAndWAL(ctx, tenantID, rt); err != nil {
 		log.Printf("[pageserver] bootstrap/walreceiver for %s failed: %v", tenantID, err)
 	}
+	cp.TouchTenantActivity(tenantID)
 
 	resp.Password = appPW
 	return &resp, nil
@@ -1001,9 +1010,35 @@ func (cp *ControlPlane) backupTenantToR2(ctx context.Context, tenantID, bkpType 
 		}
 	}
 
-	walSegs, err := backup.DrainAndEncryptWALSpoolToR2(ctx, cp.agent, s3c, bucket, tenantID)
+	walCount, err := cp.drainWALSpoolAndUpdateManifest(ctx, tenantID)
 	if err != nil {
 		return nil, err
+	}
+
+	resp := &BackupResponse{
+		TenantID:            tenantID,
+		Type:                bkpType,
+		WALSegmentsArchived: walCount,
+	}
+	if art != nil {
+		resp.BackupID = art.BackupID
+		resp.ParentID = art.ParentID
+		resp.Type = art.Type
+		resp.R2Key = art.R2Key
+		resp.Epoch = art.Epoch
+		resp.CipherBytes = art.CipherBytes
+	}
+	return resp, nil
+}
+
+func (cp *ControlPlane) drainWALSpoolAndUpdateManifest(ctx context.Context, tenantID string) (int, error) {
+	s3c, bucket := cp.backupStore()
+	if s3c == nil || bucket == "" {
+		return 0, nil
+	}
+	walSegs, err := backup.DrainAndEncryptWALSpoolToR2(ctx, cp.agent, s3c, bucket, tenantID)
+	if err != nil {
+		return 0, err
 	}
 	if len(walSegs) > 0 {
 		manifest, etag, mErr := fencing.ReadManifestWithETag(ctx, s3c, bucket, tenantID)
@@ -1019,25 +1054,11 @@ func (cp *ControlPlane) backupTenantToR2(ctx context.Context, tenantID, bkpType 
 				}
 			}
 			if _, casErr := fencing.PutManifestCAS(ctx, s3c, bucket, manifest, etag); casErr != nil {
-				return nil, casErr
+				return 0, casErr
 			}
 		}
 	}
-
-	resp := &BackupResponse{
-		TenantID:            tenantID,
-		Type:                bkpType,
-		WALSegmentsArchived: len(walSegs),
-	}
-	if art != nil {
-		resp.BackupID = art.BackupID
-		resp.ParentID = art.ParentID
-		resp.Type = art.Type
-		resp.R2Key = art.R2Key
-		resp.Epoch = art.Epoch
-		resp.CipherBytes = art.CipherBytes
-	}
-	return resp, nil
+	return len(walSegs), nil
 }
 
 // RestoreDatabase executes CombineAndReplayPITR for a tenant up to targetLSN (or latest WAL).
@@ -1342,8 +1363,9 @@ func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drai
 		return err
 	}
 
+	ps := cp.getPageserver()
 	evictToR2 := false
-	if cp.r2Primary {
+	if cp.r2Primary && ps == nil {
 		if s3c, bucket := cp.backupStore(); s3c != nil && bucket != "" {
 			if _, bErr := cp.backupTenantToR2(ctx, tenantID, "INCR"); bErr != nil {
 				return fmt.Errorf("sync tenant %s to R2 before suspend: %w", tenantID, bErr)
@@ -1352,26 +1374,39 @@ func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drai
 		}
 	}
 
-		if err := cp.agent.StopTenantClean(tenantID); err != nil {
+	if err := cp.agent.StopTenantClean(tenantID); err != nil {
+		return err
+	}
+	cp.stopWALReceiver(tenantID)
+
+	cp.coldMu.Lock()
+	queueActive := cp.coldQueueStarted
+	cp.coldMu.Unlock()
+
+	if queueActive {
+		if _, err := cp.db.Exec(ctx,
+			`UPDATE clusters SET state = 'SUSPENDED', updated_at = NOW() WHERE tenant_id = $1 AND state = 'ACTIVE'`,
+			tenantID,
+		); err != nil {
 			return err
 		}
-		cp.stopWALReceiver(tenantID)
-		if ps := cp.getPageserver(); ps != nil {
-			if _, fErr := ps.FlushTenant(ctx, tenantID); fErr != nil {
-				return fmt.Errorf("flush pageserver layers for %s: %w", tenantID, fErr)
-			}
-			if pgDataDir, pdErr := cp.agent.TenantPGDataDir(tenantID); pdErr == nil {
-				if _, sErr := ps.SaveMetadataSkeleton(ctx, tenantID, epoch, pgDataDir); sErr != nil {
-					return fmt.Errorf("save metadata skeleton for %s: %w", tenantID, sErr)
-				}
-			}
-			if cp.agent.HasAirSmgr() {
-				// Keep local pgdata + LFC warm across suspend for sub-second warm wakes;
-				// R2 backup + skeleton + pageserver layers are already synced above.
-				// Set AIR_EVICT_ON_SUSPEND=true to force local pgdata eviction on every suspend.
-				evictToR2 = os.Getenv("AIR_EVICT_ON_SUSPEND") == "true"
+		cp.EnqueueColdOffload(tenantID)
+		return nil
+	}
+
+	if ps != nil {
+		if _, fErr := ps.FlushTenant(ctx, tenantID); fErr != nil {
+			return fmt.Errorf("flush pageserver layers for %s: %w", tenantID, fErr)
+		}
+		if pgDataDir, pdErr := cp.agent.TenantPGDataDir(tenantID); pdErr == nil {
+			if _, sErr := ps.SaveMetadataSkeleton(ctx, tenantID, epoch, pgDataDir); sErr != nil {
+				return fmt.Errorf("save metadata skeleton for %s: %w", tenantID, sErr)
 			}
 		}
+		if cp.agent.HasAirSmgr() {
+			evictToR2 = cp.shouldEvictLocalOnSuspend()
+		}
+	}
 	if evictToR2 {
 		if eErr := cp.agent.EvictTenantLocalData(tenantID); eErr != nil {
 			return fmt.Errorf("evict local pgdata for %s after R2 sync: %w", tenantID, eErr)
@@ -1383,6 +1418,184 @@ func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drai
 		tenantID,
 	)
 	return err
+}
+
+func (cp *ControlPlane) shouldEvictLocalOnSuspend() bool {
+	return cp.evictOnSuspend || os.Getenv("AIR_EVICT_ON_SUSPEND") == "true"
+}
+
+// StartColdOffloadWorker starts background workers that upload cold data of suspended tenants
+// to R2 and delete local pgdata/WAL cache once durable R2 sync succeeds.
+func (cp *ControlPlane) StartColdOffloadWorker(ctx context.Context, workers int) {
+	if workers <= 0 {
+		workers = 2
+	}
+	cp.coldMu.Lock()
+	if cp.coldQueueStarted {
+		cp.coldMu.Unlock()
+		return
+	}
+	cp.coldQueueStarted = true
+	cp.coldPending = make(map[string]bool)
+	cp.coldQueueCh = make(chan string, 256)
+	if cp.coldRetryDelay <= 0 {
+		cp.coldRetryDelay = 5 * time.Second
+	}
+	cp.coldMu.Unlock()
+
+	for i := 0; i < workers; i++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case tid := <-cp.coldQueueCh:
+					cp.coldMu.Lock()
+					delete(cp.coldPending, tid)
+					cp.coldMu.Unlock()
+					cp.runColdOffloadWithRetry(ctx, tid)
+				}
+			}
+		}()
+	}
+
+	// On startup, enqueue any already-suspended tenants that still have local pgdata cached.
+	if cp.agent != nil && cp.db != nil {
+		rows, err := cp.db.Query(ctx, `SELECT tenant_id FROM clusters WHERE state = 'SUSPENDED'`)
+		if err == nil {
+			var suspendedIDs []string
+			for rows.Next() {
+				var tid string
+				if scanErr := rows.Scan(&tid); scanErr == nil {
+					suspendedIDs = append(suspendedIDs, tid)
+				}
+			}
+			rows.Close()
+			for _, tid := range suspendedIDs {
+				if cp.agent.HasLocalPGData(tid) {
+					cp.EnqueueColdOffload(tid)
+				}
+			}
+		}
+	}
+}
+
+// EnqueueColdOffload queues a suspended tenant for asynchronous R2 cold upload and local cache eviction.
+func (cp *ControlPlane) EnqueueColdOffload(tenantID string) {
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return
+	}
+	cp.coldMu.Lock()
+	if !cp.coldQueueStarted || cp.coldQueueCh == nil {
+		cp.coldMu.Unlock()
+		return
+	}
+	if cp.coldPending[tenantID] {
+		cp.coldMu.Unlock()
+		return
+	}
+	cp.coldPending[tenantID] = true
+	ch := cp.coldQueueCh
+	cp.coldMu.Unlock()
+
+	select {
+	case ch <- tenantID:
+	default:
+		// Queue full: clear pending flag so a subsequent scan/suspend can re-enqueue.
+		cp.coldMu.Lock()
+		delete(cp.coldPending, tenantID)
+		cp.coldMu.Unlock()
+		log.Printf("[cold-offload] queue full, skipping enqueue for %s", tenantID)
+	}
+}
+
+func (cp *ControlPlane) runColdOffloadWithRetry(ctx context.Context, tenantID string) {
+	const maxAttempts = 5
+	delay := cp.coldRetryDelay
+	if delay <= 0 {
+		delay = 5 * time.Second
+	}
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return
+		}
+		jobCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		evicted, err := cp.processColdOffload(jobCtx, tenantID)
+		cancel()
+		if err == nil {
+			if evicted {
+				log.Printf("[cold-offload] tenant=%s r2_sync=ok evicted=true", tenantID)
+			}
+			return
+		}
+		log.Printf("[cold-offload] tenant=%s attempt=%d/%d failed (keeping local cache): %v", tenantID, attempt, maxAttempts, err)
+		if attempt == maxAttempts {
+			return
+		}
+		timer := time.NewTimer(delay * time.Duration(attempt))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func (cp *ControlPlane) processColdOffload(ctx context.Context, tenantID string) (bool, error) {
+	if cp.agent == nil {
+		return false, nil
+	}
+	unlock := cp.lockTenantLifecycle(tenantID)
+	defer unlock()
+
+	var state string
+	var epoch int64
+	err := cp.db.QueryRow(ctx, `SELECT state, fencing_epoch FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&state, &epoch)
+	if errors.Is(err, pgx.ErrNoRows) || state != "SUSPENDED" {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	ps := cp.getPageserver()
+	if ps != nil {
+		if _, fErr := ps.FlushTenant(ctx, tenantID); fErr != nil {
+			return false, fmt.Errorf("flush pageserver layers: %w", fErr)
+		}
+		if pgDataDir, pdErr := cp.agent.TenantPGDataDir(tenantID); pdErr == nil {
+			if _, stErr := os.Stat(filepath.Join(pgDataDir, "PG_VERSION")); stErr == nil {
+				if _, sErr := ps.SaveMetadataSkeleton(ctx, tenantID, epoch, pgDataDir); sErr != nil {
+					return false, fmt.Errorf("save metadata skeleton: %w", sErr)
+				}
+			}
+		}
+	}
+
+	if _, wErr := cp.drainWALSpoolAndUpdateManifest(ctx, tenantID); wErr != nil {
+		return false, fmt.Errorf("drain WAL spool to R2: %w", wErr)
+	}
+
+	if !cp.shouldEvictLocalOnSuspend() {
+		return false, nil
+	}
+	// Safety guard: never evict local pgdata unless durable state is confirmed in R2/pageserver.
+	if ps != nil {
+		if !ps.HasMetadataSkeleton(ctx, tenantID) {
+			return false, fmt.Errorf("refusing to evict %s: metadata skeleton not confirmed", tenantID)
+		}
+	} else if !cp.r2Primary {
+		return false, nil
+	}
+
+	if !cp.agent.HasLocalPGData(tenantID) {
+		return false, nil
+	}
+	if eErr := cp.agent.EvictTenantLocalData(tenantID); eErr != nil {
+		return false, fmt.Errorf("evict local pgdata: %w", eErr)
+	}
+	return true, nil
 }
 
 // SuspendIdleTenants suspends any ACTIVE tenant whose last recorded activity exceeds idleTimeout.
@@ -1435,6 +1648,9 @@ func (cp *ControlPlane) StartIdleReaper(ctx context.Context, idleTimeout, interv
 	}
 	if interval <= 0 {
 		interval = idleTimeout / 2
+		if interval > 5*time.Second {
+			interval = 5 * time.Second
+		}
 		if interval < 50*time.Millisecond {
 			interval = 50 * time.Millisecond
 		}
