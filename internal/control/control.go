@@ -290,6 +290,20 @@ func (cp *ControlPlane) readPGControlLSN(pgDataDir string) uint64 {
 	return 0
 }
 
+func (cp *ControlPlane) preloadPageserverTenant(ctx context.Context, tenantID string, epoch int64, wrappedDEK string) {
+	if cp.kms != nil && wrappedDEK != "" {
+		_ = cp.kms.LoadWrappedDEK(tenantID, wrappedDEK)
+	}
+	ps := cp.getPageserver()
+	if ps == nil {
+		return
+	}
+	tl := ps.EnsureTenant(tenantID, epoch)
+	if tl.LastLSN() == 0 {
+		_ = tl.LoadLayersFromR2(ctx)
+	}
+}
+
 func (cp *ControlPlane) ensurePageserverBootstrapAndWAL(ctx context.Context, tenantID string, rt *cell.TenantRuntime) error {
 	ps := cp.getPageserver()
 	if ps == nil || rt == nil {
@@ -795,24 +809,32 @@ func (cp *ControlPlane) RecoverProvisioningOperations(ctx context.Context) (int,
 
 	// Reconcile ACTIVE clusters against Cell Agent runtime (e.g. if PG stopped cleanly during server restart).
 	if cp.agent != nil {
-		cRows, err := cp.db.Query(ctx, `SELECT tenant_id, fencing_epoch FROM clusters WHERE state = 'ACTIVE'`)
+		cRows, err := cp.db.Query(ctx, `SELECT tenant_id, fencing_epoch, COALESCE(wrapped_dek, '') FROM clusters WHERE state = 'ACTIVE'`)
 		if err == nil {
 			type activeRow struct {
-				tid   string
-				epoch int64
+				tid        string
+				epoch      int64
+				wrappedDEK string
 			}
 			var active []activeRow
 			for cRows.Next() {
 				var r activeRow
-				if err := cRows.Scan(&r.tid, &r.epoch); err == nil {
+				if err := cRows.Scan(&r.tid, &r.epoch, &r.wrappedDEK); err == nil {
 					active = append(active, r)
 				}
 			}
 			cRows.Close()
 			for _, r := range active {
 				if _, ok := cp.agent.GetTenant(r.tid); !ok {
+					cp.preloadPageserverTenant(ctx, r.tid, r.epoch, r.wrappedDEK)
+					if cp.getPageserver() != nil {
+						_ = cp.agent.WriteTenantConfigs(r.tid)
+					}
 					if rt, err := cp.agent.StartOrAdoptTenant(r.tid, r.epoch); err == nil {
 						_, _ = cp.db.Exec(ctx, `UPDATE clusters SET direct_port = $2, updated_at = now() WHERE tenant_id = $1`, r.tid, rt.Port)
+						if err := cp.ensurePageserverBootstrapAndWAL(ctx, r.tid, rt); err != nil {
+							log.Printf("[pageserver] adopt walreceiver for %s failed: %v", r.tid, err)
+						}
 					} else {
 						log.Printf("[control] warn: failed to adopt active tenant %s: %v", r.tid, err)
 					}
@@ -1235,6 +1257,9 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 			restoreDur = time.Since(restoreStart)
 		}
 		if cp.getPageserver() != nil {
+			var wrappedDEK string
+			_ = cp.db.QueryRow(ctx, `SELECT COALESCE(wrapped_dek, '') FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&wrappedDEK)
+			cp.preloadPageserverTenant(ctx, tenantID, epoch, wrappedDEK)
 			_ = cp.agent.WriteTenantConfigs(tenantID)
 		}
 		startBegin := time.Now()

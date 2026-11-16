@@ -2,7 +2,7 @@ app = "air-pg-server"
 primary_region = "iad"
 
 [build]
-  image = "ghcr.io/mahadi-rsio/air:v2.0.5"
+  image = "ghcr.io/mahadi-rsio/air:v2.0.12"
 
 [env]
   AIR_DATA_DIR = "/var/lib/air"
@@ -16,6 +16,7 @@ primary_region = "iad"
   AIR_R2_BUCKET = "air-pg-backups"
   AIR_R2_REGION = "auto"
   AIR_R2_PRIMARY = "true"
+  AIR_PAGESERVER_ENABLED = "true"
 
 [mounts]
   source = "air_data"
