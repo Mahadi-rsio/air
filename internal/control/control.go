@@ -1206,7 +1206,11 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 		if curState != "SUSPENDED" && curState != "ACTIVE" {
 			return nil, fmt.Errorf("tenant %s cannot wake from state %s", tenantID, curState)
 		}
-		if !cp.agent.HasLocalPGData(tenantID) {
+		wakeTotalStart := time.Now()
+		hasLocal := cp.agent.HasLocalPGData(tenantID)
+		var restoreDur, startDur, psWalDur time.Duration
+		if !hasLocal {
+			restoreStart := time.Now()
 			var wrappedDEK string
 			if dErr := cp.db.QueryRow(ctx, `SELECT wrapped_dek FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&wrappedDEK); dErr == nil && wrappedDEK != "" {
 				_ = cp.kms.LoadWrappedDEK(tenantID, wrappedDEK)
@@ -1228,17 +1232,24 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 					return nil, fmt.Errorf("hydrate tenant %s from R2: %w", tenantID, hErr)
 				}
 			}
+			restoreDur = time.Since(restoreStart)
 		}
 		if cp.getPageserver() != nil {
 			_ = cp.agent.WriteTenantConfigs(tenantID)
 		}
+		startBegin := time.Now()
 		rt, sErr := cp.agent.StartOrAdoptTenant(tenantID, epoch)
+		startDur = time.Since(startBegin)
 		if sErr != nil {
 			return nil, sErr
 		}
+		psWalBegin := time.Now()
 		if err := cp.ensurePageserverBootstrapAndWAL(ctx, tenantID, rt); err != nil {
 			log.Printf("[pageserver] wake walreceiver for %s failed: %v", tenantID, err)
 		}
+		psWalDur = time.Since(psWalBegin)
+		log.Printf("[wake] tenant=%s local_pgdata=%v restore=%v start=%v ps_wal=%v total=%v",
+			tenantID, hasLocal, restoreDur, startDur, psWalDur, time.Since(wakeTotalStart))
 		if _, uErr := cp.db.Exec(ctx,
 			`UPDATE clusters SET state = 'ACTIVE', direct_port = $2, updated_at = NOW() WHERE tenant_id = $1`,
 			tenantID, rt.Port,
@@ -1330,7 +1341,10 @@ func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drai
 				}
 			}
 			if cp.agent.HasAirSmgr() {
-				evictToR2 = true
+				// Keep local pgdata + LFC warm across suspend for sub-second warm wakes;
+				// R2 backup + skeleton + pageserver layers are already synced above.
+				// Set AIR_EVICT_ON_SUSPEND=true to force local pgdata eviction on every suspend.
+				evictToR2 = os.Getenv("AIR_EVICT_ON_SUSPEND") == "true"
 			}
 		}
 	if evictToR2 {

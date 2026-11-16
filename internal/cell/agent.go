@@ -3,6 +3,7 @@ package cell
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -93,6 +94,12 @@ type Agent struct {
 	pageserverEnabled bool
 	pageserverSocket  string
 	lfcMaxMB          int
+
+	warmPoolMu     sync.Mutex
+	warmPoolSlots  []string
+	warmPoolTarget int
+	warmPoolSeq    atomic.Int64
+	warmPoolNotify chan struct{}
 }
 
 // SetPageserverConfig configures air_smgr GUC generation in tenant postgresql.conf files.
@@ -159,6 +166,7 @@ func NewAgent(volDir, pgBinDir string, kms *crypto.EnvelopeKMS) (*Agent, error) 
 		"tenants/active",
 		"spool/wal",
 		"backups",
+		"lfc",
 		"tmp",
 	} {
 		if err := os.MkdirAll(filepath.Join(volDir, sub), 0o755); err != nil {
@@ -179,6 +187,7 @@ func NewAgent(volDir, pgBinDir string, kms *crypto.EnvelopeKMS) (*Agent, error) 
 	}
 	a.portSeq.Store(int32(18000 + (os.Getpid()%400)*20))
 	a.ReadoptRunningTenants()
+	a.initWarmPool()
 	return a, nil
 }
 
@@ -273,14 +282,16 @@ func (a *Agent) ClaimCluster(tenantID string) (string, error) {
 	}
 	_ = os.RemoveAll(claimDir)
 	pgData := filepath.Join(claimDir, "pgdata")
-	if err := os.MkdirAll(pgData, 0o700); err != nil {
-		return "", err
-	}
-	if out, err := a.runPostgresCmd(
-		filepath.Join(a.pgBin, "initdb"),
-		"-D", pgData, "-U", "postgres", "--auth-local=trust", "--auth-host=scram-sha-256", "--data-checksums", "--no-instructions",
-	); err != nil {
-		return "", fmt.Errorf("initdb failed: %w (%s)", err, out)
+	if !a.claimWarmPGData(pgData) {
+		if err := os.MkdirAll(pgData, 0o700); err != nil {
+			return "", err
+		}
+		if out, err := a.runPostgresCmd(
+			filepath.Join(a.pgBin, "initdb"),
+			"-D", pgData, "-U", "postgres", "--auth-local=trust", "--auth-host=scram-sha-256", "--data-checksums", "--no-instructions",
+		); err != nil {
+			return "", fmt.Errorf("initdb failed: %w (%s)", err, out)
+		}
 	}
 	sysID := a.readSystemIdentifier(pgData)
 	if sysID == "" {
@@ -427,7 +438,10 @@ func (a *Agent) WriteTenantConfigs(tenantID string) error {
 	sharedLibs := "supautils"
 	smgrConf := ""
 	if psEnabled && psSocket != "" {
-		lfcDir := filepath.Join(activeBase, "lfc")
+		lfcDir, lfcErr := tenant.SafeSubpath(a.volDir, "lfc", tenantID)
+		if lfcErr != nil {
+			return lfcErr
+		}
 		if err := os.MkdirAll(lfcDir, 0o700); err != nil {
 			return err
 		}
@@ -449,6 +463,7 @@ maintenance_work_mem = 16MB
 temp_file_limit = 32MB
 password_encryption = 'scram-sha-256'
 wal_level = replica
+min_wal_size = 32MB
 summarize_wal = on
 archive_mode = on
 archive_command = 'cp %%p %s/%%f'
@@ -500,10 +515,12 @@ func (a *Agent) StartOrAdoptTenant(tenantID string, epoch int64) (*TenantRuntime
 	a.tenantMu.Unlock()
 
 	pid, port, pidPGData := readPostmasterDetails(pgData)
+	adopted := false
 	if pid > 0 && pidPGData == pgData && verifyPostgresProcessIdentity(pid, pgData) == nil {
 		if port == 0 {
 			port = a.allocOrReusePort(tenantID)
 		}
+		adopted = true
 	} else {
 		port = a.allocOrReusePort(tenantID)
 		logFile := filepath.Join(activeBase, "postgresql.log")
@@ -521,8 +538,10 @@ func (a *Agent) StartOrAdoptTenant(tenantID string, epoch int64) (*TenantRuntime
 		pid, port, _ = readPostmasterDetails(pgData)
 	}
 
-	if err := a.waitReady(sockDir, port, 20*time.Second); err != nil {
-		return nil, fmt.Errorf("tenant %s readiness check failed: %w", tenantID, err)
+	if adopted {
+		if err := a.waitReady(sockDir, port, 20*time.Second); err != nil {
+			return nil, fmt.Errorf("tenant %s readiness check failed: %w", tenantID, err)
+		}
 	}
 
 	cgPath, _ := a.setupTenantCgroupV2(tenantID, pid)
@@ -737,6 +756,9 @@ func (a *Agent) StopAndPurgeTenant(tenantID string) error {
 	if a.kms != nil {
 		a.kms.ShredDEK(tenantID)
 	}
+	if lfcDir, lfcErr := tenant.SafeSubpath(a.volDir, "lfc", tenantID); lfcErr == nil {
+		_ = os.RemoveAll(lfcDir)
+	}
 	_ = os.RemoveAll(claimDir)
 	return os.RemoveAll(activeBase)
 }
@@ -887,6 +909,17 @@ func (a *Agent) waitReady(sockDir string, port int, timeout time.Duration) error
 }
 
 func (a *Agent) readSystemIdentifier(pgData string) string {
+	// Fast path: bytes 0..7 of global/pg_control hold the uint64 system_identifier in host (little-endian) order.
+	if f, err := os.Open(filepath.Join(pgData, "global", "pg_control")); err == nil {
+		var hdr [8]byte
+		n, rErr := f.Read(hdr[:])
+		_ = f.Close()
+		if rErr == nil && n == 8 {
+			if sysID := binary.LittleEndian.Uint64(hdr[:]); sysID != 0 {
+				return strconv.FormatUint(sysID, 10)
+			}
+		}
+	}
 	out, err := a.runPostgresCmd(filepath.Join(a.pgBin, "pg_controldata"), pgData)
 	if err != nil {
 		return ""

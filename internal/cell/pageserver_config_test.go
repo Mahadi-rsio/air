@@ -44,7 +44,7 @@ func TestWriteTenantConfigsWithPageserver(t *testing.T) {
 		}
 	}
 
-	lfcDir := filepath.Join(volDir, "tenants", "active", tenantID, "lfc")
+	lfcDir := filepath.Join(volDir, "lfc", tenantID)
 	if st, err := os.Stat(lfcDir); err != nil || !st.IsDir() {
 		t.Fatalf("expected lfc dir %s to exist: %v", lfcDir, err)
 	}
