@@ -366,5 +366,9 @@ func (p *Pageserver) RestoreMetadataSkeleton(ctx context.Context, tenantID strin
 		}
 	}
 
+	tl := p.EnsureTenant(tenantID, epoch)
+	if err := tl.LoadLayersFromR2(ctx); err != nil {
+		return nil, fmt.Errorf("load pageserver layers from R2 for %s: %w", tenantID, err)
+	}
 	return meta, nil
 }

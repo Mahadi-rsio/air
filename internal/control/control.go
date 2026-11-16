@@ -99,6 +99,8 @@ type ControlPlane struct {
 	pageserver   *pageserver.Pageserver
 	psMu         sync.RWMutex
 	wakeGroup    singleflight.Group
+	tenantLocksMu sync.Mutex
+	tenantLocks   map[string]*sync.Mutex
 	activityMu   sync.Mutex
 	lastActivity map[string]time.Time
 	walMu        sync.Mutex
@@ -295,6 +297,9 @@ func (cp *ControlPlane) ensurePageserverBootstrapAndWAL(ctx context.Context, ten
 	}
 
 	tl := ps.EnsureTenant(tenantID, rt.FencingEpoch)
+	if tl.LastLSN() == 0 {
+		_ = tl.LoadLayersFromR2(ctx)
+	}
 	if tl.LastLSN() == 0 && rt.PGData != "" && rt.SockDir != "" && rt.Port > 0 {
 		connStr := fmt.Sprintf("host=%s port=%d user=postgres dbname=postgres", rt.SockDir, rt.Port)
 		connCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -1164,6 +1169,21 @@ func (cp *ControlPlane) GetTenantRouteAndCredentials(ctx context.Context, tenant
 
 // WakeTenant coalesces concurrent wake requests for a SUSPENDED tenant via singleflight,
 // starting the tenant's PostgreSQL 17 instance once and transitioning state back to ACTIVE.
+func (cp *ControlPlane) lockTenantLifecycle(tenantID string) func() {
+	cp.tenantLocksMu.Lock()
+	if cp.tenantLocks == nil {
+		cp.tenantLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := cp.tenantLocks[tenantID]
+	if !ok {
+		mu = &sync.Mutex{}
+		cp.tenantLocks[tenantID] = mu
+	}
+	cp.tenantLocksMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
 func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (directPort int, sockDir string, appPassword string, err error) {
 	if err := tenant.ValidateID(tenantID); err != nil {
 		return 0, "", "", err
@@ -1172,6 +1192,8 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 		return 0, "", "", errors.New("cell agent not configured")
 	}
 	v, err, _ := cp.wakeGroup.Do(tenantID, func() (any, error) {
+		unlock := cp.lockTenantLifecycle(tenantID)
+		defer unlock()
 		var curState string
 		var curPort int
 		var epoch int64
@@ -1185,6 +1207,10 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 			return nil, fmt.Errorf("tenant %s cannot wake from state %s", tenantID, curState)
 		}
 		if !cp.agent.HasLocalPGData(tenantID) {
+			var wrappedDEK string
+			if dErr := cp.db.QueryRow(ctx, `SELECT wrapped_dek FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&wrappedDEK); dErr == nil && wrappedDEK != "" {
+				_ = cp.kms.LoadWrappedDEK(tenantID, wrappedDEK)
+			}
 			if ps := cp.getPageserver(); ps != nil && ps.HasMetadataSkeleton(ctx, tenantID) {
 				pgDataDir, pdErr := cp.agent.TenantPGDataDir(tenantID)
 				if pdErr != nil {
@@ -1197,10 +1223,6 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 				s3c, bucket := cp.backupStore()
 				if s3c == nil || bucket == "" {
 					return nil, fmt.Errorf("tenant %s has no local pgdata and backup store is not configured", tenantID)
-				}
-				var wrappedDEK string
-				if dErr := cp.db.QueryRow(ctx, `SELECT wrapped_dek FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&wrappedDEK); dErr == nil && wrappedDEK != "" {
-					_ = cp.kms.LoadWrappedDEK(tenantID, wrappedDEK)
 				}
 				if hErr := backup.HydrateTenantPGDataFromR2(ctx, cp.agent, s3c, bucket, tenantID); hErr != nil {
 					return nil, fmt.Errorf("hydrate tenant %s from R2: %w", tenantID, hErr)
@@ -1257,6 +1279,8 @@ func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drai
 	if drainTimeout <= 0 {
 		drainTimeout = 3 * time.Second
 	}
+	unlock := cp.lockTenantLifecycle(tenantID)
+	defer unlock()
 
 	var state string
 	var epoch int64

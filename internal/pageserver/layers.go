@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/Mahadi-rsio/air/internal/crypto"
@@ -340,23 +342,34 @@ func DecodeLayerIndex(raw []byte, meta LayerMeta, count uint32, kms *crypto.Enve
 	return out, nil
 }
 
+type layerDownload struct {
+	done chan struct{}
+	err  error
+}
+
 // LayerStore persists and range-reads immutable layer files across local disk and R2.
 type LayerStore struct {
-	localDir string
-	s3c      *s3.Client
-	bucket   string
-	kms      *crypto.EnvelopeKMS
-	cache    *DiskCache
+	localDir   string
+	s3c        *s3.Client
+	bucket     string
+	kms        *crypto.EnvelopeKMS
+	cache      *DiskCache
+	idxMu      sync.RWMutex
+	indexCache map[string][]LayerIndexEntry
+	dlMu       sync.Mutex
+	dlFlight   map[string]*layerDownload
 }
 
 // NewLayerStore creates a LayerStore backed by localDir, optional S3/R2, optional KMS, and optional DiskCache.
 func NewLayerStore(localDir string, s3c *s3.Client, bucket string, kms *crypto.EnvelopeKMS, cache *DiskCache) *LayerStore {
 	return &LayerStore{
-		localDir: localDir,
-		s3c:      s3c,
-		bucket:   bucket,
-		kms:      kms,
-		cache:    cache,
+		localDir:   localDir,
+		s3c:        s3c,
+		bucket:     bucket,
+		kms:        kms,
+		cache:      cache,
+		indexCache: make(map[string][]LayerIndexEntry),
+		dlFlight:   make(map[string]*layerDownload),
 	}
 }
 
@@ -398,6 +411,52 @@ func (s *LayerStore) WriteLayer(ctx context.Context, meta LayerMeta, recs []Laye
 	return meta, nil
 }
 
+func (s *LayerStore) ensureLayerCached(ctx context.Context, meta LayerMeta) error {
+	if s.cache == nil || s.s3c == nil || s.bucket == "" || meta.FileSize <= 0 || meta.FileSize > s.cache.maxBytes {
+		return nil
+	}
+	s.dlMu.Lock()
+	if s.dlFlight == nil {
+		s.dlFlight = make(map[string]*layerDownload)
+	}
+	if f, ok := s.dlFlight[meta.R2Key]; ok {
+		s.dlMu.Unlock()
+		select {
+		case <-f.done:
+			return f.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	f := &layerDownload{done: make(chan struct{})}
+	s.dlFlight[meta.R2Key] = f
+	s.dlMu.Unlock()
+
+	var err error
+	resp, getErr := s.s3c.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(meta.R2Key),
+	})
+	if getErr != nil {
+		err = getErr
+	} else {
+		data, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			err = readErr
+		} else {
+			err = s.cache.Put(meta.R2Key, data)
+		}
+	}
+
+	s.dlMu.Lock()
+	f.err = err
+	close(f.done)
+	delete(s.dlFlight, meta.R2Key)
+	s.dlMu.Unlock()
+	return err
+}
+
 // ReadRange fetches [offset, offset+length) from disk cache, localDir, or R2 HTTP Range.
 func (s *LayerStore) ReadRange(ctx context.Context, meta LayerMeta, offset, length int64) ([]byte, error) {
 	if s.cache != nil {
@@ -419,6 +478,13 @@ func (s *LayerStore) ReadRange(ctx context.Context, meta LayerMeta, offset, leng
 	if s.s3c == nil || s.bucket == "" {
 		return nil, fmt.Errorf("pageserver: layer %s not found locally and R2 not configured", meta.R2Key)
 	}
+	if s.cache != nil && meta.FileSize > 0 && meta.FileSize <= s.cache.maxBytes {
+		if err := s.ensureLayerCached(ctx, meta); err == nil {
+			if b, ok := s.cache.GetRange(meta.R2Key, offset, length); ok {
+				return b, nil
+			}
+		}
+	}
 	rng := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
 	resp, err := s.s3c.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
@@ -432,29 +498,50 @@ func (s *LayerStore) ReadRange(ctx context.Context, meta LayerMeta, offset, leng
 	return io.ReadAll(resp.Body)
 }
 
-// LookupKeyInLayer reads only the footer, index, and matching entry ranges for key <= lsn.
+// LookupKeyInLayer reads only the footer, index (cached in memory per layer), and matching entry ranges for key <= lsn.
 func (s *LayerStore) LookupKeyInLayer(ctx context.Context, meta LayerMeta, key Key, lsn uint64) ([]WALDelta, error) {
 	if meta.FileSize < int64(LayerFooterSize) {
 		return nil, errors.New("pageserver: layer file smaller than footer")
 	}
-	footerRaw, err := s.ReadRange(ctx, meta, meta.FileSize-int64(LayerFooterSize), int64(LayerFooterSize))
-	if err != nil {
-		return nil, err
+	s.idxMu.RLock()
+	entries, cached := s.indexCache[meta.R2Key]
+	s.idxMu.RUnlock()
+
+	if !cached {
+		footerRaw, err := s.ReadRange(ctx, meta, meta.FileSize-int64(LayerFooterSize), int64(LayerFooterSize))
+		if err != nil {
+			return nil, err
+		}
+		footer, err := DecodeLayerFooter(footerRaw)
+		if err != nil {
+			return nil, err
+		}
+		if footer.EntryCount == 0 {
+			s.idxMu.Lock()
+			if s.indexCache == nil {
+				s.indexCache = make(map[string][]LayerIndexEntry)
+			}
+			s.indexCache[meta.R2Key] = []LayerIndexEntry{}
+			s.idxMu.Unlock()
+			return nil, nil
+		}
+		idxRaw, err := s.ReadRange(ctx, meta, int64(footer.IndexOffset), int64(footer.IndexLen))
+		if err != nil {
+			return nil, err
+		}
+		entries, err = DecodeLayerIndex(idxRaw, meta, footer.EntryCount, s.kms)
+		if err != nil {
+			return nil, err
+		}
+		s.idxMu.Lock()
+		if s.indexCache == nil {
+			s.indexCache = make(map[string][]LayerIndexEntry)
+		}
+		s.indexCache[meta.R2Key] = entries
+		s.idxMu.Unlock()
 	}
-	footer, err := DecodeLayerFooter(footerRaw)
-	if err != nil {
-		return nil, err
-	}
-	if footer.EntryCount == 0 {
+	if len(entries) == 0 {
 		return nil, nil
-	}
-	idxRaw, err := s.ReadRange(ctx, meta, int64(footer.IndexOffset), int64(footer.IndexLen))
-	if err != nil {
-		return nil, err
-	}
-	entries, err := DecodeLayerIndex(idxRaw, meta, footer.EntryCount, s.kms)
-	if err != nil {
-		return nil, err
 	}
 
 	// Binary search for first index >= key.
@@ -484,4 +571,105 @@ func (s *LayerStore) LookupKeyInLayer(ctx context.Context, meta LayerMeta, key K
 		out = append(out, delta)
 	}
 	return out, nil
+}
+
+// ListLayersFromR2 lists and parses immutable layer metadata for a tenant timeline from R2.
+func (s *LayerStore) ListLayersFromR2(ctx context.Context, tenantID string, epoch int64) ([]LayerMeta, uint64, error) {
+	if s.s3c == nil || s.bucket == "" {
+		return nil, 0, nil
+	}
+	prefix := fmt.Sprintf("tenants/%s/timeline_%d/layers/", tenantID, epoch)
+	var layers []LayerMeta
+	var maxSeq uint64
+	var token *string
+	for {
+		out, err := s.s3c.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return nil, 0, err
+		}
+		for _, obj := range out.Contents {
+			if obj.Key == nil || obj.Size == nil || *obj.Size < int64(LayerFooterSize) {
+				continue
+			}
+			fileName := strings.TrimPrefix(*obj.Key, prefix)
+			kind, seq, startLSN, endLSN, ok := parseLayerFileName(fileName)
+			if !ok {
+				continue
+			}
+			if seq > maxSeq {
+				maxSeq = seq
+			}
+			layers = append(layers, LayerMeta{
+				TenantID:  tenantID,
+				Epoch:     epoch,
+				Kind:      kind,
+				FileName:  fileName,
+				R2Key:     *obj.Key,
+				StartLSN:  startLSN,
+				EndLSN:    endLSN,
+				FileSize:  *obj.Size,
+				Encrypted: s.kms != nil,
+			})
+		}
+		if !aws.ToBool(out.IsTruncated) || out.NextContinuationToken == nil {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+
+	// Order oldest -> newest: bootstrap/image layers first, then L1/L0 by LSN & filename.
+	sort.Slice(layers, func(i, j int) bool {
+		if layers[i].EndLSN != layers[j].EndLSN {
+			return layers[i].EndLSN < layers[j].EndLSN
+		}
+		if layers[i].Kind != layers[j].Kind {
+			return layers[i].Kind > layers[j].Kind // Image > L1 > L0 at same LSN
+		}
+		return layers[i].FileName < layers[j].FileName
+	})
+	return layers, maxSeq, nil
+}
+
+func parseLayerFileName(name string) (kind LayerKind, seq, startLSN, endLSN uint64, ok bool) {
+	if !strings.HasSuffix(name, ".layer") {
+		return 0, 0, 0, 0, false
+	}
+	stem := strings.TrimSuffix(name, ".layer")
+	if strings.HasPrefix(stem, "img_bootstrap_") {
+		lsnHex := strings.TrimPrefix(stem, "img_bootstrap_")
+		lsn, err := strconv.ParseUint(lsnHex, 16, 64)
+		if err != nil {
+			return 0, 0, 0, 0, false
+		}
+		return LayerKindImage, 0, lsn, lsn, true
+	}
+	parts := strings.Split(stem, "_")
+	if len(parts) != 4 {
+		return 0, 0, 0, 0, false
+	}
+	switch parts[0] {
+	case "img":
+		kind = LayerKindImage
+	case "l1":
+		kind = LayerKindL1
+	case "l0":
+		kind = LayerKindL0
+	default:
+		return 0, 0, 0, 0, false
+	}
+	var err error
+	if seq, err = strconv.ParseUint(parts[1], 10, 64); err != nil {
+		return 0, 0, 0, 0, false
+	}
+	if startLSN, err = strconv.ParseUint(parts[2], 16, 64); err != nil {
+		return 0, 0, 0, 0, false
+	}
+	if endLSN, err = strconv.ParseUint(parts[3], 16, 64); err != nil {
+		return 0, 0, 0, 0, false
+	}
+	return kind, seq, startLSN, endLSN, true
 }

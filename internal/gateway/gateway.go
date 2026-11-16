@@ -136,6 +136,9 @@ func (g *Gateway) getOrCreatePool(tenantID, sockDir string, port int, appPasswor
 		return p
 	}
 	p := newTenantPool(tenantID, sockDir, port, appPassword, g.poolMaxBackends)
+	p.setWakeFn(func(ctx context.Context) (int, string, string, error) {
+		return g.cp.WakeTenant(ctx, tenantID)
+	})
 	g.pools[tenantID] = p
 	return p
 }
@@ -232,7 +235,7 @@ func (g *Gateway) handleConn(rawConn net.Conn) {
 		return
 	}
 	if state == "SUSPENDED" {
-		wakeCtx, wakeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		wakeCtx, wakeCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		wPort, wSock, wPass, wakeErr := g.cp.WakeTenant(wakeCtx, startupTenant)
 		wakeCancel()
 		if wakeErr != nil {

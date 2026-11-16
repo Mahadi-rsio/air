@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -59,6 +60,7 @@ type TenantPool struct {
 	appPassword string
 	idlePool    []*backendConn
 	sem         chan struct{}
+	wakeFn      func(ctx context.Context) (port int, sockDir string, appPassword string, err error)
 
 	stmtSeq       atomic.Uint64
 	clientSeq     atomic.Uint64
@@ -79,6 +81,12 @@ func newTenantPool(tenantID, sockDir string, port int, appPassword string, maxBa
 		appPassword: appPassword,
 		sem:         make(chan struct{}, maxBackends),
 	}
+}
+
+func (p *TenantPool) setWakeFn(fn func(ctx context.Context) (int, string, string, error)) {
+	p.mu.Lock()
+	p.wakeFn = fn
+	p.mu.Unlock()
 }
 
 func (p *TenantPool) updateEndpoint(sockDir string, port int, appPassword string) {
@@ -140,6 +148,16 @@ func (p *TenantPool) acquireBackend(clientID uint64) (*backendConn, error) {
 	return b, nil
 }
 
+func dialBackendConn(sockDir string, port int) (net.Conn, error) {
+	if sockDir != "" {
+		sockPath := filepath.Join(sockDir, fmt.Sprintf(".s.PGSQL.%d", port))
+		if c, err := net.DialTimeout("unix", sockPath, 5*time.Second); err == nil {
+			return c, nil
+		}
+	}
+	return net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
+}
+
 func (p *TenantPool) acquireBackendLocked(clientID uint64) (*backendConn, error) {
 	p.mu.Lock()
 	if len(p.idlePool) > 0 {
@@ -153,6 +171,9 @@ func (p *TenantPool) acquireBackendLocked(clientID uint64) (*backendConn, error)
 			}
 			b.lastClientID = clientID
 			b.preparedStmts = make(map[string]bool)
+		} else if err := execSimpleBackend(b, ""); err != nil {
+			b.Close()
+			return p.acquireBackendLocked(clientID)
 		}
 		return b, nil
 	}
@@ -161,21 +182,44 @@ func (p *TenantPool) acquireBackendLocked(clientID uint64) (*backendConn, error)
 	user := p.backendUser
 	appPass := p.appPassword
 	db := p.tenantID
+	wakeFn := p.wakeFn
 	p.mu.Unlock()
 
-	var c net.Conn
-	var err error
-	if sockDir != "" {
-		sockPath := filepath.Join(sockDir, fmt.Sprintf(".s.PGSQL.%d", port))
-		c, err = net.DialTimeout("unix", sockPath, 5*time.Second)
+	dialAndStartup := func(sd string, prt int, pass string) (*backendConn, error) {
+		c, dialErr := dialBackendConn(sd, prt)
+		if dialErr != nil {
+			return nil, dialErr
+		}
+		b, stErr := startupBackendConn(c, user, pass, db, clientID)
+		if stErr != nil {
+			_ = c.Close()
+			return nil, stErr
+		}
+		return b, nil
 	}
-	if c == nil {
-		c, err = net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
+
+	b, err := dialAndStartup(sockDir, port, appPass)
+	if err != nil && wakeFn != nil {
+		wakeCtx, wakeCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		wPort, wSock, wPass, wakeErr := wakeFn(wakeCtx)
+		wakeCancel()
+		if wakeErr == nil && wPort > 0 {
+			p.updateEndpoint(wSock, wPort, wPass)
+			p.mu.Lock()
+			sockDir = p.sockDir
+			port = p.port
+			appPass = p.appPassword
+			p.mu.Unlock()
+			b, err = dialAndStartup(sockDir, port, appPass)
+		}
 	}
 	if err != nil {
 		return nil, err
 	}
+	return b, nil
+}
 
+func startupBackendConn(c net.Conn, user, appPass, db string, clientID uint64) (*backendConn, error) {
 	fe := pgproto3.NewFrontend(c, c)
 	fe.Send(&pgproto3.StartupMessage{
 		ProtocolVersion: pgproto3.ProtocolVersionNumber,
@@ -186,14 +230,12 @@ func (p *TenantPool) acquireBackendLocked(clientID uint64) (*backendConn, error)
 		},
 	})
 	if err := fe.Flush(); err != nil {
-		_ = c.Close()
 		return nil, err
 	}
 
 	for {
 		msg, err := fe.Receive()
 		if err != nil {
-			_ = c.Close()
 			return nil, err
 		}
 		switch m := msg.(type) {
@@ -201,14 +243,12 @@ func (p *TenantPool) acquireBackendLocked(clientID uint64) (*backendConn, error)
 		case *pgproto3.AuthenticationCleartextPassword:
 			fe.Send(&pgproto3.PasswordMessage{Password: appPass})
 			if err := fe.Flush(); err != nil {
-				_ = c.Close()
 				return nil, err
 			}
 		case *pgproto3.ParameterStatus, *pgproto3.BackendKeyData:
 		case *pgproto3.ReadyForQuery:
 			return &backendConn{conn: c, fe: fe, lastClientID: clientID}, nil
 		case *pgproto3.ErrorResponse:
-			_ = c.Close()
 			return nil, fmt.Errorf("backend startup error (%s): %s", m.Code, m.Message)
 		}
 	}
@@ -446,29 +486,68 @@ func (p *TenantPool) serveClient(clientConn net.Conn, startupUser, expectedPass 
 			}
 		}
 
+		failCycle := func(err error) bool {
+			if currentBackend != nil {
+				p.releaseBackend(currentBackend, true)
+				currentBackend = nil
+			}
+			txStatus = 'I'
+			if inTxCounted {
+				p.activeTxCount.Add(-1)
+				inTxCounted = false
+			}
+			be.Send(&pgproto3.ErrorResponse{
+				Severity: "ERROR",
+				Code:     "08006",
+				Message:  err.Error(),
+			})
+			be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+			return be.Flush() == nil
+		}
+
 		completedCycle := false
 		switch m := msg.(type) {
 		case *pgproto3.Query:
 			m.String = rewriteSQLQuery(m.String)
 			currentBackend.fe.Send(m)
 			if err := currentBackend.fe.Flush(); err != nil {
-				p.releaseBackend(currentBackend, true)
-				currentBackend = nil
-				if inTxCounted {
-					p.activeTxCount.Add(-1)
-					inTxCounted = false
+				if txStatus == 'I' {
+					p.releaseBackend(currentBackend, true)
+					currentBackend = nil
+					b, acqErr := p.acquireBackend(clientID)
+					if acqErr != nil {
+						if !failCycle(acqErr) {
+							return
+						}
+						continue
+					}
+					if prepErr := ensureSessionAndStmts(b); prepErr != nil {
+						p.releaseBackend(b, true)
+						if !failCycle(prepErr) {
+							return
+						}
+						continue
+					}
+					currentBackend = b
+					currentBackend.fe.Send(m)
+					if err2 := currentBackend.fe.Flush(); err2 != nil {
+						if !failCycle(err2) {
+							return
+						}
+						continue
+					}
+				} else {
+					if !failCycle(err) {
+						return
+					}
+					continue
 				}
-				continue
 			}
 			var errB error
 			txStatus, errB = flushPoolBackendReplies(currentBackend, be, true)
 			if errB != nil {
-				p.releaseBackend(currentBackend, true)
-				currentBackend = nil
-				txStatus = 'I'
-				if inTxCounted {
-					p.activeTxCount.Add(-1)
-					inTxCounted = false
+				if !failCycle(errB) {
+					return
 				}
 				continue
 			}
@@ -546,20 +625,14 @@ func (p *TenantPool) serveClient(clientConn net.Conn, startupUser, expectedPass 
 		case *pgproto3.Flush:
 			currentBackend.fe.Send(m)
 			if err := currentBackend.fe.Flush(); err != nil {
-				p.releaseBackend(currentBackend, true)
-				currentBackend = nil
-				if inTxCounted {
-					p.activeTxCount.Add(-1)
-					inTxCounted = false
+				if !failCycle(err) {
+					return
 				}
 				continue
 			}
 			if err := flushPoolMidPipelineReplies(currentBackend, be); err != nil {
-				p.releaseBackend(currentBackend, true)
-				currentBackend = nil
-				if inTxCounted {
-					p.activeTxCount.Add(-1)
-					inTxCounted = false
+				if !failCycle(err) {
+					return
 				}
 				continue
 			}
@@ -567,23 +640,16 @@ func (p *TenantPool) serveClient(clientConn net.Conn, startupUser, expectedPass 
 		case *pgproto3.Sync:
 			currentBackend.fe.Send(m)
 			if err := currentBackend.fe.Flush(); err != nil {
-				p.releaseBackend(currentBackend, true)
-				currentBackend = nil
-				if inTxCounted {
-					p.activeTxCount.Add(-1)
-					inTxCounted = false
+				if !failCycle(err) {
+					return
 				}
 				continue
 			}
 			var errB error
 			txStatus, errB = flushPoolBackendReplies(currentBackend, be, true)
 			if errB != nil {
-				p.releaseBackend(currentBackend, true)
-				currentBackend = nil
-				txStatus = 'I'
-				if inTxCounted {
-					p.activeTxCount.Add(-1)
-					inTxCounted = false
+				if !failCycle(errB) {
+					return
 				}
 				continue
 			}

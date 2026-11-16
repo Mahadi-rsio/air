@@ -63,6 +63,38 @@ func (t *Timeline) AddLayer(meta LayerMeta) {
 	}
 }
 
+// LoadLayersFromR2 populates t.layers from R2 if the timeline currently has no layers loaded.
+func (t *Timeline) LoadLayersFromR2(ctx context.Context) error {
+	t.mu.RLock()
+	hasLayers := len(t.layers) > 0
+	t.mu.RUnlock()
+	if hasLayers || t.store == nil {
+		return nil
+	}
+	layers, maxSeq, err := t.store.ListLayersFromR2(ctx, t.tenantID, t.epoch)
+	if err != nil {
+		return err
+	}
+	if len(layers) == 0 {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.layers) > 0 {
+		return nil
+	}
+	t.layers = layers
+	if maxSeq > t.layerSeq {
+		t.layerSeq = maxSeq
+	}
+	for _, lm := range layers {
+		if lm.EndLSN > t.lastLSN {
+			t.lastLSN = lm.EndLSN
+		}
+	}
+	return nil
+}
+
 // PutPage inserts a full 8192-byte page snapshot into the active InMemoryLayer.
 func (t *Timeline) PutPage(key Key, lsn uint64, page []byte) {
 	p := make([]byte, PageSize)
@@ -233,7 +265,7 @@ func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byt
 		if lsn != 0 && lm.StartLSN > lsn {
 			continue
 		}
-		if key.Compare(lm.StartKey) < 0 || key.Compare(lm.EndKey) > 0 {
+		if lm.EndKey != (Key{}) && (key.Compare(lm.StartKey) < 0 || key.Compare(lm.EndKey) > 0) {
 			continue
 		}
 		deltas, err := t.store.LookupKeyInLayer(ctx, lm, key, lsn)

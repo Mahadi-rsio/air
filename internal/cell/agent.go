@@ -521,7 +521,7 @@ func (a *Agent) StartOrAdoptTenant(tenantID string, epoch int64) (*TenantRuntime
 		pid, port, _ = readPostmasterDetails(pgData)
 	}
 
-	if err := a.waitReady(sockDir, port, 10*time.Second); err != nil {
+	if err := a.waitReady(sockDir, port, 20*time.Second); err != nil {
 		return nil, fmt.Errorf("tenant %s readiness check failed: %w", tenantID, err)
 	}
 
@@ -868,7 +868,7 @@ func (a *Agent) waitReady(sockDir string, port int, timeout time.Duration) error
 	deadline := time.Now().Add(timeout)
 	connStr := fmt.Sprintf("host=%s port=%d user=postgres dbname=postgres", sockDir, port)
 	for time.Now().Before(deadline) {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		conn, err := pgx.Connect(ctx, connStr)
 		if err == nil {
 			var one int
