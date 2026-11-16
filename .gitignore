@@ -1,4 +1,7 @@
 .env
 .env.*
 .wrangler/
+extensions/air_smgr/*.o
+extensions/air_smgr/*.so
+extensions/air_smgr/*.bc
 

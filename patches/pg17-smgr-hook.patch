@@ -1,0 +1,325 @@
+diff -ruN a/src/backend/storage/smgr/smgr.c b/src/backend/storage/smgr/smgr.c
+--- a/src/backend/storage/smgr/smgr.c	2026-11-16 02:02:01.978647109 +0000
++++ b/src/backend/storage/smgr/smgr.c	2026-11-16 02:02:16.389646143 +0000
+@@ -71,42 +71,8 @@
+  * would normally be errors should be allowed during bootstrap and/or WAL
+  * recovery --- see comments in md.c for details.
+  */
+-typedef struct f_smgr
+-{
+-	void		(*smgr_init) (void);	/* may be NULL */
+-	void		(*smgr_shutdown) (void);	/* may be NULL */
+-	void		(*smgr_open) (SMgrRelation reln);
+-	void		(*smgr_close) (SMgrRelation reln, ForkNumber forknum);
+-	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
+-								bool isRedo);
+-	bool		(*smgr_exists) (SMgrRelation reln, ForkNumber forknum);
+-	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
+-								bool isRedo);
+-	void		(*smgr_extend) (SMgrRelation reln, ForkNumber forknum,
+-								BlockNumber blocknum, const void *buffer, bool skipFsync);
+-	void		(*smgr_zeroextend) (SMgrRelation reln, ForkNumber forknum,
+-									BlockNumber blocknum, int nblocks, bool skipFsync);
+-	bool		(*smgr_prefetch) (SMgrRelation reln, ForkNumber forknum,
+-								  BlockNumber blocknum, int nblocks);
+-	void		(*smgr_readv) (SMgrRelation reln, ForkNumber forknum,
+-							   BlockNumber blocknum,
+-							   void **buffers, BlockNumber nblocks);
+-	void		(*smgr_writev) (SMgrRelation reln, ForkNumber forknum,
+-								BlockNumber blocknum,
+-								const void **buffers, BlockNumber nblocks,
+-								bool skipFsync);
+-	void		(*smgr_writeback) (SMgrRelation reln, ForkNumber forknum,
+-								   BlockNumber blocknum, BlockNumber nblocks);
+-	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
+-	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
+-								  BlockNumber old_blocks, BlockNumber nblocks);
+-	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
+-	void		(*smgr_registersync) (SMgrRelation reln, ForkNumber forknum);
+-} f_smgr;
+ 
+-static const f_smgr smgrsw[] = {
+-	/* magnetic disk */
+-	{
++static const f_smgr smgr_md = {
+ 		.smgr_init = mdinit,
+ 		.smgr_shutdown = NULL,
+ 		.smgr_open = mdopen,
+@@ -124,10 +90,30 @@
+ 		.smgr_truncate = mdtruncate,
+ 		.smgr_immedsync = mdimmedsync,
+ 		.smgr_registersync = mdregistersync,
+-	}
+ };
+ 
+-static const int NSmgr = lengthof(smgrsw);
++static const f_smgr *smgrsw[MAX_SMGR] = {
++	&smgr_md
++};
++
++static int NSmgr = 1;
++
++smgr_hook_type smgr_hook = NULL;
++
++int
++smgr_register(const f_smgr *smgr)
++{
++	if (NSmgr >= MAX_SMGR)
++		ereport(ERROR, (errmsg("cannot register more than %d storage managers", MAX_SMGR)));
++	smgrsw[NSmgr] = smgr;
++	return NSmgr++;
++}
++
++const f_smgr *
++smgr_get_standard(void)
++{
++	return &smgr_md;
++}
+ 
+ /*
+  * Each backend has a hashtable that stores all extant SMgrRelation objects.
+@@ -157,8 +143,8 @@
+ 
+ 	for (i = 0; i < NSmgr; i++)
+ 	{
+-		if (smgrsw[i].smgr_init)
+-			smgrsw[i].smgr_init();
++		if (smgrsw[i]->smgr_init)
++			smgrsw[i]->smgr_init();
+ 	}
+ 
+ 	/* register the shutdown proc */
+@@ -175,8 +161,8 @@
+ 
+ 	for (i = 0; i < NSmgr; i++)
+ 	{
+-		if (smgrsw[i].smgr_shutdown)
+-			smgrsw[i].smgr_shutdown();
++		if (smgrsw[i]->smgr_shutdown)
++			smgrsw[i]->smgr_shutdown();
+ 	}
+ }
+ 
+@@ -229,14 +215,14 @@
+ 		reln->smgr_targblock = InvalidBlockNumber;
+ 		for (int i = 0; i <= MAX_FORKNUM; ++i)
+ 			reln->smgr_cached_nblocks[i] = InvalidBlockNumber;
+-		reln->smgr_which = 0;	/* we only have md.c at present */
++		reln->smgr_which = smgr_hook ? smgr_hook(rlocator, backend) : 0;
+ 
+ 		/* it is not pinned yet */
+ 		reln->pincount = 0;
+ 		dlist_push_tail(&unpinned_relns, &reln->node);
+ 
+ 		/* implementation-specific initialization */
+-		smgrsw[reln->smgr_which].smgr_open(reln);
++		smgrsw[reln->smgr_which]->smgr_open(reln);
+ 	}
+ 
+ 	return reln;
+@@ -281,7 +267,7 @@
+ 	Assert(reln->pincount == 0);
+ 
+ 	for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+-		smgrsw[reln->smgr_which].smgr_close(reln, forknum);
++		smgrsw[reln->smgr_which]->smgr_close(reln, forknum);
+ 
+ 	dlist_delete(&reln->node);
+ 
+@@ -301,7 +287,7 @@
+ {
+ 	for (ForkNumber forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+ 	{
+-		smgrsw[reln->smgr_which].smgr_close(reln, forknum);
++		smgrsw[reln->smgr_which]->smgr_close(reln, forknum);
+ 		reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
+ 	}
+ 	reln->smgr_targblock = InvalidBlockNumber;
+@@ -397,7 +383,7 @@
+ bool
+ smgrexists(SMgrRelation reln, ForkNumber forknum)
+ {
+-	return smgrsw[reln->smgr_which].smgr_exists(reln, forknum);
++	return smgrsw[reln->smgr_which]->smgr_exists(reln, forknum);
+ }
+ 
+ /*
+@@ -410,7 +396,7 @@
+ void
+ smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
+ {
+-	smgrsw[reln->smgr_which].smgr_create(reln, forknum, isRedo);
++	smgrsw[reln->smgr_which]->smgr_create(reln, forknum, isRedo);
+ }
+ 
+ /*
+@@ -442,8 +428,8 @@
+ 
+ 		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+ 		{
+-			if (smgrsw[which].smgr_exists(rels[i], forknum))
+-				smgrsw[which].smgr_immedsync(rels[i], forknum);
++			if (smgrsw[which]->smgr_exists(rels[i], forknum))
++				smgrsw[which]->smgr_immedsync(rels[i], forknum);
+ 		}
+ 	}
+ }
+@@ -488,7 +474,7 @@
+ 
+ 		/* Close the forks at smgr level */
+ 		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+-			smgrsw[which].smgr_close(rels[i], forknum);
++			smgrsw[which]->smgr_close(rels[i], forknum);
+ 	}
+ 
+ 	/*
+@@ -515,7 +501,7 @@
+ 		int			which = rels[i]->smgr_which;
+ 
+ 		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+-			smgrsw[which].smgr_unlink(rlocators[i], forknum, isRedo);
++			smgrsw[which]->smgr_unlink(rlocators[i], forknum, isRedo);
+ 	}
+ 
+ 	pfree(rlocators);
+@@ -535,7 +521,7 @@
+ smgrextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ 		   const void *buffer, bool skipFsync)
+ {
+-	smgrsw[reln->smgr_which].smgr_extend(reln, forknum, blocknum,
++	smgrsw[reln->smgr_which]->smgr_extend(reln, forknum, blocknum,
+ 										 buffer, skipFsync);
+ 
+ 	/*
+@@ -560,7 +546,7 @@
+ smgrzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ 			   int nblocks, bool skipFsync)
+ {
+-	smgrsw[reln->smgr_which].smgr_zeroextend(reln, forknum, blocknum,
++	smgrsw[reln->smgr_which]->smgr_zeroextend(reln, forknum, blocknum,
+ 											 nblocks, skipFsync);
+ 
+ 	/*
+@@ -585,7 +571,7 @@
+ smgrprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ 			 int nblocks)
+ {
+-	return smgrsw[reln->smgr_which].smgr_prefetch(reln, forknum, blocknum, nblocks);
++	return smgrsw[reln->smgr_which]->smgr_prefetch(reln, forknum, blocknum, nblocks);
+ }
+ 
+ /*
+@@ -600,7 +586,7 @@
+ smgrreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ 		  void **buffers, BlockNumber nblocks)
+ {
+-	smgrsw[reln->smgr_which].smgr_readv(reln, forknum, blocknum, buffers,
++	smgrsw[reln->smgr_which]->smgr_readv(reln, forknum, blocknum, buffers,
+ 										nblocks);
+ }
+ 
+@@ -631,7 +617,7 @@
+ smgrwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ 		   const void **buffers, BlockNumber nblocks, bool skipFsync)
+ {
+-	smgrsw[reln->smgr_which].smgr_writev(reln, forknum, blocknum,
++	smgrsw[reln->smgr_which]->smgr_writev(reln, forknum, blocknum,
+ 										 buffers, nblocks, skipFsync);
+ }
+ 
+@@ -643,7 +629,7 @@
+ smgrwriteback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ 			  BlockNumber nblocks)
+ {
+-	smgrsw[reln->smgr_which].smgr_writeback(reln, forknum, blocknum,
++	smgrsw[reln->smgr_which]->smgr_writeback(reln, forknum, blocknum,
+ 											nblocks);
+ }
+ 
+@@ -661,7 +647,7 @@
+ 	if (result != InvalidBlockNumber)
+ 		return result;
+ 
+-	result = smgrsw[reln->smgr_which].smgr_nblocks(reln, forknum);
++	result = smgrsw[reln->smgr_which]->smgr_nblocks(reln, forknum);
+ 
+ 	reln->smgr_cached_nblocks[forknum] = result;
+ 
+@@ -753,7 +739,7 @@
+ 		/* Make the cached size is invalid if we encounter an error. */
+ 		reln->smgr_cached_nblocks[forknum[i]] = InvalidBlockNumber;
+ 
+-		smgrsw[reln->smgr_which].smgr_truncate(reln, forknum[i],
++		smgrsw[reln->smgr_which]->smgr_truncate(reln, forknum[i],
+ 											   old_nblocks[i], nblocks[i]);
+ 
+ 		/*
+@@ -791,7 +777,7 @@
+ void
+ smgrregistersync(SMgrRelation reln, ForkNumber forknum)
+ {
+-	smgrsw[reln->smgr_which].smgr_registersync(reln, forknum);
++	smgrsw[reln->smgr_which]->smgr_registersync(reln, forknum);
+ }
+ 
+ /*
+@@ -823,7 +809,7 @@
+ void
+ smgrimmedsync(SMgrRelation reln, ForkNumber forknum)
+ {
+-	smgrsw[reln->smgr_which].smgr_immedsync(reln, forknum);
++	smgrsw[reln->smgr_which]->smgr_immedsync(reln, forknum);
+ }
+ 
+ /*
+diff -ruN a/src/include/storage/smgr.h b/src/include/storage/smgr.h
+--- a/src/include/storage/smgr.h	2026-11-16 02:02:01.897647114 +0000
++++ b/src/include/storage/smgr.h	2026-11-16 02:02:16.389646143 +0000
+@@ -73,6 +73,47 @@
+ #define SmgrIsTemp(smgr) \
+ 	RelFileLocatorBackendIsTemp((smgr)->smgr_rlocator)
+ 
++typedef struct f_smgr
++{
++	void		(*smgr_init) (void);	/* may be NULL */
++	void		(*smgr_shutdown) (void);	/* may be NULL */
++	void		(*smgr_open) (SMgrRelation reln);
++	void		(*smgr_close) (SMgrRelation reln, ForkNumber forknum);
++	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
++								bool isRedo);
++	bool		(*smgr_exists) (SMgrRelation reln, ForkNumber forknum);
++	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
++								bool isRedo);
++	void		(*smgr_extend) (SMgrRelation reln, ForkNumber forknum,
++								BlockNumber blocknum, const void *buffer, bool skipFsync);
++	void		(*smgr_zeroextend) (SMgrRelation reln, ForkNumber forknum,
++									BlockNumber blocknum, int nblocks, bool skipFsync);
++	bool		(*smgr_prefetch) (SMgrRelation reln, ForkNumber forknum,
++								  BlockNumber blocknum, int nblocks);
++	void		(*smgr_readv) (SMgrRelation reln, ForkNumber forknum,
++							   BlockNumber blocknum,
++							   void **buffers, BlockNumber nblocks);
++	void		(*smgr_writev) (SMgrRelation reln, ForkNumber forknum,
++								BlockNumber blocknum,
++								const void **buffers, BlockNumber nblocks,
++								bool skipFsync);
++	void		(*smgr_writeback) (SMgrRelation reln, ForkNumber forknum,
++								   BlockNumber blocknum, BlockNumber nblocks);
++	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
++	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
++								  BlockNumber old_blocks, BlockNumber nblocks);
++	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
++	void		(*smgr_registersync) (SMgrRelation reln, ForkNumber forknum);
++} f_smgr;
++
++#define MAX_SMGR 4
++
++typedef int (*smgr_hook_type) (RelFileLocator rlocator, ProcNumber backend);
++extern PGDLLIMPORT smgr_hook_type smgr_hook;
++
++extern int smgr_register(const f_smgr *smgr);
++extern const f_smgr *smgr_get_standard(void);
++
+ extern void smgrinit(void);
+ extern SMgrRelation smgropen(RelFileLocator rlocator, ProcNumber backend);
+ extern bool smgrexists(SMgrRelation reln, ForkNumber forknum);

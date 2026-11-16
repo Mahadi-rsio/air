@@ -1,0 +1,4 @@
+comment = 'AIR Pageserver storage manager for PostgreSQL 17'
+default_version = '1.0'
+module_pathname = '$libdir/air_smgr'
+relocatable = false
