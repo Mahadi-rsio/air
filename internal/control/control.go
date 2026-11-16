@@ -97,9 +97,13 @@ type ControlPlane struct {
 	backupBucket string
 	r2Primary    bool
 	pageserver   *pageserver.Pageserver
+	psMu         sync.RWMutex
 	wakeGroup    singleflight.Group
 	activityMu   sync.Mutex
 	lastActivity map[string]time.Time
+	walMu        sync.Mutex
+	walReceivers map[string]context.CancelFunc
+	walDone      map[string]chan struct{}
 }
 
 // NewControlPlane initializes a ControlPlane backed by a local single-node PG17 MetaDir.
@@ -246,9 +250,139 @@ func (cp *ControlPlane) SetBackupStore(s3c *s3.Client, bucket string) {
 
 // SetPageserver attaches an in-process AIR Pageserver for layer flushing and wake coordination.
 func (cp *ControlPlane) SetPageserver(ps *pageserver.Pageserver) {
-	cp.provMu.Lock()
+	cp.psMu.Lock()
 	cp.pageserver = ps
-	cp.provMu.Unlock()
+	cp.psMu.Unlock()
+}
+
+func (cp *ControlPlane) getPageserver() *pageserver.Pageserver {
+	cp.psMu.RLock()
+	defer cp.psMu.RUnlock()
+	return cp.pageserver
+}
+
+func parsePGLSN(s string) (uint64, error) {
+	var hi, lo uint32
+	if _, err := fmt.Sscanf(strings.TrimSpace(s), "%X/%X", &hi, &lo); err != nil {
+		return 0, fmt.Errorf("parse LSN %q: %w", s, err)
+	}
+	return (uint64(hi) << 32) | uint64(lo), nil
+}
+
+func (cp *ControlPlane) ensurePageserverBootstrapAndWAL(ctx context.Context, tenantID string, rt *cell.TenantRuntime) error {
+	ps := cp.getPageserver()
+	if ps == nil || rt == nil {
+		return nil
+	}
+
+	tl := ps.EnsureTenant(tenantID, rt.FencingEpoch)
+	if tl.LastLSN() == 0 && rt.PGData != "" && rt.SockDir != "" && rt.Port > 0 {
+		connStr := fmt.Sprintf("host=%s port=%d user=postgres dbname=postgres", rt.SockDir, rt.Port)
+		connCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		conn, err := pgx.Connect(connCtx, connStr)
+		if err != nil {
+			cancel()
+			return fmt.Errorf("connect for pageserver bootstrap: %w", err)
+		}
+		var lsnStr string
+		if _, err := conn.Exec(connCtx, `CHECKPOINT`); err != nil {
+			_ = conn.Close(connCtx)
+			cancel()
+			return fmt.Errorf("checkpoint for pageserver bootstrap: %w", err)
+		}
+		if err := conn.QueryRow(connCtx, `SELECT pg_current_wal_lsn()::text`).Scan(&lsnStr); err != nil {
+			_ = conn.Close(connCtx)
+			cancel()
+			return fmt.Errorf("read init LSN for pageserver bootstrap: %w", err)
+		}
+		_ = conn.Close(connCtx)
+		cancel()
+
+		initLSN, err := parsePGLSN(lsnStr)
+		if err != nil {
+			return err
+		}
+		if _, err := ps.BootstrapTenantFromPGData(ctx, tenantID, rt.FencingEpoch, rt.PGData, initLSN); err != nil {
+			return fmt.Errorf("bootstrap pageserver from pgdata: %w", err)
+		}
+	}
+
+	if rt.SockDir == "" || rt.Port <= 0 {
+		return nil
+	}
+
+	cp.stopWALReceiver(tenantID)
+
+	rxCtx, rxCancel := context.WithCancel(context.Background())
+	doneCh := make(chan struct{})
+	dsn := fmt.Sprintf("host=%s port=%d user=postgres dbname=postgres replication=database", rt.SockDir, rt.Port)
+	rx := pageserver.NewWALReceiver(dsn, tl, tl.LastLSN())
+
+	cp.walMu.Lock()
+	if cp.walReceivers == nil {
+		cp.walReceivers = make(map[string]context.CancelFunc)
+	}
+	if cp.walDone == nil {
+		cp.walDone = make(map[string]chan struct{})
+	}
+	cp.walReceivers[tenantID] = rxCancel
+	cp.walDone[tenantID] = doneCh
+	cp.walMu.Unlock()
+
+	go func() {
+		defer close(doneCh)
+		if err := rx.Run(rxCtx); err != nil && rxCtx.Err() == nil {
+			log.Printf("[pageserver] walreceiver for %s exited: %v", tenantID, err)
+		}
+	}()
+	return nil
+}
+
+func (cp *ControlPlane) stopWALReceiver(tenantID string) {
+	cp.walMu.Lock()
+	cancel := cp.walReceivers[tenantID]
+	done := cp.walDone[tenantID]
+	delete(cp.walReceivers, tenantID)
+	delete(cp.walDone, tenantID)
+	cp.walMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func (cp *ControlPlane) stopAllWALReceivers() {
+	cp.walMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(cp.walReceivers))
+	dones := make([]chan struct{}, 0, len(cp.walDone))
+	for k, c := range cp.walReceivers {
+		cancels = append(cancels, c)
+		delete(cp.walReceivers, k)
+	}
+	for k, d := range cp.walDone {
+		dones = append(dones, d)
+		delete(cp.walDone, k)
+	}
+	cp.walMu.Unlock()
+
+	for _, c := range cancels {
+		c()
+	}
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for _, d := range dones {
+		select {
+		case <-d:
+		case <-deadline.C:
+			return
+		}
+	}
 }
 
 func (cp *ControlPlane) backupStore() (*s3.Client, string) {
@@ -547,6 +681,10 @@ func (cp *ControlPlane) ProvisionDatabase(ctx context.Context, accountID, idempo
 		return nil, err
 	}
 
+	if err := cp.ensurePageserverBootstrapAndWAL(ctx, tenantID, rt); err != nil {
+		log.Printf("[pageserver] bootstrap/walreceiver for %s failed: %v", tenantID, err)
+	}
+
 	resp.Password = appPW
 	return &resp, nil
 }
@@ -681,6 +819,7 @@ func (cp *ControlPlane) DeleteDatabase(ctx context.Context, accountID, tenantID 
 	if _, err := cp.db.Exec(ctx, `UPDATE clusters SET state = 'DELETING', updated_at = now() WHERE tenant_id = $1`, tenantID); err != nil {
 		return err
 	}
+	cp.stopWALReceiver(tenantID)
 	if cp.agent != nil {
 		if err := cp.agent.StopAndPurgeTenant(tenantID); err != nil {
 			return err
@@ -1013,9 +1152,15 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 				return nil, fmt.Errorf("hydrate tenant %s from R2: %w", tenantID, hErr)
 			}
 		}
+		if cp.getPageserver() != nil {
+			_ = cp.agent.WriteTenantConfigs(tenantID)
+		}
 		rt, sErr := cp.agent.StartOrAdoptTenant(tenantID, epoch)
 		if sErr != nil {
 			return nil, sErr
+		}
+		if err := cp.ensurePageserverBootstrapAndWAL(ctx, tenantID, rt); err != nil {
+			log.Printf("[pageserver] wake walreceiver for %s failed: %v", tenantID, err)
 		}
 		if _, uErr := cp.db.Exec(ctx,
 			`UPDATE clusters SET state = 'ACTIVE', direct_port = $2, updated_at = NOW() WHERE tenant_id = $1`,
@@ -1094,8 +1239,9 @@ func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drai
 		if err := cp.agent.StopTenantClean(tenantID); err != nil {
 			return err
 		}
-		if cp.pageserver != nil {
-			if _, fErr := cp.pageserver.FlushTenant(ctx, tenantID); fErr != nil {
+		cp.stopWALReceiver(tenantID)
+		if ps := cp.getPageserver(); ps != nil {
+			if _, fErr := ps.FlushTenant(ctx, tenantID); fErr != nil {
 				return fmt.Errorf("flush pageserver layers for %s: %w", tenantID, fErr)
 			}
 		}
@@ -1291,6 +1437,7 @@ func (cp *ControlPlane) RevokeAPIKey(ctx context.Context, accountID, keyID strin
 }
 
 func (cp *ControlPlane) Close() {
+	cp.stopAllWALReceivers()
 	if cp.db != nil {
 		cp.db.Close()
 	}

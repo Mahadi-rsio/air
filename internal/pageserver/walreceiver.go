@@ -60,19 +60,24 @@ func (r *WALReceiver) Run(ctx context.Context) error {
 	}
 	defer conn.Close(context.Background())
 
-	startStr := formatLSN(r.startLSN)
-	if r.startLSN == 0 {
+	startLSN := r.startLSN
+	if startLSN == 0 {
 		res := conn.Exec(ctx, "IDENTIFY_SYSTEM")
 		rows, err := res.ReadAll()
 		if err != nil {
 			return fmt.Errorf("pageserver: IDENTIFY_SYSTEM: %w", err)
 		}
 		if len(rows) > 0 && len(rows[0].Rows) > 0 && len(rows[0].Rows[0]) >= 3 {
-			startStr = string(rows[0].Rows[0][2])
-		} else {
-			startStr = "0/0"
+			var hi, lo uint32
+			if _, sErr := fmt.Sscanf(string(rows[0].Rows[0][2]), "%X/%X", &hi, &lo); sErr == nil {
+				startLSN = (uint64(hi) << 32) | uint64(lo)
+			}
 		}
 	}
+	// Align START_REPLICATION to an 8192-byte WAL page boundary so the stream
+	// begins with a valid XLogPageHeaderData.
+	alignedStart := startLSN & ^uint64(XLogPageSize-1)
+	startStr := formatLSN(alignedStart)
 
 	sql := fmt.Sprintf("START_REPLICATION %s", startStr)
 	conn.Frontend().Send(&pgproto3.Query{String: sql})
@@ -94,7 +99,7 @@ func (r *WALReceiver) Run(ctx context.Context) error {
 		}
 	}
 
-	var pageBuf []byte
+	var parser WALStreamParser
 	for {
 		select {
 		case <-ctx.Done():
@@ -116,11 +121,16 @@ func (r *WALReceiver) Run(ctx context.Context) error {
 			}
 			walEnd := binary.BigEndian.Uint64(cd.Data[9:17])
 			walPayload := cd.Data[25:]
-			pageBuf = append(pageBuf, walPayload...)
-			if len(pageBuf) >= XLogPageSize {
-				aligned := (len(pageBuf) / XLogPageSize) * XLogPageSize
-				_, _ = r.IngestWALPages(ctx, pageBuf[:aligned])
-				pageBuf = append([]byte(nil), pageBuf[aligned:]...)
+			recs, pErr := parser.Push(walPayload)
+			if pErr != nil {
+				n := len(walPayload)
+				if n > 16 {
+					n = 16
+				}
+				return fmt.Errorf("pageserver: parse wal stream at %x (len=%d head=%x): %w", binary.BigEndian.Uint64(cd.Data[1:9]), len(walPayload), walPayload[:n], pErr)
+			}
+			for _, rec := range recs {
+				r.timeline.ApplyWALRecord(rec)
 			}
 			_ = walEnd
 		case 'k':

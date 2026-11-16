@@ -78,6 +78,7 @@ func main() {
 			log.Fatalf("start pageserver: %v", psErr)
 		}
 		defer ps.Close()
+		ag.SetPageserverConfig(true, cfg.PageserverSocket, cfg.PageserverCacheMB)
 		cp.SetPageserver(ps)
 		log.Printf("[air-server] pageserver listening on %s (cache_mb=%d)", cfg.PageserverSocket, cfg.PageserverCacheMB)
 	}

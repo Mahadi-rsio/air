@@ -89,6 +89,22 @@ type Agent struct {
 	lastLeaseAckMono time.Time
 	watchdogFenced   atomic.Bool
 	watchdogKillMs   atomic.Int64
+
+	pageserverEnabled bool
+	pageserverSocket  string
+	lfcMaxMB          int
+}
+
+// SetPageserverConfig configures air_smgr GUC generation in tenant postgresql.conf files.
+func (a *Agent) SetPageserverConfig(enabled bool, socketPath string, lfcMaxMB int) {
+	a.tenantMu.Lock()
+	defer a.tenantMu.Unlock()
+	a.pageserverEnabled = enabled
+	a.pageserverSocket = socketPath
+	if lfcMaxMB < 0 {
+		lfcMaxMB = 0
+	}
+	a.lfcMaxMB = lfcMaxMB
 }
 
 func NewAgent(volDir, pgBinDir string, kms *crypto.EnvelopeKMS) (*Agent, error) {
@@ -359,6 +375,26 @@ func (a *Agent) WriteTenantConfigs(tenantID string) error {
 	}
 	port := a.allocOrReusePort(tenantID)
 
+	a.tenantMu.RLock()
+	psEnabled := a.pageserverEnabled
+	psSocket := a.pageserverSocket
+	lfcMaxMB := a.lfcMaxMB
+	a.tenantMu.RUnlock()
+
+	sharedLibs := "supautils"
+	smgrConf := ""
+	if psEnabled && psSocket != "" {
+		lfcDir := filepath.Join(activeBase, "lfc")
+		if err := os.MkdirAll(lfcDir, 0o700); err != nil {
+			return err
+		}
+		sharedLibs = "supautils,air_smgr"
+		smgrConf = fmt.Sprintf(
+			"air_smgr.enabled = on\nair_smgr.pageserver_socket = '%s'\nair_smgr.tenant_id = '%s'\nair_smgr.lfc_dir = '%s'\nair_smgr.lfc_max_mb = %d\n",
+			psSocket, tenantID, lfcDir, lfcMaxMB,
+		)
+	}
+
 	conf := fmt.Sprintf(`listen_addresses = '127.0.0.1'
 port = %d
 unix_socket_directories = '%s'
@@ -375,7 +411,7 @@ archive_mode = on
 archive_command = 'cp %%p %s/%%f'
 ssl = off
 logging_collector = off
-shared_preload_libraries = 'supautils'
+shared_preload_libraries = '%s'
 supautils.superuser = 'postgres'
 supautils.privileged_role = 'app_user'
 supautils.privileged_extensions = 'pg_stat_statements,pg_trgm'
@@ -383,7 +419,7 @@ supautils.privileged_role_allowed_configs = 'session_replication_role'
 supautils.reserved_roles = 'postgres'
 supautils.reserved_memberships = 'pg_read_server_files,pg_write_server_files,pg_execute_server_program,postgres'
 supautils.restrict_extension_versions = 'error'
-`, port, sockDir, walSpoolDir)
+%s`, port, sockDir, walSpoolDir, sharedLibs, smgrConf)
 	if err := os.WriteFile(filepath.Join(pgData, "postgresql.conf"), []byte(conf), 0o600); err != nil {
 		return err
 	}

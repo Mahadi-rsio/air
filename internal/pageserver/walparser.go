@@ -115,15 +115,16 @@ func DecodeWALRecord(lsn uint64, raw []byte) (*DecodedWALRecord, error) {
 		dataLen  uint16
 	}
 	var hdrs []blkHeader
+	payloadBytes := 0
 
 	// Parse block and metadata headers before payload section.
-	for off < int(totLen) {
+	for off+payloadBytes < int(totLen) {
 		id := recBuf[off]
 		off++
 		switch id {
 		case XLRBlockIDDataShort:
 			if off >= int(totLen) {
-				return nil, ErrTruncatedWAL
+				return nil, fmt.Errorf("%w: data_short off=%d totLen=%d", ErrTruncatedWAL, off, totLen)
 			}
 			mainDataLen = uint32(recBuf[off])
 			off++
@@ -150,7 +151,7 @@ func DecodeWALRecord(lsn uint64, raw []byte) (*DecodedWALRecord, error) {
 				return nil, fmt.Errorf("pageserver: unknown WAL block id %d", id)
 			}
 			if off+3 > int(totLen) {
-				return nil, ErrTruncatedWAL
+				return nil, fmt.Errorf("%w: blk_hdr id=%d off=%d totLen=%d", ErrTruncatedWAL, id, off, totLen)
 			}
 			forkFlags := recBuf[off]
 			dataLen := binary.LittleEndian.Uint16(recBuf[off+1 : off+3])
@@ -191,7 +192,7 @@ func DecodeWALRecord(lsn uint64, raw []byte) (*DecodedWALRecord, error) {
 
 			if (forkFlags & BkpBlockSameRel) == 0 {
 				if off+12 > int(totLen) {
-					return nil, ErrTruncatedWAL
+					return nil, fmt.Errorf("%w: rel_loc off=%d totLen=%d", ErrTruncatedWAL, off, totLen)
 				}
 				lastRel = RelFileLocator{
 					SpcOID:    binary.LittleEndian.Uint32(recBuf[off : off+4]),
@@ -212,6 +213,12 @@ func DecodeWALRecord(lsn uint64, raw []byte) (*DecodedWALRecord, error) {
 			off += 4
 
 			hdrs = append(hdrs, blkHeader{ref: ref, imgLen: imgLen, dataLen: dataLen})
+			if ref.HasImage {
+				payloadBytes += int(imgLen)
+			}
+			if ref.HasData {
+				payloadBytes += int(dataLen)
+			}
 		}
 	}
 
@@ -355,4 +362,145 @@ func ParseWALPages(data []byte) ([]*DecodedWALRecord, error) {
 
 func maxAlign8(n int) int {
 	return (n + 7) &^ 7
+}
+
+// WALStreamParser incrementally decodes PG17 WAL records from streaming walsender chunks
+// starting at an 8192-byte WAL page boundary.
+type WALStreamParser struct {
+	buf      []byte
+	pos      int
+	pageAddr uint64
+	inPage   bool
+	contBuf  []byte
+	contLSN  uint64
+	contNeed int
+}
+
+// Push appends a WAL chunk and returns all newly completed WAL records.
+func (p *WALStreamParser) Push(chunk []byte) ([]*DecodedWALRecord, error) {
+	p.buf = append(p.buf, chunk...)
+	var out []*DecodedWALRecord
+
+	for len(p.buf) >= SizeOfShortPHD {
+		pageLen := len(p.buf)
+		if pageLen > XLogPageSize {
+			pageLen = XLogPageSize
+		}
+
+		if !p.inPage {
+			magic := binary.LittleEndian.Uint16(p.buf[0:2])
+			if magic == 0 {
+				if len(p.buf) < XLogPageSize {
+					break
+				}
+				p.buf = append([]byte(nil), p.buf[XLogPageSize:]...)
+				p.pos = 0
+				p.inPage = false
+				continue
+			}
+			if magic != XLogPageMagic {
+				return out, fmt.Errorf("%w: got 0x%04x", ErrInvalidWALMagic, magic)
+			}
+			info := binary.LittleEndian.Uint16(p.buf[2:4])
+			hdrSize := SizeOfShortPHD
+			if (info & XLPLongHeader) != 0 {
+				hdrSize = SizeOfLongPHD
+			}
+			if pageLen < hdrSize {
+				break
+			}
+			p.pageAddr = binary.LittleEndian.Uint64(p.buf[8:16])
+			remLen := int(binary.LittleEndian.Uint32(p.buf[16:20]))
+			p.pos = hdrSize
+			p.inPage = true
+
+			if (info & XLPFirstIsContRecord) != 0 {
+				take := remLen
+				if p.pos+take > XLogPageSize {
+					take = XLogPageSize - p.pos
+				}
+				if pageLen < p.pos+take {
+					// Wait for the rest of the continuation bytes on this page.
+					if (info & XLPFirstIsOverwriteContRec) == 0 && len(p.contBuf) > 0 && p.contNeed > 0 {
+						// We'll process once enough bytes arrive.
+					}
+					p.inPage = false
+					break
+				}
+				if (info & XLPFirstIsOverwriteContRec) != 0 {
+					p.contBuf = nil
+					p.contNeed = 0
+				} else if len(p.contBuf) > 0 && p.contNeed > 0 {
+					p.contBuf = append(p.contBuf, p.buf[p.pos:p.pos+take]...)
+					p.contNeed -= take
+					if p.contNeed <= 0 {
+						rec, err := DecodeWALRecord(p.contLSN, p.contBuf)
+						if err != nil {
+							return out, err
+						}
+						out = append(out, rec)
+						p.contBuf = nil
+						p.contNeed = 0
+					}
+				}
+				p.pos += maxAlign8(take)
+				if pageLen < p.pos && pageLen < XLogPageSize {
+					// Wait for alignment padding bytes.
+					p.pos -= maxAlign8(take)
+					p.inPage = false
+					break
+				}
+			}
+		}
+
+		advancedPage := false
+		for p.pos+SizeOfXLogRecord <= pageLen {
+			totLen := int(binary.LittleEndian.Uint32(p.buf[p.pos : p.pos+4]))
+			if totLen == 0 {
+				if pageLen == XLogPageSize {
+					p.buf = append([]byte(nil), p.buf[XLogPageSize:]...)
+					p.pos = 0
+					p.inPage = false
+					advancedPage = true
+				}
+				break
+			}
+			recLSN := p.pageAddr + uint64(p.pos)
+			availInPage := XLogPageSize - p.pos
+			if totLen <= availInPage {
+				if p.pos+totLen > pageLen {
+					break
+				}
+				rec, err := DecodeWALRecord(recLSN, p.buf[p.pos:p.pos+totLen])
+				if err != nil {
+					return out, fmt.Errorf("pageAddr=%x pos=%d totLen=%d: %w", p.pageAddr, p.pos, totLen, err)
+				}
+				out = append(out, rec)
+				p.pos += maxAlign8(totLen)
+			} else {
+				if pageLen < XLogPageSize {
+					break
+				}
+				p.contLSN = recLSN
+				p.contBuf = append([]byte(nil), p.buf[p.pos:XLogPageSize]...)
+				p.contNeed = totLen - availInPage
+				p.buf = append([]byte(nil), p.buf[XLogPageSize:]...)
+				p.pos = 0
+				p.inPage = false
+				advancedPage = true
+				break
+			}
+		}
+		if advancedPage {
+			continue
+		}
+		if pageLen == XLogPageSize && p.pos+SizeOfXLogRecord > XLogPageSize {
+			p.buf = append([]byte(nil), p.buf[XLogPageSize:]...)
+			p.pos = 0
+			p.inPage = false
+			continue
+		}
+		break
+	}
+	return out, nil
 }
