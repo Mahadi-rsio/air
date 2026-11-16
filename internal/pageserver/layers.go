@@ -411,54 +411,9 @@ func (s *LayerStore) WriteLayer(ctx context.Context, meta LayerMeta, recs []Laye
 	return meta, nil
 }
 
-func (s *LayerStore) ensureLayerCached(ctx context.Context, meta LayerMeta) error {
-	if s.cache == nil || s.s3c == nil || s.bucket == "" || meta.FileSize <= 0 || meta.FileSize > s.cache.maxBytes {
-		return nil
-	}
-	s.dlMu.Lock()
-	if s.dlFlight == nil {
-		s.dlFlight = make(map[string]*layerDownload)
-	}
-	if f, ok := s.dlFlight[meta.R2Key]; ok {
-		s.dlMu.Unlock()
-		select {
-		case <-f.done:
-			return f.err
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	f := &layerDownload{done: make(chan struct{})}
-	s.dlFlight[meta.R2Key] = f
-	s.dlMu.Unlock()
+const layerCacheChunkSize int64 = 4 * 1024 * 1024 // 4 MiB chunks for Neon-style on-demand R2 caching
 
-	var err error
-	resp, getErr := s.s3c.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(meta.R2Key),
-	})
-	if getErr != nil {
-		err = getErr
-	} else {
-		data, readErr := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if readErr != nil {
-			err = readErr
-		} else {
-			err = s.cache.Put(meta.R2Key, data)
-		}
-	}
-
-	s.dlMu.Lock()
-	f.err = err
-	close(f.done)
-	delete(s.dlFlight, meta.R2Key)
-	s.dlMu.Unlock()
-	return err
-}
-
-// ReadRange fetches [offset, offset+length) from disk cache, localDir, or R2 HTTP Range.
-func (s *LayerStore) ReadRange(ctx context.Context, meta LayerMeta, offset, length int64) ([]byte, error) {
+func (s *LayerStore) readRangeLocalOrR2Direct(ctx context.Context, meta LayerMeta, offset, length int64) ([]byte, error) {
 	if s.cache != nil {
 		if b, ok := s.cache.GetRange(meta.R2Key, offset, length); ok {
 			return b, nil
@@ -478,13 +433,6 @@ func (s *LayerStore) ReadRange(ctx context.Context, meta LayerMeta, offset, leng
 	if s.s3c == nil || s.bucket == "" {
 		return nil, fmt.Errorf("pageserver: layer %s not found locally and R2 not configured", meta.R2Key)
 	}
-	if s.cache != nil && meta.FileSize > 0 && meta.FileSize <= s.cache.maxBytes {
-		if err := s.ensureLayerCached(ctx, meta); err == nil {
-			if b, ok := s.cache.GetRange(meta.R2Key, offset, length); ok {
-				return b, nil
-			}
-		}
-	}
 	rng := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
 	resp, err := s.s3c.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
@@ -498,6 +446,141 @@ func (s *LayerStore) ReadRange(ctx context.Context, meta LayerMeta, offset, leng
 	return io.ReadAll(resp.Body)
 }
 
+func (s *LayerStore) ensureChunkCached(ctx context.Context, meta LayerMeta, chunkIdx int64) (string, error) {
+	chunkKey := fmt.Sprintf("%s@c%d", meta.R2Key, chunkIdx)
+	if s.cache == nil || s.s3c == nil || s.bucket == "" || meta.FileSize <= 0 || layerCacheChunkSize > s.cache.maxBytes {
+		return chunkKey, nil
+	}
+	chunkStart := chunkIdx * layerCacheChunkSize
+	if chunkStart >= meta.FileSize {
+		return chunkKey, fmt.Errorf("pageserver: chunk %d out of range for %s (size=%d)", chunkIdx, meta.R2Key, meta.FileSize)
+	}
+	chunkEnd := chunkStart + layerCacheChunkSize
+	if chunkEnd > meta.FileSize {
+		chunkEnd = meta.FileSize
+	}
+
+	// Fast path: already in disk cache.
+	if _, ok := s.cache.GetRange(chunkKey, 0, 1); ok {
+		return chunkKey, nil
+	}
+
+	s.dlMu.Lock()
+	if s.dlFlight == nil {
+		s.dlFlight = make(map[string]*layerDownload)
+	}
+	if f, ok := s.dlFlight[chunkKey]; ok {
+		s.dlMu.Unlock()
+		select {
+		case <-f.done:
+			return chunkKey, f.err
+		case <-ctx.Done():
+			return chunkKey, ctx.Err()
+		}
+	}
+	f := &layerDownload{done: make(chan struct{})}
+	s.dlFlight[chunkKey] = f
+	s.dlMu.Unlock()
+
+	var err error
+	rng := fmt.Sprintf("bytes=%d-%d", chunkStart, chunkEnd-1)
+	resp, getErr := s.s3c.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(meta.R2Key),
+		Range:  aws.String(rng),
+	})
+	if getErr != nil {
+		err = getErr
+	} else {
+		data, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			err = readErr
+		} else {
+			err = s.cache.Put(chunkKey, data)
+		}
+	}
+
+	s.dlMu.Lock()
+	f.err = err
+	close(f.done)
+	delete(s.dlFlight, chunkKey)
+	s.dlMu.Unlock()
+	return chunkKey, err
+}
+
+// ReadRange fetches [offset, offset+length) from disk cache, localDir, or chunked R2 cache.
+func (s *LayerStore) ReadRange(ctx context.Context, meta LayerMeta, offset, length int64) ([]byte, error) {
+	if length <= 0 {
+		return nil, nil
+	}
+	if s.cache != nil {
+		if b, ok := s.cache.GetRange(meta.R2Key, offset, length); ok {
+			return b, nil
+		}
+	}
+	if s.localDir != "" {
+		localPath := filepath.Join(s.localDir, meta.TenantID, meta.FileName)
+		if f, err := os.Open(localPath); err == nil {
+			defer f.Close()
+			buf := make([]byte, length)
+			n, err := f.ReadAt(buf, offset)
+			if err == nil || (errors.Is(err, io.EOF) && int64(n) == length) {
+				return buf[:n], nil
+			}
+		}
+	}
+	if s.s3c == nil || s.bucket == "" {
+		return nil, fmt.Errorf("pageserver: layer %s not found locally and R2 not configured", meta.R2Key)
+	}
+	if s.cache != nil && meta.FileSize > 0 && layerCacheChunkSize <= s.cache.maxBytes {
+		end := offset + length
+		if end > meta.FileSize {
+			end = meta.FileSize
+		}
+		firstChunk := offset / layerCacheChunkSize
+		lastChunk := (end - 1) / layerCacheChunkSize
+		if firstChunk == lastChunk {
+			chunkKey, err := s.ensureChunkCached(ctx, meta, firstChunk)
+			if err == nil {
+				if b, ok := s.cache.GetRange(chunkKey, offset-firstChunk*layerCacheChunkSize, end-offset); ok {
+					return b, nil
+				}
+			}
+		} else {
+			out := make([]byte, 0, end-offset)
+			okAll := true
+			for ci := firstChunk; ci <= lastChunk; ci++ {
+				chunkKey, err := s.ensureChunkCached(ctx, meta, ci)
+				if err != nil {
+					okAll = false
+					break
+				}
+				cStart := ci * layerCacheChunkSize
+				readOff := int64(0)
+				if offset > cStart {
+					readOff = offset - cStart
+				}
+				cEnd := cStart + layerCacheChunkSize
+				if end < cEnd {
+					cEnd = end
+				}
+				readLen := cEnd - (cStart + readOff)
+				b, ok := s.cache.GetRange(chunkKey, readOff, readLen)
+				if !ok {
+					okAll = false
+					break
+				}
+				out = append(out, b...)
+			}
+			if okAll {
+				return out, nil
+			}
+		}
+	}
+	return s.readRangeLocalOrR2Direct(ctx, meta, offset, length)
+}
+
 // LookupKeyInLayer reads only the footer, index (cached in memory per layer), and matching entry ranges for key <= lsn.
 func (s *LayerStore) LookupKeyInLayer(ctx context.Context, meta LayerMeta, key Key, lsn uint64) ([]WALDelta, error) {
 	if meta.FileSize < int64(LayerFooterSize) {
@@ -508,7 +591,7 @@ func (s *LayerStore) LookupKeyInLayer(ctx context.Context, meta LayerMeta, key K
 	s.idxMu.RUnlock()
 
 	if !cached {
-		footerRaw, err := s.ReadRange(ctx, meta, meta.FileSize-int64(LayerFooterSize), int64(LayerFooterSize))
+		footerRaw, err := s.readRangeLocalOrR2Direct(ctx, meta, meta.FileSize-int64(LayerFooterSize), int64(LayerFooterSize))
 		if err != nil {
 			return nil, err
 		}
@@ -525,7 +608,7 @@ func (s *LayerStore) LookupKeyInLayer(ctx context.Context, meta LayerMeta, key K
 			s.idxMu.Unlock()
 			return nil, nil
 		}
-		idxRaw, err := s.ReadRange(ctx, meta, int64(footer.IndexOffset), int64(footer.IndexLen))
+		idxRaw, err := s.readRangeLocalOrR2Direct(ctx, meta, int64(footer.IndexOffset), int64(footer.IndexLen))
 		if err != nil {
 			return nil, err
 		}
