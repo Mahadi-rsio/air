@@ -762,8 +762,10 @@ func (a *Agent) StopAndPurgeTenant(tenantID string) error {
 	if a.kms != nil {
 		a.kms.ShredDEK(tenantID)
 	}
-	if lfcDir, lfcErr := tenant.SafeSubpath(a.volDir, "lfc", tenantID); lfcErr == nil {
-		_ = os.RemoveAll(lfcDir)
+	for _, prefix := range []string{"lfc", "spool/wal", "backups", "ps_layers"} {
+		if dir, pErr := tenant.SafeSubpath(a.volDir, prefix, tenantID); pErr == nil {
+			_ = os.RemoveAll(dir)
+		}
 	}
 	_ = os.RemoveAll(claimDir)
 	return os.RemoveAll(activeBase)

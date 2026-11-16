@@ -2,7 +2,7 @@ app = "air-pg-server"
 primary_region = "iad"
 
 [build]
-  image = "ghcr.io/mahadi-rsio/air:v2.0.14"
+  image = "ghcr.io/mahadi-rsio/air:v2.0.15"
 
 [env]
   AIR_DATA_DIR = "/var/lib/air"

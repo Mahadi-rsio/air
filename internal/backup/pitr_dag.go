@@ -313,6 +313,28 @@ func DrainAndEncryptWALSpoolToR2WithFault(
 	return drainWALSpoolDirWithFault(ctx, agent.KMS(), s3c, bucket, tenantID, rt.FencingEpoch, walSpoolDir, faultHook)
 }
 
+// DrainStoppedWALSpoolToR2 drains any remaining spooled WAL segments for an already-stopped
+// tenant to R2 without requiring an active PostgreSQL backend.
+func DrainStoppedWALSpoolToR2(
+	ctx context.Context,
+	agent *cell.Agent,
+	s3c *s3.Client,
+	bucket, tenantID string,
+	epoch int64,
+) ([]WALSegmentArtifact, error) {
+	if s3c == nil || strings.TrimSpace(bucket) == "" {
+		return nil, ErrR2ClientRequired
+	}
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return nil, err
+	}
+	walSpoolDir, err := tenant.SafeSubpath(agent.VolDir(), "spool/wal", tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return drainWALSpoolDirWithFault(ctx, agent.KMS(), s3c, bucket, tenantID, epoch, walSpoolDir, nil)
+}
+
 func drainWALSpoolDirWithFault(
 	ctx context.Context,
 	kms *crypto.EnvelopeKMS,

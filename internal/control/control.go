@@ -1010,7 +1010,7 @@ func (cp *ControlPlane) backupTenantToR2(ctx context.Context, tenantID, bkpType 
 		}
 	}
 
-	walCount, err := cp.drainWALSpoolAndUpdateManifest(ctx, tenantID)
+	walCount, err := cp.drainWALSpoolAndUpdateManifest(ctx, tenantID, 0, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1031,12 +1031,18 @@ func (cp *ControlPlane) backupTenantToR2(ctx context.Context, tenantID, bkpType 
 	return resp, nil
 }
 
-func (cp *ControlPlane) drainWALSpoolAndUpdateManifest(ctx context.Context, tenantID string) (int, error) {
+func (cp *ControlPlane) drainWALSpoolAndUpdateManifest(ctx context.Context, tenantID string, epoch int64, stopped bool) (int, error) {
 	s3c, bucket := cp.backupStore()
 	if s3c == nil || bucket == "" {
 		return 0, nil
 	}
-	walSegs, err := backup.DrainAndEncryptWALSpoolToR2(ctx, cp.agent, s3c, bucket, tenantID)
+	var walSegs []backup.WALSegmentArtifact
+	var err error
+	if stopped {
+		walSegs, err = backup.DrainStoppedWALSpoolToR2(ctx, cp.agent, s3c, bucket, tenantID, epoch)
+	} else {
+		walSegs, err = backup.DrainAndEncryptWALSpoolToR2(ctx, cp.agent, s3c, bucket, tenantID)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -1573,7 +1579,7 @@ func (cp *ControlPlane) processColdOffload(ctx context.Context, tenantID string)
 		}
 	}
 
-	if _, wErr := cp.drainWALSpoolAndUpdateManifest(ctx, tenantID); wErr != nil {
+	if _, wErr := cp.drainWALSpoolAndUpdateManifest(ctx, tenantID, epoch, true); wErr != nil {
 		return false, fmt.Errorf("drain WAL spool to R2: %w", wErr)
 	}
 
