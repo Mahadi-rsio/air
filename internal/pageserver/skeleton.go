@@ -20,7 +20,7 @@ import (
 
 const (
 	skeletonAADKey       = "pageserver-metadata-skeleton"
-	maxSkeletonTotalSize = 256 * 1024 * 1024 // 256 MiB safety cap
+	maxSkeletonTotalSize = 2 * 1024 * 1024 * 1024 // 2 GiB safety cap
 )
 
 // SkeletonMeta describes a lightweight non-relation PGDATA metadata snapshot.
