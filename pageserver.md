@@ -117,3 +117,11 @@ Implemented in `internal/pageserver/cau.go`, `layers.go`, `readpath.go`, `compac
   - `LayerMeta.AADKey` preserves the logical key for `EnvelopeKMS` decryption on CAU layers, while legacy layers fall back to `R2Key`.
 - **GC Safety:**
   Automatic deletion of content-addressed objects is intentionally disabled until a tenant-wide reference-aware mark-and-sweep GC (tracking all manifest versions and in-progress upload grace periods) is implemented.
+
+---
+
+## 5. Control Plane Integration & Recovery (`internal/control/control.go`)
+
+- **Enablement:** Requires `AIR_PAGESERVER_ENABLED=true` (`--pageserver`) so `air-server` starts the Pageserver Unix socket listener (`AIR_PAGESERVER_SOCKET`) and wires `air_smgr` + WAL streaming.
+- **Preloading on Wake & Startup Reconcile:**
+  Both `WakeTenant` and `Reconcile` (when re-adopting `ACTIVE` clusters after a machine restart) call `preloadPageserverTenant` (`EnsureTenant` + `LoadLayersFromR2`) **before** `StartOrAdoptTenant`, ensuring `air_smgr` can immediately serve system catalog relations such as `global/1260` (`pg_authid`) during startup and authentication. After adoption in `Reconcile`, `ensurePageserverBootstrapAndWAL` re-attaches the WAL receiver.

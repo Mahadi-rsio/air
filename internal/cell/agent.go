@@ -526,7 +526,7 @@ func (a *Agent) StartOrAdoptTenant(tenantID string, epoch int64) (*TenantRuntime
 		logFile := filepath.Join(activeBase, "postgresql.log")
 		if out, err := a.runPostgresCmd(
 			filepath.Join(a.pgBin, "pg_ctl"),
-			"-D", pgData, "-l", logFile, "-w", "-t", "15",
+			"-D", pgData, "-l", logFile, "-W",
 			"-o", fmt.Sprintf("-p %d", port),
 			"start",
 		); err != nil {
@@ -534,6 +534,12 @@ func (a *Agent) StartOrAdoptTenant(tenantID string, epoch int64) (*TenantRuntime
 			a.releaseFlockLocked(tenantID)
 			a.tenantMu.Unlock()
 			return nil, fmt.Errorf("pg_ctl start failed: %w (%s)", err, out)
+		}
+		if err := a.waitReady(sockDir, port, 15*time.Second); err != nil {
+			a.tenantMu.Lock()
+			a.releaseFlockLocked(tenantID)
+			a.tenantMu.Unlock()
+			return nil, fmt.Errorf("tenant %s readiness check failed: %w", tenantID, err)
 		}
 		pid, port, _ = readPostmasterDetails(pgData)
 	}
@@ -890,7 +896,7 @@ func (a *Agent) waitReady(sockDir string, port int, timeout time.Duration) error
 	deadline := time.Now().Add(timeout)
 	connStr := fmt.Sprintf("host=%s port=%d user=postgres dbname=postgres", sockDir, port)
 	for time.Now().Before(deadline) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		conn, err := pgx.Connect(ctx, connStr)
 		if err == nil {
 			var one int
@@ -903,7 +909,7 @@ func (a *Agent) waitReady(sockDir string, port int, timeout time.Duration) error
 		} else {
 			cancel()
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(15 * time.Millisecond)
 	}
 	return fmt.Errorf("timeout waiting for postgres on port %d", port)
 }

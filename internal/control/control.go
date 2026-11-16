@@ -1219,10 +1219,11 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 		var curState string
 		var curPort int
 		var epoch int64
+		var wrappedDEK string
 		if qErr := cp.db.QueryRow(ctx,
-			`SELECT state, direct_port, fencing_epoch FROM clusters WHERE tenant_id = $1`,
+			`SELECT state, direct_port, fencing_epoch, COALESCE(wrapped_dek, '') FROM clusters WHERE tenant_id = $1`,
 			tenantID,
-		).Scan(&curState, &curPort, &epoch); qErr != nil {
+		).Scan(&curState, &curPort, &epoch, &wrappedDEK); qErr != nil {
 			return nil, qErr
 		}
 		if curState != "SUSPENDED" && curState != "ACTIVE" {
@@ -1230,11 +1231,10 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 		}
 		wakeTotalStart := time.Now()
 		hasLocal := cp.agent.HasLocalPGData(tenantID)
-		var restoreDur, startDur, psWalDur time.Duration
+		var restoreDur, preloadDur, startDur, psWalDur time.Duration
 		if !hasLocal {
 			restoreStart := time.Now()
-			var wrappedDEK string
-			if dErr := cp.db.QueryRow(ctx, `SELECT wrapped_dek FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&wrappedDEK); dErr == nil && wrappedDEK != "" {
+			if wrappedDEK != "" {
 				_ = cp.kms.LoadWrappedDEK(tenantID, wrappedDEK)
 			}
 			if ps := cp.getPageserver(); ps != nil && ps.HasMetadataSkeleton(ctx, tenantID) {
@@ -1257,10 +1257,10 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 			restoreDur = time.Since(restoreStart)
 		}
 		if cp.getPageserver() != nil {
-			var wrappedDEK string
-			_ = cp.db.QueryRow(ctx, `SELECT COALESCE(wrapped_dek, '') FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&wrappedDEK)
+			preloadBegin := time.Now()
 			cp.preloadPageserverTenant(ctx, tenantID, epoch, wrappedDEK)
 			_ = cp.agent.WriteTenantConfigs(tenantID)
+			preloadDur = time.Since(preloadBegin)
 		}
 		startBegin := time.Now()
 		rt, sErr := cp.agent.StartOrAdoptTenant(tenantID, epoch)
@@ -1273,8 +1273,8 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 			log.Printf("[pageserver] wake walreceiver for %s failed: %v", tenantID, err)
 		}
 		psWalDur = time.Since(psWalBegin)
-		log.Printf("[wake] tenant=%s local_pgdata=%v restore=%v start=%v ps_wal=%v total=%v",
-			tenantID, hasLocal, restoreDur, startDur, psWalDur, time.Since(wakeTotalStart))
+		log.Printf("[wake] tenant=%s local_pgdata=%v restore=%v preload=%v start=%v ps_wal=%v total=%v",
+			tenantID, hasLocal, restoreDur, preloadDur, startDur, psWalDur, time.Since(wakeTotalStart))
 		if _, uErr := cp.db.Exec(ctx,
 			`UPDATE clusters SET state = 'ACTIVE', direct_port = $2, updated_at = NOW() WHERE tenant_id = $1`,
 			tenantID, rt.Port,

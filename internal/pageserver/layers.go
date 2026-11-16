@@ -1267,14 +1267,74 @@ func (s *LayerStore) ListLayersFromR2(ctx context.Context, tenantID string, epoc
 		return nil, 0, nil
 	}
 
+	var (
+		manifest *TimelineLayerManifest
+		manErr   error
+		legacy   []LayerMeta
+		listErr  error
+		wg       sync.WaitGroup
+	)
+	prefix := fmt.Sprintf("tenants/%s/timeline_%d/layers/", tenantID, epoch)
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		manifest, manErr = s.LoadLayerManifest(ctx, tenantID, epoch)
+	}()
+	go func() {
+		defer wg.Done()
+		var token *string
+		for {
+			out, err := s.s3c.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+				Bucket:            aws.String(s.bucket),
+				Prefix:            aws.String(prefix),
+				ContinuationToken: token,
+			})
+			if err != nil {
+				listErr = err
+				return
+			}
+			for _, obj := range out.Contents {
+				if obj.Key == nil || obj.Size == nil || *obj.Size < int64(LayerFooterSize) {
+					continue
+				}
+				fileName := strings.TrimPrefix(*obj.Key, prefix)
+				kind, seq, startLSN, endLSN, ok := parseLayerFileName(fileName)
+				if !ok {
+					continue
+				}
+				legacy = append(legacy, LayerMeta{
+					TenantID:          tenantID,
+					Epoch:             epoch,
+					Kind:              kind,
+					Seq:               seq,
+					FileName:          fileName,
+					R2Key:             *obj.Key,
+					StartLSN:          startLSN,
+					EndLSN:            endLSN,
+					FileSize:          *obj.Size,
+					Encrypted:         s.kms != nil,
+					RemotelyAvailable: true,
+				})
+			}
+			if !aws.ToBool(out.IsTruncated) || out.NextContinuationToken == nil {
+				break
+			}
+			token = out.NextContinuationToken
+		}
+	}()
+	wg.Wait()
+
+	if manErr != nil {
+		return nil, 0, manErr
+	}
+	if listErr != nil {
+		return nil, 0, listErr
+	}
+
 	var layers []LayerMeta
 	var maxSeq uint64
 	seen := make(map[string]struct{})
-
-	manifest, err := s.LoadLayerManifest(ctx, tenantID, epoch)
-	if err != nil {
-		return nil, 0, err
-	}
 	if manifest != nil {
 		if manifest.MaxSeq > maxSeq {
 			maxSeq = manifest.MaxSeq
@@ -1290,54 +1350,17 @@ func (s *LayerStore) ListLayersFromR2(ctx context.Context, tenantID string, epoc
 			layers = append(layers, lm)
 		}
 	}
-
-	prefix := fmt.Sprintf("tenants/%s/timeline_%d/layers/", tenantID, epoch)
-	var token *string
-	for {
-		out, err := s.s3c.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket:            aws.String(s.bucket),
-			Prefix:            aws.String(prefix),
-			ContinuationToken: token,
-		})
-		if err != nil {
-			return nil, 0, err
+	for _, lm := range legacy {
+		if _, ok := seen[lm.R2Key]; ok {
+			continue
 		}
-		for _, obj := range out.Contents {
-			if obj.Key == nil || obj.Size == nil || *obj.Size < int64(LayerFooterSize) {
-				continue
-			}
-			fileName := strings.TrimPrefix(*obj.Key, prefix)
-			if _, ok := seen[*obj.Key]; ok {
-				continue
-			}
-			if _, ok := seen[fileName]; ok {
-				continue
-			}
-			kind, seq, startLSN, endLSN, ok := parseLayerFileName(fileName)
-			if !ok {
-				continue
-			}
-			if seq > maxSeq {
-				maxSeq = seq
-			}
-			layers = append(layers, LayerMeta{
-				TenantID:          tenantID,
-				Epoch:             epoch,
-				Kind:              kind,
-				Seq:               seq,
-				FileName:          fileName,
-				R2Key:             *obj.Key,
-				StartLSN:          startLSN,
-				EndLSN:            endLSN,
-				FileSize:          *obj.Size,
-				Encrypted:         s.kms != nil,
-				RemotelyAvailable: true,
-			})
+		if _, ok := seen[lm.FileName]; ok {
+			continue
 		}
-		if !aws.ToBool(out.IsTruncated) || out.NextContinuationToken == nil {
-			break
+		if lm.Seq > maxSeq {
+			maxSeq = lm.Seq
 		}
-		token = out.NextContinuationToken
+		layers = append(layers, lm)
 	}
 
 	// Order oldest -> newest: bootstrap/image layers first, then L1/L0 by LSN & filename.
