@@ -765,3 +765,201 @@ func GarbageCollectBackupDAG(nodes []fencing.BackupArtifact, retentionCutoff tim
 	sort.Strings(res.SweptBackupIDs)
 	return res
 }
+
+// HydrateTenantPGDataFromR2 downloads and decrypts the tenant's latest backup chain and WAL segments from R2,
+// replays WAL to a consistent promoted state, and installs the resulting pgdata into tenants/active/<tenantID>/pgdata.
+func HydrateTenantPGDataFromR2(
+	ctx context.Context,
+	agent *cell.Agent,
+	s3c *s3.Client,
+	bucket, tenantID string,
+) error {
+	if s3c == nil || strings.TrimSpace(bucket) == "" {
+		return ErrR2ClientRequired
+	}
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return err
+	}
+	activeBase, err := tenant.SafeSubpath(agent.VolDir(), "tenants/active", tenantID)
+	if err != nil {
+		return err
+	}
+	targetPGData := filepath.Join(activeBase, "pgdata")
+	if _, err := os.Stat(filepath.Join(targetPGData, "PG_VERSION")); err == nil {
+		return nil
+	}
+
+	manifest, _, err := fencing.ReadManifestWithETag(ctx, s3c, bucket, tenantID)
+	if err != nil {
+		return fmt.Errorf("read R2 manifest for %s: %w", tenantID, err)
+	}
+	if len(manifest.Backups) == 0 {
+		return fmt.Errorf("no backups recorded in R2 manifest for %s", tenantID)
+	}
+
+	byID := make(map[string]*fencing.BackupArtifact, len(manifest.Backups))
+	for i := range manifest.Backups {
+		b := manifest.Backups[i]
+		byID[b.BackupID] = &b
+	}
+	var revChain []*fencing.BackupArtifact
+	curr := &manifest.Backups[len(manifest.Backups)-1]
+	for curr != nil {
+		revChain = append(revChain, curr)
+		if curr.Type == "FULL" || curr.ParentID == "" {
+			break
+		}
+		curr = byID[curr.ParentID]
+	}
+	chain := make([]*fencing.BackupArtifact, len(revChain))
+	for i := range revChain {
+		chain[i] = revChain[len(revChain)-1-i]
+	}
+
+	bkpBase, err := tenant.SafeSubpath(agent.VolDir(), "backups", tenantID)
+	if err != nil {
+		return err
+	}
+	hydrateRoot := filepath.Join(bkpBase, fmt.Sprintf("hydrate_%d", time.Now().UnixNano()))
+	if err := os.MkdirAll(hydrateRoot, 0o700); err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(hydrateRoot) }()
+
+	var unpackedDirs []string
+	maxObjBytes := int64(maxRestoreObjMiB) * 1024 * 1024
+	for i, art := range chain {
+		obj, err := s3c.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(art.R2Key),
+		})
+		if err != nil {
+			return fmt.Errorf("get backup %s: %w", art.R2Key, err)
+		}
+		cipherBytes, err := io.ReadAll(io.LimitReader(obj.Body, maxObjBytes+1))
+		_ = obj.Body.Close()
+		if err != nil {
+			return err
+		}
+		if int64(len(cipherBytes)) > maxObjBytes {
+			return fmt.Errorf("backup object %s exceeds %d MiB limit", art.R2Key, maxRestoreObjMiB)
+		}
+		plainBytes, err := agent.KMS().DecryptObject(tenantID, art.Epoch, art.R2Key, cipherBytes)
+		if err != nil {
+			return err
+		}
+		partDir := filepath.Join(hydrateRoot, fmt.Sprintf("part_%d", i))
+		if err := ExtractTarZstSafe(bytes.NewReader(plainBytes), partDir, TarExtractLimits{}); err != nil {
+			return fmt.Errorf("extract part_%d: %w", i, err)
+		}
+		unpackedDirs = append(unpackedDirs, partDir)
+	}
+
+	combinedDir := filepath.Join(hydrateRoot, "combined_pgdata")
+	if len(unpackedDirs) == 1 {
+		if err := os.Rename(unpackedDirs[0], combinedDir); err != nil {
+			return err
+		}
+	} else {
+		args := append([]string{filepath.Join(agent.PGBin(), "pg_combinebackup"), "-o", combinedDir}, unpackedDirs...)
+		if out, err := agent.RunPostgresCmd(args[0], args[1:]...); err != nil {
+			return fmt.Errorf("pg_combinebackup failed: %w (%s)", err, out)
+		}
+	}
+	_ = os.Chmod(combinedDir, 0o700)
+	if out, err := agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "pg_verifybackup"), combinedDir); err != nil {
+		return fmt.Errorf("pg_verifybackup failed: %w (%s)", err, out)
+	}
+
+	walRestoreDir := filepath.Join(hydrateRoot, "wal_archive")
+	if err := os.MkdirAll(walRestoreDir, 0o700); err != nil {
+		return err
+	}
+	for _, r2Key := range manifest.WALSegments {
+		segName := strings.TrimSuffix(filepath.Base(r2Key), ".zst.enc")
+		if !isValidWALFilename(segName) {
+			continue
+		}
+		epoch := manifest.FencingEpoch
+		for _, part := range strings.Split(r2Key, "/") {
+			if strings.HasPrefix(part, "epoch_") {
+				if parsed, pErr := strconv.ParseInt(strings.TrimPrefix(part, "epoch_"), 10, 64); pErr == nil && parsed > 0 {
+					epoch = parsed
+				}
+			}
+		}
+		obj, err := s3c.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(r2Key),
+		})
+		if err != nil {
+			return fmt.Errorf("get wal %s: %w", r2Key, err)
+		}
+		cipherBytes, err := io.ReadAll(io.LimitReader(obj.Body, maxWALObjBytes+1))
+		_ = obj.Body.Close()
+		if err != nil {
+			return err
+		}
+		zstBytes, err := agent.KMS().DecryptObject(tenantID, epoch, r2Key, cipherBytes)
+		if err != nil {
+			return fmt.Errorf("decrypt wal %s: %w", segName, err)
+		}
+		rawWAL, err := DecompressBytesZstd(zstBytes, maxWALObjBytes)
+		if err != nil {
+			return fmt.Errorf("decompress wal %s: %w", segName, err)
+		}
+		if err := os.WriteFile(filepath.Join(walRestoreDir, segName), rawWAL, 0o600); err != nil {
+			return err
+		}
+	}
+
+	port, err := allocFreePort()
+	if err != nil {
+		return err
+	}
+	sockDir := fmt.Sprintf("/tmp/air_hydrate_%d", port)
+	if err := os.MkdirAll(sockDir, 0o755); err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(sockDir) }()
+
+	pitrConf := fmt.Sprintf("\nport = %d\nunix_socket_directories = '%s'\narchive_mode = off\nrestore_command = 'cp %s/%%f %%p'\nrecovery_target_action = 'promote'\n", port, sockDir, walRestoreDir)
+	f, err := os.OpenFile(filepath.Join(combinedDir, "postgresql.conf"), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, _ = f.WriteString(pitrConf)
+	_ = f.Close()
+
+	if err := os.WriteFile(filepath.Join(combinedDir, "recovery.signal"), []byte(""), 0o600); err != nil {
+		return err
+	}
+	logFile := filepath.Join(hydrateRoot, "hydrate_restore.log")
+	if out, err := agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "pg_ctl"), "-D", combinedDir, "-l", logFile, "-w", "-t", "25", "start"); err != nil {
+		logBytes, _ := os.ReadFile(logFile)
+		return fmt.Errorf("hydrate pg_ctl start failed: %w (%s / log: %s)", err, out, string(logBytes))
+	}
+	for i := 0; i < 40; i++ {
+		inRec, _ := agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "psql"), "-h", sockDir, "-p", strconv.Itoa(port), "-U", "postgres", "-d", "postgres", "-t", "-A", "-c", "SELECT pg_is_in_recovery();")
+		if strings.TrimSpace(inRec) == "f" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if out, err := agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "pg_ctl"), "-D", combinedDir, "-m", "fast", "-w", "-t", "15", "stop"); err != nil {
+		return fmt.Errorf("hydrate pg_ctl stop failed: %w (%s)", err, out)
+	}
+
+	_ = os.Remove(filepath.Join(combinedDir, "postmaster.pid"))
+	_ = os.Remove(filepath.Join(combinedDir, "recovery.signal"))
+	_ = os.Remove(filepath.Join(combinedDir, "standby.signal"))
+
+	if err := os.MkdirAll(activeBase, 0o755); err != nil {
+		return err
+	}
+	_ = os.RemoveAll(targetPGData)
+	if err := os.Rename(combinedDir, targetPGData); err != nil {
+		return err
+	}
+	return agent.WriteTenantConfigs(tenantID)
+}

@@ -2,7 +2,7 @@ app = "air-pg-server"
 primary_region = "iad"
 
 [build]
-  image = "ghcr.io/mahadi-rsio/air:v2.0.4"
+  image = "ghcr.io/mahadi-rsio/air:v2.0.5"
 
 [env]
   AIR_DATA_DIR = "/var/lib/air"
@@ -15,6 +15,7 @@ primary_region = "iad"
   AIR_R2_ENDPOINT = "https://dcd4d8a920e7d7f054ba6565cd8db426.r2.cloudflarestorage.com"
   AIR_R2_BUCKET = "air-pg-backups"
   AIR_R2_REGION = "auto"
+  AIR_R2_PRIMARY = "true"
 
 [mounts]
   source = "air_data"

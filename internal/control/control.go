@@ -70,12 +70,13 @@ type DatabaseInfo struct {
 
 // ControlPlaneConfig configures ControlPlane metadata storage (either external HA MetaDSN or local MetaDir).
 type ControlPlaneConfig struct {
-	MetaDir  string
-	MetaDSN  string
-	PGBinDir string
-	MetaPort int
-	Agent    *cell.Agent
-	KMS      *crypto.EnvelopeKMS
+	MetaDir   string
+	MetaDSN   string
+	PGBinDir  string
+	MetaPort  int
+	Agent     *cell.Agent
+	KMS       *crypto.EnvelopeKMS
+	R2Primary bool
 }
 
 // ControlPlane manages durable PG17 metadata, schema migrations, provisioning state machine, and tenant routing.
@@ -93,6 +94,7 @@ type ControlPlane struct {
 	gatewayPort  int
 	s3Client     *s3.Client
 	backupBucket string
+	r2Primary    bool
 	wakeGroup    singleflight.Group
 	activityMu   sync.Mutex
 	lastActivity map[string]time.Time
@@ -202,6 +204,7 @@ func NewControlPlaneWithConfig(ctx context.Context, cfg ControlPlaneConfig) (*Co
 		db:           pool,
 		agent:        cfg.Agent,
 		kms:          cfg.KMS,
+		r2Primary:    cfg.R2Primary,
 		lastActivity: make(map[string]time.Time),
 	}
 	if err := cp.runMigrations(ctx); err != nil {
@@ -739,6 +742,14 @@ func (cp *ControlPlane) TriggerBackup(ctx context.Context, accountID, tenantID, 
 	if bkpType != "FULL" && bkpType != "INCR" && bkpType != "WAL" {
 		return nil, fmt.Errorf("unsupported backup type %q (must be FULL, INCR, or WAL)", backupType)
 	}
+	return cp.backupTenantToR2(ctx, tenantID, bkpType)
+}
+
+func (cp *ControlPlane) backupTenantToR2(ctx context.Context, tenantID, bkpType string) (*BackupResponse, error) {
+	s3c, bucket := cp.backupStore()
+	if s3c == nil || bucket == "" {
+		return nil, ErrBackupNotConfigured
+	}
 
 	var art *fencing.BackupArtifact
 	if bkpType != "WAL" {
@@ -763,6 +774,7 @@ func (cp *ControlPlane) TriggerBackup(ctx context.Context, accountID, tenantID, 
 		}
 
 		bkpID := fmt.Sprintf("bkp_%d", time.Now().UnixNano())
+		var err error
 		art, _, err = backup.RunEncryptedBackupStep(ctx, cp.agent, s3c, bucket, tenantID, bkpID, parentID, bkpType, parentManifestPath)
 		if err != nil {
 			return nil, err
@@ -979,6 +991,19 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 		if curState != "SUSPENDED" && curState != "ACTIVE" {
 			return nil, fmt.Errorf("tenant %s cannot wake from state %s", tenantID, curState)
 		}
+		if !cp.agent.HasLocalPGData(tenantID) {
+			s3c, bucket := cp.backupStore()
+			if s3c == nil || bucket == "" {
+				return nil, fmt.Errorf("tenant %s has no local pgdata and backup store is not configured", tenantID)
+			}
+			var wrappedDEK string
+			if dErr := cp.db.QueryRow(ctx, `SELECT wrapped_dek FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&wrappedDEK); dErr == nil && wrappedDEK != "" {
+				_ = cp.kms.LoadWrappedDEK(tenantID, wrappedDEK)
+			}
+			if hErr := backup.HydrateTenantPGDataFromR2(ctx, cp.agent, s3c, bucket, tenantID); hErr != nil {
+				return nil, fmt.Errorf("hydrate tenant %s from R2: %w", tenantID, hErr)
+			}
+		}
 		rt, sErr := cp.agent.StartOrAdoptTenant(tenantID, epoch)
 		if sErr != nil {
 			return nil, sErr
@@ -1047,8 +1072,23 @@ func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drai
 		return err
 	}
 
+	evictToR2 := false
+	if cp.r2Primary {
+		if s3c, bucket := cp.backupStore(); s3c != nil && bucket != "" {
+			if _, bErr := cp.backupTenantToR2(ctx, tenantID, "INCR"); bErr != nil {
+				return fmt.Errorf("sync tenant %s to R2 before suspend: %w", tenantID, bErr)
+			}
+			evictToR2 = true
+		}
+	}
+
 	if err := cp.agent.StopTenantClean(tenantID); err != nil {
 		return err
+	}
+	if evictToR2 {
+		if eErr := cp.agent.EvictTenantLocalData(tenantID); eErr != nil {
+			return fmt.Errorf("evict local pgdata for %s after R2 sync: %w", tenantID, eErr)
+		}
 	}
 
 	_, err := cp.db.Exec(ctx,

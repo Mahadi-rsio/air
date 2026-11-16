@@ -252,61 +252,10 @@ func (a *Agent) ActivateCluster(tenantID, appPassword string, epoch int64) (*Ten
 		return nil, fmt.Errorf("missing active pgdata for %s: %w", tenantID, err)
 	}
 
+	if err := a.WriteTenantConfigs(tenantID); err != nil {
+		return nil, err
+	}
 	sockDir := filepath.Join(activeBase, "sock")
-	if err := os.MkdirAll(sockDir, 0o755); err != nil {
-		return nil, err
-	}
-	walSpoolDir, err := tenant.SafeSubpath(a.volDir, "spool/wal", tenantID)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(walSpoolDir, 0o700); err != nil {
-		return nil, err
-	}
-	port := a.allocOrReusePort(tenantID)
-
-	conf := fmt.Sprintf(`listen_addresses = '127.0.0.1'
-port = %d
-unix_socket_directories = '%s'
-max_connections = 100
-max_prepared_transactions = 16
-shared_buffers = 32MB
-work_mem = 4MB
-maintenance_work_mem = 16MB
-temp_file_limit = 32MB
-password_encryption = 'scram-sha-256'
-wal_level = replica
-summarize_wal = on
-archive_mode = on
-archive_command = 'cp %%p %s/%%f'
-ssl = off
-logging_collector = off
-shared_preload_libraries = 'supautils'
-supautils.superuser = 'postgres'
-supautils.privileged_role = 'app_user'
-supautils.privileged_extensions = 'pg_stat_statements,pg_trgm'
-supautils.privileged_role_allowed_configs = 'session_replication_role'
-supautils.reserved_roles = 'postgres'
-supautils.reserved_memberships = 'pg_read_server_files,pg_write_server_files,pg_execute_server_program,postgres'
-supautils.restrict_extension_versions = 'error'
-`, port, sockDir, walSpoolDir)
-	if err := os.WriteFile(filepath.Join(pgData, "postgresql.conf"), []byte(conf), 0o600); err != nil {
-		return nil, err
-	}
-
-	hba := `
-local   all             postgres                                trust
-local   replication     postgres                                trust
-local   all             app_user                                password
-host    all             postgres        127.0.0.1/32            reject
-host    all             all             127.0.0.1/32            scram-sha-256
-host    replication     postgres        127.0.0.1/32            reject
-host    replication     all             127.0.0.1/32            scram-sha-256
-`
-	if err := os.WriteFile(filepath.Join(pgData, "pg_hba.conf"), []byte(strings.TrimSpace(hba)+"\n"), 0o600); err != nil {
-		return nil, err
-	}
-	_ = os.Chmod(pgData, 0o700)
 
 	rt, err := a.StartOrAdoptTenant(tenantID, epoch)
 	if err != nil {
@@ -359,6 +308,99 @@ host    replication     all             127.0.0.1/32            scram-sha-256
 		return nil, err
 	}
 	return rt, nil
+}
+
+// HasLocalPGData reports whether the tenant has a local pgdata directory cached on the cell volume.
+func (a *Agent) HasLocalPGData(tenantID string) bool {
+	activeBase, err := tenant.SafeSubpath(a.volDir, "tenants/active", tenantID)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(filepath.Join(activeBase, "pgdata", "PG_VERSION"))
+	return err == nil
+}
+
+// EvictTenantLocalData removes local pgdata, WAL spool, and local backup staging files for a suspended tenant
+// after its durable state has been synced to R2.
+func (a *Agent) EvictTenantLocalData(tenantID string) error {
+	for _, prefix := range []string{"tenants/active", "spool/wal", "backups"} {
+		dir, err := tenant.SafeSubpath(a.volDir, prefix, tenantID)
+		if err != nil {
+			return err
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			return err
+		}
+	}
+	a.tenantMu.Lock()
+	delete(a.tenants, tenantID)
+	delete(a.tenantPorts, tenantID)
+	a.tenantMu.Unlock()
+	return nil
+}
+
+// WriteTenantConfigs writes standard postgresql.conf, pg_hba.conf, sockDir, and walSpoolDir for an active tenant.
+func (a *Agent) WriteTenantConfigs(tenantID string) error {
+	activeBase, err := tenant.SafeSubpath(a.volDir, "tenants/active", tenantID)
+	if err != nil {
+		return err
+	}
+	pgData := filepath.Join(activeBase, "pgdata")
+	sockDir := filepath.Join(activeBase, "sock")
+	if err := os.MkdirAll(sockDir, 0o755); err != nil {
+		return err
+	}
+	walSpoolDir, err := tenant.SafeSubpath(a.volDir, "spool/wal", tenantID)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(walSpoolDir, 0o700); err != nil {
+		return err
+	}
+	port := a.allocOrReusePort(tenantID)
+
+	conf := fmt.Sprintf(`listen_addresses = '127.0.0.1'
+port = %d
+unix_socket_directories = '%s'
+max_connections = 100
+max_prepared_transactions = 16
+shared_buffers = 32MB
+work_mem = 4MB
+maintenance_work_mem = 16MB
+temp_file_limit = 32MB
+password_encryption = 'scram-sha-256'
+wal_level = replica
+summarize_wal = on
+archive_mode = on
+archive_command = 'cp %%p %s/%%f'
+ssl = off
+logging_collector = off
+shared_preload_libraries = 'supautils'
+supautils.superuser = 'postgres'
+supautils.privileged_role = 'app_user'
+supautils.privileged_extensions = 'pg_stat_statements,pg_trgm'
+supautils.privileged_role_allowed_configs = 'session_replication_role'
+supautils.reserved_roles = 'postgres'
+supautils.reserved_memberships = 'pg_read_server_files,pg_write_server_files,pg_execute_server_program,postgres'
+supautils.restrict_extension_versions = 'error'
+`, port, sockDir, walSpoolDir)
+	if err := os.WriteFile(filepath.Join(pgData, "postgresql.conf"), []byte(conf), 0o600); err != nil {
+		return err
+	}
+
+	hba := `
+local   all             postgres                                trust
+local   replication     postgres                                trust
+local   all             app_user                                password
+host    all             postgres        127.0.0.1/32            reject
+host    all             all             127.0.0.1/32            scram-sha-256
+host    replication     postgres        127.0.0.1/32            reject
+host    replication     all             127.0.0.1/32            scram-sha-256
+`
+	if err := os.WriteFile(filepath.Join(pgData, "pg_hba.conf"), []byte(strings.TrimSpace(hba)+"\n"), 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(pgData, 0o700)
 }
 
 // StartOrAdoptTenant acquires flock, starts PG17 if not running (or verifies running identity), and records pidmeta.

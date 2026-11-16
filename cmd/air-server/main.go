@@ -41,12 +41,13 @@ func main() {
 	defer ag.Close()
 
 	cp, err := control.NewControlPlaneWithConfig(ctx, control.ControlPlaneConfig{
-		MetaDir:  cfg.MetaDir,
-		MetaDSN:  cfg.MetaDSN,
-		PGBinDir: cfg.PGBinDir,
-		MetaPort: cfg.MetaPort,
-		Agent:    ag,
-		KMS:      kms,
+		MetaDir:   cfg.MetaDir,
+		MetaDSN:   cfg.MetaDSN,
+		PGBinDir:  cfg.PGBinDir,
+		MetaPort:  cfg.MetaPort,
+		Agent:     ag,
+		KMS:       kms,
+		R2Primary: cfg.R2Primary,
 	})
 	if err != nil {
 		log.Fatalf("init control plane: %v", err)
@@ -112,6 +113,9 @@ func main() {
 func configureBackupStore(cp *control.ControlPlane, cfg config.Config) error {
 	anySet := cfg.R2Endpoint != "" || cfg.R2Bucket != "" || cfg.R2AccessKeyID != "" || cfg.R2SecretAccessKey != ""
 	if !anySet {
+		if cfg.R2Primary {
+			return fmt.Errorf("AIR_R2_PRIMARY=true requires R2 configuration (AIR_R2_ENDPOINT, AIR_R2_BUCKET, AIR_R2_ACCESS_KEY_ID, AIR_R2_SECRET_ACCESS_KEY)")
+		}
 		return nil
 	}
 	if cfg.R2Endpoint == "" || cfg.R2Bucket == "" || cfg.R2AccessKeyID == "" || cfg.R2SecretAccessKey == "" {
