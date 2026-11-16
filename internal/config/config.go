@@ -33,6 +33,9 @@ type Config struct {
 	R2SecretAccessKey  string
 	R2Region           string
 	R2Primary          bool
+	PageserverEnabled  bool
+	PageserverSocket   string
+	PageserverCacheMB  int
 }
 
 // Default returns safe defaults rooted under dataDir.
@@ -51,6 +54,8 @@ func Default(dataDir string) Config {
 		BootstrapAccountID: "acct_default",
 		PoolMaxBackends:    16,
 		R2Region:           "auto",
+		PageserverSocket:   filepath.Join(dataDir, "pageserver.sock"),
+		PageserverCacheMB:  256,
 	}
 }
 
@@ -72,6 +77,15 @@ func Load(args []string) (Config, error) {
 	cfg.R2AccessKeyID = envOr("AIR_R2_ACCESS_KEY_ID", cfg.R2AccessKeyID)
 	cfg.R2SecretAccessKey = envOr("AIR_R2_SECRET_ACCESS_KEY", cfg.R2SecretAccessKey)
 	cfg.R2Region = envOr("AIR_R2_REGION", cfg.R2Region)
+	cfg.PageserverSocket = envOr("AIR_PAGESERVER_SOCKET", filepath.Join(cfg.DataDir, "pageserver.sock"))
+	if v := strings.TrimSpace(os.Getenv("AIR_PAGESERVER_ENABLED")); v != "" {
+		cfg.PageserverEnabled = v == "1" || strings.EqualFold(v, "true")
+	}
+	if p := os.Getenv("AIR_PAGESERVER_CACHE_MB"); p != "" {
+		if v, err := strconv.Atoi(p); err == nil && v > 0 {
+			cfg.PageserverCacheMB = v
+		}
+	}
 	if v := strings.TrimSpace(os.Getenv("AIR_REQUIRE_TLS")); v != "" {
 		cfg.RequireTLS = v == "1" || strings.EqualFold(v, "true")
 	}
@@ -120,6 +134,9 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&cfg.R2SecretAccessKey, "r2-secret-access-key", cfg.R2SecretAccessKey, "S3/R2 secret access key")
 	fs.StringVar(&cfg.R2Region, "r2-region", cfg.R2Region, "S3/R2 region (default: auto)")
 	fs.BoolVar(&cfg.R2Primary, "r2-primary", cfg.R2Primary, "Use R2 as primary durable storage and evict local pgdata on suspend")
+	fs.BoolVar(&cfg.PageserverEnabled, "pageserver", cfg.PageserverEnabled, "Enable in-process AIR Pageserver over Unix socket")
+	fs.StringVar(&cfg.PageserverSocket, "pageserver-socket", cfg.PageserverSocket, "Unix socket path for AIR Pageserver")
+	fs.IntVar(&cfg.PageserverCacheMB, "pageserver-cache-mb", cfg.PageserverCacheMB, "Bounded LRU disk cache size in MB for Pageserver")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}

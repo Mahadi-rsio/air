@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/Mahadi-rsio/air/internal/control"
 	"github.com/Mahadi-rsio/air/internal/crypto"
 	"github.com/Mahadi-rsio/air/internal/gateway"
+	"github.com/Mahadi-rsio/air/internal/pageserver"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -54,8 +56,30 @@ func main() {
 	}
 	defer cp.Close()
 
-	if err := configureBackupStore(cp, cfg); err != nil {
+	s3c, err := configureBackupStore(cp, cfg)
+	if err != nil {
 		log.Fatalf("init backup store: %v", err)
+	}
+
+	if cfg.PageserverEnabled {
+		ps, psErr := pageserver.New(pageserver.Config{
+			SocketPath:    cfg.PageserverSocket,
+			LayerDir:      filepath.Join(cfg.DataDir, "ps_layers"),
+			CacheDir:      filepath.Join(cfg.DataDir, "ps_cache"),
+			CacheMaxBytes: int64(cfg.PageserverCacheMB) * 1024 * 1024,
+			S3Client:      s3c,
+			R2Bucket:      cfg.R2Bucket,
+			KMS:           kms,
+		})
+		if psErr != nil {
+			log.Fatalf("init pageserver: %v", psErr)
+		}
+		if psErr := ps.Start(ctx); psErr != nil {
+			log.Fatalf("start pageserver: %v", psErr)
+		}
+		defer ps.Close()
+		cp.SetPageserver(ps)
+		log.Printf("[air-server] pageserver listening on %s (cache_mb=%d)", cfg.PageserverSocket, cfg.PageserverCacheMB)
 	}
 
 	if cfg.BootstrapAPIKey != "" {
@@ -110,16 +134,16 @@ func main() {
 	_ = srv.Shutdown(shutCtx)
 }
 
-func configureBackupStore(cp *control.ControlPlane, cfg config.Config) error {
+func configureBackupStore(cp *control.ControlPlane, cfg config.Config) (*s3.Client, error) {
 	anySet := cfg.R2Endpoint != "" || cfg.R2Bucket != "" || cfg.R2AccessKeyID != "" || cfg.R2SecretAccessKey != ""
 	if !anySet {
 		if cfg.R2Primary {
-			return fmt.Errorf("AIR_R2_PRIMARY=true requires R2 configuration (AIR_R2_ENDPOINT, AIR_R2_BUCKET, AIR_R2_ACCESS_KEY_ID, AIR_R2_SECRET_ACCESS_KEY)")
+			return nil, fmt.Errorf("AIR_R2_PRIMARY=true requires R2 configuration (AIR_R2_ENDPOINT, AIR_R2_BUCKET, AIR_R2_ACCESS_KEY_ID, AIR_R2_SECRET_ACCESS_KEY)")
 		}
-		return nil
+		return nil, nil
 	}
 	if cfg.R2Endpoint == "" || cfg.R2Bucket == "" || cfg.R2AccessKeyID == "" || cfg.R2SecretAccessKey == "" {
-		return fmt.Errorf("incomplete R2 configuration: AIR_R2_ENDPOINT, AIR_R2_BUCKET, AIR_R2_ACCESS_KEY_ID, and AIR_R2_SECRET_ACCESS_KEY must all be set")
+		return nil, fmt.Errorf("incomplete R2 configuration: AIR_R2_ENDPOINT, AIR_R2_BUCKET, AIR_R2_ACCESS_KEY_ID, and AIR_R2_SECRET_ACCESS_KEY must all be set")
 	}
 	region := cfg.R2Region
 	if region == "" {
@@ -135,5 +159,5 @@ func configureBackupStore(cp *control.ControlPlane, cfg config.Config) error {
 	})
 	cp.SetBackupStore(s3c, cfg.R2Bucket)
 	log.Printf("[air-server] backup store enabled (bucket=%s, endpoint=%s, region=%s)", cfg.R2Bucket, cfg.R2Endpoint, region)
-	return nil
+	return s3c, nil
 }

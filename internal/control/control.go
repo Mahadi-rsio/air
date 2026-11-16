@@ -22,6 +22,7 @@ import (
 	"github.com/Mahadi-rsio/air/internal/cell"
 	"github.com/Mahadi-rsio/air/internal/crypto"
 	"github.com/Mahadi-rsio/air/internal/fencing"
+	"github.com/Mahadi-rsio/air/internal/pageserver"
 	"github.com/Mahadi-rsio/air/internal/tenant"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5"
@@ -95,6 +96,7 @@ type ControlPlane struct {
 	s3Client     *s3.Client
 	backupBucket string
 	r2Primary    bool
+	pageserver   *pageserver.Pageserver
 	wakeGroup    singleflight.Group
 	activityMu   sync.Mutex
 	lastActivity map[string]time.Time
@@ -239,6 +241,13 @@ func (cp *ControlPlane) SetBackupStore(s3c *s3.Client, bucket string) {
 	cp.provMu.Lock()
 	cp.s3Client = s3c
 	cp.backupBucket = strings.TrimSpace(bucket)
+	cp.provMu.Unlock()
+}
+
+// SetPageserver attaches an in-process AIR Pageserver for layer flushing and wake coordination.
+func (cp *ControlPlane) SetPageserver(ps *pageserver.Pageserver) {
+	cp.provMu.Lock()
+	cp.pageserver = ps
 	cp.provMu.Unlock()
 }
 
@@ -1082,9 +1091,14 @@ func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drai
 		}
 	}
 
-	if err := cp.agent.StopTenantClean(tenantID); err != nil {
-		return err
-	}
+		if err := cp.agent.StopTenantClean(tenantID); err != nil {
+			return err
+		}
+		if cp.pageserver != nil {
+			if _, fErr := cp.pageserver.FlushTenant(ctx, tenantID); fErr != nil {
+				return fmt.Errorf("flush pageserver layers for %s: %w", tenantID, fErr)
+			}
+		}
 	if evictToR2 {
 		if eErr := cp.agent.EvictTenantLocalData(tenantID); eErr != nil {
 			return fmt.Errorf("evict local pgdata for %s after R2 sync: %w", tenantID, eErr)
