@@ -251,4 +251,47 @@ func TestNeonServerlessLifecycleWithPageserver(t *testing.T) {
 	if tl.LastLSN() <= afterWriteLSN {
 		t.Fatalf("expected WALReceiver after wake to advance LSN past %x, got %x", afterWriteLSN, tl.LastLSN())
 	}
+
+	// Phase J: Suspend again, verify lightweight metadata skeleton (< 5 MB), evict local PGDATA,
+	// and verify fast skeleton-only restore without relation files while Pageserver still serves blocks.
+	if err := cp.SuspendTenant(ctx, tenantID, 5*time.Second, nil); err != nil {
+		t.Fatalf("SuspendTenant (Phase J): %v", err)
+	}
+	if !ps.HasMetadataSkeleton(ctx, tenantID) {
+		t.Fatalf("expected HasMetadataSkeleton to be true after SuspendTenant")
+	}
+	if err := ag.EvictTenantLocalData(tenantID); err != nil {
+		t.Fatalf("EvictTenantLocalData: %v", err)
+	}
+	if ag.HasLocalPGData(tenantID) {
+		t.Fatalf("expected HasLocalPGData to be false after eviction")
+	}
+
+	pgDataDir, err := ag.TenantPGDataDir(tenantID)
+	if err != nil {
+		t.Fatalf("TenantPGDataDir: %v", err)
+	}
+	wakeStart := time.Now()
+	skelMeta, err := ps.RestoreMetadataSkeleton(ctx, tenantID, 1, pgDataDir)
+	if err != nil {
+		t.Fatalf("RestoreMetadataSkeleton: %v", err)
+	}
+	wakeElapsed := time.Since(wakeStart)
+	t.Logf("Restored metadata skeleton in %v (%d files, %d compressed bytes)", wakeElapsed, skelMeta.FileCount, skelMeta.CompressedBytes)
+	if skelMeta.CompressedBytes >= 5*1024*1024 {
+		t.Fatalf("expected metadata skeleton < 5 MB, got %d bytes", skelMeta.CompressedBytes)
+	}
+	for _, rel := range []string{"PG_VERSION", "global/pg_control", "global/pg_filenode.map"} {
+		if _, err := os.Stat(filepath.Join(pgDataDir, rel)); err != nil {
+			t.Fatalf("expected %s in restored skeleton: %v", rel, err)
+		}
+	}
+	evictedRelPath := filepath.Join(pgDataDir, "base", fmt.Sprintf("%d", dbOID), fmt.Sprintf("%d", relNode))
+	if _, err := os.Stat(evictedRelPath); !os.IsNotExist(err) {
+		t.Fatalf("expected relation file %s to be absent in skeleton-only restore", evictedRelPath)
+	}
+	servedBlocks, err := ps.GetRelSize(ctx, tenantID, 1663, dbOID, relNode, 0, tl.LastLSN())
+	if err != nil || servedBlocks < 1 {
+		t.Fatalf("expected Pageserver to serve evicted relation size >= 1, got %d (err=%v)", servedBlocks, err)
+	}
 }

@@ -217,3 +217,51 @@
   - [x] Implement idle tenant suspend (`ACTIVE -> SUSPENDED`) and `singleflight` wake-on-connect in the Gateway.
 - [x] **Phase H Live PG17 Verification ([tests/e2e/phase_h_test.go](file:///workspaces/air/tests/e2e/phase_h_test.go)):**
   - [x] Verify pooled concurrency, session isolation, drain vetoes, and `singleflight` wake storms against PostgreSQL 17 with `go test -v -race -count=1 ./...`.
+
+---
+
+## Phase I — Custom Storage Manager (`air_smgr`) & Encrypted Pageserver (`AIR v2.1` — `COMPLETED`)
+
+- [x] **PostgreSQL 17 Custom `f_smgr` Extension & Patch ([patches/pg17-smgr-hook.patch](file:///workspaces/air/patches/pg17-smgr-hook.patch) & [ext/air_smgr/](file:///workspaces/air/ext/air_smgr)):**
+  - [x] Implement `air_smgr.c`, `lfc.c` (CLOCK-Pro / Sharded LRU Local File Cache with `pread`/`pwrite` and CRC32C verification), and `ps_client.c` (persistent Unix domain socket client with `SO_RCVTIMEO`/`SO_SNDTIMEO`, automatic reconnect, `OpGetRelSize`, `OpGetPageAtLSN`, and `OpGetPageBatch`).
+  - [x] Verify `air_smgr` against a mock Pageserver (`ext/air_smgr/test_smgr_mock.py` — single page, 32-block batch `readv`, LFC hit after socket close, write-through `extend`/`writev`, and unlogged local-disk bypass).
+- [x] **Encrypted Multi-Tenant Pageserver ([internal/pageserver/](file:///workspaces/air/internal/pageserver)):**
+  - [x] Implement binary wire protocol & framing ([internal/pageserver/protocol.go](file:///workspaces/air/internal/pageserver/protocol.go)), PG17 WAL record & Full-Page Image (`BKPIMAGE`) decoder + incremental `WALStreamParser` ([internal/pageserver/walparser.go](file:///workspaces/air/internal/pageserver/walparser.go)), and `AES-256-GCM-AAD` + `zstd` 64 KB block-indexed immutable `.layer` writer/reader ([internal/pageserver/layer.go](file:///workspaces/air/internal/pageserver/layer.go)).
+  - [x] Implement LSN-aware page reconstruction (`GetPageAtLSN`, `GetPageBatch`, `GetRelSize`) and L0 $\rightarrow$ L1 compaction ([internal/pageserver/readpath.go](file:///workspaces/air/internal/pageserver/readpath.go)), streaming `pglogrepl` `START_REPLICATION` receiver ([internal/pageserver/walreceiver.go](file:///workspaces/air/internal/pageserver/walreceiver.go)), LRU local disk cache ([internal/pageserver/diskcache.go](file:///workspaces/air/internal/pageserver/diskcache.go)), and `BootstrapTenantFromPGData` + Unix socket server ([internal/pageserver/service.go](file:///workspaces/air/internal/pageserver/service.go)).
+- [x] **Cell Agent, Control Plane & Server Wiring ([internal/cell/agent.go](file:///workspaces/air/internal/cell/agent.go), [internal/control/control.go](file:///workspaces/air/internal/control/control.go) & [cmd/air-server/main.go](file:///workspaces/air/cmd/air-server/main.go)):**
+  - [x] Wire `SetPageserverConfig` and `WriteTenantConfigs` to emit `shared_preload_libraries = 'supautils,air_smgr'` and `air_smgr.*` GUCs ([internal/cell/pageserver_config_test.go](file:///workspaces/air/internal/cell/pageserver_config_test.go)).
+  - [x] Wire `ensurePageserverBootstrapAndWAL`, `stopWALReceiver`, and `FlushTenant` into `ProvisionDatabase`, `SuspendTenant`, `WakeTenant`, `DeleteDatabase`, and `Close()`.
+- [x] **Phase I Live PG17 End-to-End Verification ([internal/control/pageserver_integration_test.go](file:///workspaces/air/internal/control/pageserver_integration_test.go)):**
+  - [x] Verify `TestNeonServerlessLifecycleWithPageserver` (`ProvisionDatabase` $\rightarrow$ `BootstrapTenantFromPGData` $\rightarrow$ live `WALReceiver` streaming $\rightarrow$ Unix socket `OpGetRelSize` & `OpGetPageAtLSN` $\rightarrow$ `SuspendTenant` L0 layer flush $\rightarrow$ `WakeTenant` WAL resume & row verification).
+
+---
+
+## Phase J — True Stateless Compute Eviction & Fast Metadata-Skeleton Wake (`AIR v2.2` — `COMPLETED`)
+
+- [x] **Lightweight Metadata-Skeleton Snapshot on Suspend ([internal/pageserver/skeleton.go](file:///workspaces/air/internal/pageserver/skeleton.go), [internal/cell/agent.go](file:///workspaces/air/internal/cell/agent.go) & [internal/control/control.go](file:///workspaces/air/internal/control/control.go)):**
+  - [x] Capture only non-relation compute state (`global/pg_control`, `global/pg_filenode.map`, `pg_xact/`, `pg_multixact/`, `pg_logical/`, `PG_VERSION`, per-DB `pg_filenode.map` / `PG_VERSION`, and active WAL segment tail) into a `zstd` + `AES-256-GCM-AAD` snapshot (`SaveMetadataSkeleton`), skipping all `base/` and `global/` relation fork files stored in the Pageserver.
+  - [x] Evict local compute `PGDATA` (including `base/` relation fork files) on `SuspendTenant` after `StopTenantClean` and `Pageserver.FlushTenant` complete when `air_smgr` or `R2Primary` is active.
+- [x] **Sub-Second Stateless Compute Hydration on Wake ([internal/pageserver/skeleton.go](file:///workspaces/air/internal/pageserver/skeleton.go) & [internal/control/control.go](file:///workspaces/air/internal/control/control.go)):**
+  - [x] Reconstruct the minimal `PGDATA` directory skeleton on `WakeTenant` (`RestoreMetadataSkeleton`) in milliseconds (`~80 ms`, `1.89 MB` compressed) without downloading relation files from R2.
+- [x] **Phase J Verification ([internal/pageserver/skeleton_test.go](file:///workspaces/air/internal/pageserver/skeleton_test.go) & [internal/control/pageserver_integration_test.go](file:///workspaces/air/internal/control/pageserver_integration_test.go)):**
+  - [x] Verified `TestSaveAndRestoreMetadataSkeleton` and `TestNeonServerlessLifecycleWithPageserver` (`SuspendTenant` $\rightarrow$ `EvictTenantLocalData` $\rightarrow$ `RestoreMetadataSkeleton` in `80.32 ms`, `0` relation files on local disk, Pageserver serving relation blocks over Unix socket).
+
+---
+
+## Phase K — Live Patched PostgreSQL 17.12 (`smgr_hook`) + `air_smgr.so` End-to-End Verification (`AIR v2.3` — `NEXT`)
+
+- [ ] **Build & Install Patched PG 17.12 + `air_smgr.so` ([Dockerfile](file:///workspaces/air/Dockerfile) & [ext/air_smgr/Makefile](file:///workspaces/air/ext/air_smgr/Makefile)):**
+  - [ ] Build PostgreSQL 17.12 with [patches/pg17-smgr-hook.patch](file:///workspaces/air/patches/pg17-smgr-hook.patch) and install `air_smgr.so` + `supautils.so`.
+- [ ] **Zero-Local-Heap SQL Execution Verification:**
+  - [ ] Run end-to-end tests where tenant relation files under `base/<dbOid>/<relNode>` are unlinked/absent on local disk and verify `SELECT`, `INSERT`, `UPDATE`, `VACUUM`, and index scans execute seamlessly through `air_smgr.so` $\rightarrow$ `LFC` $\rightarrow$ `Pageserver` Unix socket.
+
+---
+
+## Phase L — Background Compaction Daemon, R2 Layer Offload & Pageserver Observability (`AIR v2.4`)
+
+- [ ] **Background L0 $\rightarrow$ L1 Compaction & GC Loop ([internal/pageserver/service.go](file:///workspaces/air/internal/pageserver/service.go) & [internal/pageserver/readpath.go](file:///workspaces/air/internal/pageserver/readpath.go)):**
+  - [ ] Run periodic background compaction triggered when a tenant's L0 layer count exceeds threshold (e.g., $\ge 8$ L0 layers), merging into key-partitioned L1 layers and removing superseded L0 files.
+- [ ] **Cloudflare R2 Layer Upload & On-Demand Range Hydration ([internal/pageserver/service.go](file:///workspaces/air/internal/pageserver/service.go) & [internal/pageserver/diskcache.go](file:///workspaces/air/internal/pageserver/diskcache.go)):**
+  - [ ] Upload sealed `.layer` files to R2 with `PutManifestCAS` epoch fencing and fetch evicted layers on demand via `DiskCache` + R2 range reads when local NVMe cache reaches capacity.
+- [ ] **Pageserver OpenMetrics Exporter ([internal/control/http.go](file:///workspaces/air/internal/control/http.go) & [internal/pageserver/service.go](file:///workspaces/air/internal/pageserver/service.go)):**
+  - [ ] Export `pageserver_getpage_latency_seconds`, `pageserver_batch_pages_total`, `pageserver_l0_layers_count`, `pageserver_compactions_total`, `pageserver_diskcache_bytes`, and `pageserver_wal_ingest_lsn` on `/metrics`.

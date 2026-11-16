@@ -1140,16 +1140,26 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 			return nil, fmt.Errorf("tenant %s cannot wake from state %s", tenantID, curState)
 		}
 		if !cp.agent.HasLocalPGData(tenantID) {
-			s3c, bucket := cp.backupStore()
-			if s3c == nil || bucket == "" {
-				return nil, fmt.Errorf("tenant %s has no local pgdata and backup store is not configured", tenantID)
-			}
-			var wrappedDEK string
-			if dErr := cp.db.QueryRow(ctx, `SELECT wrapped_dek FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&wrappedDEK); dErr == nil && wrappedDEK != "" {
-				_ = cp.kms.LoadWrappedDEK(tenantID, wrappedDEK)
-			}
-			if hErr := backup.HydrateTenantPGDataFromR2(ctx, cp.agent, s3c, bucket, tenantID); hErr != nil {
-				return nil, fmt.Errorf("hydrate tenant %s from R2: %w", tenantID, hErr)
+			if ps := cp.getPageserver(); ps != nil && ps.HasMetadataSkeleton(ctx, tenantID) {
+				pgDataDir, pdErr := cp.agent.TenantPGDataDir(tenantID)
+				if pdErr != nil {
+					return nil, pdErr
+				}
+				if _, rErr := ps.RestoreMetadataSkeleton(ctx, tenantID, epoch, pgDataDir); rErr != nil {
+					return nil, fmt.Errorf("restore metadata skeleton for %s: %w", tenantID, rErr)
+				}
+			} else {
+				s3c, bucket := cp.backupStore()
+				if s3c == nil || bucket == "" {
+					return nil, fmt.Errorf("tenant %s has no local pgdata and backup store is not configured", tenantID)
+				}
+				var wrappedDEK string
+				if dErr := cp.db.QueryRow(ctx, `SELECT wrapped_dek FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&wrappedDEK); dErr == nil && wrappedDEK != "" {
+					_ = cp.kms.LoadWrappedDEK(tenantID, wrappedDEK)
+				}
+				if hErr := backup.HydrateTenantPGDataFromR2(ctx, cp.agent, s3c, bucket, tenantID); hErr != nil {
+					return nil, fmt.Errorf("hydrate tenant %s from R2: %w", tenantID, hErr)
+				}
 			}
 		}
 		if cp.getPageserver() != nil {
@@ -1204,7 +1214,8 @@ func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drai
 	}
 
 	var state string
-	if err := cp.db.QueryRow(ctx, `SELECT state FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&state); err != nil {
+	var epoch int64
+	if err := cp.db.QueryRow(ctx, `SELECT state, fencing_epoch FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&state, &epoch); err != nil {
 		return err
 	}
 	if state == "SUSPENDED" {
@@ -1243,6 +1254,14 @@ func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drai
 		if ps := cp.getPageserver(); ps != nil {
 			if _, fErr := ps.FlushTenant(ctx, tenantID); fErr != nil {
 				return fmt.Errorf("flush pageserver layers for %s: %w", tenantID, fErr)
+			}
+			if pgDataDir, pdErr := cp.agent.TenantPGDataDir(tenantID); pdErr == nil {
+				if _, sErr := ps.SaveMetadataSkeleton(ctx, tenantID, epoch, pgDataDir); sErr != nil {
+					return fmt.Errorf("save metadata skeleton for %s: %w", tenantID, sErr)
+				}
+			}
+			if cp.agent.HasAirSmgr() {
+				evictToR2 = true
 			}
 		}
 	if evictToR2 {

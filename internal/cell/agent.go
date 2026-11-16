@@ -107,6 +107,40 @@ func (a *Agent) SetPageserverConfig(enabled bool, socketPath string, lfcMaxMB in
 	a.lfcMaxMB = lfcMaxMB
 }
 
+// IsPageserverEnabled reports whether air_smgr/Pageserver mode is enabled on the agent.
+func (a *Agent) IsPageserverEnabled() bool {
+	a.tenantMu.RLock()
+	defer a.tenantMu.RUnlock()
+	return a.pageserverEnabled && a.pageserverSocket != ""
+}
+
+// HasAirSmgr reports whether Pageserver mode is enabled and the air_smgr.so extension
+// is installed alongside PostgreSQL on this host.
+func (a *Agent) HasAirSmgr() bool {
+	if !a.IsPageserverEnabled() {
+		return false
+	}
+	candidates := []string{
+		filepath.Clean(filepath.Join(a.pgBin, "..", "lib", "air_smgr.so")),
+		"/usr/lib/postgresql/17/lib/air_smgr.so",
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// TenantPGDataDir returns the validated active PGDATA directory path for tenantID.
+func (a *Agent) TenantPGDataDir(tenantID string) (string, error) {
+	activeBase, err := tenant.SafeSubpath(a.volDir, "tenants/active", tenantID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(activeBase, "pgdata"), nil
+}
+
 func NewAgent(volDir, pgBinDir string, kms *crypto.EnvelopeKMS) (*Agent, error) {
 	if pgBinDir == "" {
 		pgBinDir = "/usr/lib/postgresql/17/bin"
