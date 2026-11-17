@@ -1,0 +1,88 @@
+{
+  "trials": [
+    {
+      "trial": 1,
+      "tenant_id": "repro_db_1",
+      "provision_ms": 2627.03,
+      "ro_tps": 7908.024078,
+      "ro_lat_ms": 1.012,
+      "rw_tps": 1150.226972,
+      "rw_lat_ms": 6.955,
+      "suspend_ms": 10081.9,
+      "wake_ms": 17053.13
+    },
+    {
+      "trial": 2,
+      "tenant_id": "repro_db_2",
+      "provision_ms": 2740.39,
+      "ro_tps": 8122.597262,
+      "ro_lat_ms": 0.985,
+      "rw_tps": 1150.392809,
+      "rw_lat_ms": 6.954,
+      "suspend_ms": 10077.32,
+      "wake_ms": 14969.35
+    },
+    {
+      "trial": 3,
+      "tenant_id": "repro_db_3",
+      "provision_ms": 2574.76,
+      "ro_tps": 8054.620232,
+      "ro_lat_ms": 0.993,
+      "rw_tps": 1144.800759,
+      "rw_lat_ms": 6.988,
+      "suspend_ms": 10079.46,
+      "wake_ms": 12869.71
+    }
+  ],
+  "summary": {
+    "provision_ms": {
+      "min": 2574.76,
+      "median": 2627.03,
+      "max": 2740.39,
+      "variance": 7169.323233333302,
+      "stddev": 84.671856205786
+    },
+    "ro_tps": {
+      "min": 7908.024078,
+      "median": 8054.620232,
+      "max": 8122.597262,
+      "variance": 12025.493377851728,
+      "stddev": 109.66081058359785
+    },
+    "ro_lat_ms": {
+      "min": 0.985,
+      "median": 0.993,
+      "max": 1.012,
+      "variance": 0.00019233333333333366,
+      "stddev": 0.01386842937514316
+    },
+    "rw_tps": {
+      "min": 1144.800759,
+      "median": 1150.226972,
+      "max": 1150.392809,
+      "variance": 10.123718772406212,
+      "stddev": 3.1817791834767872
+    },
+    "rw_lat_ms": {
+      "min": 6.954,
+      "median": 6.955,
+      "max": 6.988,
+      "variance": 0.0003743333333333453,
+      "stddev": 0.01934769581457558
+    },
+    "suspend_ms": {
+      "min": 10077.32,
+      "median": 10079.46,
+      "max": 10081.9,
+      "variance": 5.251599999999888,
+      "stddev": 2.291636969504526
+    },
+    "wake_ms": {
+      "min": 12869.71,
+      "median": 14969.35,
+      "max": 17053.13,
+      "variance": 4375271.685733337,
+      "stddev": 2091.7150106391973
+    }
+  }
+}

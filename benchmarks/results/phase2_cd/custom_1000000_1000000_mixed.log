@@ -1,0 +1,13 @@
+pgbench (17.12 (Ubuntu 17.12-1.pgdg24.04+1))
+transaction type: /tmp/p2c_mixed.sql
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 2
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 11595
+number of failed transactions: 0 (0.000%)
+latency average = 10.335 ms
+initial connection time = 48.014 ms
+tps = 774.071625 (without initial connection time)

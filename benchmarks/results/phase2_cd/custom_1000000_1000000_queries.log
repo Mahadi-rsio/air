@@ -1,0 +1,102 @@
+Timing is on.
+                                                     QUERY PLAN                                                     
+--------------------------------------------------------------------------------------------------------------------
+ Index Scan using items_pkey on items  (cost=0.42..8.44 rows=1 width=131) (actual time=0.542..0.543 rows=1 loops=1)
+   Index Cond: (id = 500000)
+   Buffers: shared hit=4 read=3 written=3
+ Planning:
+   Buffers: shared hit=135 read=4 written=4
+ Planning Time: 1.698 ms
+ Execution Time: 0.591 ms
+(7 rows)
+
+Time: 5.435 ms
+                                                           QUERY PLAN                                                            
+---------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=325.63..325.64 rows=1 width=40) (actual time=21.237..21.238 rows=1 loops=1)
+   Buffers: shared hit=1 read=122 written=122
+   ->  Index Scan using items_pkey on items  (cost=0.42..297.79 rows=5568 width=8) (actual time=0.504..20.528 rows=5001 loops=1)
+         Index Cond: ((id >= 250000) AND (id <= 255000))
+         Buffers: shared hit=1 read=122 written=122
+ Planning:
+   Buffers: shared hit=33 read=5 written=5
+ Planning Time: 1.086 ms
+ Execution Time: 21.282 ms
+(9 rows)
+
+Time: 24.460 ms
+                                                             QUERY PLAN                                                             
+------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=9.54..361.78 rows=100 width=16) (actual time=0.862..14.014 rows=100 loops=1)
+   Buffers: shared read=103 written=51
+   ->  Bitmap Heap Scan on items  (cost=9.54..1767.21 rows=499 width=16) (actual time=0.861..13.966 rows=100 loops=1)
+         Recheck Cond: ((category = 42) AND (val > 50000))
+         Heap Blocks: exact=100
+         Buffers: shared read=103 written=51
+         ->  Bitmap Index Scan on idx_items_cat_val  (cost=0.00..9.42 rows=499 width=0) (actual time=0.562..0.563 rows=500 loops=1)
+               Index Cond: ((category = 42) AND (val > 50000))
+               Buffers: shared read=3 written=3
+ Planning:
+   Buffers: shared hit=11
+ Planning Time: 0.266 ms
+ Execution Time: 14.088 ms
+(13 rows)
+
+Time: 15.071 ms
+                                                                   QUERY PLAN                                                                    
+-------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize GroupAggregate  (cost=30610.40..30610.94 rows=2 width=37) (actual time=448.859..451.795 rows=2 loops=1)
+   Group Key: status
+   Buffers: shared hit=3658 read=17635
+   ->  Gather Merge  (cost=30610.40..30610.86 rows=4 width=53) (actual time=448.845..451.780 rows=6 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=3658 read=17635
+         ->  Sort  (cost=29610.37..29610.38 rows=2 width=53) (actual time=441.865..441.867 rows=2 loops=3)
+               Sort Key: status
+               Sort Method: quicksort  Memory: 25kB
+               Buffers: shared hit=3658 read=17635
+               Worker 0:  Sort Method: quicksort  Memory: 25kB
+               Worker 1:  Sort Method: quicksort  Memory: 25kB
+               ->  Partial HashAggregate  (cost=29610.34..29610.36 rows=2 width=53) (actual time=441.785..441.787 rows=2 loops=3)
+                     Group Key: status
+                     Batches: 1  Memory Usage: 24kB
+                     Buffers: shared hit=3642 read=17635
+                     Worker 0:  Batches: 1  Memory Usage: 24kB
+                     Worker 1:  Batches: 1  Memory Usage: 24kB
+                     ->  Parallel Seq Scan on items  (cost=0.00..25443.67 rows=416667 width=13) (actual time=0.614..316.716 rows=333333 loops=3)
+                           Buffers: shared hit=3642 read=17635
+ Planning:
+   Buffers: shared hit=30 read=1
+ Planning Time: 0.452 ms
+ Execution Time: 451.887 ms
+(25 rows)
+
+Time: 453.839 ms
+                                                              QUERY PLAN                                                              
+--------------------------------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=27506.59..27506.60 rows=1 width=8) (actual time=185.341..188.206 rows=1 loops=1)
+   Buffers: shared hit=3738 read=17539 written=96
+   ->  Gather  (cost=27506.38..27506.59 rows=2 width=8) (actual time=185.136..188.199 rows=3 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=3738 read=17539 written=96
+         ->  Partial Aggregate  (cost=26506.38..26506.39 rows=1 width=8) (actual time=178.946..178.947 rows=1 loops=3)
+               Buffers: shared hit=3738 read=17539 written=96
+               ->  Parallel Seq Scan on items  (cost=0.00..26485.33 rows=8418 width=0) (actual time=1.268..178.551 rows=2449 loops=3)
+                     Filter: (payload ~~ '%abc%'::text)
+                     Rows Removed by Filter: 330884
+                     Buffers: shared hit=3738 read=17539 written=96
+ Planning Time: 0.263 ms
+ Execution Time: 188.228 ms
+(14 rows)
+
+Time: 189.278 ms
+BEGIN
+Time: 0.095 ms
+INSERT 0 10000
+Time: 130.394 ms
+DELETE 10000
+Time: 5.238 ms
+COMMIT
+Time: 2.014 ms

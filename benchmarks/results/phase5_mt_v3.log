@@ -1,0 +1,71 @@
+2026/11/17 05:29:32 === Multi-Tenant Tier: 1 tenants ===
+2026/11/17 05:30:02 TIER 1 RESULT: {"tenants":1,"provision_p50_ms":2101,"provision_p95_ms":2101,"provision_fail":0,"read_agg_tps":5166,"read_p95_ms":0.144,"read_p99_ms":0.212,"read_fail":0,"mixed_agg_tps":3735.9,"mixed_p95_ms":0.284,"mixed_p99_ms":0.387,"mixed_fail":0,"isolation_passed":true,"isolation_detail":"verified 1 tenants: unique data + cross-tenant auth/db rejected","active_mem_mib":122.4,"idle_mem_mib":150.7,"concurrent_wake_p50_ms":1080,"concurrent_wake_p95_ms":1080,"concurrent_wake_fail":0}
+2026/11/17 05:30:02 === Multi-Tenant Tier: 10 tenants ===
+2026/11/17 05:32:40 TIER 10 RESULT: {"tenants":10,"provision_p50_ms":2099,"provision_p95_ms":2546.1,"provision_fail":0,"read_agg_tps":8742.1,"read_p95_ms":1.309,"read_p99_ms":2.545,"read_fail":0,"mixed_agg_tps":5858.4,"mixed_p95_ms":2.42,"mixed_p99_ms":3.89,"mixed_fail":0,"isolation_passed":true,"isolation_detail":"verified 10 tenants: unique data + cross-tenant auth/db rejected","active_mem_mib":711,"idle_mem_mib":231.2,"concurrent_wake_p50_ms":636.5,"concurrent_wake_p95_ms":648.55,"concurrent_wake_fail":0}
+2026/11/17 05:32:40 === Multi-Tenant Tier: 25 tenants ===
+2026/11/17 05:38:22 TIER 25 RESULT: {"tenants":25,"provision_p50_ms":2082,"provision_p95_ms":2339,"provision_fail":0,"read_agg_tps":8796.2,"read_p95_ms":2.979,"read_p99_ms":5.128,"read_fail":0,"mixed_agg_tps":5232.8,"mixed_p95_ms":7.46,"mixed_p99_ms":11.745,"mixed_fail":0,"isolation_passed":true,"isolation_detail":"verified 25 tenants: unique data + cross-tenant auth/db rejected","active_mem_mib":1806.336,"idle_mem_mib":601.8,"concurrent_wake_p50_ms":630,"concurrent_wake_p95_ms":644.15,"concurrent_wake_fail":0}
+[
+  {
+    "tenants": 1,
+    "provision_p50_ms": 2101,
+    "provision_p95_ms": 2101,
+    "provision_fail": 0,
+    "read_agg_tps": 5166,
+    "read_p95_ms": 0.144,
+    "read_p99_ms": 0.212,
+    "read_fail": 0,
+    "mixed_agg_tps": 3735.9,
+    "mixed_p95_ms": 0.284,
+    "mixed_p99_ms": 0.387,
+    "mixed_fail": 0,
+    "isolation_passed": true,
+    "isolation_detail": "verified 1 tenants: unique data + cross-tenant auth/db rejected",
+    "active_mem_mib": 122.4,
+    "idle_mem_mib": 150.7,
+    "concurrent_wake_p50_ms": 1080,
+    "concurrent_wake_p95_ms": 1080,
+    "concurrent_wake_fail": 0
+  },
+  {
+    "tenants": 10,
+    "provision_p50_ms": 2099,
+    "provision_p95_ms": 2546.1,
+    "provision_fail": 0,
+    "read_agg_tps": 8742.1,
+    "read_p95_ms": 1.309,
+    "read_p99_ms": 2.545,
+    "read_fail": 0,
+    "mixed_agg_tps": 5858.4,
+    "mixed_p95_ms": 2.42,
+    "mixed_p99_ms": 3.89,
+    "mixed_fail": 0,
+    "isolation_passed": true,
+    "isolation_detail": "verified 10 tenants: unique data + cross-tenant auth/db rejected",
+    "active_mem_mib": 711,
+    "idle_mem_mib": 231.2,
+    "concurrent_wake_p50_ms": 636.5,
+    "concurrent_wake_p95_ms": 648.55,
+    "concurrent_wake_fail": 0
+  },
+  {
+    "tenants": 25,
+    "provision_p50_ms": 2082,
+    "provision_p95_ms": 2339,
+    "provision_fail": 0,
+    "read_agg_tps": 8796.2,
+    "read_p95_ms": 2.979,
+    "read_p99_ms": 5.128,
+    "read_fail": 0,
+    "mixed_agg_tps": 5232.8,
+    "mixed_p95_ms": 7.46,
+    "mixed_p99_ms": 11.745,
+    "mixed_fail": 0,
+    "isolation_passed": true,
+    "isolation_detail": "verified 25 tenants: unique data + cross-tenant auth/db rejected",
+    "active_mem_mib": 1806.336,
+    "idle_mem_mib": 601.8,
+    "concurrent_wake_p50_ms": 630,
+    "concurrent_wake_p95_ms": 644.15,
+    "concurrent_wake_fail": 0
+  }
+]

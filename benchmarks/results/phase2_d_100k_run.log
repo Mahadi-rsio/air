@@ -1,0 +1,7 @@
+Loading 100K rows into p2d_100k on port 18024...
+--- Measuring first_after_clean_startup (port=18024) ---
+--- Measuring warm (port=18024) ---
+--- Measuring after_suspend_wake (port=18024) ---
+--- Measuring after_local_cache_eviction (port=18024) ---
+--- Measuring after_container_restart (port=18021) ---
+Done Phase 2D 100K!

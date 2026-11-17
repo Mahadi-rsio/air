@@ -1,0 +1,32 @@
+[
+  {
+    "name": "Test A: Normal suspend \u0026 wake (cache cleared)",
+    "passed": true,
+    "detail": "cnt=1940 (want 1940) hash=43f8100a6a7f05975b7eda4348263b041bfb8933ce84c4394225369ebc68bd3a (want 43f8100a6a7f05975b7eda4348263b041bfb8933ce84c4394225369ebc68bd3a) idxErr=\u003cnil\u003e err=\u003cnil\u003e"
+  },
+  {
+    "name": "Test B: Full container restart (lfc+ps_cache cleared)",
+    "passed": true,
+    "detail": "cnt=1941 (want 1941) hash=25303643999a11aa4476d4cee4ac4cf93d2abdab7174473ca1675d98ad21ec8c (want 25303643999a11aa4476d4cee4ac4cf93d2abdab7174473ca1675d98ad21ec8c) idxErr=\u003cnil\u003e err=\u003cnil\u003e"
+  },
+  {
+    "name": "Test C: Abrupt SIGKILL air-bench",
+    "passed": true,
+    "detail": "acknowledged_committed=1477 found_after_recovery=1477 missing=0 base_cnt=1941 base_hash_ok=true",
+    "metrics": {
+      "acknowledged_committed": 1477,
+      "found": 1477,
+      "missing": 0
+    }
+  },
+  {
+    "name": "Test D: WAL \u0026 Backup/Restore",
+    "passed": false,
+    "detail": "backup failed code=503 err=\u003cnil\u003e body={\"error\":\"backup store is not configured\"}"
+  },
+  {
+    "name": "Test E: Repeated 20-cycle write-\u003ecommit-\u003esuspend-\u003ewake-\u003everify",
+    "passed": false,
+    "detail": "failures=1 firstErr=cycle 1 insert: ERROR: inconsistent types deduced for parameter $1 (SQLSTATE 42P08)"
+  }
+]

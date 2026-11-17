@@ -1,0 +1,10 @@
+CREATE TABLE
+INSERT 0 1000000
+CREATE INDEX
+CREATE INDEX
+VACUUM
+ total_rel_size | total_rel_bytes 
+----------------+-----------------
+ 0 bytes        |               0
+(1 row)
+

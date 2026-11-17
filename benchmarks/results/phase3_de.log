@@ -1,0 +1,4 @@
+2026/11/17 05:10:46 Provisioned dur_de_1794892245 on port 18022
+2026/11/17 05:10:51 Test D backup: code=201 err=<nil> body={"tenant_id":"dur_de_1794892245","backup_id":"bkp_1794892246995517257","type":"FULL","r2_key":"tenants/dur_de_1794892245/epoch_000001/bkp_1794892246995517257.tar.zst.enc","epoch":1,"cipher_bytes":1630235,"wal_segments_archived":3}
+2026/11/17 05:10:56 Test D restore: code=200 err=<nil> body={"tenant_id":"dur_de_1794892245","restored_backups":1,"wal_segments_replayed":3,"staging_headroom_ok":true,"amcheck_ok":true,"verify_query_output":"500"}
+2026/11/17 05:10:56 Test E summary: failures=1 firstErr=cycle 1 insert: ERROR: inconsistent types deduced for parameter $1 (SQLSTATE 42P08)

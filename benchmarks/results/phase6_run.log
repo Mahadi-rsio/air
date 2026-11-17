@@ -1,0 +1,14 @@
+Deleted 180 objects (338801761 bytes) from s3://air-pg-backups/
+[F1 R2 Unavailable] {"error":"operation error S3: HeadObject, exceeded maximum number of attempts, 3, https response error StatusCode: 503, RequestID: , HostID: , api error ServiceUnavailable: Service Unavailable"} HTTP:400
+[F1 Active DB Query During R2 Outage] 100
+[F2 R2 Timeout 3s] {"error":"operation error S3: HeadObject, exceeded maximum number of attempts, 3, https response error StatusCode: 504, RequestID: , HostID: , api error GatewayTimeout: Gateway Timeout"} HTTP:400
+[F3 R2 Transient 5xx] {"account_id":"acct_default","tenant_id":"f6_5xx","database":"f6_5xx","username":"app_user","password":"5fdd39e56d505899f2b0df6d","direct_port":18022,"system_identifier":"7709010740068794480","fencing_epoch":1,"state":"ACTIVE"} HTTP:201
+[F4 Drop Layer PUT] suspend={"status":"SUSPENDED","tenant_id":"f6_db"} HTTP:200 wake={"app_password":"0b72e074c73d511c178835ea","host":"","port":18021,"sock_dir":"/var/lib/air/tenants/active/f6_db/sock","state":"ACTIVE","tenant_id":"f6_db"} HTTP:200 count=101
+[F5 Drop WAL PUT] suspend={"status":"SUSPENDED","tenant_id":"f6_db"} HTTP:200 wake={"app_password":"0b72e074c73d511c178835ea","host":"","port":18021,"sock_dir":"/var/lib/air/tenants/active/f6_db/sock","state":"ACTIVE","tenant_id":"f6_db"} HTTP:200 count=102
+[F8 Corrupted Layer GET] wake={"error":"tenant f6_db readiness check failed: timeout waiting for postgres on port 18021"} HTTP:400
+[F10 Insufficient Disk 4MB tmpfs] selecting default time zone ... Etc/UTC
+creating configuration files ... ok
+running bootstrap script ... 2026-11-17 05:40:22.013 UTC [39] FATAL:  could not write to file "pg_wal/xlogtemp.39": No space left on device
+child process exited with exit code 1
+initdb: removing contents of data directory "/var/lib/air/meta/pgdata")
+Done Phase 6!

@@ -1,0 +1,21 @@
+=== Phase 12 Real Container Verification & Benchmarks ===
+
+--- [Part 4] PG17 air_smgr Storage Introspection ---
+SIZES_AFTER_INSERT: 180224|24576|0|212992|262144|16384|7763635
+SIZES_AFTER_UPDATE_DELETE_VACUUM_AUX: 270336|311296|368640|7771827
+SIZES_AFTER_SUSPEND_WAKE: 270336|311296|368640|8197811
+SIZES_AFTER_RESTART: 270336|311296|368640|8197811
+SIZES_AFTER_TRUNCATE_DROP: 0|8192|24576|7771827
+
+--- [Part 1 & 7] Tenant ID Reuse Isolation ---
+TENANT_RECREATE_MS=2570 RECREATED_PUBLIC_TABLES=0
+
+--- [Part 2, 3, 7] Normal vs Slow vs Unavailable R2 ---
+NORMAL_R2_SUSPEND_MS=10087 NORMAL_R2_WAKE_MS=127
+SLOW_R2_3S_WAKE_MS=9955 SLOW_R2_3S_SUSPEND_MS=10195
+UNAVAIL_R2_SUSPEND: {"generation":"gen_c215099b43d4ae4b","offload_op_id":"offload_7e46105f8aa0d8be","offload_state":"pending","status":"SUSPENDED","tenant_id":"p12_slow"} HTTP:200
+UNAVAIL_R2_OFFLOAD_STATUS: {"op_id":"offload_7e46105f8aa0d8be","tenant_id":"p12_slow","generation":"gen_c215099b43d4ae4b","state":"running","started_at":"2026-11-17T08:55:19.337215Z","uploaded_objects":0,"failed_objects":0,"retry_count":0}
+
+--- [Part 7] 25-Tenant Provisioning & Isolation ---
+MT_25_PROVISION_WRITE_MS=59139 MT_25_TOTAL_MS=184482 MISMATCHES=0 CONTAINER_STATS=(mem=1.583GiB / 7.756GiB cpu=0.38%)
+=== Phase 12 Verification Complete ===

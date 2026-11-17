@@ -1,0 +1,4 @@
+=== Phase 2C & 2D: Custom Workloads (100K, 1M, 10M) & Cold vs Warm ===
+--- Setting up custom_100000 (100000 rows) on port 18023 ---
+  Completed custom suite for 100000 rows.
+--- Setting up custom_1000000 (1000000 rows) on port 18024 ---

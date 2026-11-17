@@ -1,0 +1,2 @@
+--- Measuring first_after_clean_startup (port=18022) ---
+psql: error: connection to server at "127.0.0.1", port 18022 failed: FATAL:  air_smgr readv failed: pageserver returned error status

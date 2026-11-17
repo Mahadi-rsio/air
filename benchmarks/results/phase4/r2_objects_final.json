@@ -1,0 +1,68 @@
+{
+  "bucket": "air-pg-backups",
+  "prefix": "tenants/p4_db/",
+  "object_count": 10,
+  "total_bytes": 36455731,
+  "objects": [
+    {
+      "key": "tenants/p4_db/epoch_000001/wal/000000010000000000000001.zst.enc",
+      "size": 1952080,
+      "last_modified": "2026-11-17T05:18:26Z",
+      "etag": "\"6abe5f3d38ef301fb9ac0f922c042992\""
+    },
+    {
+      "key": "tenants/p4_db/epoch_000001/wal/000000010000000000000002.zst.enc",
+      "size": 495518,
+      "last_modified": "2026-11-17T05:18:27Z",
+      "etag": "\"bb5a1a19d9366d2dcce69870d278acab\""
+    },
+    {
+      "key": "tenants/p4_db/epoch_000001/wal/000000010000000000000003.zst.enc",
+      "size": 493583,
+      "last_modified": "2026-11-17T05:18:28Z",
+      "etag": "\"3314809dbbe27213654f99c321d157cb\""
+    },
+    {
+      "key": "tenants/p4_db/epoch_000001/wal/000000010000000000000004.zst.enc",
+      "size": 613389,
+      "last_modified": "2026-11-17T05:18:28Z",
+      "etag": "\"2a4c6758b88969e002fa178483bd7383\""
+    },
+    {
+      "key": "tenants/p4_db/epoch_000001/wal/000000010000000000000005.zst.enc",
+      "size": 4130557,
+      "last_modified": "2026-11-17T05:18:29Z",
+      "etag": "\"013d98641239041cc0ebb80856fdb6bd\""
+    },
+    {
+      "key": "tenants/p4_db/epoch_000001/wal/000000010000000000000006.zst.enc",
+      "size": 297620,
+      "last_modified": "2026-11-17T05:18:30Z",
+      "etag": "\"53444c1bf0389daf9703bf6163e13130\""
+    },
+    {
+      "key": "tenants/p4_db/layers/sha256/3b/3bdb067b3c3389b8f1e65451bce3e0e02457bcf7536ad6247b2a6701f37e8ea1",
+      "size": 3078573,
+      "last_modified": "2026-11-17T05:17:50Z",
+      "etag": "\"83ff8abf503d4fa4b4ff698d0d18a2ff\""
+    },
+    {
+      "key": "tenants/p4_db/layers/sha256/90/900db5a83c71ab2af2a58710c7baa34bd8c4c9d2e463502b8a49b5961c632537",
+      "size": 17372723,
+      "last_modified": "2026-11-17T05:18:24Z",
+      "etag": "\"19d7fc7a2c30c461070743b52b8f07f7-3\""
+    },
+    {
+      "key": "tenants/p4_db/skeleton/skeleton.tar.zst.enc",
+      "size": 8019548,
+      "last_modified": "2026-11-17T05:18:25Z",
+      "etag": "\"fca5764f611bd862378b0695e3252960\""
+    },
+    {
+      "key": "tenants/p4_db/timeline_1/layer_manifest.json",
+      "size": 2140,
+      "last_modified": "2026-11-17T05:18:25Z",
+      "etag": "\"ff073c4a9147c5a3ab9ad3d03f974e68\""
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+pgbench (17.12 (Ubuntu 17.12-1.pgdg24.04+1))
+pgbench: error: client 1 script 0 aborted in command 4 query 0: ERROR:  air_smgr nblocks failed: pageserver RPC I/O failed: Connection reset by peer
+pgbench: error: client 3 script 0 aborted in command 4 query 0: ERROR:  air_smgr nblocks failed: pageserver RPC I/O failed: Connection reset by peer
+pgbench: error: client 5 script 0 aborted in command 3 query 0: ERROR:  air_smgr readv failed: pageserver RPC I/O failed: Connection reset by peer
+pgbench: error: client 2 script 0 aborted in command 3 query 0: ERROR:  air_smgr writev failed: pageserver put I/O failed: Connection reset by peer
+CONTEXT:  writing block 1203 of relation base/16385/16394
+pgbench: error: client 6 script 0 aborted in command 3 query 0: ERROR:  air_smgr nblocks failed: pageserver RPC I/O failed: Connection reset by peer
+pgbench: error: client 7 script 0 aborted in command 3 query 0: ERROR:  air_smgr nblocks failed: pageserver RPC I/O failed: Connection reset by peer
+pgbench: error: client 4 script 0 aborted in command 3 query 0: ERROR:  air_smgr nblocks failed: pageserver RPC I/O failed: Connection reset by peer
+pgbench: error: client 0 script 0 aborted in command 3 query 0: ERROR:  air_smgr nblocks failed: pageserver RPC I/O failed: Connection reset by peer
+transaction type: /tmp/p2c_iud.sql
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 2
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 6567
+number of failed transactions: 0 (0.000%)
+latency average = 7.968 ms
+initial connection time = 51.162 ms
+tps = 1004.069946 (without initial connection time)
+pgbench: error: Run was aborted; the above results are incomplete.

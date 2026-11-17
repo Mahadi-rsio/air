@@ -1,0 +1,29 @@
+2026/11/17 05:09:22 Provisioned dur_db_1794892159 on port 18023
+2026/11/17 05:09:22 Deterministic dataset seeded: count=1940 sha256=43f8100a6a7f05975b7eda4348263b041bfb8933ce84c4394225369ebc68bd3a
+[
+  {
+    "name": "Test A: Normal suspend \u0026 wake (cache cleared)",
+    "passed": true,
+    "detail": "cnt=1940 (want 1940) hash=43f8100a6a7f05975b7eda4348263b041bfb8933ce84c4394225369ebc68bd3a (want 43f8100a6a7f05975b7eda4348263b041bfb8933ce84c4394225369ebc68bd3a) idxErr=\u003cnil\u003e err=\u003cnil\u003e"
+  },
+  {
+    "name": "Test B: Full container restart (lfc+ps_cache cleared)",
+    "passed": true,
+    "detail": "cnt=1941 (want 1941) hash=25303643999a11aa4476d4cee4ac4cf93d2abdab7174473ca1675d98ad21ec8c (want 25303643999a11aa4476d4cee4ac4cf93d2abdab7174473ca1675d98ad21ec8c) idxErr=\u003cnil\u003e err=\u003cnil\u003e"
+  },
+  {
+    "name": "Test C: Abrupt SIGKILL air-bench",
+    "passed": false,
+    "detail": "failed to connect to `user=app_user database=dur_db_1794892159`: 127.0.0.1:18021 (127.0.0.1): server error: PANIC: could not open critical system index 2662 (SQLSTATE XX001)"
+  },
+  {
+    "name": "Test D: WAL \u0026 Backup/Restore",
+    "passed": false,
+    "detail": "failed to connect to `user=app_user database=dur_db_1794892159`: 127.0.0.1:18021 (127.0.0.1): server error: PANIC: could not open critical system index 2662 (SQLSTATE XX001)"
+  },
+  {
+    "name": "Test E: Repeated 20-cycle write-\u003ecommit-\u003esuspend-\u003ewake-\u003everify",
+    "passed": false,
+    "detail": "failures=1 firstErr=cycle 1 connect: failed to connect to `user=app_user database=dur_db_1794892159`: 127.0.0.1:18021 (127.0.0.1): server error: PANIC: could not open critical system index 2662 (SQLSTATE XX001)"
+  }
+]

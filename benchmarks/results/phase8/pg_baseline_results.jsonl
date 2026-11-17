@@ -1,0 +1,4 @@
+{"tps": 13386.640044, "avg_lat_ms": 0.598, "tx_processed": 401331, "tx_failed": 0, "p50_ms": 0.526, "p95_ms": 1.067, "p99_ms": 2.229, "samples": 401331, "engine": "pg17-local", "mode": "RO", "clients": 8}
+{"tps": 11872.621631, "avg_lat_ms": 2.695, "tx_processed": 355618, "tx_failed": 0, "p50_ms": 2.692, "p95_ms": 4.881, "p99_ms": 7.645, "samples": 355618, "engine": "pg17-local", "mode": "RO", "clients": 32}
+{"tps": 1959.816558, "avg_lat_ms": 4.082, "tx_processed": 58776, "tx_failed": 0, "p50_ms": 3.8, "p95_ms": 6.704, "p99_ms": 10.417, "samples": 58776, "engine": "pg17-local", "mode": "RW", "clients": 8}
+{"tps": 1745.40882, "avg_lat_ms": 18.334, "tx_processed": 52368, "tx_failed": 0, "p50_ms": 15.421, "p95_ms": 38.572, "p99_ms": 61.146, "samples": 52368, "engine": "pg17-local", "mode": "RW", "clients": 32}

@@ -1,0 +1,68 @@
+[
+  {
+    "scenario": "warm_random_reads",
+    "readers": 1,
+    "pages_per_sec": 11305.5,
+    "total_pages": 90444,
+    "errors": 0,
+    "p50_us": 81.8,
+    "p95_us": 117.49,
+    "p99_us": 158.22,
+    "mem_mib": 0
+  },
+  {
+    "scenario": "warm_random_reads",
+    "readers": 8,
+    "pages_per_sec": 23876.13,
+    "total_pages": 191009,
+    "errors": 0,
+    "p50_us": 247.12,
+    "p95_us": 877.66,
+    "p99_us": 2390.96,
+    "mem_mib": 0
+  },
+  {
+    "scenario": "warm_random_reads",
+    "readers": 32,
+    "pages_per_sec": 29326.63,
+    "total_pages": 234613,
+    "errors": 0,
+    "p50_us": 884.95,
+    "p95_us": 2894.01,
+    "p99_us": 4510.72,
+    "mem_mib": 0
+  },
+  {
+    "scenario": "warm_random_reads",
+    "readers": 64,
+    "pages_per_sec": 31576.38,
+    "total_pages": 252611,
+    "errors": 0,
+    "p50_us": 1773.83,
+    "p95_us": 4811.73,
+    "p99_us": 7517.09,
+    "mem_mib": 0
+  },
+  {
+    "scenario": "warm_random_reads",
+    "readers": 128,
+    "pages_per_sec": 33156.25,
+    "total_pages": 265250,
+    "errors": 0,
+    "p50_us": 3198.02,
+    "p95_us": 9290.81,
+    "p99_us": 15111.86,
+    "mem_mib": 0
+  },
+  {
+    "scenario": "same_page_64_readers",
+    "readers": 64,
+    "pages_per_sec": 31582,
+    "total_pages": 157910,
+    "errors": 0,
+    "p50_us": 1733.75,
+    "p95_us": 4993.94,
+    "p99_us": 8128.64,
+    "mem_mib": 0
+  }
+]
