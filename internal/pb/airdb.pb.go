@@ -21,6 +21,58 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type TenantEventType int32
+
+const (
+	TenantEventType_TENANT_EVENT_UNSPECIFIED     TenantEventType = 0
+	TenantEventType_TENANT_EVENT_UPSERT          TenantEventType = 1
+	TenantEventType_TENANT_EVENT_DELETE          TenantEventType = 2
+	TenantEventType_TENANT_EVENT_RESYNC_REQUIRED TenantEventType = 3
+)
+
+// Enum value maps for TenantEventType.
+var (
+	TenantEventType_name = map[int32]string{
+		0: "TENANT_EVENT_UNSPECIFIED",
+		1: "TENANT_EVENT_UPSERT",
+		2: "TENANT_EVENT_DELETE",
+		3: "TENANT_EVENT_RESYNC_REQUIRED",
+	}
+	TenantEventType_value = map[string]int32{
+		"TENANT_EVENT_UNSPECIFIED":     0,
+		"TENANT_EVENT_UPSERT":          1,
+		"TENANT_EVENT_DELETE":          2,
+		"TENANT_EVENT_RESYNC_REQUIRED": 3,
+	}
+)
+
+func (x TenantEventType) Enum() *TenantEventType {
+	p := new(TenantEventType)
+	*p = x
+	return p
+}
+
+func (x TenantEventType) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (TenantEventType) Descriptor() protoreflect.EnumDescriptor {
+	return file_airdb_proto_enumTypes[0].Descriptor()
+}
+
+func (TenantEventType) Type() protoreflect.EnumType {
+	return &file_airdb_proto_enumTypes[0]
+}
+
+func (x TenantEventType) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use TenantEventType.Descriptor instead.
+func (TenantEventType) EnumDescriptor() ([]byte, []int) {
+	return file_airdb_proto_rawDescGZIP(), []int{0}
+}
+
 type Empty struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -466,10 +518,11 @@ func (x *ListDatabasesRequest) GetAccountId() string {
 }
 
 type ListDatabasesResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Databases     []*DatabaseInfo        `protobuf:"bytes,1,rep,name=databases,proto3" json:"databases,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Databases       []*DatabaseInfo        `protobuf:"bytes,1,rep,name=databases,proto3" json:"databases,omitempty"`
+	SnapshotVersion int64                  `protobuf:"varint,2,opt,name=snapshot_version,json=snapshotVersion,proto3" json:"snapshot_version,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ListDatabasesResponse) Reset() {
@@ -507,6 +560,13 @@ func (x *ListDatabasesResponse) GetDatabases() []*DatabaseInfo {
 		return x.Databases
 	}
 	return nil
+}
+
+func (x *ListDatabasesResponse) GetSnapshotVersion() int64 {
+	if x != nil {
+		return x.SnapshotVersion
+	}
+	return 0
 }
 
 type StatusResponse struct {
@@ -561,6 +621,170 @@ func (x *StatusResponse) GetTenantId() string {
 	return ""
 }
 
+type WatchTenantsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	AfterVersion  int64                  `protobuf:"varint,1,opt,name=after_version,json=afterVersion,proto3" json:"after_version,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WatchTenantsRequest) Reset() {
+	*x = WatchTenantsRequest{}
+	mi := &file_airdb_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WatchTenantsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WatchTenantsRequest) ProtoMessage() {}
+
+func (x *WatchTenantsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_airdb_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WatchTenantsRequest.ProtoReflect.Descriptor instead.
+func (*WatchTenantsRequest) Descriptor() ([]byte, []int) {
+	return file_airdb_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *WatchTenantsRequest) GetAfterVersion() int64 {
+	if x != nil {
+		return x.AfterVersion
+	}
+	return 0
+}
+
+type TenantChangeEvent struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Version         int64                  `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
+	Type            TenantEventType        `protobuf:"varint,2,opt,name=type,proto3,enum=air.db.v1.TenantEventType" json:"type,omitempty"`
+	Route           *TenantRouteResponse   `protobuf:"bytes,3,opt,name=route,proto3" json:"route,omitempty"`
+	FencingEpoch    int64                  `protobuf:"varint,4,opt,name=fencing_epoch,json=fencingEpoch,proto3" json:"fencing_epoch,omitempty"`
+	EmittedAtUnixMs int64                  `protobuf:"varint,5,opt,name=emitted_at_unix_ms,json=emittedAtUnixMs,proto3" json:"emitted_at_unix_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *TenantChangeEvent) Reset() {
+	*x = TenantChangeEvent{}
+	mi := &file_airdb_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TenantChangeEvent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TenantChangeEvent) ProtoMessage() {}
+
+func (x *TenantChangeEvent) ProtoReflect() protoreflect.Message {
+	mi := &file_airdb_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TenantChangeEvent.ProtoReflect.Descriptor instead.
+func (*TenantChangeEvent) Descriptor() ([]byte, []int) {
+	return file_airdb_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *TenantChangeEvent) GetVersion() int64 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *TenantChangeEvent) GetType() TenantEventType {
+	if x != nil {
+		return x.Type
+	}
+	return TenantEventType_TENANT_EVENT_UNSPECIFIED
+}
+
+func (x *TenantChangeEvent) GetRoute() *TenantRouteResponse {
+	if x != nil {
+		return x.Route
+	}
+	return nil
+}
+
+func (x *TenantChangeEvent) GetFencingEpoch() int64 {
+	if x != nil {
+		return x.FencingEpoch
+	}
+	return 0
+}
+
+func (x *TenantChangeEvent) GetEmittedAtUnixMs() int64 {
+	if x != nil {
+		return x.EmittedAtUnixMs
+	}
+	return 0
+}
+
+type BatchTouchActivityRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TenantIds     []string               `protobuf:"bytes,1,rep,name=tenant_ids,json=tenantIds,proto3" json:"tenant_ids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchTouchActivityRequest) Reset() {
+	*x = BatchTouchActivityRequest{}
+	mi := &file_airdb_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchTouchActivityRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchTouchActivityRequest) ProtoMessage() {}
+
+func (x *BatchTouchActivityRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_airdb_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchTouchActivityRequest.ProtoReflect.Descriptor instead.
+func (*BatchTouchActivityRequest) Descriptor() ([]byte, []int) {
+	return file_airdb_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *BatchTouchActivityRequest) GetTenantIds() []string {
+	if x != nil {
+		return x.TenantIds
+	}
+	return nil
+}
+
 var File_airdb_proto protoreflect.FileDescriptor
 
 const file_airdb_proto_rawDesc = "" +
@@ -601,17 +825,36 @@ const file_airdb_proto_rawDesc = "" +
 	"\x05state\x18\x06 \x01(\tR\x05state\"5\n" +
 	"\x14ListDatabasesRequest\x12\x1d\n" +
 	"\n" +
-	"account_id\x18\x01 \x01(\tR\taccountId\"N\n" +
+	"account_id\x18\x01 \x01(\tR\taccountId\"y\n" +
 	"\x15ListDatabasesResponse\x125\n" +
-	"\tdatabases\x18\x01 \x03(\v2\x17.air.db.v1.DatabaseInfoR\tdatabases\"E\n" +
+	"\tdatabases\x18\x01 \x03(\v2\x17.air.db.v1.DatabaseInfoR\tdatabases\x12)\n" +
+	"\x10snapshot_version\x18\x02 \x01(\x03R\x0fsnapshotVersion\"E\n" +
 	"\x0eStatusResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12\x1b\n" +
-	"\ttenant_id\x18\x02 \x01(\tR\btenantId2\xb2\x06\n" +
+	"\ttenant_id\x18\x02 \x01(\tR\btenantId\":\n" +
+	"\x13WatchTenantsRequest\x12#\n" +
+	"\rafter_version\x18\x01 \x01(\x03R\fafterVersion\"\xe5\x01\n" +
+	"\x11TenantChangeEvent\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\x03R\aversion\x12.\n" +
+	"\x04type\x18\x02 \x01(\x0e2\x1a.air.db.v1.TenantEventTypeR\x04type\x124\n" +
+	"\x05route\x18\x03 \x01(\v2\x1e.air.db.v1.TenantRouteResponseR\x05route\x12#\n" +
+	"\rfencing_epoch\x18\x04 \x01(\x03R\ffencingEpoch\x12+\n" +
+	"\x12emitted_at_unix_ms\x18\x05 \x01(\x03R\x0femittedAtUnixMs\":\n" +
+	"\x19BatchTouchActivityRequest\x12\x1d\n" +
+	"\n" +
+	"tenant_ids\x18\x01 \x03(\tR\ttenantIds*\x83\x01\n" +
+	"\x0fTenantEventType\x12\x1c\n" +
+	"\x18TENANT_EVENT_UNSPECIFIED\x10\x00\x12\x17\n" +
+	"\x13TENANT_EVENT_UPSERT\x10\x01\x12\x17\n" +
+	"\x13TENANT_EVENT_DELETE\x10\x02\x12 \n" +
+	"\x1cTENANT_EVENT_RESYNC_REQUIRED\x10\x032\xd6\a\n" +
 	"\fAirDBControl\x12J\n" +
 	"\x0eGetTenantRoute\x12\x18.air.db.v1.TenantRequest\x1a\x1e.air.db.v1.TenantRouteResponse\x12F\n" +
 	"\n" +
 	"WakeTenant\x12\x18.air.db.v1.TenantRequest\x1a\x1e.air.db.v1.TenantRouteResponse\x12;\n" +
-	"\rTouchActivity\x12\x18.air.db.v1.TenantRequest\x1a\x10.air.db.v1.Empty\x12U\n" +
+	"\rTouchActivity\x12\x18.air.db.v1.TenantRequest\x1a\x10.air.db.v1.Empty\x12L\n" +
+	"\x12BatchTouchActivity\x12$.air.db.v1.BatchTouchActivityRequest\x1a\x10.air.db.v1.Empty\x12T\n" +
+	"\x12WatchTenantChanges\x12\x1e.air.db.v1.WatchTenantsRequest\x1a\x1c.air.db.v1.TenantChangeEvent0\x01\x12U\n" +
 	"\x0eCreateDatabase\x12 .air.db.v1.CreateDatabaseRequest\x1a!.air.db.v1.CreateDatabaseResponse\x12R\n" +
 	"\rListDatabases\x12\x1f.air.db.v1.ListDatabasesRequest\x1a .air.db.v1.ListDatabasesResponse\x12@\n" +
 	"\vGetDatabase\x12\x18.air.db.v1.TenantRequest\x1a\x17.air.db.v1.DatabaseInfo\x12E\n" +
@@ -633,47 +876,58 @@ func file_airdb_proto_rawDescGZIP() []byte {
 	return file_airdb_proto_rawDescData
 }
 
-var file_airdb_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_airdb_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_airdb_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_airdb_proto_goTypes = []any{
-	(*Empty)(nil),                  // 0: air.db.v1.Empty
-	(*TenantRequest)(nil),          // 1: air.db.v1.TenantRequest
-	(*TenantRouteResponse)(nil),    // 2: air.db.v1.TenantRouteResponse
-	(*CreateDatabaseRequest)(nil),  // 3: air.db.v1.CreateDatabaseRequest
-	(*CreateDatabaseResponse)(nil), // 4: air.db.v1.CreateDatabaseResponse
-	(*DatabaseInfo)(nil),           // 5: air.db.v1.DatabaseInfo
-	(*ListDatabasesRequest)(nil),   // 6: air.db.v1.ListDatabasesRequest
-	(*ListDatabasesResponse)(nil),  // 7: air.db.v1.ListDatabasesResponse
-	(*StatusResponse)(nil),         // 8: air.db.v1.StatusResponse
+	(TenantEventType)(0),              // 0: air.db.v1.TenantEventType
+	(*Empty)(nil),                     // 1: air.db.v1.Empty
+	(*TenantRequest)(nil),             // 2: air.db.v1.TenantRequest
+	(*TenantRouteResponse)(nil),       // 3: air.db.v1.TenantRouteResponse
+	(*CreateDatabaseRequest)(nil),     // 4: air.db.v1.CreateDatabaseRequest
+	(*CreateDatabaseResponse)(nil),    // 5: air.db.v1.CreateDatabaseResponse
+	(*DatabaseInfo)(nil),              // 6: air.db.v1.DatabaseInfo
+	(*ListDatabasesRequest)(nil),      // 7: air.db.v1.ListDatabasesRequest
+	(*ListDatabasesResponse)(nil),     // 8: air.db.v1.ListDatabasesResponse
+	(*StatusResponse)(nil),            // 9: air.db.v1.StatusResponse
+	(*WatchTenantsRequest)(nil),       // 10: air.db.v1.WatchTenantsRequest
+	(*TenantChangeEvent)(nil),         // 11: air.db.v1.TenantChangeEvent
+	(*BatchTouchActivityRequest)(nil), // 12: air.db.v1.BatchTouchActivityRequest
 }
 var file_airdb_proto_depIdxs = []int32{
-	5,  // 0: air.db.v1.ListDatabasesResponse.databases:type_name -> air.db.v1.DatabaseInfo
-	1,  // 1: air.db.v1.AirDBControl.GetTenantRoute:input_type -> air.db.v1.TenantRequest
-	1,  // 2: air.db.v1.AirDBControl.WakeTenant:input_type -> air.db.v1.TenantRequest
-	1,  // 3: air.db.v1.AirDBControl.TouchActivity:input_type -> air.db.v1.TenantRequest
-	3,  // 4: air.db.v1.AirDBControl.CreateDatabase:input_type -> air.db.v1.CreateDatabaseRequest
-	6,  // 5: air.db.v1.AirDBControl.ListDatabases:input_type -> air.db.v1.ListDatabasesRequest
-	1,  // 6: air.db.v1.AirDBControl.GetDatabase:input_type -> air.db.v1.TenantRequest
-	1,  // 7: air.db.v1.AirDBControl.DeleteDatabase:input_type -> air.db.v1.TenantRequest
-	1,  // 8: air.db.v1.AirDBControl.SuspendDatabase:input_type -> air.db.v1.TenantRequest
-	1,  // 9: air.db.v1.AirDBControl.StartDatabase:input_type -> air.db.v1.TenantRequest
-	1,  // 10: air.db.v1.AirDBControl.LockDatabase:input_type -> air.db.v1.TenantRequest
-	1,  // 11: air.db.v1.AirDBControl.UnlockDatabase:input_type -> air.db.v1.TenantRequest
-	2,  // 12: air.db.v1.AirDBControl.GetTenantRoute:output_type -> air.db.v1.TenantRouteResponse
-	2,  // 13: air.db.v1.AirDBControl.WakeTenant:output_type -> air.db.v1.TenantRouteResponse
-	0,  // 14: air.db.v1.AirDBControl.TouchActivity:output_type -> air.db.v1.Empty
-	4,  // 15: air.db.v1.AirDBControl.CreateDatabase:output_type -> air.db.v1.CreateDatabaseResponse
-	7,  // 16: air.db.v1.AirDBControl.ListDatabases:output_type -> air.db.v1.ListDatabasesResponse
-	5,  // 17: air.db.v1.AirDBControl.GetDatabase:output_type -> air.db.v1.DatabaseInfo
-	8,  // 18: air.db.v1.AirDBControl.DeleteDatabase:output_type -> air.db.v1.StatusResponse
-	8,  // 19: air.db.v1.AirDBControl.SuspendDatabase:output_type -> air.db.v1.StatusResponse
-	2,  // 20: air.db.v1.AirDBControl.StartDatabase:output_type -> air.db.v1.TenantRouteResponse
-	8,  // 21: air.db.v1.AirDBControl.LockDatabase:output_type -> air.db.v1.StatusResponse
-	8,  // 22: air.db.v1.AirDBControl.UnlockDatabase:output_type -> air.db.v1.StatusResponse
-	12, // [12:23] is the sub-list for method output_type
-	1,  // [1:12] is the sub-list for method input_type
-	1,  // [1:1] is the sub-list for extension type_name
-	1,  // [1:1] is the sub-list for extension extendee
-	0,  // [0:1] is the sub-list for field type_name
+	6,  // 0: air.db.v1.ListDatabasesResponse.databases:type_name -> air.db.v1.DatabaseInfo
+	0,  // 1: air.db.v1.TenantChangeEvent.type:type_name -> air.db.v1.TenantEventType
+	3,  // 2: air.db.v1.TenantChangeEvent.route:type_name -> air.db.v1.TenantRouteResponse
+	2,  // 3: air.db.v1.AirDBControl.GetTenantRoute:input_type -> air.db.v1.TenantRequest
+	2,  // 4: air.db.v1.AirDBControl.WakeTenant:input_type -> air.db.v1.TenantRequest
+	2,  // 5: air.db.v1.AirDBControl.TouchActivity:input_type -> air.db.v1.TenantRequest
+	12, // 6: air.db.v1.AirDBControl.BatchTouchActivity:input_type -> air.db.v1.BatchTouchActivityRequest
+	10, // 7: air.db.v1.AirDBControl.WatchTenantChanges:input_type -> air.db.v1.WatchTenantsRequest
+	4,  // 8: air.db.v1.AirDBControl.CreateDatabase:input_type -> air.db.v1.CreateDatabaseRequest
+	7,  // 9: air.db.v1.AirDBControl.ListDatabases:input_type -> air.db.v1.ListDatabasesRequest
+	2,  // 10: air.db.v1.AirDBControl.GetDatabase:input_type -> air.db.v1.TenantRequest
+	2,  // 11: air.db.v1.AirDBControl.DeleteDatabase:input_type -> air.db.v1.TenantRequest
+	2,  // 12: air.db.v1.AirDBControl.SuspendDatabase:input_type -> air.db.v1.TenantRequest
+	2,  // 13: air.db.v1.AirDBControl.StartDatabase:input_type -> air.db.v1.TenantRequest
+	2,  // 14: air.db.v1.AirDBControl.LockDatabase:input_type -> air.db.v1.TenantRequest
+	2,  // 15: air.db.v1.AirDBControl.UnlockDatabase:input_type -> air.db.v1.TenantRequest
+	3,  // 16: air.db.v1.AirDBControl.GetTenantRoute:output_type -> air.db.v1.TenantRouteResponse
+	3,  // 17: air.db.v1.AirDBControl.WakeTenant:output_type -> air.db.v1.TenantRouteResponse
+	1,  // 18: air.db.v1.AirDBControl.TouchActivity:output_type -> air.db.v1.Empty
+	1,  // 19: air.db.v1.AirDBControl.BatchTouchActivity:output_type -> air.db.v1.Empty
+	11, // 20: air.db.v1.AirDBControl.WatchTenantChanges:output_type -> air.db.v1.TenantChangeEvent
+	5,  // 21: air.db.v1.AirDBControl.CreateDatabase:output_type -> air.db.v1.CreateDatabaseResponse
+	8,  // 22: air.db.v1.AirDBControl.ListDatabases:output_type -> air.db.v1.ListDatabasesResponse
+	6,  // 23: air.db.v1.AirDBControl.GetDatabase:output_type -> air.db.v1.DatabaseInfo
+	9,  // 24: air.db.v1.AirDBControl.DeleteDatabase:output_type -> air.db.v1.StatusResponse
+	9,  // 25: air.db.v1.AirDBControl.SuspendDatabase:output_type -> air.db.v1.StatusResponse
+	3,  // 26: air.db.v1.AirDBControl.StartDatabase:output_type -> air.db.v1.TenantRouteResponse
+	9,  // 27: air.db.v1.AirDBControl.LockDatabase:output_type -> air.db.v1.StatusResponse
+	9,  // 28: air.db.v1.AirDBControl.UnlockDatabase:output_type -> air.db.v1.StatusResponse
+	16, // [16:29] is the sub-list for method output_type
+	3,  // [3:16] is the sub-list for method input_type
+	3,  // [3:3] is the sub-list for extension type_name
+	3,  // [3:3] is the sub-list for extension extendee
+	0,  // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_airdb_proto_init() }
@@ -686,13 +940,14 @@ func file_airdb_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_airdb_proto_rawDesc), len(file_airdb_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   9,
+			NumEnums:      1,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
 		GoTypes:           file_airdb_proto_goTypes,
 		DependencyIndexes: file_airdb_proto_depIdxs,
+		EnumInfos:         file_airdb_proto_enumTypes,
 		MessageInfos:      file_airdb_proto_msgTypes,
 	}.Build()
 	File_airdb_proto = out.File

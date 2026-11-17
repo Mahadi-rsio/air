@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -112,6 +113,52 @@ read_full(int fd, void *buf, size_t len)
 	return true;
 }
 
+static bool
+iov_full(int fd, struct iovec *iov, int iovcnt, bool is_write)
+{
+	while (iovcnt > 0)
+	{
+		ssize_t		n = is_write ? writev(fd, iov, iovcnt) : readv(fd, iov, iovcnt);
+		size_t		rem;
+
+		if (n < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			return false;
+		}
+		if (n == 0)
+			return false;
+
+		rem = (size_t) n;
+
+		while (iovcnt > 0 && rem >= iov[0].iov_len)
+		{
+			rem -= iov[0].iov_len;
+			iov++;
+			iovcnt--;
+		}
+		if (iovcnt > 0 && rem > 0)
+		{
+			iov[0].iov_base = (uint8_t *) iov[0].iov_base + rem;
+			iov[0].iov_len -= rem;
+		}
+	}
+	return true;
+}
+
+static bool
+writev_full(int fd, struct iovec *iov, int iovcnt)
+{
+	return iov_full(fd, iov, iovcnt, true);
+}
+
+static bool
+readv_full(int fd, struct iovec *iov, int iovcnt)
+{
+	return iov_full(fd, iov, iovcnt, false);
+}
+
 static void
 fill_req_header(AirPsReqHeader *req,
 				AirPsOp op,
@@ -201,13 +248,38 @@ do_rpc(const char *socket_path,
 						 resp->payload_len, expected_len);
 				return false;
 			}
-			for (BlockNumber i = 0; i < expected_pages; i++)
+			if (expected_pages == 1)
 			{
-				if (!read_full(fd, page_buffers[i], AIR_PAGE_SIZE))
+				if (!read_full(fd, page_buffers[0], AIR_PAGE_SIZE))
 				{
 					air_communicator_close();
-					snprintf(errbuf, errbuf_len, "short read on pageserver page %u/%u", i + 1, expected_pages);
+					snprintf(errbuf, errbuf_len, "short read on pageserver page 1/1");
 					return false;
+				}
+			}
+			else
+			{
+				BlockNumber done = 0;
+
+				while (done < expected_pages)
+				{
+					struct iovec iov[128];
+					BlockNumber batch = expected_pages - done;
+
+					if (batch > 128)
+						batch = 128;
+					for (BlockNumber i = 0; i < batch; i++)
+					{
+						iov[i].iov_base = page_buffers[done + i];
+						iov[i].iov_len = AIR_PAGE_SIZE;
+					}
+					if (!readv_full(fd, iov, (int) batch))
+					{
+						air_communicator_close();
+						snprintf(errbuf, errbuf_len, "short read on pageserver batch (%u pages)", expected_pages);
+						return false;
+					}
+					done += batch;
 				}
 			}
 		}
@@ -336,34 +408,22 @@ air_ps_put_pages(const char *socket_path,
 
 		for (int attempt = 0; attempt < 2; attempt++)
 		{
+			struct iovec iov[1 + 128];
 			int			fd = ensure_connected(socket_path, errbuf, errbuf_len);
 
 			if (fd < 0)
 				return false;
 
-			if (!write_full(fd, &req, sizeof(req)))
-			{
-				int			saved = errno;
-
-				air_communicator_close();
-				if (attempt == 0)
-					continue;
-				snprintf(errbuf, errbuf_len, "pageserver put write header failed: %s", strerror(saved));
-				return false;
-			}
-
-			bool		w_ok = true;
-
+			iov[0].iov_base = &req;
+			iov[0].iov_len = sizeof(req);
 			for (BlockNumber i = 0; i < chunk; i++)
 			{
-				if (!write_full(fd, buffers[sent + i], AIR_PAGE_SIZE))
-				{
-					w_ok = false;
-					break;
-				}
+				/* writev only reads from iov_base */
+				iov[1 + i].iov_base = (void *) (uintptr_t) buffers[sent + i];
+				iov[1 + i].iov_len = AIR_PAGE_SIZE;
 			}
 
-			if (!w_ok || !read_full(fd, &resp, sizeof(resp)))
+			if (!writev_full(fd, iov, 1 + (int) chunk) || !read_full(fd, &resp, sizeof(resp)))
 			{
 				int			saved = errno;
 

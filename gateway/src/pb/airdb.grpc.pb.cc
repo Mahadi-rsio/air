@@ -28,6 +28,8 @@ static const char* AirDBControl_method_names[] = {
   "/air.db.v1.AirDBControl/GetTenantRoute",
   "/air.db.v1.AirDBControl/WakeTenant",
   "/air.db.v1.AirDBControl/TouchActivity",
+  "/air.db.v1.AirDBControl/BatchTouchActivity",
+  "/air.db.v1.AirDBControl/WatchTenantChanges",
   "/air.db.v1.AirDBControl/CreateDatabase",
   "/air.db.v1.AirDBControl/ListDatabases",
   "/air.db.v1.AirDBControl/GetDatabase",
@@ -48,14 +50,16 @@ AirDBControl::Stub::Stub(const std::shared_ptr< ::grpc::ChannelInterface>& chann
   : channel_(channel), rpcmethod_GetTenantRoute_(AirDBControl_method_names[0], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
   , rpcmethod_WakeTenant_(AirDBControl_method_names[1], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
   , rpcmethod_TouchActivity_(AirDBControl_method_names[2], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
-  , rpcmethod_CreateDatabase_(AirDBControl_method_names[3], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
-  , rpcmethod_ListDatabases_(AirDBControl_method_names[4], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
-  , rpcmethod_GetDatabase_(AirDBControl_method_names[5], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
-  , rpcmethod_DeleteDatabase_(AirDBControl_method_names[6], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
-  , rpcmethod_SuspendDatabase_(AirDBControl_method_names[7], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
-  , rpcmethod_StartDatabase_(AirDBControl_method_names[8], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
-  , rpcmethod_LockDatabase_(AirDBControl_method_names[9], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
-  , rpcmethod_UnlockDatabase_(AirDBControl_method_names[10], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_BatchTouchActivity_(AirDBControl_method_names[3], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_WatchTenantChanges_(AirDBControl_method_names[4], options.suffix_for_stats(),::grpc::internal::RpcMethod::SERVER_STREAMING, channel)
+  , rpcmethod_CreateDatabase_(AirDBControl_method_names[5], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_ListDatabases_(AirDBControl_method_names[6], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_GetDatabase_(AirDBControl_method_names[7], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_DeleteDatabase_(AirDBControl_method_names[8], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_SuspendDatabase_(AirDBControl_method_names[9], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_StartDatabase_(AirDBControl_method_names[10], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_LockDatabase_(AirDBControl_method_names[11], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_UnlockDatabase_(AirDBControl_method_names[12], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
   {}
 
 ::grpc::Status AirDBControl::Stub::GetTenantRoute(::grpc::ClientContext* context, const ::air::db::v1::TenantRequest& request, ::air::db::v1::TenantRouteResponse* response) {
@@ -125,6 +129,45 @@ void AirDBControl::Stub::async::TouchActivity(::grpc::ClientContext* context, co
     this->PrepareAsyncTouchActivityRaw(context, request, cq);
   result->StartCall();
   return result;
+}
+
+::grpc::Status AirDBControl::Stub::BatchTouchActivity(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest& request, ::air::db::v1::Empty* response) {
+  return ::grpc::internal::BlockingUnaryCall< ::air::db::v1::BatchTouchActivityRequest, ::air::db::v1::Empty, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(channel_.get(), rpcmethod_BatchTouchActivity_, context, request, response);
+}
+
+void AirDBControl::Stub::async::BatchTouchActivity(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest* request, ::air::db::v1::Empty* response, std::function<void(::grpc::Status)> f) {
+  ::grpc::internal::CallbackUnaryCall< ::air::db::v1::BatchTouchActivityRequest, ::air::db::v1::Empty, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(stub_->channel_.get(), stub_->rpcmethod_BatchTouchActivity_, context, request, response, std::move(f));
+}
+
+void AirDBControl::Stub::async::BatchTouchActivity(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest* request, ::air::db::v1::Empty* response, ::grpc::ClientUnaryReactor* reactor) {
+  ::grpc::internal::ClientCallbackUnaryFactory::Create< ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(stub_->channel_.get(), stub_->rpcmethod_BatchTouchActivity_, context, request, response, reactor);
+}
+
+::grpc::ClientAsyncResponseReader< ::air::db::v1::Empty>* AirDBControl::Stub::PrepareAsyncBatchTouchActivityRaw(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest& request, ::grpc::CompletionQueue* cq) {
+  return ::grpc::internal::ClientAsyncResponseReaderHelper::Create< ::air::db::v1::Empty, ::air::db::v1::BatchTouchActivityRequest, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(channel_.get(), cq, rpcmethod_BatchTouchActivity_, context, request);
+}
+
+::grpc::ClientAsyncResponseReader< ::air::db::v1::Empty>* AirDBControl::Stub::AsyncBatchTouchActivityRaw(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest& request, ::grpc::CompletionQueue* cq) {
+  auto* result =
+    this->PrepareAsyncBatchTouchActivityRaw(context, request, cq);
+  result->StartCall();
+  return result;
+}
+
+::grpc::ClientReader< ::air::db::v1::TenantChangeEvent>* AirDBControl::Stub::WatchTenantChangesRaw(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest& request) {
+  return ::grpc::internal::ClientReaderFactory< ::air::db::v1::TenantChangeEvent>::Create(channel_.get(), rpcmethod_WatchTenantChanges_, context, request);
+}
+
+void AirDBControl::Stub::async::WatchTenantChanges(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest* request, ::grpc::ClientReadReactor< ::air::db::v1::TenantChangeEvent>* reactor) {
+  ::grpc::internal::ClientCallbackReaderFactory< ::air::db::v1::TenantChangeEvent>::Create(stub_->channel_.get(), stub_->rpcmethod_WatchTenantChanges_, context, request, reactor);
+}
+
+::grpc::ClientAsyncReader< ::air::db::v1::TenantChangeEvent>* AirDBControl::Stub::AsyncWatchTenantChangesRaw(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest& request, ::grpc::CompletionQueue* cq, void* tag) {
+  return ::grpc::internal::ClientAsyncReaderFactory< ::air::db::v1::TenantChangeEvent>::Create(channel_.get(), cq, rpcmethod_WatchTenantChanges_, context, request, true, tag);
+}
+
+::grpc::ClientAsyncReader< ::air::db::v1::TenantChangeEvent>* AirDBControl::Stub::PrepareAsyncWatchTenantChangesRaw(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest& request, ::grpc::CompletionQueue* cq) {
+  return ::grpc::internal::ClientAsyncReaderFactory< ::air::db::v1::TenantChangeEvent>::Create(channel_.get(), cq, rpcmethod_WatchTenantChanges_, context, request, false, nullptr);
 }
 
 ::grpc::Status AirDBControl::Stub::CreateDatabase(::grpc::ClientContext* context, const ::air::db::v1::CreateDatabaseRequest& request, ::air::db::v1::CreateDatabaseResponse* response) {
@@ -345,6 +388,26 @@ AirDBControl::Service::Service() {
   AddMethod(new ::grpc::internal::RpcServiceMethod(
       AirDBControl_method_names[3],
       ::grpc::internal::RpcMethod::NORMAL_RPC,
+      new ::grpc::internal::RpcMethodHandler< AirDBControl::Service, ::air::db::v1::BatchTouchActivityRequest, ::air::db::v1::Empty, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
+          [](AirDBControl::Service* service,
+             ::grpc::ServerContext* ctx,
+             const ::air::db::v1::BatchTouchActivityRequest* req,
+             ::air::db::v1::Empty* resp) {
+               return service->BatchTouchActivity(ctx, req, resp);
+             }, this)));
+  AddMethod(new ::grpc::internal::RpcServiceMethod(
+      AirDBControl_method_names[4],
+      ::grpc::internal::RpcMethod::SERVER_STREAMING,
+      new ::grpc::internal::ServerStreamingHandler< AirDBControl::Service, ::air::db::v1::WatchTenantsRequest, ::air::db::v1::TenantChangeEvent>(
+          [](AirDBControl::Service* service,
+             ::grpc::ServerContext* ctx,
+             const ::air::db::v1::WatchTenantsRequest* req,
+             ::grpc::ServerWriter<::air::db::v1::TenantChangeEvent>* writer) {
+               return service->WatchTenantChanges(ctx, req, writer);
+             }, this)));
+  AddMethod(new ::grpc::internal::RpcServiceMethod(
+      AirDBControl_method_names[5],
+      ::grpc::internal::RpcMethod::NORMAL_RPC,
       new ::grpc::internal::RpcMethodHandler< AirDBControl::Service, ::air::db::v1::CreateDatabaseRequest, ::air::db::v1::CreateDatabaseResponse, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
           [](AirDBControl::Service* service,
              ::grpc::ServerContext* ctx,
@@ -353,7 +416,7 @@ AirDBControl::Service::Service() {
                return service->CreateDatabase(ctx, req, resp);
              }, this)));
   AddMethod(new ::grpc::internal::RpcServiceMethod(
-      AirDBControl_method_names[4],
+      AirDBControl_method_names[6],
       ::grpc::internal::RpcMethod::NORMAL_RPC,
       new ::grpc::internal::RpcMethodHandler< AirDBControl::Service, ::air::db::v1::ListDatabasesRequest, ::air::db::v1::ListDatabasesResponse, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
           [](AirDBControl::Service* service,
@@ -363,7 +426,7 @@ AirDBControl::Service::Service() {
                return service->ListDatabases(ctx, req, resp);
              }, this)));
   AddMethod(new ::grpc::internal::RpcServiceMethod(
-      AirDBControl_method_names[5],
+      AirDBControl_method_names[7],
       ::grpc::internal::RpcMethod::NORMAL_RPC,
       new ::grpc::internal::RpcMethodHandler< AirDBControl::Service, ::air::db::v1::TenantRequest, ::air::db::v1::DatabaseInfo, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
           [](AirDBControl::Service* service,
@@ -373,7 +436,7 @@ AirDBControl::Service::Service() {
                return service->GetDatabase(ctx, req, resp);
              }, this)));
   AddMethod(new ::grpc::internal::RpcServiceMethod(
-      AirDBControl_method_names[6],
+      AirDBControl_method_names[8],
       ::grpc::internal::RpcMethod::NORMAL_RPC,
       new ::grpc::internal::RpcMethodHandler< AirDBControl::Service, ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
           [](AirDBControl::Service* service,
@@ -383,7 +446,7 @@ AirDBControl::Service::Service() {
                return service->DeleteDatabase(ctx, req, resp);
              }, this)));
   AddMethod(new ::grpc::internal::RpcServiceMethod(
-      AirDBControl_method_names[7],
+      AirDBControl_method_names[9],
       ::grpc::internal::RpcMethod::NORMAL_RPC,
       new ::grpc::internal::RpcMethodHandler< AirDBControl::Service, ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
           [](AirDBControl::Service* service,
@@ -393,7 +456,7 @@ AirDBControl::Service::Service() {
                return service->SuspendDatabase(ctx, req, resp);
              }, this)));
   AddMethod(new ::grpc::internal::RpcServiceMethod(
-      AirDBControl_method_names[8],
+      AirDBControl_method_names[10],
       ::grpc::internal::RpcMethod::NORMAL_RPC,
       new ::grpc::internal::RpcMethodHandler< AirDBControl::Service, ::air::db::v1::TenantRequest, ::air::db::v1::TenantRouteResponse, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
           [](AirDBControl::Service* service,
@@ -403,7 +466,7 @@ AirDBControl::Service::Service() {
                return service->StartDatabase(ctx, req, resp);
              }, this)));
   AddMethod(new ::grpc::internal::RpcServiceMethod(
-      AirDBControl_method_names[9],
+      AirDBControl_method_names[11],
       ::grpc::internal::RpcMethod::NORMAL_RPC,
       new ::grpc::internal::RpcMethodHandler< AirDBControl::Service, ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
           [](AirDBControl::Service* service,
@@ -413,7 +476,7 @@ AirDBControl::Service::Service() {
                return service->LockDatabase(ctx, req, resp);
              }, this)));
   AddMethod(new ::grpc::internal::RpcServiceMethod(
-      AirDBControl_method_names[10],
+      AirDBControl_method_names[12],
       ::grpc::internal::RpcMethod::NORMAL_RPC,
       new ::grpc::internal::RpcMethodHandler< AirDBControl::Service, ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
           [](AirDBControl::Service* service,
@@ -445,6 +508,20 @@ AirDBControl::Service::~Service() {
   (void) context;
   (void) request;
   (void) response;
+  return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+}
+
+::grpc::Status AirDBControl::Service::BatchTouchActivity(::grpc::ServerContext* context, const ::air::db::v1::BatchTouchActivityRequest* request, ::air::db::v1::Empty* response) {
+  (void) context;
+  (void) request;
+  (void) response;
+  return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+}
+
+::grpc::Status AirDBControl::Service::WatchTenantChanges(::grpc::ServerContext* context, const ::air::db::v1::WatchTenantsRequest* request, ::grpc::ServerWriter< ::air::db::v1::TenantChangeEvent>* writer) {
+  (void) context;
+  (void) request;
+  (void) writer;
   return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
 }
 

@@ -117,6 +117,7 @@ type ControlPlane struct {
 	coldPending      map[string]bool
 	coldQueueCh      chan string
 	coldRetryDelay   time.Duration
+	eventBroker      tenantEventBroker
 }
 
 // NewControlPlane initializes a ControlPlane backed by a local single-node PG17 MetaDir.
@@ -530,6 +531,35 @@ func (cp *ControlPlane) runMigrations(ctx context.Context) error {
 			return err
 		}
 	}
+	if current < 3 {
+		tx, err := cp.db.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		stmts := []string{
+			`CREATE TABLE IF NOT EXISTS tenant_events (
+				version BIGSERIAL PRIMARY KEY,
+				tenant_id TEXT NOT NULL,
+				event_type TEXT NOT NULL,
+				state TEXT NOT NULL,
+				host TEXT NOT NULL DEFAULT '',
+				direct_port INT NOT NULL DEFAULT 0,
+				fencing_epoch BIGINT NOT NULL DEFAULT 1,
+				emitted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_tenant_events_tenant_id ON tenant_events(tenant_id, version)`,
+			`INSERT INTO schema_migrations(version) VALUES (3) ON CONFLICT DO NOTHING`,
+		}
+		for _, s := range stmts {
+			if _, err := tx.Exec(ctx, s); err != nil {
+				return fmt.Errorf("migration v3 failed: %w", err)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -758,6 +788,7 @@ func (cp *ControlPlane) ProvisionDatabase(ctx context.Context, accountID, idempo
 		cp.rollbackOp(ctx, opID, tenantID, err)
 		return nil, err
 	}
+	cp.emitTenantEvent(ctx, tenantID, tenantEventUpsert, "ACTIVE", rt.Port, rt.FencingEpoch)
 
 	if err := cp.ensurePageserverBootstrapAndWAL(ctx, tenantID, rt); err != nil {
 		log.Printf("[pageserver] bootstrap/walreceiver for %s failed: %v", tenantID, err)
@@ -952,6 +983,9 @@ func (cp *ControlPlane) DeleteDatabase(ctx context.Context, accountID, tenantID 
 		cp.kms.ShredDEK(tenantID)
 	}
 	_, err = cp.db.Exec(ctx, `UPDATE clusters SET state = 'PURGED', direct_port = 0, app_password_enc = '', wrapped_dek = '', updated_at = now() WHERE tenant_id = $1`, tenantID)
+	if err == nil {
+		cp.emitTenantEvent(ctx, tenantID, tenantEventDelete, "PURGED", 0, 1)
+	}
 	return err
 }
 
@@ -1350,6 +1384,7 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 		); uErr != nil {
 			return nil, uErr
 		}
+		cp.emitTenantEvent(ctx, tenantID, tenantEventUpsert, "ACTIVE", rt.Port, 1)
 		cp.TouchTenantActivity(tenantID)
 		_, _, _, pw, credErr := cp.GetTenantRouteAndCredentials(ctx, tenantID)
 		if credErr != nil {
@@ -1438,6 +1473,7 @@ func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drai
 		); err != nil {
 			return err
 		}
+		cp.emitTenantEvent(ctx, tenantID, tenantEventUpsert, "SUSPENDED", 0, 1)
 		cp.EnqueueColdOffload(tenantID)
 		return nil
 	}
@@ -1465,6 +1501,9 @@ func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drai
 		`UPDATE clusters SET state = 'SUSPENDED', updated_at = NOW() WHERE tenant_id = $1 AND state = 'ACTIVE'`,
 		tenantID,
 	)
+	if err == nil {
+		cp.emitTenantEvent(ctx, tenantID, tenantEventUpsert, "SUSPENDED", 0, 1)
+	}
 	return err
 }
 
@@ -1506,6 +1545,9 @@ func (cp *ControlPlane) LockDatabase(ctx context.Context, tenantID string, drain
 		}
 	}
 	_, err = cp.db.Exec(ctx, `UPDATE clusters SET state = 'LOCKED', updated_at = NOW() WHERE tenant_id = $1`, tenantID)
+	if err == nil {
+		cp.emitTenantEvent(ctx, tenantID, tenantEventUpsert, "LOCKED", 0, 1)
+	}
 	return err
 }
 
@@ -1532,6 +1574,9 @@ func (cp *ControlPlane) UnlockDatabase(ctx context.Context, tenantID string) err
 		return fmt.Errorf("cannot unlock tenant %s in state %s", tenantID, state)
 	}
 	_, err = cp.db.Exec(ctx, `UPDATE clusters SET state = 'SUSPENDED', updated_at = NOW() WHERE tenant_id = $1 AND state = 'LOCKED'`, tenantID)
+	if err == nil {
+		cp.emitTenantEvent(ctx, tenantID, tenantEventUpsert, "SUSPENDED", 0, 1)
+	}
 	return err
 }
 

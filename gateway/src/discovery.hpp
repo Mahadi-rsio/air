@@ -13,6 +13,7 @@
 #include <libpq-fe.h>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -128,21 +129,34 @@ public:
 
     void start() {
         running_.store(true);
-        // Initial synchronous discovery attempt (non-fatal if metadata PG is still booting).
-        poll_metadata_once();
+        // Initial synchronous discovery attempt via gRPC ListDatabases (non-fatal if control plane is booting).
+        if (!sync_databases_grpc() && !cfg_.meta_dsn.empty()) {
+            poll_metadata_once();
+        }
         worker_ = std::thread([this]() { discovery_loop(); });
+        touch_worker_ = std::thread([this]() { touch_loop(); });
     }
 
     void stop() {
         running_.store(false);
         cv_.notify_all();
+        touch_cv_.notify_all();
+        {
+            std::lock_guard<std::mutex> lk(watch_ctx_mu_);
+            if (watch_ctx_) {
+                watch_ctx_->TryCancel();
+            }
+        }
         if (worker_.joinable()) {
             worker_.join();
+        }
+        if (touch_worker_.joinable()) {
+            touch_worker_.join();
         }
     }
 
     std::vector<TenantRoute> list_cached() const {
-        std::lock_guard<std::mutex> lk(cache_mu_);
+        std::shared_lock<std::shared_mutex> lk(cache_mu_);
         std::vector<TenantRoute> out;
         out.reserve(cache_.size());
         for (const auto& [_, r] : cache_) {
@@ -152,14 +166,15 @@ public:
     }
 
     bool resolve_tenant(const std::string& tenant_id, TenantRoute& route_out, std::string& err_out) {
-        // Check metadata DB on cache miss so newly created DBs are discovered immediately.
-        bool known = false;
+        // Fast path: serve ACTIVE cached routes with credentials directly under a shared read lock.
         {
-            std::lock_guard<std::mutex> lk(cache_mu_);
-            known = cache_.find(tenant_id) != cache_.end();
-        }
-        if (!known) {
-            poll_metadata_once();
+            std::shared_lock<std::shared_mutex> lk(cache_mu_);
+            auto it = cache_.find(tenant_id);
+            if (it != cache_.end() && it->second.state == "ACTIVE" &&
+                it->second.port > 0 && !it->second.app_password.empty()) {
+                route_out = it->second;
+                return true;
+            }
         }
 
         air::db::v1::TenantRequest req;
@@ -379,7 +394,7 @@ public:
         TenantRoute updated;
         bool found = false;
         {
-            std::lock_guard<std::mutex> lk(cache_mu_);
+            std::unique_lock<std::shared_mutex> lk(cache_mu_);
             auto it = cache_.find(tenant_id);
             if (it != cache_.end()) {
                 it->second.state = state;
@@ -399,16 +414,7 @@ public:
     }
 
     void evict_cache(const std::string& tenant_id) {
-        {
-            std::lock_guard<std::mutex> lk(cache_mu_);
-            cache_.erase(tenant_id);
-        }
-        TenantRemovedCallback cb;
-        {
-            std::lock_guard<std::mutex> lk(cb_mu_);
-            cb = on_remove_;
-        }
-        if (cb) cb(tenant_id);
+        remove_cache(tenant_id);
     }
 
     void upsert_route(const TenantRoute& r) {
@@ -416,7 +422,7 @@ public:
     }
 
     void touch_activity(const std::string& tenant_id) {
-        if (tenant_id.empty()) return;
+        if (tenant_id.empty() || !running_.load()) return;
         auto now = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lk(touch_mu_);
@@ -426,19 +432,9 @@ public:
                 return;
             }
             last_touch_[tenant_id] = now;
+            pending_touches_.insert(tenant_id);
         }
-
-        auto stub = stub_;
-        std::string token = cfg_.internal_token;
-        std::thread([stub, token, tenant_id]() {
-            air::db::v1::TenantRequest req;
-            req.set_tenant_id(tenant_id);
-            air::db::v1::Empty resp;
-            grpc::ClientContext ctx;
-            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
-            if (!token.empty()) ctx.AddMetadata("x-air-internal-token", token);
-            stub->TouchActivity(&ctx, req, &resp);
-        }).detach();
+        touch_cv_.notify_one();
     }
 
 private:
@@ -493,28 +489,138 @@ private:
     std::mutex pq_mu_;
     PGconn* pg_conn_ = nullptr;
 
-    mutable std::mutex cache_mu_;
+    mutable std::shared_mutex cache_mu_;
     std::unordered_map<std::string, TenantRoute> cache_;
+
+    std::mutex watch_ctx_mu_;
+    grpc::ClientContext* watch_ctx_ = nullptr;
+    int64_t last_event_version_ = 0;
 
     std::mutex cb_mu_;
     TenantCallback on_upsert_;
     TenantRemovedCallback on_remove_;
 
     std::mutex touch_mu_;
+    std::condition_variable touch_cv_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> last_touch_;
+    std::unordered_set<std::string> pending_touches_;
+    std::thread touch_worker_;
+
+    void touch_loop() {
+        while (true) {
+            std::unordered_set<std::string> batch;
+            {
+                std::unique_lock<std::mutex> lk(touch_mu_);
+                touch_cv_.wait(lk, [this]() {
+                    return !running_.load() || !pending_touches_.empty();
+                });
+                if (!running_.load() && pending_touches_.empty()) {
+                    return;
+                }
+                batch.swap(pending_touches_);
+            }
+            if (!running_.load() || batch.empty()) return;
+            air::db::v1::BatchTouchActivityRequest req;
+            for (const auto& tenant_id : batch) {
+                req.add_tenant_ids(tenant_id);
+            }
+            air::db::v1::Empty resp;
+            grpc::ClientContext ctx;
+            prepare_ctx(ctx, 2);
+            grpc::Status st = stub_->BatchTouchActivity(&ctx, req, &resp);
+            if (!st.ok()) {
+                std::cerr << "[air-gateway] BatchTouchActivity failed: code=" << st.error_code()
+                          << " msg=" << st.error_message() << std::endl;
+            }
+        }
+    }
+
+    bool sync_databases_grpc() {
+        air::db::v1::ListDatabasesRequest req;
+        air::db::v1::ListDatabasesResponse resp;
+        grpc::ClientContext ctx;
+        prepare_ctx(ctx, 10);
+        grpc::Status st = stub_->ListDatabases(&ctx, req, &resp);
+        if (!st.ok()) {
+            return false;
+        }
+        std::vector<TenantRoute> discovered;
+        discovered.reserve(static_cast<size_t>(resp.databases_size()));
+        for (int i = 0; i < resp.databases_size(); ++i) {
+            const auto& d = resp.databases(i);
+            if (d.state() == "PURGED") continue;
+            TenantRoute r;
+            r.tenant_id = d.tenant_id();
+            r.state = d.state();
+            r.port = d.direct_port();
+            if (!cfg_.backend_host.empty()) {
+                r.host = cfg_.backend_host;
+            }
+            discovered.push_back(std::move(r));
+        }
+        reconcile_snapshot(discovered);
+        if (resp.snapshot_version() > last_event_version_) {
+            last_event_version_ = resp.snapshot_version();
+        }
+        return true;
+    }
+
+    void watch_tenant_stream() {
+        air::db::v1::WatchTenantsRequest req;
+        req.set_after_version(last_event_version_);
+        grpc::ClientContext ctx;
+        if (!cfg_.internal_token.empty()) {
+            ctx.AddMetadata("x-air-internal-token", cfg_.internal_token);
+        }
+        {
+            std::lock_guard<std::mutex> lk(watch_ctx_mu_);
+            if (!running_.load()) return;
+            watch_ctx_ = &ctx;
+        }
+        std::unique_ptr<grpc::ClientReader<air::db::v1::TenantChangeEvent>> reader(
+            stub_->WatchTenantChanges(&ctx, req));
+
+        air::db::v1::TenantChangeEvent ev;
+        while (running_.load() && reader->Read(&ev)) {
+            if (ev.version() > last_event_version_) {
+                last_event_version_ = ev.version();
+            }
+            if (ev.type() == air::db::v1::TENANT_EVENT_RESYNC_REQUIRED) {
+                break;
+            }
+            if (ev.type() == air::db::v1::TENANT_EVENT_DELETE) {
+                remove_cache(ev.route().tenant_id());
+            } else if (ev.type() == air::db::v1::TENANT_EVENT_UPSERT && ev.has_route()) {
+                upsert_cache(from_proto_route(ev.route()));
+            }
+        }
+        reader->Finish();
+        {
+            std::lock_guard<std::mutex> lk(watch_ctx_mu_);
+            watch_ctx_ = nullptr;
+        }
+    }
 
     void discovery_loop() {
+        int backoff_ms = 500;
         while (running_.load()) {
-            poll_metadata_once();
+            if (sync_databases_grpc()) {
+                backoff_ms = 500;
+                watch_tenant_stream();
+                if (!running_.load()) break;
+            } else if (!cfg_.meta_dsn.empty()) {
+                poll_metadata_once();
+            }
             std::unique_lock<std::mutex> lk(cv_mu_);
-            cv_.wait_for(lk, std::chrono::milliseconds(cfg_.discovery_interval_ms),
+            cv_.wait_for(lk, std::chrono::milliseconds(backoff_ms),
                          [this]() { return !running_.load(); });
+            backoff_ms = std::min(backoff_ms * 2, 5000);
         }
     }
 
     void upsert_cache(const TenantRoute& r) {
         {
-            std::lock_guard<std::mutex> lk(cache_mu_);
+            std::unique_lock<std::shared_mutex> lk(cache_mu_);
             auto& cur = cache_[r.tenant_id];
             if (r.app_password.empty() && !cur.app_password.empty()) {
                 TenantRoute merged = r;
@@ -530,6 +636,20 @@ private:
             cb = on_upsert_;
         }
         if (cb) cb(r);
+    }
+
+    void remove_cache(const std::string& tenant_id) {
+        if (tenant_id.empty()) return;
+        {
+            std::unique_lock<std::shared_mutex> lk(cache_mu_);
+            cache_.erase(tenant_id);
+        }
+        TenantRemovedCallback cb;
+        {
+            std::lock_guard<std::mutex> lk(cb_mu_);
+            cb = on_remove_;
+        }
+        if (cb) cb(tenant_id);
     }
 
     void poll_metadata_once() {
@@ -573,12 +693,16 @@ private:
             PQclear(res);
         }
 
+        reconcile_snapshot(discovered);
+    }
+
+    void reconcile_snapshot(const std::vector<TenantRoute>& discovered) {
         std::unordered_set<std::string> seen;
         std::vector<TenantRoute> changed;
         std::vector<std::string> removed;
 
         {
-            std::lock_guard<std::mutex> lk(cache_mu_);
+            std::unique_lock<std::shared_mutex> lk(cache_mu_);
             for (const auto& d : discovered) {
                 seen.insert(d.tenant_id);
                 auto it = cache_.find(d.tenant_id);

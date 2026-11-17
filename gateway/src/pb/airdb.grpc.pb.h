@@ -59,6 +59,22 @@ class AirDBControl final {
     std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::Empty>> PrepareAsyncTouchActivity(::grpc::ClientContext* context, const ::air::db::v1::TenantRequest& request, ::grpc::CompletionQueue* cq) {
       return std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::Empty>>(PrepareAsyncTouchActivityRaw(context, request, cq));
     }
+    virtual ::grpc::Status BatchTouchActivity(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest& request, ::air::db::v1::Empty* response) = 0;
+    std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::Empty>> AsyncBatchTouchActivity(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::Empty>>(AsyncBatchTouchActivityRaw(context, request, cq));
+    }
+    std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::Empty>> PrepareAsyncBatchTouchActivity(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::Empty>>(PrepareAsyncBatchTouchActivityRaw(context, request, cq));
+    }
+    std::unique_ptr< ::grpc::ClientReaderInterface< ::air::db::v1::TenantChangeEvent>> WatchTenantChanges(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest& request) {
+      return std::unique_ptr< ::grpc::ClientReaderInterface< ::air::db::v1::TenantChangeEvent>>(WatchTenantChangesRaw(context, request));
+    }
+    std::unique_ptr< ::grpc::ClientAsyncReaderInterface< ::air::db::v1::TenantChangeEvent>> AsyncWatchTenantChanges(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest& request, ::grpc::CompletionQueue* cq, void* tag) {
+      return std::unique_ptr< ::grpc::ClientAsyncReaderInterface< ::air::db::v1::TenantChangeEvent>>(AsyncWatchTenantChangesRaw(context, request, cq, tag));
+    }
+    std::unique_ptr< ::grpc::ClientAsyncReaderInterface< ::air::db::v1::TenantChangeEvent>> PrepareAsyncWatchTenantChanges(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncReaderInterface< ::air::db::v1::TenantChangeEvent>>(PrepareAsyncWatchTenantChangesRaw(context, request, cq));
+    }
     virtual ::grpc::Status CreateDatabase(::grpc::ClientContext* context, const ::air::db::v1::CreateDatabaseRequest& request, ::air::db::v1::CreateDatabaseResponse* response) = 0;
     std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::CreateDatabaseResponse>> AsyncCreateDatabase(::grpc::ClientContext* context, const ::air::db::v1::CreateDatabaseRequest& request, ::grpc::CompletionQueue* cq) {
       return std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::CreateDatabaseResponse>>(AsyncCreateDatabaseRaw(context, request, cq));
@@ -124,6 +140,9 @@ class AirDBControl final {
       virtual void WakeTenant(::grpc::ClientContext* context, const ::air::db::v1::TenantRequest* request, ::air::db::v1::TenantRouteResponse* response, ::grpc::ClientUnaryReactor* reactor) = 0;
       virtual void TouchActivity(::grpc::ClientContext* context, const ::air::db::v1::TenantRequest* request, ::air::db::v1::Empty* response, std::function<void(::grpc::Status)>) = 0;
       virtual void TouchActivity(::grpc::ClientContext* context, const ::air::db::v1::TenantRequest* request, ::air::db::v1::Empty* response, ::grpc::ClientUnaryReactor* reactor) = 0;
+      virtual void BatchTouchActivity(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest* request, ::air::db::v1::Empty* response, std::function<void(::grpc::Status)>) = 0;
+      virtual void BatchTouchActivity(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest* request, ::air::db::v1::Empty* response, ::grpc::ClientUnaryReactor* reactor) = 0;
+      virtual void WatchTenantChanges(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest* request, ::grpc::ClientReadReactor< ::air::db::v1::TenantChangeEvent>* reactor) = 0;
       virtual void CreateDatabase(::grpc::ClientContext* context, const ::air::db::v1::CreateDatabaseRequest* request, ::air::db::v1::CreateDatabaseResponse* response, std::function<void(::grpc::Status)>) = 0;
       virtual void CreateDatabase(::grpc::ClientContext* context, const ::air::db::v1::CreateDatabaseRequest* request, ::air::db::v1::CreateDatabaseResponse* response, ::grpc::ClientUnaryReactor* reactor) = 0;
       virtual void ListDatabases(::grpc::ClientContext* context, const ::air::db::v1::ListDatabasesRequest* request, ::air::db::v1::ListDatabasesResponse* response, std::function<void(::grpc::Status)>) = 0;
@@ -151,6 +170,11 @@ class AirDBControl final {
     virtual ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::TenantRouteResponse>* PrepareAsyncWakeTenantRaw(::grpc::ClientContext* context, const ::air::db::v1::TenantRequest& request, ::grpc::CompletionQueue* cq) = 0;
     virtual ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::Empty>* AsyncTouchActivityRaw(::grpc::ClientContext* context, const ::air::db::v1::TenantRequest& request, ::grpc::CompletionQueue* cq) = 0;
     virtual ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::Empty>* PrepareAsyncTouchActivityRaw(::grpc::ClientContext* context, const ::air::db::v1::TenantRequest& request, ::grpc::CompletionQueue* cq) = 0;
+    virtual ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::Empty>* AsyncBatchTouchActivityRaw(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest& request, ::grpc::CompletionQueue* cq) = 0;
+    virtual ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::Empty>* PrepareAsyncBatchTouchActivityRaw(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest& request, ::grpc::CompletionQueue* cq) = 0;
+    virtual ::grpc::ClientReaderInterface< ::air::db::v1::TenantChangeEvent>* WatchTenantChangesRaw(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest& request) = 0;
+    virtual ::grpc::ClientAsyncReaderInterface< ::air::db::v1::TenantChangeEvent>* AsyncWatchTenantChangesRaw(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest& request, ::grpc::CompletionQueue* cq, void* tag) = 0;
+    virtual ::grpc::ClientAsyncReaderInterface< ::air::db::v1::TenantChangeEvent>* PrepareAsyncWatchTenantChangesRaw(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest& request, ::grpc::CompletionQueue* cq) = 0;
     virtual ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::CreateDatabaseResponse>* AsyncCreateDatabaseRaw(::grpc::ClientContext* context, const ::air::db::v1::CreateDatabaseRequest& request, ::grpc::CompletionQueue* cq) = 0;
     virtual ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::CreateDatabaseResponse>* PrepareAsyncCreateDatabaseRaw(::grpc::ClientContext* context, const ::air::db::v1::CreateDatabaseRequest& request, ::grpc::CompletionQueue* cq) = 0;
     virtual ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::ListDatabasesResponse>* AsyncListDatabasesRaw(::grpc::ClientContext* context, const ::air::db::v1::ListDatabasesRequest& request, ::grpc::CompletionQueue* cq) = 0;
@@ -191,6 +215,22 @@ class AirDBControl final {
     }
     std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::air::db::v1::Empty>> PrepareAsyncTouchActivity(::grpc::ClientContext* context, const ::air::db::v1::TenantRequest& request, ::grpc::CompletionQueue* cq) {
       return std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::air::db::v1::Empty>>(PrepareAsyncTouchActivityRaw(context, request, cq));
+    }
+    ::grpc::Status BatchTouchActivity(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest& request, ::air::db::v1::Empty* response) override;
+    std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::air::db::v1::Empty>> AsyncBatchTouchActivity(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::air::db::v1::Empty>>(AsyncBatchTouchActivityRaw(context, request, cq));
+    }
+    std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::air::db::v1::Empty>> PrepareAsyncBatchTouchActivity(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::air::db::v1::Empty>>(PrepareAsyncBatchTouchActivityRaw(context, request, cq));
+    }
+    std::unique_ptr< ::grpc::ClientReader< ::air::db::v1::TenantChangeEvent>> WatchTenantChanges(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest& request) {
+      return std::unique_ptr< ::grpc::ClientReader< ::air::db::v1::TenantChangeEvent>>(WatchTenantChangesRaw(context, request));
+    }
+    std::unique_ptr< ::grpc::ClientAsyncReader< ::air::db::v1::TenantChangeEvent>> AsyncWatchTenantChanges(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest& request, ::grpc::CompletionQueue* cq, void* tag) {
+      return std::unique_ptr< ::grpc::ClientAsyncReader< ::air::db::v1::TenantChangeEvent>>(AsyncWatchTenantChangesRaw(context, request, cq, tag));
+    }
+    std::unique_ptr< ::grpc::ClientAsyncReader< ::air::db::v1::TenantChangeEvent>> PrepareAsyncWatchTenantChanges(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncReader< ::air::db::v1::TenantChangeEvent>>(PrepareAsyncWatchTenantChangesRaw(context, request, cq));
     }
     ::grpc::Status CreateDatabase(::grpc::ClientContext* context, const ::air::db::v1::CreateDatabaseRequest& request, ::air::db::v1::CreateDatabaseResponse* response) override;
     std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::air::db::v1::CreateDatabaseResponse>> AsyncCreateDatabase(::grpc::ClientContext* context, const ::air::db::v1::CreateDatabaseRequest& request, ::grpc::CompletionQueue* cq) {
@@ -257,6 +297,9 @@ class AirDBControl final {
       void WakeTenant(::grpc::ClientContext* context, const ::air::db::v1::TenantRequest* request, ::air::db::v1::TenantRouteResponse* response, ::grpc::ClientUnaryReactor* reactor) override;
       void TouchActivity(::grpc::ClientContext* context, const ::air::db::v1::TenantRequest* request, ::air::db::v1::Empty* response, std::function<void(::grpc::Status)>) override;
       void TouchActivity(::grpc::ClientContext* context, const ::air::db::v1::TenantRequest* request, ::air::db::v1::Empty* response, ::grpc::ClientUnaryReactor* reactor) override;
+      void BatchTouchActivity(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest* request, ::air::db::v1::Empty* response, std::function<void(::grpc::Status)>) override;
+      void BatchTouchActivity(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest* request, ::air::db::v1::Empty* response, ::grpc::ClientUnaryReactor* reactor) override;
+      void WatchTenantChanges(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest* request, ::grpc::ClientReadReactor< ::air::db::v1::TenantChangeEvent>* reactor) override;
       void CreateDatabase(::grpc::ClientContext* context, const ::air::db::v1::CreateDatabaseRequest* request, ::air::db::v1::CreateDatabaseResponse* response, std::function<void(::grpc::Status)>) override;
       void CreateDatabase(::grpc::ClientContext* context, const ::air::db::v1::CreateDatabaseRequest* request, ::air::db::v1::CreateDatabaseResponse* response, ::grpc::ClientUnaryReactor* reactor) override;
       void ListDatabases(::grpc::ClientContext* context, const ::air::db::v1::ListDatabasesRequest* request, ::air::db::v1::ListDatabasesResponse* response, std::function<void(::grpc::Status)>) override;
@@ -290,6 +333,11 @@ class AirDBControl final {
     ::grpc::ClientAsyncResponseReader< ::air::db::v1::TenantRouteResponse>* PrepareAsyncWakeTenantRaw(::grpc::ClientContext* context, const ::air::db::v1::TenantRequest& request, ::grpc::CompletionQueue* cq) override;
     ::grpc::ClientAsyncResponseReader< ::air::db::v1::Empty>* AsyncTouchActivityRaw(::grpc::ClientContext* context, const ::air::db::v1::TenantRequest& request, ::grpc::CompletionQueue* cq) override;
     ::grpc::ClientAsyncResponseReader< ::air::db::v1::Empty>* PrepareAsyncTouchActivityRaw(::grpc::ClientContext* context, const ::air::db::v1::TenantRequest& request, ::grpc::CompletionQueue* cq) override;
+    ::grpc::ClientAsyncResponseReader< ::air::db::v1::Empty>* AsyncBatchTouchActivityRaw(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest& request, ::grpc::CompletionQueue* cq) override;
+    ::grpc::ClientAsyncResponseReader< ::air::db::v1::Empty>* PrepareAsyncBatchTouchActivityRaw(::grpc::ClientContext* context, const ::air::db::v1::BatchTouchActivityRequest& request, ::grpc::CompletionQueue* cq) override;
+    ::grpc::ClientReader< ::air::db::v1::TenantChangeEvent>* WatchTenantChangesRaw(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest& request) override;
+    ::grpc::ClientAsyncReader< ::air::db::v1::TenantChangeEvent>* AsyncWatchTenantChangesRaw(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest& request, ::grpc::CompletionQueue* cq, void* tag) override;
+    ::grpc::ClientAsyncReader< ::air::db::v1::TenantChangeEvent>* PrepareAsyncWatchTenantChangesRaw(::grpc::ClientContext* context, const ::air::db::v1::WatchTenantsRequest& request, ::grpc::CompletionQueue* cq) override;
     ::grpc::ClientAsyncResponseReader< ::air::db::v1::CreateDatabaseResponse>* AsyncCreateDatabaseRaw(::grpc::ClientContext* context, const ::air::db::v1::CreateDatabaseRequest& request, ::grpc::CompletionQueue* cq) override;
     ::grpc::ClientAsyncResponseReader< ::air::db::v1::CreateDatabaseResponse>* PrepareAsyncCreateDatabaseRaw(::grpc::ClientContext* context, const ::air::db::v1::CreateDatabaseRequest& request, ::grpc::CompletionQueue* cq) override;
     ::grpc::ClientAsyncResponseReader< ::air::db::v1::ListDatabasesResponse>* AsyncListDatabasesRaw(::grpc::ClientContext* context, const ::air::db::v1::ListDatabasesRequest& request, ::grpc::CompletionQueue* cq) override;
@@ -309,6 +357,8 @@ class AirDBControl final {
     const ::grpc::internal::RpcMethod rpcmethod_GetTenantRoute_;
     const ::grpc::internal::RpcMethod rpcmethod_WakeTenant_;
     const ::grpc::internal::RpcMethod rpcmethod_TouchActivity_;
+    const ::grpc::internal::RpcMethod rpcmethod_BatchTouchActivity_;
+    const ::grpc::internal::RpcMethod rpcmethod_WatchTenantChanges_;
     const ::grpc::internal::RpcMethod rpcmethod_CreateDatabase_;
     const ::grpc::internal::RpcMethod rpcmethod_ListDatabases_;
     const ::grpc::internal::RpcMethod rpcmethod_GetDatabase_;
@@ -327,6 +377,8 @@ class AirDBControl final {
     virtual ::grpc::Status GetTenantRoute(::grpc::ServerContext* context, const ::air::db::v1::TenantRequest* request, ::air::db::v1::TenantRouteResponse* response);
     virtual ::grpc::Status WakeTenant(::grpc::ServerContext* context, const ::air::db::v1::TenantRequest* request, ::air::db::v1::TenantRouteResponse* response);
     virtual ::grpc::Status TouchActivity(::grpc::ServerContext* context, const ::air::db::v1::TenantRequest* request, ::air::db::v1::Empty* response);
+    virtual ::grpc::Status BatchTouchActivity(::grpc::ServerContext* context, const ::air::db::v1::BatchTouchActivityRequest* request, ::air::db::v1::Empty* response);
+    virtual ::grpc::Status WatchTenantChanges(::grpc::ServerContext* context, const ::air::db::v1::WatchTenantsRequest* request, ::grpc::ServerWriter< ::air::db::v1::TenantChangeEvent>* writer);
     virtual ::grpc::Status CreateDatabase(::grpc::ServerContext* context, const ::air::db::v1::CreateDatabaseRequest* request, ::air::db::v1::CreateDatabaseResponse* response);
     virtual ::grpc::Status ListDatabases(::grpc::ServerContext* context, const ::air::db::v1::ListDatabasesRequest* request, ::air::db::v1::ListDatabasesResponse* response);
     virtual ::grpc::Status GetDatabase(::grpc::ServerContext* context, const ::air::db::v1::TenantRequest* request, ::air::db::v1::DatabaseInfo* response);
@@ -397,12 +449,52 @@ class AirDBControl final {
     }
   };
   template <class BaseClass>
+  class WithAsyncMethod_BatchTouchActivity : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithAsyncMethod_BatchTouchActivity() {
+      ::grpc::Service::MarkMethodAsync(3);
+    }
+    ~WithAsyncMethod_BatchTouchActivity() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status BatchTouchActivity(::grpc::ServerContext* /*context*/, const ::air::db::v1::BatchTouchActivityRequest* /*request*/, ::air::db::v1::Empty* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    void RequestBatchTouchActivity(::grpc::ServerContext* context, ::air::db::v1::BatchTouchActivityRequest* request, ::grpc::ServerAsyncResponseWriter< ::air::db::v1::Empty>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
+      ::grpc::Service::RequestAsyncUnary(3, context, request, response, new_call_cq, notification_cq, tag);
+    }
+  };
+  template <class BaseClass>
+  class WithAsyncMethod_WatchTenantChanges : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithAsyncMethod_WatchTenantChanges() {
+      ::grpc::Service::MarkMethodAsync(4);
+    }
+    ~WithAsyncMethod_WatchTenantChanges() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status WatchTenantChanges(::grpc::ServerContext* /*context*/, const ::air::db::v1::WatchTenantsRequest* /*request*/, ::grpc::ServerWriter< ::air::db::v1::TenantChangeEvent>* /*writer*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    void RequestWatchTenantChanges(::grpc::ServerContext* context, ::air::db::v1::WatchTenantsRequest* request, ::grpc::ServerAsyncWriter< ::air::db::v1::TenantChangeEvent>* writer, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
+      ::grpc::Service::RequestAsyncServerStreaming(4, context, request, writer, new_call_cq, notification_cq, tag);
+    }
+  };
+  template <class BaseClass>
   class WithAsyncMethod_CreateDatabase : public BaseClass {
    private:
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithAsyncMethod_CreateDatabase() {
-      ::grpc::Service::MarkMethodAsync(3);
+      ::grpc::Service::MarkMethodAsync(5);
     }
     ~WithAsyncMethod_CreateDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -413,7 +505,7 @@ class AirDBControl final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     void RequestCreateDatabase(::grpc::ServerContext* context, ::air::db::v1::CreateDatabaseRequest* request, ::grpc::ServerAsyncResponseWriter< ::air::db::v1::CreateDatabaseResponse>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-      ::grpc::Service::RequestAsyncUnary(3, context, request, response, new_call_cq, notification_cq, tag);
+      ::grpc::Service::RequestAsyncUnary(5, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
   template <class BaseClass>
@@ -422,7 +514,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithAsyncMethod_ListDatabases() {
-      ::grpc::Service::MarkMethodAsync(4);
+      ::grpc::Service::MarkMethodAsync(6);
     }
     ~WithAsyncMethod_ListDatabases() override {
       BaseClassMustBeDerivedFromService(this);
@@ -433,7 +525,7 @@ class AirDBControl final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     void RequestListDatabases(::grpc::ServerContext* context, ::air::db::v1::ListDatabasesRequest* request, ::grpc::ServerAsyncResponseWriter< ::air::db::v1::ListDatabasesResponse>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-      ::grpc::Service::RequestAsyncUnary(4, context, request, response, new_call_cq, notification_cq, tag);
+      ::grpc::Service::RequestAsyncUnary(6, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
   template <class BaseClass>
@@ -442,7 +534,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithAsyncMethod_GetDatabase() {
-      ::grpc::Service::MarkMethodAsync(5);
+      ::grpc::Service::MarkMethodAsync(7);
     }
     ~WithAsyncMethod_GetDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -453,7 +545,7 @@ class AirDBControl final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     void RequestGetDatabase(::grpc::ServerContext* context, ::air::db::v1::TenantRequest* request, ::grpc::ServerAsyncResponseWriter< ::air::db::v1::DatabaseInfo>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-      ::grpc::Service::RequestAsyncUnary(5, context, request, response, new_call_cq, notification_cq, tag);
+      ::grpc::Service::RequestAsyncUnary(7, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
   template <class BaseClass>
@@ -462,7 +554,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithAsyncMethod_DeleteDatabase() {
-      ::grpc::Service::MarkMethodAsync(6);
+      ::grpc::Service::MarkMethodAsync(8);
     }
     ~WithAsyncMethod_DeleteDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -473,7 +565,7 @@ class AirDBControl final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     void RequestDeleteDatabase(::grpc::ServerContext* context, ::air::db::v1::TenantRequest* request, ::grpc::ServerAsyncResponseWriter< ::air::db::v1::StatusResponse>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-      ::grpc::Service::RequestAsyncUnary(6, context, request, response, new_call_cq, notification_cq, tag);
+      ::grpc::Service::RequestAsyncUnary(8, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
   template <class BaseClass>
@@ -482,7 +574,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithAsyncMethod_SuspendDatabase() {
-      ::grpc::Service::MarkMethodAsync(7);
+      ::grpc::Service::MarkMethodAsync(9);
     }
     ~WithAsyncMethod_SuspendDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -493,7 +585,7 @@ class AirDBControl final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     void RequestSuspendDatabase(::grpc::ServerContext* context, ::air::db::v1::TenantRequest* request, ::grpc::ServerAsyncResponseWriter< ::air::db::v1::StatusResponse>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-      ::grpc::Service::RequestAsyncUnary(7, context, request, response, new_call_cq, notification_cq, tag);
+      ::grpc::Service::RequestAsyncUnary(9, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
   template <class BaseClass>
@@ -502,7 +594,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithAsyncMethod_StartDatabase() {
-      ::grpc::Service::MarkMethodAsync(8);
+      ::grpc::Service::MarkMethodAsync(10);
     }
     ~WithAsyncMethod_StartDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -513,7 +605,7 @@ class AirDBControl final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     void RequestStartDatabase(::grpc::ServerContext* context, ::air::db::v1::TenantRequest* request, ::grpc::ServerAsyncResponseWriter< ::air::db::v1::TenantRouteResponse>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-      ::grpc::Service::RequestAsyncUnary(8, context, request, response, new_call_cq, notification_cq, tag);
+      ::grpc::Service::RequestAsyncUnary(10, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
   template <class BaseClass>
@@ -522,7 +614,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithAsyncMethod_LockDatabase() {
-      ::grpc::Service::MarkMethodAsync(9);
+      ::grpc::Service::MarkMethodAsync(11);
     }
     ~WithAsyncMethod_LockDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -533,7 +625,7 @@ class AirDBControl final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     void RequestLockDatabase(::grpc::ServerContext* context, ::air::db::v1::TenantRequest* request, ::grpc::ServerAsyncResponseWriter< ::air::db::v1::StatusResponse>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-      ::grpc::Service::RequestAsyncUnary(9, context, request, response, new_call_cq, notification_cq, tag);
+      ::grpc::Service::RequestAsyncUnary(11, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
   template <class BaseClass>
@@ -542,7 +634,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithAsyncMethod_UnlockDatabase() {
-      ::grpc::Service::MarkMethodAsync(10);
+      ::grpc::Service::MarkMethodAsync(12);
     }
     ~WithAsyncMethod_UnlockDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -553,10 +645,10 @@ class AirDBControl final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     void RequestUnlockDatabase(::grpc::ServerContext* context, ::air::db::v1::TenantRequest* request, ::grpc::ServerAsyncResponseWriter< ::air::db::v1::StatusResponse>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-      ::grpc::Service::RequestAsyncUnary(10, context, request, response, new_call_cq, notification_cq, tag);
+      ::grpc::Service::RequestAsyncUnary(12, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
-  typedef WithAsyncMethod_GetTenantRoute<WithAsyncMethod_WakeTenant<WithAsyncMethod_TouchActivity<WithAsyncMethod_CreateDatabase<WithAsyncMethod_ListDatabases<WithAsyncMethod_GetDatabase<WithAsyncMethod_DeleteDatabase<WithAsyncMethod_SuspendDatabase<WithAsyncMethod_StartDatabase<WithAsyncMethod_LockDatabase<WithAsyncMethod_UnlockDatabase<Service > > > > > > > > > > > AsyncService;
+  typedef WithAsyncMethod_GetTenantRoute<WithAsyncMethod_WakeTenant<WithAsyncMethod_TouchActivity<WithAsyncMethod_BatchTouchActivity<WithAsyncMethod_WatchTenantChanges<WithAsyncMethod_CreateDatabase<WithAsyncMethod_ListDatabases<WithAsyncMethod_GetDatabase<WithAsyncMethod_DeleteDatabase<WithAsyncMethod_SuspendDatabase<WithAsyncMethod_StartDatabase<WithAsyncMethod_LockDatabase<WithAsyncMethod_UnlockDatabase<Service > > > > > > > > > > > > > AsyncService;
   template <class BaseClass>
   class WithCallbackMethod_GetTenantRoute : public BaseClass {
    private:
@@ -639,18 +731,67 @@ class AirDBControl final {
       ::grpc::CallbackServerContext* /*context*/, const ::air::db::v1::TenantRequest* /*request*/, ::air::db::v1::Empty* /*response*/)  { return nullptr; }
   };
   template <class BaseClass>
+  class WithCallbackMethod_BatchTouchActivity : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithCallbackMethod_BatchTouchActivity() {
+      ::grpc::Service::MarkMethodCallback(3,
+          new ::grpc::internal::CallbackUnaryHandler< ::air::db::v1::BatchTouchActivityRequest, ::air::db::v1::Empty>(
+            [this](
+                   ::grpc::CallbackServerContext* context, const ::air::db::v1::BatchTouchActivityRequest* request, ::air::db::v1::Empty* response) { return this->BatchTouchActivity(context, request, response); }));}
+    void SetMessageAllocatorFor_BatchTouchActivity(
+        ::grpc::MessageAllocator< ::air::db::v1::BatchTouchActivityRequest, ::air::db::v1::Empty>* allocator) {
+      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(3);
+      static_cast<::grpc::internal::CallbackUnaryHandler< ::air::db::v1::BatchTouchActivityRequest, ::air::db::v1::Empty>*>(handler)
+              ->SetMessageAllocator(allocator);
+    }
+    ~WithCallbackMethod_BatchTouchActivity() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status BatchTouchActivity(::grpc::ServerContext* /*context*/, const ::air::db::v1::BatchTouchActivityRequest* /*request*/, ::air::db::v1::Empty* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    virtual ::grpc::ServerUnaryReactor* BatchTouchActivity(
+      ::grpc::CallbackServerContext* /*context*/, const ::air::db::v1::BatchTouchActivityRequest* /*request*/, ::air::db::v1::Empty* /*response*/)  { return nullptr; }
+  };
+  template <class BaseClass>
+  class WithCallbackMethod_WatchTenantChanges : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithCallbackMethod_WatchTenantChanges() {
+      ::grpc::Service::MarkMethodCallback(4,
+          new ::grpc::internal::CallbackServerStreamingHandler< ::air::db::v1::WatchTenantsRequest, ::air::db::v1::TenantChangeEvent>(
+            [this](
+                   ::grpc::CallbackServerContext* context, const ::air::db::v1::WatchTenantsRequest* request) { return this->WatchTenantChanges(context, request); }));
+    }
+    ~WithCallbackMethod_WatchTenantChanges() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status WatchTenantChanges(::grpc::ServerContext* /*context*/, const ::air::db::v1::WatchTenantsRequest* /*request*/, ::grpc::ServerWriter< ::air::db::v1::TenantChangeEvent>* /*writer*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    virtual ::grpc::ServerWriteReactor< ::air::db::v1::TenantChangeEvent>* WatchTenantChanges(
+      ::grpc::CallbackServerContext* /*context*/, const ::air::db::v1::WatchTenantsRequest* /*request*/)  { return nullptr; }
+  };
+  template <class BaseClass>
   class WithCallbackMethod_CreateDatabase : public BaseClass {
    private:
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithCallbackMethod_CreateDatabase() {
-      ::grpc::Service::MarkMethodCallback(3,
+      ::grpc::Service::MarkMethodCallback(5,
           new ::grpc::internal::CallbackUnaryHandler< ::air::db::v1::CreateDatabaseRequest, ::air::db::v1::CreateDatabaseResponse>(
             [this](
                    ::grpc::CallbackServerContext* context, const ::air::db::v1::CreateDatabaseRequest* request, ::air::db::v1::CreateDatabaseResponse* response) { return this->CreateDatabase(context, request, response); }));}
     void SetMessageAllocatorFor_CreateDatabase(
         ::grpc::MessageAllocator< ::air::db::v1::CreateDatabaseRequest, ::air::db::v1::CreateDatabaseResponse>* allocator) {
-      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(3);
+      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(5);
       static_cast<::grpc::internal::CallbackUnaryHandler< ::air::db::v1::CreateDatabaseRequest, ::air::db::v1::CreateDatabaseResponse>*>(handler)
               ->SetMessageAllocator(allocator);
     }
@@ -671,13 +812,13 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithCallbackMethod_ListDatabases() {
-      ::grpc::Service::MarkMethodCallback(4,
+      ::grpc::Service::MarkMethodCallback(6,
           new ::grpc::internal::CallbackUnaryHandler< ::air::db::v1::ListDatabasesRequest, ::air::db::v1::ListDatabasesResponse>(
             [this](
                    ::grpc::CallbackServerContext* context, const ::air::db::v1::ListDatabasesRequest* request, ::air::db::v1::ListDatabasesResponse* response) { return this->ListDatabases(context, request, response); }));}
     void SetMessageAllocatorFor_ListDatabases(
         ::grpc::MessageAllocator< ::air::db::v1::ListDatabasesRequest, ::air::db::v1::ListDatabasesResponse>* allocator) {
-      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(4);
+      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(6);
       static_cast<::grpc::internal::CallbackUnaryHandler< ::air::db::v1::ListDatabasesRequest, ::air::db::v1::ListDatabasesResponse>*>(handler)
               ->SetMessageAllocator(allocator);
     }
@@ -698,13 +839,13 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithCallbackMethod_GetDatabase() {
-      ::grpc::Service::MarkMethodCallback(5,
+      ::grpc::Service::MarkMethodCallback(7,
           new ::grpc::internal::CallbackUnaryHandler< ::air::db::v1::TenantRequest, ::air::db::v1::DatabaseInfo>(
             [this](
                    ::grpc::CallbackServerContext* context, const ::air::db::v1::TenantRequest* request, ::air::db::v1::DatabaseInfo* response) { return this->GetDatabase(context, request, response); }));}
     void SetMessageAllocatorFor_GetDatabase(
         ::grpc::MessageAllocator< ::air::db::v1::TenantRequest, ::air::db::v1::DatabaseInfo>* allocator) {
-      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(5);
+      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(7);
       static_cast<::grpc::internal::CallbackUnaryHandler< ::air::db::v1::TenantRequest, ::air::db::v1::DatabaseInfo>*>(handler)
               ->SetMessageAllocator(allocator);
     }
@@ -725,13 +866,13 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithCallbackMethod_DeleteDatabase() {
-      ::grpc::Service::MarkMethodCallback(6,
+      ::grpc::Service::MarkMethodCallback(8,
           new ::grpc::internal::CallbackUnaryHandler< ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse>(
             [this](
                    ::grpc::CallbackServerContext* context, const ::air::db::v1::TenantRequest* request, ::air::db::v1::StatusResponse* response) { return this->DeleteDatabase(context, request, response); }));}
     void SetMessageAllocatorFor_DeleteDatabase(
         ::grpc::MessageAllocator< ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse>* allocator) {
-      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(6);
+      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(8);
       static_cast<::grpc::internal::CallbackUnaryHandler< ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse>*>(handler)
               ->SetMessageAllocator(allocator);
     }
@@ -752,13 +893,13 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithCallbackMethod_SuspendDatabase() {
-      ::grpc::Service::MarkMethodCallback(7,
+      ::grpc::Service::MarkMethodCallback(9,
           new ::grpc::internal::CallbackUnaryHandler< ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse>(
             [this](
                    ::grpc::CallbackServerContext* context, const ::air::db::v1::TenantRequest* request, ::air::db::v1::StatusResponse* response) { return this->SuspendDatabase(context, request, response); }));}
     void SetMessageAllocatorFor_SuspendDatabase(
         ::grpc::MessageAllocator< ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse>* allocator) {
-      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(7);
+      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(9);
       static_cast<::grpc::internal::CallbackUnaryHandler< ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse>*>(handler)
               ->SetMessageAllocator(allocator);
     }
@@ -779,13 +920,13 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithCallbackMethod_StartDatabase() {
-      ::grpc::Service::MarkMethodCallback(8,
+      ::grpc::Service::MarkMethodCallback(10,
           new ::grpc::internal::CallbackUnaryHandler< ::air::db::v1::TenantRequest, ::air::db::v1::TenantRouteResponse>(
             [this](
                    ::grpc::CallbackServerContext* context, const ::air::db::v1::TenantRequest* request, ::air::db::v1::TenantRouteResponse* response) { return this->StartDatabase(context, request, response); }));}
     void SetMessageAllocatorFor_StartDatabase(
         ::grpc::MessageAllocator< ::air::db::v1::TenantRequest, ::air::db::v1::TenantRouteResponse>* allocator) {
-      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(8);
+      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(10);
       static_cast<::grpc::internal::CallbackUnaryHandler< ::air::db::v1::TenantRequest, ::air::db::v1::TenantRouteResponse>*>(handler)
               ->SetMessageAllocator(allocator);
     }
@@ -806,13 +947,13 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithCallbackMethod_LockDatabase() {
-      ::grpc::Service::MarkMethodCallback(9,
+      ::grpc::Service::MarkMethodCallback(11,
           new ::grpc::internal::CallbackUnaryHandler< ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse>(
             [this](
                    ::grpc::CallbackServerContext* context, const ::air::db::v1::TenantRequest* request, ::air::db::v1::StatusResponse* response) { return this->LockDatabase(context, request, response); }));}
     void SetMessageAllocatorFor_LockDatabase(
         ::grpc::MessageAllocator< ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse>* allocator) {
-      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(9);
+      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(11);
       static_cast<::grpc::internal::CallbackUnaryHandler< ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse>*>(handler)
               ->SetMessageAllocator(allocator);
     }
@@ -833,13 +974,13 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithCallbackMethod_UnlockDatabase() {
-      ::grpc::Service::MarkMethodCallback(10,
+      ::grpc::Service::MarkMethodCallback(12,
           new ::grpc::internal::CallbackUnaryHandler< ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse>(
             [this](
                    ::grpc::CallbackServerContext* context, const ::air::db::v1::TenantRequest* request, ::air::db::v1::StatusResponse* response) { return this->UnlockDatabase(context, request, response); }));}
     void SetMessageAllocatorFor_UnlockDatabase(
         ::grpc::MessageAllocator< ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse>* allocator) {
-      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(10);
+      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(12);
       static_cast<::grpc::internal::CallbackUnaryHandler< ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse>*>(handler)
               ->SetMessageAllocator(allocator);
     }
@@ -854,7 +995,7 @@ class AirDBControl final {
     virtual ::grpc::ServerUnaryReactor* UnlockDatabase(
       ::grpc::CallbackServerContext* /*context*/, const ::air::db::v1::TenantRequest* /*request*/, ::air::db::v1::StatusResponse* /*response*/)  { return nullptr; }
   };
-  typedef WithCallbackMethod_GetTenantRoute<WithCallbackMethod_WakeTenant<WithCallbackMethod_TouchActivity<WithCallbackMethod_CreateDatabase<WithCallbackMethod_ListDatabases<WithCallbackMethod_GetDatabase<WithCallbackMethod_DeleteDatabase<WithCallbackMethod_SuspendDatabase<WithCallbackMethod_StartDatabase<WithCallbackMethod_LockDatabase<WithCallbackMethod_UnlockDatabase<Service > > > > > > > > > > > CallbackService;
+  typedef WithCallbackMethod_GetTenantRoute<WithCallbackMethod_WakeTenant<WithCallbackMethod_TouchActivity<WithCallbackMethod_BatchTouchActivity<WithCallbackMethod_WatchTenantChanges<WithCallbackMethod_CreateDatabase<WithCallbackMethod_ListDatabases<WithCallbackMethod_GetDatabase<WithCallbackMethod_DeleteDatabase<WithCallbackMethod_SuspendDatabase<WithCallbackMethod_StartDatabase<WithCallbackMethod_LockDatabase<WithCallbackMethod_UnlockDatabase<Service > > > > > > > > > > > > > CallbackService;
   typedef CallbackService ExperimentalCallbackService;
   template <class BaseClass>
   class WithGenericMethod_GetTenantRoute : public BaseClass {
@@ -908,12 +1049,46 @@ class AirDBControl final {
     }
   };
   template <class BaseClass>
+  class WithGenericMethod_BatchTouchActivity : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithGenericMethod_BatchTouchActivity() {
+      ::grpc::Service::MarkMethodGeneric(3);
+    }
+    ~WithGenericMethod_BatchTouchActivity() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status BatchTouchActivity(::grpc::ServerContext* /*context*/, const ::air::db::v1::BatchTouchActivityRequest* /*request*/, ::air::db::v1::Empty* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+  };
+  template <class BaseClass>
+  class WithGenericMethod_WatchTenantChanges : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithGenericMethod_WatchTenantChanges() {
+      ::grpc::Service::MarkMethodGeneric(4);
+    }
+    ~WithGenericMethod_WatchTenantChanges() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status WatchTenantChanges(::grpc::ServerContext* /*context*/, const ::air::db::v1::WatchTenantsRequest* /*request*/, ::grpc::ServerWriter< ::air::db::v1::TenantChangeEvent>* /*writer*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+  };
+  template <class BaseClass>
   class WithGenericMethod_CreateDatabase : public BaseClass {
    private:
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithGenericMethod_CreateDatabase() {
-      ::grpc::Service::MarkMethodGeneric(3);
+      ::grpc::Service::MarkMethodGeneric(5);
     }
     ~WithGenericMethod_CreateDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -930,7 +1105,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithGenericMethod_ListDatabases() {
-      ::grpc::Service::MarkMethodGeneric(4);
+      ::grpc::Service::MarkMethodGeneric(6);
     }
     ~WithGenericMethod_ListDatabases() override {
       BaseClassMustBeDerivedFromService(this);
@@ -947,7 +1122,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithGenericMethod_GetDatabase() {
-      ::grpc::Service::MarkMethodGeneric(5);
+      ::grpc::Service::MarkMethodGeneric(7);
     }
     ~WithGenericMethod_GetDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -964,7 +1139,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithGenericMethod_DeleteDatabase() {
-      ::grpc::Service::MarkMethodGeneric(6);
+      ::grpc::Service::MarkMethodGeneric(8);
     }
     ~WithGenericMethod_DeleteDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -981,7 +1156,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithGenericMethod_SuspendDatabase() {
-      ::grpc::Service::MarkMethodGeneric(7);
+      ::grpc::Service::MarkMethodGeneric(9);
     }
     ~WithGenericMethod_SuspendDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -998,7 +1173,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithGenericMethod_StartDatabase() {
-      ::grpc::Service::MarkMethodGeneric(8);
+      ::grpc::Service::MarkMethodGeneric(10);
     }
     ~WithGenericMethod_StartDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -1015,7 +1190,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithGenericMethod_LockDatabase() {
-      ::grpc::Service::MarkMethodGeneric(9);
+      ::grpc::Service::MarkMethodGeneric(11);
     }
     ~WithGenericMethod_LockDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -1032,7 +1207,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithGenericMethod_UnlockDatabase() {
-      ::grpc::Service::MarkMethodGeneric(10);
+      ::grpc::Service::MarkMethodGeneric(12);
     }
     ~WithGenericMethod_UnlockDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -1104,12 +1279,52 @@ class AirDBControl final {
     }
   };
   template <class BaseClass>
+  class WithRawMethod_BatchTouchActivity : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithRawMethod_BatchTouchActivity() {
+      ::grpc::Service::MarkMethodRaw(3);
+    }
+    ~WithRawMethod_BatchTouchActivity() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status BatchTouchActivity(::grpc::ServerContext* /*context*/, const ::air::db::v1::BatchTouchActivityRequest* /*request*/, ::air::db::v1::Empty* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    void RequestBatchTouchActivity(::grpc::ServerContext* context, ::grpc::ByteBuffer* request, ::grpc::ServerAsyncResponseWriter< ::grpc::ByteBuffer>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
+      ::grpc::Service::RequestAsyncUnary(3, context, request, response, new_call_cq, notification_cq, tag);
+    }
+  };
+  template <class BaseClass>
+  class WithRawMethod_WatchTenantChanges : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithRawMethod_WatchTenantChanges() {
+      ::grpc::Service::MarkMethodRaw(4);
+    }
+    ~WithRawMethod_WatchTenantChanges() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status WatchTenantChanges(::grpc::ServerContext* /*context*/, const ::air::db::v1::WatchTenantsRequest* /*request*/, ::grpc::ServerWriter< ::air::db::v1::TenantChangeEvent>* /*writer*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    void RequestWatchTenantChanges(::grpc::ServerContext* context, ::grpc::ByteBuffer* request, ::grpc::ServerAsyncWriter< ::grpc::ByteBuffer>* writer, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
+      ::grpc::Service::RequestAsyncServerStreaming(4, context, request, writer, new_call_cq, notification_cq, tag);
+    }
+  };
+  template <class BaseClass>
   class WithRawMethod_CreateDatabase : public BaseClass {
    private:
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithRawMethod_CreateDatabase() {
-      ::grpc::Service::MarkMethodRaw(3);
+      ::grpc::Service::MarkMethodRaw(5);
     }
     ~WithRawMethod_CreateDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -1120,7 +1335,7 @@ class AirDBControl final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     void RequestCreateDatabase(::grpc::ServerContext* context, ::grpc::ByteBuffer* request, ::grpc::ServerAsyncResponseWriter< ::grpc::ByteBuffer>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-      ::grpc::Service::RequestAsyncUnary(3, context, request, response, new_call_cq, notification_cq, tag);
+      ::grpc::Service::RequestAsyncUnary(5, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
   template <class BaseClass>
@@ -1129,7 +1344,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithRawMethod_ListDatabases() {
-      ::grpc::Service::MarkMethodRaw(4);
+      ::grpc::Service::MarkMethodRaw(6);
     }
     ~WithRawMethod_ListDatabases() override {
       BaseClassMustBeDerivedFromService(this);
@@ -1140,7 +1355,7 @@ class AirDBControl final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     void RequestListDatabases(::grpc::ServerContext* context, ::grpc::ByteBuffer* request, ::grpc::ServerAsyncResponseWriter< ::grpc::ByteBuffer>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-      ::grpc::Service::RequestAsyncUnary(4, context, request, response, new_call_cq, notification_cq, tag);
+      ::grpc::Service::RequestAsyncUnary(6, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
   template <class BaseClass>
@@ -1149,7 +1364,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithRawMethod_GetDatabase() {
-      ::grpc::Service::MarkMethodRaw(5);
+      ::grpc::Service::MarkMethodRaw(7);
     }
     ~WithRawMethod_GetDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -1160,7 +1375,7 @@ class AirDBControl final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     void RequestGetDatabase(::grpc::ServerContext* context, ::grpc::ByteBuffer* request, ::grpc::ServerAsyncResponseWriter< ::grpc::ByteBuffer>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-      ::grpc::Service::RequestAsyncUnary(5, context, request, response, new_call_cq, notification_cq, tag);
+      ::grpc::Service::RequestAsyncUnary(7, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
   template <class BaseClass>
@@ -1169,7 +1384,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithRawMethod_DeleteDatabase() {
-      ::grpc::Service::MarkMethodRaw(6);
+      ::grpc::Service::MarkMethodRaw(8);
     }
     ~WithRawMethod_DeleteDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -1180,7 +1395,7 @@ class AirDBControl final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     void RequestDeleteDatabase(::grpc::ServerContext* context, ::grpc::ByteBuffer* request, ::grpc::ServerAsyncResponseWriter< ::grpc::ByteBuffer>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-      ::grpc::Service::RequestAsyncUnary(6, context, request, response, new_call_cq, notification_cq, tag);
+      ::grpc::Service::RequestAsyncUnary(8, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
   template <class BaseClass>
@@ -1189,7 +1404,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithRawMethod_SuspendDatabase() {
-      ::grpc::Service::MarkMethodRaw(7);
+      ::grpc::Service::MarkMethodRaw(9);
     }
     ~WithRawMethod_SuspendDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -1200,7 +1415,7 @@ class AirDBControl final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     void RequestSuspendDatabase(::grpc::ServerContext* context, ::grpc::ByteBuffer* request, ::grpc::ServerAsyncResponseWriter< ::grpc::ByteBuffer>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-      ::grpc::Service::RequestAsyncUnary(7, context, request, response, new_call_cq, notification_cq, tag);
+      ::grpc::Service::RequestAsyncUnary(9, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
   template <class BaseClass>
@@ -1209,7 +1424,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithRawMethod_StartDatabase() {
-      ::grpc::Service::MarkMethodRaw(8);
+      ::grpc::Service::MarkMethodRaw(10);
     }
     ~WithRawMethod_StartDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -1220,7 +1435,7 @@ class AirDBControl final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     void RequestStartDatabase(::grpc::ServerContext* context, ::grpc::ByteBuffer* request, ::grpc::ServerAsyncResponseWriter< ::grpc::ByteBuffer>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-      ::grpc::Service::RequestAsyncUnary(8, context, request, response, new_call_cq, notification_cq, tag);
+      ::grpc::Service::RequestAsyncUnary(10, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
   template <class BaseClass>
@@ -1229,7 +1444,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithRawMethod_LockDatabase() {
-      ::grpc::Service::MarkMethodRaw(9);
+      ::grpc::Service::MarkMethodRaw(11);
     }
     ~WithRawMethod_LockDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -1240,7 +1455,7 @@ class AirDBControl final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     void RequestLockDatabase(::grpc::ServerContext* context, ::grpc::ByteBuffer* request, ::grpc::ServerAsyncResponseWriter< ::grpc::ByteBuffer>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-      ::grpc::Service::RequestAsyncUnary(9, context, request, response, new_call_cq, notification_cq, tag);
+      ::grpc::Service::RequestAsyncUnary(11, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
   template <class BaseClass>
@@ -1249,7 +1464,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithRawMethod_UnlockDatabase() {
-      ::grpc::Service::MarkMethodRaw(10);
+      ::grpc::Service::MarkMethodRaw(12);
     }
     ~WithRawMethod_UnlockDatabase() override {
       BaseClassMustBeDerivedFromService(this);
@@ -1260,7 +1475,7 @@ class AirDBControl final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     void RequestUnlockDatabase(::grpc::ServerContext* context, ::grpc::ByteBuffer* request, ::grpc::ServerAsyncResponseWriter< ::grpc::ByteBuffer>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-      ::grpc::Service::RequestAsyncUnary(10, context, request, response, new_call_cq, notification_cq, tag);
+      ::grpc::Service::RequestAsyncUnary(12, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
   template <class BaseClass>
@@ -1330,12 +1545,56 @@ class AirDBControl final {
       ::grpc::CallbackServerContext* /*context*/, const ::grpc::ByteBuffer* /*request*/, ::grpc::ByteBuffer* /*response*/)  { return nullptr; }
   };
   template <class BaseClass>
+  class WithRawCallbackMethod_BatchTouchActivity : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithRawCallbackMethod_BatchTouchActivity() {
+      ::grpc::Service::MarkMethodRawCallback(3,
+          new ::grpc::internal::CallbackUnaryHandler< ::grpc::ByteBuffer, ::grpc::ByteBuffer>(
+            [this](
+                   ::grpc::CallbackServerContext* context, const ::grpc::ByteBuffer* request, ::grpc::ByteBuffer* response) { return this->BatchTouchActivity(context, request, response); }));
+    }
+    ~WithRawCallbackMethod_BatchTouchActivity() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status BatchTouchActivity(::grpc::ServerContext* /*context*/, const ::air::db::v1::BatchTouchActivityRequest* /*request*/, ::air::db::v1::Empty* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    virtual ::grpc::ServerUnaryReactor* BatchTouchActivity(
+      ::grpc::CallbackServerContext* /*context*/, const ::grpc::ByteBuffer* /*request*/, ::grpc::ByteBuffer* /*response*/)  { return nullptr; }
+  };
+  template <class BaseClass>
+  class WithRawCallbackMethod_WatchTenantChanges : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithRawCallbackMethod_WatchTenantChanges() {
+      ::grpc::Service::MarkMethodRawCallback(4,
+          new ::grpc::internal::CallbackServerStreamingHandler< ::grpc::ByteBuffer, ::grpc::ByteBuffer>(
+            [this](
+                   ::grpc::CallbackServerContext* context, const::grpc::ByteBuffer* request) { return this->WatchTenantChanges(context, request); }));
+    }
+    ~WithRawCallbackMethod_WatchTenantChanges() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status WatchTenantChanges(::grpc::ServerContext* /*context*/, const ::air::db::v1::WatchTenantsRequest* /*request*/, ::grpc::ServerWriter< ::air::db::v1::TenantChangeEvent>* /*writer*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    virtual ::grpc::ServerWriteReactor< ::grpc::ByteBuffer>* WatchTenantChanges(
+      ::grpc::CallbackServerContext* /*context*/, const ::grpc::ByteBuffer* /*request*/)  { return nullptr; }
+  };
+  template <class BaseClass>
   class WithRawCallbackMethod_CreateDatabase : public BaseClass {
    private:
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithRawCallbackMethod_CreateDatabase() {
-      ::grpc::Service::MarkMethodRawCallback(3,
+      ::grpc::Service::MarkMethodRawCallback(5,
           new ::grpc::internal::CallbackUnaryHandler< ::grpc::ByteBuffer, ::grpc::ByteBuffer>(
             [this](
                    ::grpc::CallbackServerContext* context, const ::grpc::ByteBuffer* request, ::grpc::ByteBuffer* response) { return this->CreateDatabase(context, request, response); }));
@@ -1357,7 +1616,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithRawCallbackMethod_ListDatabases() {
-      ::grpc::Service::MarkMethodRawCallback(4,
+      ::grpc::Service::MarkMethodRawCallback(6,
           new ::grpc::internal::CallbackUnaryHandler< ::grpc::ByteBuffer, ::grpc::ByteBuffer>(
             [this](
                    ::grpc::CallbackServerContext* context, const ::grpc::ByteBuffer* request, ::grpc::ByteBuffer* response) { return this->ListDatabases(context, request, response); }));
@@ -1379,7 +1638,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithRawCallbackMethod_GetDatabase() {
-      ::grpc::Service::MarkMethodRawCallback(5,
+      ::grpc::Service::MarkMethodRawCallback(7,
           new ::grpc::internal::CallbackUnaryHandler< ::grpc::ByteBuffer, ::grpc::ByteBuffer>(
             [this](
                    ::grpc::CallbackServerContext* context, const ::grpc::ByteBuffer* request, ::grpc::ByteBuffer* response) { return this->GetDatabase(context, request, response); }));
@@ -1401,7 +1660,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithRawCallbackMethod_DeleteDatabase() {
-      ::grpc::Service::MarkMethodRawCallback(6,
+      ::grpc::Service::MarkMethodRawCallback(8,
           new ::grpc::internal::CallbackUnaryHandler< ::grpc::ByteBuffer, ::grpc::ByteBuffer>(
             [this](
                    ::grpc::CallbackServerContext* context, const ::grpc::ByteBuffer* request, ::grpc::ByteBuffer* response) { return this->DeleteDatabase(context, request, response); }));
@@ -1423,7 +1682,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithRawCallbackMethod_SuspendDatabase() {
-      ::grpc::Service::MarkMethodRawCallback(7,
+      ::grpc::Service::MarkMethodRawCallback(9,
           new ::grpc::internal::CallbackUnaryHandler< ::grpc::ByteBuffer, ::grpc::ByteBuffer>(
             [this](
                    ::grpc::CallbackServerContext* context, const ::grpc::ByteBuffer* request, ::grpc::ByteBuffer* response) { return this->SuspendDatabase(context, request, response); }));
@@ -1445,7 +1704,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithRawCallbackMethod_StartDatabase() {
-      ::grpc::Service::MarkMethodRawCallback(8,
+      ::grpc::Service::MarkMethodRawCallback(10,
           new ::grpc::internal::CallbackUnaryHandler< ::grpc::ByteBuffer, ::grpc::ByteBuffer>(
             [this](
                    ::grpc::CallbackServerContext* context, const ::grpc::ByteBuffer* request, ::grpc::ByteBuffer* response) { return this->StartDatabase(context, request, response); }));
@@ -1467,7 +1726,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithRawCallbackMethod_LockDatabase() {
-      ::grpc::Service::MarkMethodRawCallback(9,
+      ::grpc::Service::MarkMethodRawCallback(11,
           new ::grpc::internal::CallbackUnaryHandler< ::grpc::ByteBuffer, ::grpc::ByteBuffer>(
             [this](
                    ::grpc::CallbackServerContext* context, const ::grpc::ByteBuffer* request, ::grpc::ByteBuffer* response) { return this->LockDatabase(context, request, response); }));
@@ -1489,7 +1748,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithRawCallbackMethod_UnlockDatabase() {
-      ::grpc::Service::MarkMethodRawCallback(10,
+      ::grpc::Service::MarkMethodRawCallback(12,
           new ::grpc::internal::CallbackUnaryHandler< ::grpc::ByteBuffer, ::grpc::ByteBuffer>(
             [this](
                    ::grpc::CallbackServerContext* context, const ::grpc::ByteBuffer* request, ::grpc::ByteBuffer* response) { return this->UnlockDatabase(context, request, response); }));
@@ -1587,12 +1846,39 @@ class AirDBControl final {
     virtual ::grpc::Status StreamedTouchActivity(::grpc::ServerContext* context, ::grpc::ServerUnaryStreamer< ::air::db::v1::TenantRequest,::air::db::v1::Empty>* server_unary_streamer) = 0;
   };
   template <class BaseClass>
+  class WithStreamedUnaryMethod_BatchTouchActivity : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithStreamedUnaryMethod_BatchTouchActivity() {
+      ::grpc::Service::MarkMethodStreamed(3,
+        new ::grpc::internal::StreamedUnaryHandler<
+          ::air::db::v1::BatchTouchActivityRequest, ::air::db::v1::Empty>(
+            [this](::grpc::ServerContext* context,
+                   ::grpc::ServerUnaryStreamer<
+                     ::air::db::v1::BatchTouchActivityRequest, ::air::db::v1::Empty>* streamer) {
+                       return this->StreamedBatchTouchActivity(context,
+                         streamer);
+                  }));
+    }
+    ~WithStreamedUnaryMethod_BatchTouchActivity() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable regular version of this method
+    ::grpc::Status BatchTouchActivity(::grpc::ServerContext* /*context*/, const ::air::db::v1::BatchTouchActivityRequest* /*request*/, ::air::db::v1::Empty* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    // replace default version of method with streamed unary
+    virtual ::grpc::Status StreamedBatchTouchActivity(::grpc::ServerContext* context, ::grpc::ServerUnaryStreamer< ::air::db::v1::BatchTouchActivityRequest,::air::db::v1::Empty>* server_unary_streamer) = 0;
+  };
+  template <class BaseClass>
   class WithStreamedUnaryMethod_CreateDatabase : public BaseClass {
    private:
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithStreamedUnaryMethod_CreateDatabase() {
-      ::grpc::Service::MarkMethodStreamed(3,
+      ::grpc::Service::MarkMethodStreamed(5,
         new ::grpc::internal::StreamedUnaryHandler<
           ::air::db::v1::CreateDatabaseRequest, ::air::db::v1::CreateDatabaseResponse>(
             [this](::grpc::ServerContext* context,
@@ -1619,7 +1905,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithStreamedUnaryMethod_ListDatabases() {
-      ::grpc::Service::MarkMethodStreamed(4,
+      ::grpc::Service::MarkMethodStreamed(6,
         new ::grpc::internal::StreamedUnaryHandler<
           ::air::db::v1::ListDatabasesRequest, ::air::db::v1::ListDatabasesResponse>(
             [this](::grpc::ServerContext* context,
@@ -1646,7 +1932,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithStreamedUnaryMethod_GetDatabase() {
-      ::grpc::Service::MarkMethodStreamed(5,
+      ::grpc::Service::MarkMethodStreamed(7,
         new ::grpc::internal::StreamedUnaryHandler<
           ::air::db::v1::TenantRequest, ::air::db::v1::DatabaseInfo>(
             [this](::grpc::ServerContext* context,
@@ -1673,7 +1959,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithStreamedUnaryMethod_DeleteDatabase() {
-      ::grpc::Service::MarkMethodStreamed(6,
+      ::grpc::Service::MarkMethodStreamed(8,
         new ::grpc::internal::StreamedUnaryHandler<
           ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse>(
             [this](::grpc::ServerContext* context,
@@ -1700,7 +1986,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithStreamedUnaryMethod_SuspendDatabase() {
-      ::grpc::Service::MarkMethodStreamed(7,
+      ::grpc::Service::MarkMethodStreamed(9,
         new ::grpc::internal::StreamedUnaryHandler<
           ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse>(
             [this](::grpc::ServerContext* context,
@@ -1727,7 +2013,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithStreamedUnaryMethod_StartDatabase() {
-      ::grpc::Service::MarkMethodStreamed(8,
+      ::grpc::Service::MarkMethodStreamed(10,
         new ::grpc::internal::StreamedUnaryHandler<
           ::air::db::v1::TenantRequest, ::air::db::v1::TenantRouteResponse>(
             [this](::grpc::ServerContext* context,
@@ -1754,7 +2040,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithStreamedUnaryMethod_LockDatabase() {
-      ::grpc::Service::MarkMethodStreamed(9,
+      ::grpc::Service::MarkMethodStreamed(11,
         new ::grpc::internal::StreamedUnaryHandler<
           ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse>(
             [this](::grpc::ServerContext* context,
@@ -1781,7 +2067,7 @@ class AirDBControl final {
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
    public:
     WithStreamedUnaryMethod_UnlockDatabase() {
-      ::grpc::Service::MarkMethodStreamed(10,
+      ::grpc::Service::MarkMethodStreamed(12,
         new ::grpc::internal::StreamedUnaryHandler<
           ::air::db::v1::TenantRequest, ::air::db::v1::StatusResponse>(
             [this](::grpc::ServerContext* context,
@@ -1802,9 +2088,36 @@ class AirDBControl final {
     // replace default version of method with streamed unary
     virtual ::grpc::Status StreamedUnlockDatabase(::grpc::ServerContext* context, ::grpc::ServerUnaryStreamer< ::air::db::v1::TenantRequest,::air::db::v1::StatusResponse>* server_unary_streamer) = 0;
   };
-  typedef WithStreamedUnaryMethod_GetTenantRoute<WithStreamedUnaryMethod_WakeTenant<WithStreamedUnaryMethod_TouchActivity<WithStreamedUnaryMethod_CreateDatabase<WithStreamedUnaryMethod_ListDatabases<WithStreamedUnaryMethod_GetDatabase<WithStreamedUnaryMethod_DeleteDatabase<WithStreamedUnaryMethod_SuspendDatabase<WithStreamedUnaryMethod_StartDatabase<WithStreamedUnaryMethod_LockDatabase<WithStreamedUnaryMethod_UnlockDatabase<Service > > > > > > > > > > > StreamedUnaryService;
-  typedef Service SplitStreamedService;
-  typedef WithStreamedUnaryMethod_GetTenantRoute<WithStreamedUnaryMethod_WakeTenant<WithStreamedUnaryMethod_TouchActivity<WithStreamedUnaryMethod_CreateDatabase<WithStreamedUnaryMethod_ListDatabases<WithStreamedUnaryMethod_GetDatabase<WithStreamedUnaryMethod_DeleteDatabase<WithStreamedUnaryMethod_SuspendDatabase<WithStreamedUnaryMethod_StartDatabase<WithStreamedUnaryMethod_LockDatabase<WithStreamedUnaryMethod_UnlockDatabase<Service > > > > > > > > > > > StreamedService;
+  typedef WithStreamedUnaryMethod_GetTenantRoute<WithStreamedUnaryMethod_WakeTenant<WithStreamedUnaryMethod_TouchActivity<WithStreamedUnaryMethod_BatchTouchActivity<WithStreamedUnaryMethod_CreateDatabase<WithStreamedUnaryMethod_ListDatabases<WithStreamedUnaryMethod_GetDatabase<WithStreamedUnaryMethod_DeleteDatabase<WithStreamedUnaryMethod_SuspendDatabase<WithStreamedUnaryMethod_StartDatabase<WithStreamedUnaryMethod_LockDatabase<WithStreamedUnaryMethod_UnlockDatabase<Service > > > > > > > > > > > > StreamedUnaryService;
+  template <class BaseClass>
+  class WithSplitStreamingMethod_WatchTenantChanges : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithSplitStreamingMethod_WatchTenantChanges() {
+      ::grpc::Service::MarkMethodStreamed(4,
+        new ::grpc::internal::SplitServerStreamingHandler<
+          ::air::db::v1::WatchTenantsRequest, ::air::db::v1::TenantChangeEvent>(
+            [this](::grpc::ServerContext* context,
+                   ::grpc::ServerSplitStreamer<
+                     ::air::db::v1::WatchTenantsRequest, ::air::db::v1::TenantChangeEvent>* streamer) {
+                       return this->StreamedWatchTenantChanges(context,
+                         streamer);
+                  }));
+    }
+    ~WithSplitStreamingMethod_WatchTenantChanges() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable regular version of this method
+    ::grpc::Status WatchTenantChanges(::grpc::ServerContext* /*context*/, const ::air::db::v1::WatchTenantsRequest* /*request*/, ::grpc::ServerWriter< ::air::db::v1::TenantChangeEvent>* /*writer*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    // replace default version of method with split streamed
+    virtual ::grpc::Status StreamedWatchTenantChanges(::grpc::ServerContext* context, ::grpc::ServerSplitStreamer< ::air::db::v1::WatchTenantsRequest,::air::db::v1::TenantChangeEvent>* server_split_streamer) = 0;
+  };
+  typedef WithSplitStreamingMethod_WatchTenantChanges<Service > SplitStreamedService;
+  typedef WithStreamedUnaryMethod_GetTenantRoute<WithStreamedUnaryMethod_WakeTenant<WithStreamedUnaryMethod_TouchActivity<WithStreamedUnaryMethod_BatchTouchActivity<WithSplitStreamingMethod_WatchTenantChanges<WithStreamedUnaryMethod_CreateDatabase<WithStreamedUnaryMethod_ListDatabases<WithStreamedUnaryMethod_GetDatabase<WithStreamedUnaryMethod_DeleteDatabase<WithStreamedUnaryMethod_SuspendDatabase<WithStreamedUnaryMethod_StartDatabase<WithStreamedUnaryMethod_LockDatabase<WithStreamedUnaryMethod_UnlockDatabase<Service > > > > > > > > > > > > > StreamedService;
 };
 
 }  // namespace v1

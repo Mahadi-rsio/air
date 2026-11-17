@@ -8,6 +8,8 @@ service AirDBControl {
   rpc GetTenantRoute(TenantRequest) returns (TenantRouteResponse);
   rpc WakeTenant(TenantRequest) returns (TenantRouteResponse);
   rpc TouchActivity(TenantRequest) returns (Empty);
+  rpc BatchTouchActivity(BatchTouchActivityRequest) returns (Empty);
+  rpc WatchTenantChanges(WatchTenantsRequest) returns (stream TenantChangeEvent);
 
   rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
   rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
@@ -65,9 +67,33 @@ message ListDatabasesRequest {
 
 message ListDatabasesResponse {
   repeated DatabaseInfo databases = 1;
+  int64 snapshot_version = 2;
 }
 
 message StatusResponse {
   string status = 1;
   string tenant_id = 2;
+}
+
+enum TenantEventType {
+  TENANT_EVENT_UNSPECIFIED = 0;
+  TENANT_EVENT_UPSERT = 1;
+  TENANT_EVENT_DELETE = 2;
+  TENANT_EVENT_RESYNC_REQUIRED = 3;
+}
+
+message WatchTenantsRequest {
+  int64 after_version = 1;
+}
+
+message TenantChangeEvent {
+  int64 version = 1;
+  TenantEventType type = 2;
+  TenantRouteResponse route = 3;
+  int64 fencing_epoch = 4;
+  int64 emitted_at_unix_ms = 5;
+}
+
+message BatchTouchActivityRequest {
+  repeated string tenant_ids = 1;
 }

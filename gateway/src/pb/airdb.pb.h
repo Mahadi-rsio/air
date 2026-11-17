@@ -30,6 +30,7 @@
 #include "google/protobuf/message_lite.h"
 #include "google/protobuf/repeated_field.h"  // IWYU pragma: export
 #include "google/protobuf/extension_set.h"  // IWYU pragma: export
+#include "google/protobuf/generated_enum_reflection.h"
 #include "google/protobuf/unknown_field_set.h"
 // @@protoc_insertion_point(includes)
 
@@ -57,6 +58,16 @@ extern const ::google::protobuf::internal::DescriptorTable descriptor_table_aird
 namespace air {
 namespace db {
 namespace v1 {
+enum TenantEventType : int;
+extern const uint32_t TenantEventType_internal_data_[];
+class BatchTouchActivityRequest;
+struct BatchTouchActivityRequestGlobalsTypeInternal;
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+extern BatchTouchActivityRequestGlobalsTypeInternal BatchTouchActivityRequest_globals_;
+extern const ::google::protobuf::internal::ClassDataFull BatchTouchActivityRequest_class_data_;
+#else
+extern const BatchTouchActivityRequestGlobalsTypeInternal BatchTouchActivityRequest_globals_;
+#endif  // PROTOBUF_MESSAGE_GLOBALS
 class CreateDatabaseRequest;
 struct CreateDatabaseRequestGlobalsTypeInternal;
 #ifndef PROTOBUF_MESSAGE_GLOBALS
@@ -113,6 +124,14 @@ extern const ::google::protobuf::internal::ClassDataFull StatusResponse_class_da
 #else
 extern const StatusResponseGlobalsTypeInternal StatusResponse_globals_;
 #endif  // PROTOBUF_MESSAGE_GLOBALS
+class TenantChangeEvent;
+struct TenantChangeEventGlobalsTypeInternal;
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+extern TenantChangeEventGlobalsTypeInternal TenantChangeEvent_globals_;
+extern const ::google::protobuf::internal::ClassDataFull TenantChangeEvent_class_data_;
+#else
+extern const TenantChangeEventGlobalsTypeInternal TenantChangeEvent_globals_;
+#endif  // PROTOBUF_MESSAGE_GLOBALS
 class TenantRequest;
 struct TenantRequestGlobalsTypeInternal;
 #ifndef PROTOBUF_MESSAGE_GLOBALS
@@ -129,21 +148,277 @@ extern const ::google::protobuf::internal::ClassDataFull TenantRouteResponse_cla
 #else
 extern const TenantRouteResponseGlobalsTypeInternal TenantRouteResponse_globals_;
 #endif  // PROTOBUF_MESSAGE_GLOBALS
+class WatchTenantsRequest;
+struct WatchTenantsRequestGlobalsTypeInternal;
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+extern WatchTenantsRequestGlobalsTypeInternal WatchTenantsRequest_globals_;
+extern const ::google::protobuf::internal::ClassDataFull WatchTenantsRequest_class_data_;
+#else
+extern const WatchTenantsRequestGlobalsTypeInternal WatchTenantsRequest_globals_;
+#endif  // PROTOBUF_MESSAGE_GLOBALS
 }  // namespace v1
 }  // namespace db
 }  // namespace air
 namespace google {
 namespace protobuf {
+template <>
+internal::EnumTraitsT<::air::db::v1::TenantEventType_internal_data_>
+    internal::EnumTraitsImpl::value<::air::db::v1::TenantEventType>;
 }  // namespace protobuf
 }  // namespace google
 
 namespace air {
 namespace db {
 namespace v1 {
+enum TenantEventType : int {
+  TENANT_EVENT_UNSPECIFIED = 0,
+  TENANT_EVENT_UPSERT = 1,
+  TENANT_EVENT_DELETE = 2,
+  TENANT_EVENT_RESYNC_REQUIRED = 3,
+  TenantEventType_INT_MIN_SENTINEL_DO_NOT_USE_ =
+      ::std::numeric_limits<::int32_t>::min(),
+  TenantEventType_INT_MAX_SENTINEL_DO_NOT_USE_ =
+      ::std::numeric_limits<::int32_t>::max(),
+};
+
+extern const uint32_t TenantEventType_internal_data_[];
+inline constexpr TenantEventType TenantEventType_MIN =
+    static_cast<TenantEventType>(0);
+inline constexpr TenantEventType TenantEventType_MAX =
+    static_cast<TenantEventType>(3);
+[[nodiscard]] inline bool TenantEventType_IsValid(int value) {
+  return 0 <= value && value <= 3;
+}
+inline constexpr int TenantEventType_ARRAYSIZE = 3 + 1;
+[[nodiscard]] const ::google::protobuf::EnumDescriptor* PROTOBUF_NONNULL
+TenantEventType_descriptor();
+[[nodiscard]] inline auto ProtobufInternalGetEnumDescriptor(TenantEventType) {
+  return TenantEventType_descriptor();
+}
+template <typename T>
+[[nodiscard]] const ::std::string& TenantEventType_Name(T value) {
+  static_assert(::std::is_same<T, TenantEventType>::value ||
+                    ::std::is_integral<T>::value,
+                "Incorrect type passed to TenantEventType_Name().");
+  return TenantEventType_Name(static_cast<TenantEventType>(value));
+}
+template <>
+[[nodiscard]] inline const ::std::string& TenantEventType_Name(TenantEventType value) {
+  return ::google::protobuf::internal::NameOfDenseEnum<TenantEventType_descriptor, 0, 3>(
+      static_cast<int>(value));
+}
+[[nodiscard]] inline bool TenantEventType_Parse(
+    ::absl::string_view name, TenantEventType* PROTOBUF_NONNULL value) {
+  return ::google::protobuf::internal::ParseNamedEnum<TenantEventType>(TenantEventType_descriptor(), name,
+                                           value);
+}
+using ::google::protobuf::internal::generated_enum::AbslParseFlag;
+using ::google::protobuf::internal::generated_enum::AbslUnparseFlag;
 
 // ===================================================================
 
 
+// -------------------------------------------------------------------
+
+class  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED WatchTenantsRequest final : public ::google::protobuf::Message
+/* @@protoc_insertion_point(class_definition:air.db.v1.WatchTenantsRequest) */ {
+ public:
+  inline WatchTenantsRequest() : WatchTenantsRequest(nullptr) {}
+  ~WatchTenantsRequest() PROTOBUF_FINAL;
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  void operator delete(WatchTenantsRequest* PROTOBUF_NONNULL msg, ::std::destroying_delete_t) {
+    SharedDtor(*msg);
+    ::google::protobuf::internal::SizedDelete(msg, sizeof(WatchTenantsRequest));
+  }
+#endif
+
+  template <typename = void>
+  explicit constexpr WatchTenantsRequest(::google::protobuf::internal::ConstantInitialized,
+                           const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL
+                               class_data);
+
+  inline WatchTenantsRequest(const WatchTenantsRequest& from) : WatchTenantsRequest(nullptr, from) {}
+  inline WatchTenantsRequest(WatchTenantsRequest&& from) noexcept : WatchTenantsRequest(nullptr, ::std::move(from)) {}
+  inline WatchTenantsRequest& operator=(const WatchTenantsRequest& from) {
+    CopyFrom(from);
+    return *this;
+  }
+  inline WatchTenantsRequest& operator=(WatchTenantsRequest&& from) noexcept {
+    if (this == &from) return *this;
+    if (::google::protobuf::internal::CanMoveWithInternalSwap(GetArena(), from.GetArena())) {
+      InternalSwap(&from);
+    } else {
+      CopyFrom(from);
+    }
+    return *this;
+  }
+
+  [[nodiscard]] inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance);
+  }
+  [[nodiscard]] inline ::google::protobuf::UnknownFieldSet* PROTOBUF_NONNULL
+  mutable_unknown_fields() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.mutable_unknown_fields<::google::protobuf::UnknownFieldSet>();
+  }
+
+  [[nodiscard]] static const ::google::protobuf::Descriptor* PROTOBUF_NONNULL descriptor() {
+    return GetDescriptor();
+  }
+  [[nodiscard]] static const ::google::protobuf::Descriptor* PROTOBUF_NONNULL
+  GetDescriptor() {
+    return default_instance().GetMetadata().descriptor;
+  }
+  [[nodiscard]] static const ::google::protobuf::Reflection* PROTOBUF_NONNULL GetReflection() {
+    return default_instance().GetMetadata().reflection;
+  }
+  [[nodiscard]] static const WatchTenantsRequest& default_instance() {
+    return *::google::protobuf::internal::MessageGlobalsBase::ToDefaultInstance<WatchTenantsRequest>(&WatchTenantsRequest_globals_);
+  }
+  static constexpr int kIndexInFileMessages = 9;
+  friend void swap(WatchTenantsRequest& a, WatchTenantsRequest& b) { a.Swap(&b); }
+  inline void Swap(WatchTenantsRequest* PROTOBUF_NONNULL other) {
+    if (other == this) return;
+    if (::google::protobuf::internal::CanUseInternalSwap(GetArena(), other->GetArena())) {
+      InternalSwap(other);
+    } else {
+      ::google::protobuf::internal::GenericSwap(this, other);
+    }
+  }
+  void UnsafeArenaSwap(WatchTenantsRequest* PROTOBUF_NONNULL other) {
+    if (other == this) return;
+    ABSL_DCHECK(GetArena() == other->GetArena());
+    InternalSwap(other);
+  }
+
+  // implements Message ----------------------------------------------
+
+  [[nodiscard]] WatchTenantsRequest* PROTOBUF_NONNULL
+  New(::google::protobuf::Arena* PROTOBUF_NULLABLE arena = nullptr) const {
+    return ::google::protobuf::Message::DefaultConstruct<WatchTenantsRequest>(arena);
+  }
+  using ::google::protobuf::Message::CopyFrom;
+  void CopyFrom(const WatchTenantsRequest& from);
+  using ::google::protobuf::Message::MergeFrom;
+  void MergeFrom(const WatchTenantsRequest& from) { WatchTenantsRequest::MergeImpl(*this, from); }
+
+  private:
+  static void MergeImpl(::google::protobuf::MessageLite& to_msg,
+                        const ::google::protobuf::MessageLite& from_msg);
+
+  public:
+  [[nodiscard]] bool IsInitialized() const {
+    return true;
+  }
+  ABSL_ATTRIBUTE_REINITIALIZES void Clear() PROTOBUF_FINAL;
+  #if defined(PROTOBUF_CUSTOM_VTABLE)
+  private:
+  [[nodiscard]] static ::size_t ByteSizeLong(const ::google::protobuf::MessageLite& msg);
+  [[nodiscard]] static ::uint8_t* PROTOBUF_NONNULL _InternalSerialize(
+      const ::google::protobuf::MessageLite& msg, ::uint8_t* PROTOBUF_NONNULL target,
+      ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream);
+
+  public:
+  [[nodiscard]] ::size_t ByteSizeLong() const { return ByteSizeLong(*this); }
+  [[nodiscard]] ::uint8_t* PROTOBUF_NONNULL _InternalSerialize(
+      ::uint8_t* PROTOBUF_NONNULL target,
+      ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) const {
+    return _InternalSerialize(*this, target, stream);
+  }
+  #else   // PROTOBUF_CUSTOM_VTABLE
+  [[nodiscard]] ::size_t ByteSizeLong() const final;
+  [[nodiscard]] ::uint8_t* PROTOBUF_NONNULL _InternalSerialize(
+      ::uint8_t* PROTOBUF_NONNULL target,
+      ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) const final;
+  #endif  // PROTOBUF_CUSTOM_VTABLE
+  [[nodiscard]] int GetCachedSize() const {
+    return _impl_._cached_size_.Get();
+  }
+
+  private:
+  void SharedCtor(::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+  static void SharedDtor(MessageLite& self);
+  void InternalSwap(WatchTenantsRequest* PROTOBUF_NONNULL other);
+ private:
+  template <typename T>
+  friend ::absl::string_view(::google::protobuf::internal::GetAnyMessageName)();
+  static ::absl::string_view FullMessageName() { return "air.db.v1.WatchTenantsRequest"; }
+
+  explicit WatchTenantsRequest(::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+  WatchTenantsRequest(::google::protobuf::Arena* PROTOBUF_NULLABLE arena, const WatchTenantsRequest& from);
+  WatchTenantsRequest(
+      ::google::protobuf::Arena* PROTOBUF_NULLABLE arena, WatchTenantsRequest&& from) noexcept
+      : WatchTenantsRequest(arena) {
+    *this = ::std::move(from);
+  }
+  const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL GetClassData() const PROTOBUF_FINAL;
+  static void* PROTOBUF_NONNULL PlacementNew_(
+      const void* PROTOBUF_NONNULL, void* PROTOBUF_NONNULL mem,
+      ::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+  static constexpr auto InternalNewImpl_();
+
+ public:
+  static constexpr auto InternalGenerateClassData_(
+      const MessageLite& prototype,
+      const ::google::protobuf::internal::TcParseTableBase* PROTOBUF_NULLABLE tc_table = nullptr);
+
+  [[nodiscard]] ::google::protobuf::Metadata GetMetadata() const;
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+  enum : int {
+    kAfterVersionFieldNumber = 1,
+  };
+  // int64 after_version = 1;
+  void clear_after_version() ;
+  [[nodiscard]] ::int64_t after_version() const;
+  void set_after_version(::int64_t value);
+
+  private:
+  ::int64_t _internal_after_version() const;
+  void _internal_set_after_version(::int64_t value);
+
+  public:
+  // @@protoc_insertion_point(class_scope:air.db.v1.WatchTenantsRequest)
+ private:
+  class _Internal;
+  using ParseTableT_ =
+      ::google::protobuf::internal::TcParseTable<0, 1,
+                          0, 0,
+                          2>;
+  static constexpr ParseTableT_ InternalGenerateParseTable_(
+      const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL class_data);
+  friend class ::google::protobuf::internal::TcParser;
+  #ifndef PROTOBUF_MESSAGE_GLOBALS
+  static const ParseTableT_ _table_;
+  #endif
+
+  friend class ::google::protobuf::MessageLite;
+  friend class ::google::protobuf::Arena;
+  friend ::google::protobuf::internal::PrivateAccess;
+  template <typename T>
+  friend class ::google::protobuf::Arena::InternalHelper;
+  using InternalArenaConstructable_ = void;
+  using DestructorSkippable_ = void;
+  struct Impl_ {
+    inline explicit constexpr Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                                    ::google::protobuf::internal::ConstantInitialized) noexcept;
+    inline explicit Impl_(
+        ::google::protobuf::internal::InternalVisibility visibility,
+        ::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+    inline explicit Impl_(
+        ::google::protobuf::internal::InternalVisibility visibility,
+        ::google::protobuf::Arena* PROTOBUF_NULLABLE arena, const Impl_& from,
+        const WatchTenantsRequest& from_msg);
+    ::google::protobuf::internal::HasBits<1> _has_bits_;
+    ::google::protobuf::internal::CachedSize _cached_size_;
+    ::int64_t after_version_;
+    PROTOBUF_TSAN_DECLARE_MEMBER
+  };
+  union { Impl_ _impl_; };
+  friend struct ::TableStruct_airdb_2eproto;
+};
 // -------------------------------------------------------------------
 
 class  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED TenantRouteResponse final : public ::google::protobuf::Message
@@ -2029,6 +2304,479 @@ class  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED CreateDatabaseRequest final : publi
 };
 // -------------------------------------------------------------------
 
+class  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED BatchTouchActivityRequest final : public ::google::protobuf::Message
+/* @@protoc_insertion_point(class_definition:air.db.v1.BatchTouchActivityRequest) */ {
+ public:
+  inline BatchTouchActivityRequest() : BatchTouchActivityRequest(nullptr) {}
+  ~BatchTouchActivityRequest() PROTOBUF_FINAL;
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  void operator delete(BatchTouchActivityRequest* PROTOBUF_NONNULL msg, ::std::destroying_delete_t) {
+    SharedDtor(*msg);
+    ::google::protobuf::internal::SizedDelete(msg, sizeof(BatchTouchActivityRequest));
+  }
+#endif
+
+  template <typename = void>
+  explicit constexpr BatchTouchActivityRequest(::google::protobuf::internal::ConstantInitialized,
+                           const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL
+                               class_data);
+
+  inline BatchTouchActivityRequest(const BatchTouchActivityRequest& from) : BatchTouchActivityRequest(nullptr, from) {}
+  inline BatchTouchActivityRequest(BatchTouchActivityRequest&& from) noexcept : BatchTouchActivityRequest(nullptr, ::std::move(from)) {}
+  inline BatchTouchActivityRequest& operator=(const BatchTouchActivityRequest& from) {
+    CopyFrom(from);
+    return *this;
+  }
+  inline BatchTouchActivityRequest& operator=(BatchTouchActivityRequest&& from) noexcept {
+    if (this == &from) return *this;
+    if (::google::protobuf::internal::CanMoveWithInternalSwap(GetArena(), from.GetArena())) {
+      InternalSwap(&from);
+    } else {
+      CopyFrom(from);
+    }
+    return *this;
+  }
+
+  [[nodiscard]] inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance);
+  }
+  [[nodiscard]] inline ::google::protobuf::UnknownFieldSet* PROTOBUF_NONNULL
+  mutable_unknown_fields() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.mutable_unknown_fields<::google::protobuf::UnknownFieldSet>();
+  }
+
+  [[nodiscard]] static const ::google::protobuf::Descriptor* PROTOBUF_NONNULL descriptor() {
+    return GetDescriptor();
+  }
+  [[nodiscard]] static const ::google::protobuf::Descriptor* PROTOBUF_NONNULL
+  GetDescriptor() {
+    return default_instance().GetMetadata().descriptor;
+  }
+  [[nodiscard]] static const ::google::protobuf::Reflection* PROTOBUF_NONNULL GetReflection() {
+    return default_instance().GetMetadata().reflection;
+  }
+  [[nodiscard]] static const BatchTouchActivityRequest& default_instance() {
+    return *::google::protobuf::internal::MessageGlobalsBase::ToDefaultInstance<BatchTouchActivityRequest>(&BatchTouchActivityRequest_globals_);
+  }
+  static constexpr int kIndexInFileMessages = 11;
+  friend void swap(BatchTouchActivityRequest& a, BatchTouchActivityRequest& b) { a.Swap(&b); }
+  inline void Swap(BatchTouchActivityRequest* PROTOBUF_NONNULL other) {
+    if (other == this) return;
+    if (::google::protobuf::internal::CanUseInternalSwap(GetArena(), other->GetArena())) {
+      InternalSwap(other);
+    } else {
+      ::google::protobuf::internal::GenericSwap(this, other);
+    }
+  }
+  void UnsafeArenaSwap(BatchTouchActivityRequest* PROTOBUF_NONNULL other) {
+    if (other == this) return;
+    ABSL_DCHECK(GetArena() == other->GetArena());
+    InternalSwap(other);
+  }
+
+  // implements Message ----------------------------------------------
+
+  [[nodiscard]] BatchTouchActivityRequest* PROTOBUF_NONNULL
+  New(::google::protobuf::Arena* PROTOBUF_NULLABLE arena = nullptr) const {
+    return ::google::protobuf::Message::DefaultConstruct<BatchTouchActivityRequest>(arena);
+  }
+  using ::google::protobuf::Message::CopyFrom;
+  void CopyFrom(const BatchTouchActivityRequest& from);
+  using ::google::protobuf::Message::MergeFrom;
+  void MergeFrom(const BatchTouchActivityRequest& from) { BatchTouchActivityRequest::MergeImpl(*this, from); }
+
+  private:
+  static void MergeImpl(::google::protobuf::MessageLite& to_msg,
+                        const ::google::protobuf::MessageLite& from_msg);
+
+  public:
+  [[nodiscard]] bool IsInitialized() const {
+    return true;
+  }
+  ABSL_ATTRIBUTE_REINITIALIZES void Clear() PROTOBUF_FINAL;
+  #if defined(PROTOBUF_CUSTOM_VTABLE)
+  private:
+  [[nodiscard]] static ::size_t ByteSizeLong(const ::google::protobuf::MessageLite& msg);
+  [[nodiscard]] static ::uint8_t* PROTOBUF_NONNULL _InternalSerialize(
+      const ::google::protobuf::MessageLite& msg, ::uint8_t* PROTOBUF_NONNULL target,
+      ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream);
+
+  public:
+  [[nodiscard]] ::size_t ByteSizeLong() const { return ByteSizeLong(*this); }
+  [[nodiscard]] ::uint8_t* PROTOBUF_NONNULL _InternalSerialize(
+      ::uint8_t* PROTOBUF_NONNULL target,
+      ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) const {
+    return _InternalSerialize(*this, target, stream);
+  }
+  #else   // PROTOBUF_CUSTOM_VTABLE
+  [[nodiscard]] ::size_t ByteSizeLong() const final;
+  [[nodiscard]] ::uint8_t* PROTOBUF_NONNULL _InternalSerialize(
+      ::uint8_t* PROTOBUF_NONNULL target,
+      ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) const final;
+  #endif  // PROTOBUF_CUSTOM_VTABLE
+  [[nodiscard]] int GetCachedSize() const {
+    return _impl_._cached_size_.Get();
+  }
+
+  private:
+  void SharedCtor(::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+  static void SharedDtor(MessageLite& self);
+  void InternalSwap(BatchTouchActivityRequest* PROTOBUF_NONNULL other);
+ private:
+  template <typename T>
+  friend ::absl::string_view(::google::protobuf::internal::GetAnyMessageName)();
+  static ::absl::string_view FullMessageName() { return "air.db.v1.BatchTouchActivityRequest"; }
+
+  explicit BatchTouchActivityRequest(::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+  BatchTouchActivityRequest(::google::protobuf::Arena* PROTOBUF_NULLABLE arena, const BatchTouchActivityRequest& from);
+  BatchTouchActivityRequest(
+      ::google::protobuf::Arena* PROTOBUF_NULLABLE arena, BatchTouchActivityRequest&& from) noexcept
+      : BatchTouchActivityRequest(arena) {
+    *this = ::std::move(from);
+  }
+  const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL GetClassData() const PROTOBUF_FINAL;
+  static void* PROTOBUF_NONNULL PlacementNew_(
+      const void* PROTOBUF_NONNULL, void* PROTOBUF_NONNULL mem,
+      ::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+  static constexpr auto InternalNewImpl_();
+
+ public:
+  static constexpr auto InternalGenerateClassData_(
+      const MessageLite& prototype,
+      const ::google::protobuf::internal::TcParseTableBase* PROTOBUF_NULLABLE tc_table = nullptr);
+
+  [[nodiscard]] ::google::protobuf::Metadata GetMetadata() const;
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+  enum : int {
+    kTenantIdsFieldNumber = 1,
+  };
+  // repeated string tenant_ids = 1;
+  [[nodiscard]] int tenant_ids_size()
+      const;
+  private:
+  int _internal_tenant_ids_size() const;
+
+  public:
+  void clear_tenant_ids() ;
+  [[nodiscard]] const ::std::string& tenant_ids(int index) const;
+  ::std::string* PROTOBUF_NONNULL mutable_tenant_ids(int index);
+  template <typename Arg_ = const ::std::string&, typename... Args_>
+  void set_tenant_ids(int index, Arg_&& value, Args_... args);
+  ::std::string* PROTOBUF_NONNULL add_tenant_ids();
+  template <typename Arg_ = const ::std::string&, typename... Args_>
+  void add_tenant_ids(Arg_&& value, Args_... args);
+  [[nodiscard]] const
+      ::google::protobuf::RepeatedPtrField<::std::string>&
+      tenant_ids() const;
+  [[nodiscard]] ::google::protobuf::RepeatedPtrField<::std::string>*
+      PROTOBUF_NONNULL
+      mutable_tenant_ids();
+
+  private:
+  const ::google::protobuf::RepeatedPtrField<::std::string>& _internal_tenant_ids() const;
+  ::google::protobuf::RepeatedPtrField<::std::string>* PROTOBUF_NONNULL _internal_mutable_tenant_ids();
+
+  public:
+  // @@protoc_insertion_point(class_scope:air.db.v1.BatchTouchActivityRequest)
+ private:
+  class _Internal;
+  using ParseTableT_ =
+      ::google::protobuf::internal::TcParseTable<0, 1,
+                          0, 54,
+                          2>;
+  static constexpr ParseTableT_ InternalGenerateParseTable_(
+      const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL class_data);
+  friend class ::google::protobuf::internal::TcParser;
+  #ifndef PROTOBUF_MESSAGE_GLOBALS
+  static const ParseTableT_ _table_;
+  #endif
+
+  friend class ::google::protobuf::MessageLite;
+  friend class ::google::protobuf::Arena;
+  friend ::google::protobuf::internal::PrivateAccess;
+  template <typename T>
+  friend class ::google::protobuf::Arena::InternalHelper;
+  using InternalArenaConstructable_ = void;
+  using DestructorSkippable_ = void;
+  struct Impl_ {
+    inline explicit constexpr Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                                    ::google::protobuf::internal::ConstantInitialized) noexcept;
+    inline explicit Impl_(
+        ::google::protobuf::internal::InternalVisibility visibility,
+        ::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+    inline explicit Impl_(
+        ::google::protobuf::internal::InternalVisibility visibility,
+        ::google::protobuf::Arena* PROTOBUF_NULLABLE arena, const Impl_& from,
+        const BatchTouchActivityRequest& from_msg);
+    ::google::protobuf::internal::HasBits<1> _has_bits_;
+    ::google::protobuf::internal::CachedSize _cached_size_;
+    ::google::protobuf::RepeatedPtrField<::std::string> tenant_ids_;
+    PROTOBUF_TSAN_DECLARE_MEMBER
+  };
+  union { Impl_ _impl_; };
+  friend struct ::TableStruct_airdb_2eproto;
+};
+// -------------------------------------------------------------------
+
+class  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED TenantChangeEvent final : public ::google::protobuf::Message
+/* @@protoc_insertion_point(class_definition:air.db.v1.TenantChangeEvent) */ {
+ public:
+  inline TenantChangeEvent() : TenantChangeEvent(nullptr) {}
+  ~TenantChangeEvent() PROTOBUF_FINAL;
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  void operator delete(TenantChangeEvent* PROTOBUF_NONNULL msg, ::std::destroying_delete_t) {
+    SharedDtor(*msg);
+    ::google::protobuf::internal::SizedDelete(msg, sizeof(TenantChangeEvent));
+  }
+#endif
+
+  template <typename = void>
+  explicit constexpr TenantChangeEvent(::google::protobuf::internal::ConstantInitialized,
+                           const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL
+                               class_data);
+
+  inline TenantChangeEvent(const TenantChangeEvent& from) : TenantChangeEvent(nullptr, from) {}
+  inline TenantChangeEvent(TenantChangeEvent&& from) noexcept : TenantChangeEvent(nullptr, ::std::move(from)) {}
+  inline TenantChangeEvent& operator=(const TenantChangeEvent& from) {
+    CopyFrom(from);
+    return *this;
+  }
+  inline TenantChangeEvent& operator=(TenantChangeEvent&& from) noexcept {
+    if (this == &from) return *this;
+    if (::google::protobuf::internal::CanMoveWithInternalSwap(GetArena(), from.GetArena())) {
+      InternalSwap(&from);
+    } else {
+      CopyFrom(from);
+    }
+    return *this;
+  }
+
+  [[nodiscard]] inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance);
+  }
+  [[nodiscard]] inline ::google::protobuf::UnknownFieldSet* PROTOBUF_NONNULL
+  mutable_unknown_fields() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.mutable_unknown_fields<::google::protobuf::UnknownFieldSet>();
+  }
+
+  [[nodiscard]] static const ::google::protobuf::Descriptor* PROTOBUF_NONNULL descriptor() {
+    return GetDescriptor();
+  }
+  [[nodiscard]] static const ::google::protobuf::Descriptor* PROTOBUF_NONNULL
+  GetDescriptor() {
+    return default_instance().GetMetadata().descriptor;
+  }
+  [[nodiscard]] static const ::google::protobuf::Reflection* PROTOBUF_NONNULL GetReflection() {
+    return default_instance().GetMetadata().reflection;
+  }
+  [[nodiscard]] static const TenantChangeEvent& default_instance() {
+    return *::google::protobuf::internal::MessageGlobalsBase::ToDefaultInstance<TenantChangeEvent>(&TenantChangeEvent_globals_);
+  }
+  static constexpr int kIndexInFileMessages = 10;
+  friend void swap(TenantChangeEvent& a, TenantChangeEvent& b) { a.Swap(&b); }
+  inline void Swap(TenantChangeEvent* PROTOBUF_NONNULL other) {
+    if (other == this) return;
+    if (::google::protobuf::internal::CanUseInternalSwap(GetArena(), other->GetArena())) {
+      InternalSwap(other);
+    } else {
+      ::google::protobuf::internal::GenericSwap(this, other);
+    }
+  }
+  void UnsafeArenaSwap(TenantChangeEvent* PROTOBUF_NONNULL other) {
+    if (other == this) return;
+    ABSL_DCHECK(GetArena() == other->GetArena());
+    InternalSwap(other);
+  }
+
+  // implements Message ----------------------------------------------
+
+  [[nodiscard]] TenantChangeEvent* PROTOBUF_NONNULL
+  New(::google::protobuf::Arena* PROTOBUF_NULLABLE arena = nullptr) const {
+    return ::google::protobuf::Message::DefaultConstruct<TenantChangeEvent>(arena);
+  }
+  using ::google::protobuf::Message::CopyFrom;
+  void CopyFrom(const TenantChangeEvent& from);
+  using ::google::protobuf::Message::MergeFrom;
+  void MergeFrom(const TenantChangeEvent& from) { TenantChangeEvent::MergeImpl(*this, from); }
+
+  private:
+  static void MergeImpl(::google::protobuf::MessageLite& to_msg,
+                        const ::google::protobuf::MessageLite& from_msg);
+
+  public:
+  [[nodiscard]] bool IsInitialized() const {
+    return true;
+  }
+  ABSL_ATTRIBUTE_REINITIALIZES void Clear() PROTOBUF_FINAL;
+  #if defined(PROTOBUF_CUSTOM_VTABLE)
+  private:
+  [[nodiscard]] static ::size_t ByteSizeLong(const ::google::protobuf::MessageLite& msg);
+  [[nodiscard]] static ::uint8_t* PROTOBUF_NONNULL _InternalSerialize(
+      const ::google::protobuf::MessageLite& msg, ::uint8_t* PROTOBUF_NONNULL target,
+      ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream);
+
+  public:
+  [[nodiscard]] ::size_t ByteSizeLong() const { return ByteSizeLong(*this); }
+  [[nodiscard]] ::uint8_t* PROTOBUF_NONNULL _InternalSerialize(
+      ::uint8_t* PROTOBUF_NONNULL target,
+      ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) const {
+    return _InternalSerialize(*this, target, stream);
+  }
+  #else   // PROTOBUF_CUSTOM_VTABLE
+  [[nodiscard]] ::size_t ByteSizeLong() const final;
+  [[nodiscard]] ::uint8_t* PROTOBUF_NONNULL _InternalSerialize(
+      ::uint8_t* PROTOBUF_NONNULL target,
+      ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) const final;
+  #endif  // PROTOBUF_CUSTOM_VTABLE
+  [[nodiscard]] int GetCachedSize() const {
+    return _impl_._cached_size_.Get();
+  }
+
+  private:
+  void SharedCtor(::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+  static void SharedDtor(MessageLite& self);
+  void InternalSwap(TenantChangeEvent* PROTOBUF_NONNULL other);
+ private:
+  template <typename T>
+  friend ::absl::string_view(::google::protobuf::internal::GetAnyMessageName)();
+  static ::absl::string_view FullMessageName() { return "air.db.v1.TenantChangeEvent"; }
+
+  explicit TenantChangeEvent(::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+  TenantChangeEvent(::google::protobuf::Arena* PROTOBUF_NULLABLE arena, const TenantChangeEvent& from);
+  TenantChangeEvent(
+      ::google::protobuf::Arena* PROTOBUF_NULLABLE arena, TenantChangeEvent&& from) noexcept
+      : TenantChangeEvent(arena) {
+    *this = ::std::move(from);
+  }
+  const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL GetClassData() const PROTOBUF_FINAL;
+  static void* PROTOBUF_NONNULL PlacementNew_(
+      const void* PROTOBUF_NONNULL, void* PROTOBUF_NONNULL mem,
+      ::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+  static constexpr auto InternalNewImpl_();
+
+ public:
+  static constexpr auto InternalGenerateClassData_(
+      const MessageLite& prototype,
+      const ::google::protobuf::internal::TcParseTableBase* PROTOBUF_NULLABLE tc_table = nullptr);
+
+  [[nodiscard]] ::google::protobuf::Metadata GetMetadata() const;
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+  enum : int {
+    kRouteFieldNumber = 3,
+    kVersionFieldNumber = 1,
+    kFencingEpochFieldNumber = 4,
+    kEmittedAtUnixMsFieldNumber = 5,
+    kTypeFieldNumber = 2,
+  };
+  // .air.db.v1.TenantRouteResponse route = 3;
+  [[nodiscard]] bool has_route()
+      const;
+  void clear_route() ;
+  [[nodiscard]] const ::air::db::v1::TenantRouteResponse& route() const;
+  [[nodiscard]] ::air::db::v1::TenantRouteResponse* PROTOBUF_NULLABLE release_route();
+  ::air::db::v1::TenantRouteResponse* PROTOBUF_NONNULL mutable_route();
+  void set_allocated_route(::air::db::v1::TenantRouteResponse* PROTOBUF_NULLABLE value);
+  void unsafe_arena_set_allocated_route(::air::db::v1::TenantRouteResponse* PROTOBUF_NULLABLE value);
+  ::air::db::v1::TenantRouteResponse* PROTOBUF_NULLABLE unsafe_arena_release_route();
+
+  private:
+  const ::air::db::v1::TenantRouteResponse& _internal_route() const;
+  ::air::db::v1::TenantRouteResponse* PROTOBUF_NONNULL _internal_mutable_route();
+
+  public:
+  // int64 version = 1;
+  void clear_version() ;
+  [[nodiscard]] ::int64_t version() const;
+  void set_version(::int64_t value);
+
+  private:
+  ::int64_t _internal_version() const;
+  void _internal_set_version(::int64_t value);
+
+  public:
+  // int64 fencing_epoch = 4;
+  void clear_fencing_epoch() ;
+  [[nodiscard]] ::int64_t fencing_epoch() const;
+  void set_fencing_epoch(::int64_t value);
+
+  private:
+  ::int64_t _internal_fencing_epoch() const;
+  void _internal_set_fencing_epoch(::int64_t value);
+
+  public:
+  // int64 emitted_at_unix_ms = 5;
+  void clear_emitted_at_unix_ms() ;
+  [[nodiscard]] ::int64_t emitted_at_unix_ms() const;
+  void set_emitted_at_unix_ms(::int64_t value);
+
+  private:
+  ::int64_t _internal_emitted_at_unix_ms() const;
+  void _internal_set_emitted_at_unix_ms(::int64_t value);
+
+  public:
+  // .air.db.v1.TenantEventType type = 2;
+  void clear_type() ;
+  [[nodiscard]] ::air::db::v1::TenantEventType type() const;
+  void set_type(::air::db::v1::TenantEventType value);
+
+  private:
+  ::air::db::v1::TenantEventType _internal_type() const;
+  void _internal_set_type(::air::db::v1::TenantEventType value);
+
+  public:
+  // @@protoc_insertion_point(class_scope:air.db.v1.TenantChangeEvent)
+ private:
+  class _Internal;
+  using ParseTableT_ =
+      ::google::protobuf::internal::TcParseTable<3, 5,
+                          1, 0,
+                          2>;
+  static constexpr ParseTableT_ InternalGenerateParseTable_(
+      const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL class_data);
+  friend class ::google::protobuf::internal::TcParser;
+  #ifndef PROTOBUF_MESSAGE_GLOBALS
+  static const ParseTableT_ _table_;
+  #endif
+
+  friend class ::google::protobuf::MessageLite;
+  friend class ::google::protobuf::Arena;
+  friend ::google::protobuf::internal::PrivateAccess;
+  template <typename T>
+  friend class ::google::protobuf::Arena::InternalHelper;
+  using InternalArenaConstructable_ = void;
+  using DestructorSkippable_ = void;
+  struct Impl_ {
+    inline explicit constexpr Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                                    ::google::protobuf::internal::ConstantInitialized) noexcept;
+    inline explicit Impl_(
+        ::google::protobuf::internal::InternalVisibility visibility,
+        ::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+    inline explicit Impl_(
+        ::google::protobuf::internal::InternalVisibility visibility,
+        ::google::protobuf::Arena* PROTOBUF_NULLABLE arena, const Impl_& from,
+        const TenantChangeEvent& from_msg);
+    ::google::protobuf::internal::HasBits<1> _has_bits_;
+    ::google::protobuf::internal::CachedSize _cached_size_;
+    ::air::db::v1::TenantRouteResponse* PROTOBUF_NULLABLE route_;
+    ::int64_t version_;
+    ::int64_t fencing_epoch_;
+    ::int64_t emitted_at_unix_ms_;
+    int type_;
+    PROTOBUF_TSAN_DECLARE_MEMBER
+  };
+  union { Impl_ _impl_; };
+  friend struct ::TableStruct_airdb_2eproto;
+};
+// -------------------------------------------------------------------
+
 class  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED ListDatabasesResponse final : public ::google::protobuf::Message
 /* @@protoc_insertion_point(class_definition:air.db.v1.ListDatabasesResponse) */ {
  public:
@@ -2178,6 +2926,7 @@ class  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED ListDatabasesResponse final : publi
   // accessors -------------------------------------------------------
   enum : int {
     kDatabasesFieldNumber = 1,
+    kSnapshotVersionFieldNumber = 2,
   };
   // repeated .air.db.v1.DatabaseInfo databases = 1;
   [[nodiscard]] int databases_size()
@@ -2200,11 +2949,21 @@ class  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED ListDatabasesResponse final : publi
   ::google::protobuf::RepeatedPtrField<::air::db::v1::DatabaseInfo>* PROTOBUF_NONNULL _internal_mutable_databases();
 
   public:
+  // int64 snapshot_version = 2;
+  void clear_snapshot_version() ;
+  [[nodiscard]] ::int64_t snapshot_version() const;
+  void set_snapshot_version(::int64_t value);
+
+  private:
+  ::int64_t _internal_snapshot_version() const;
+  void _internal_set_snapshot_version(::int64_t value);
+
+  public:
   // @@protoc_insertion_point(class_scope:air.db.v1.ListDatabasesResponse)
  private:
   class _Internal;
   using ParseTableT_ =
-      ::google::protobuf::internal::TcParseTable<0, 1,
+      ::google::protobuf::internal::TcParseTable<1, 2,
                           1, 0,
                           2>;
   static constexpr ParseTableT_ InternalGenerateParseTable_(
@@ -2234,6 +2993,7 @@ class  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED ListDatabasesResponse final : publi
     ::google::protobuf::internal::HasBits<1> _has_bits_;
     ::google::protobuf::internal::CachedSize _cached_size_;
     ::google::protobuf::RepeatedPtrField< ::air::db::v1::DatabaseInfo > databases_;
+    ::int64_t snapshot_version_;
     PROTOBUF_TSAN_DECLARE_MEMBER
   };
   union { Impl_ _impl_; };
@@ -3715,6 +4475,30 @@ ListDatabasesResponse::_internal_mutable_databases() {
   return &_impl_.databases_;
 }
 
+// int64 snapshot_version = 2;
+inline void ListDatabasesResponse::clear_snapshot_version() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.snapshot_version_ = ::int64_t{0};
+  ClearHasBit(_impl_._has_bits_[0], 0x00000002U);
+}
+inline ::int64_t ListDatabasesResponse::snapshot_version() const {
+  // @@protoc_insertion_point(field_get:air.db.v1.ListDatabasesResponse.snapshot_version)
+  return _internal_snapshot_version();
+}
+inline void ListDatabasesResponse::set_snapshot_version(::int64_t value) {
+  _internal_set_snapshot_version(value);
+  SetHasBit(_impl_._has_bits_[0], 0x00000002U);
+  // @@protoc_insertion_point(field_set:air.db.v1.ListDatabasesResponse.snapshot_version)
+}
+inline ::int64_t ListDatabasesResponse::_internal_snapshot_version() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.snapshot_version_;
+}
+inline void ListDatabasesResponse::_internal_set_snapshot_version(::int64_t value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.snapshot_version_ = value;
+}
+
 // -------------------------------------------------------------------
 
 // StatusResponse
@@ -3847,6 +4631,308 @@ inline void StatusResponse::set_allocated_tenant_id(::std::string* PROTOBUF_NULL
   // @@protoc_insertion_point(field_set_allocated:air.db.v1.StatusResponse.tenant_id)
 }
 
+// -------------------------------------------------------------------
+
+// WatchTenantsRequest
+
+// int64 after_version = 1;
+inline void WatchTenantsRequest::clear_after_version() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.after_version_ = ::int64_t{0};
+  ClearHasBit(_impl_._has_bits_[0], 0x00000001U);
+}
+inline ::int64_t WatchTenantsRequest::after_version() const {
+  // @@protoc_insertion_point(field_get:air.db.v1.WatchTenantsRequest.after_version)
+  return _internal_after_version();
+}
+inline void WatchTenantsRequest::set_after_version(::int64_t value) {
+  _internal_set_after_version(value);
+  SetHasBit(_impl_._has_bits_[0], 0x00000001U);
+  // @@protoc_insertion_point(field_set:air.db.v1.WatchTenantsRequest.after_version)
+}
+inline ::int64_t WatchTenantsRequest::_internal_after_version() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.after_version_;
+}
+inline void WatchTenantsRequest::_internal_set_after_version(::int64_t value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.after_version_ = value;
+}
+
+// -------------------------------------------------------------------
+
+// TenantChangeEvent
+
+// int64 version = 1;
+inline void TenantChangeEvent::clear_version() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.version_ = ::int64_t{0};
+  ClearHasBit(_impl_._has_bits_[0], 0x00000002U);
+}
+inline ::int64_t TenantChangeEvent::version() const {
+  // @@protoc_insertion_point(field_get:air.db.v1.TenantChangeEvent.version)
+  return _internal_version();
+}
+inline void TenantChangeEvent::set_version(::int64_t value) {
+  _internal_set_version(value);
+  SetHasBit(_impl_._has_bits_[0], 0x00000002U);
+  // @@protoc_insertion_point(field_set:air.db.v1.TenantChangeEvent.version)
+}
+inline ::int64_t TenantChangeEvent::_internal_version() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.version_;
+}
+inline void TenantChangeEvent::_internal_set_version(::int64_t value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.version_ = value;
+}
+
+// .air.db.v1.TenantEventType type = 2;
+inline void TenantChangeEvent::clear_type() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.type_ = 0;
+  ClearHasBit(_impl_._has_bits_[0], 0x00000010U);
+}
+inline ::air::db::v1::TenantEventType TenantChangeEvent::type() const {
+  // @@protoc_insertion_point(field_get:air.db.v1.TenantChangeEvent.type)
+  return _internal_type();
+}
+inline void TenantChangeEvent::set_type(::air::db::v1::TenantEventType value) {
+  _internal_set_type(value);
+  SetHasBit(_impl_._has_bits_[0], 0x00000010U);
+  // @@protoc_insertion_point(field_set:air.db.v1.TenantChangeEvent.type)
+}
+inline ::air::db::v1::TenantEventType TenantChangeEvent::_internal_type() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return static_cast<::air::db::v1::TenantEventType>(_impl_.type_);
+}
+inline void TenantChangeEvent::_internal_set_type(::air::db::v1::TenantEventType value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.type_ = value;
+}
+
+// .air.db.v1.TenantRouteResponse route = 3;
+inline bool TenantChangeEvent::has_route() const {
+  bool value = CheckHasBit(_impl_._has_bits_[0], 0x00000001U);
+  PROTOBUF_ASSUME(!value || _impl_.route_ != nullptr);
+  return value;
+}
+inline void TenantChangeEvent::clear_route() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  if (_impl_.route_ != nullptr) _impl_.route_->Clear();
+  ClearHasBit(_impl_._has_bits_[0], 0x00000001U);
+}
+inline const ::air::db::v1::TenantRouteResponse& TenantChangeEvent::_internal_route() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  const ::air::db::v1::TenantRouteResponse* p = _impl_.route_;
+  return p != nullptr ? *p : *::google::protobuf::internal::MessageGlobalsBase::ToDefaultInstance<::air::db::v1::TenantRouteResponse>(&::air::db::v1::TenantRouteResponse_globals_);
+}
+inline const ::air::db::v1::TenantRouteResponse& TenantChangeEvent::route() const ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_get:air.db.v1.TenantChangeEvent.route)
+  return _internal_route();
+}
+inline void TenantChangeEvent::unsafe_arena_set_allocated_route(
+    ::air::db::v1::TenantRouteResponse* PROTOBUF_NULLABLE value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  if (GetArena() == nullptr) {
+    delete reinterpret_cast<::google::protobuf::MessageLite*>(_impl_.route_);
+  }
+  _impl_.route_ = reinterpret_cast<::air::db::v1::TenantRouteResponse*>(value);
+  if (value != nullptr) {
+    SetHasBit(_impl_._has_bits_[0], 0x00000001U);
+  } else {
+    ClearHasBit(_impl_._has_bits_[0], 0x00000001U);
+  }
+  // @@protoc_insertion_point(field_unsafe_arena_set_allocated:air.db.v1.TenantChangeEvent.route)
+}
+inline ::air::db::v1::TenantRouteResponse* PROTOBUF_NULLABLE TenantChangeEvent::release_route() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+
+  ClearHasBit(_impl_._has_bits_[0], 0x00000001U);
+  ::air::db::v1::TenantRouteResponse* released = _impl_.route_;
+  _impl_.route_ = nullptr;
+  if (::google::protobuf::internal::DebugHardenForceCopyInRelease()) {
+    auto* old = reinterpret_cast<::google::protobuf::MessageLite*>(released);
+    released = ::google::protobuf::internal::DuplicateIfNonNull(released);
+    if (GetArena() == nullptr) {
+      delete old;
+    }
+  } else {
+    if (GetArena() != nullptr) {
+      released = ::google::protobuf::internal::DuplicateIfNonNull(released);
+    }
+  }
+  return released;
+}
+inline ::air::db::v1::TenantRouteResponse* PROTOBUF_NULLABLE TenantChangeEvent::unsafe_arena_release_route() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  // @@protoc_insertion_point(field_release:air.db.v1.TenantChangeEvent.route)
+
+  ClearHasBit(_impl_._has_bits_[0], 0x00000001U);
+  ::air::db::v1::TenantRouteResponse* temp = _impl_.route_;
+  _impl_.route_ = nullptr;
+  return temp;
+}
+inline ::air::db::v1::TenantRouteResponse* PROTOBUF_NONNULL TenantChangeEvent::_internal_mutable_route() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  if (_impl_.route_ == nullptr) {
+    auto* p = ::google::protobuf::Message::DefaultConstruct<::air::db::v1::TenantRouteResponse>(GetArena());
+    _impl_.route_ = reinterpret_cast<::air::db::v1::TenantRouteResponse*>(p);
+  }
+  return _impl_.route_;
+}
+inline ::air::db::v1::TenantRouteResponse* PROTOBUF_NONNULL TenantChangeEvent::mutable_route()
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  SetHasBit(_impl_._has_bits_[0], 0x00000001U);
+  ::air::db::v1::TenantRouteResponse* _msg = _internal_mutable_route();
+  // @@protoc_insertion_point(field_mutable:air.db.v1.TenantChangeEvent.route)
+  return _msg;
+}
+inline void TenantChangeEvent::set_allocated_route(::air::db::v1::TenantRouteResponse* PROTOBUF_NULLABLE value) {
+  ::google::protobuf::Arena* message_arena = GetArena();
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  if (message_arena == nullptr) {
+    delete reinterpret_cast<::google::protobuf::MessageLite*>(_impl_.route_);
+  }
+
+  if (value != nullptr) {
+    ::google::protobuf::Arena* submessage_arena = value->GetArena();
+    if (message_arena != submessage_arena) {
+      value = ::google::protobuf::internal::GetOwnedMessage(message_arena, value, submessage_arena);
+    }
+    SetHasBit(_impl_._has_bits_[0], 0x00000001U);
+  } else {
+    ClearHasBit(_impl_._has_bits_[0], 0x00000001U);
+  }
+
+  _impl_.route_ = reinterpret_cast<::air::db::v1::TenantRouteResponse*>(value);
+  // @@protoc_insertion_point(field_set_allocated:air.db.v1.TenantChangeEvent.route)
+}
+
+// int64 fencing_epoch = 4;
+inline void TenantChangeEvent::clear_fencing_epoch() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.fencing_epoch_ = ::int64_t{0};
+  ClearHasBit(_impl_._has_bits_[0], 0x00000004U);
+}
+inline ::int64_t TenantChangeEvent::fencing_epoch() const {
+  // @@protoc_insertion_point(field_get:air.db.v1.TenantChangeEvent.fencing_epoch)
+  return _internal_fencing_epoch();
+}
+inline void TenantChangeEvent::set_fencing_epoch(::int64_t value) {
+  _internal_set_fencing_epoch(value);
+  SetHasBit(_impl_._has_bits_[0], 0x00000004U);
+  // @@protoc_insertion_point(field_set:air.db.v1.TenantChangeEvent.fencing_epoch)
+}
+inline ::int64_t TenantChangeEvent::_internal_fencing_epoch() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.fencing_epoch_;
+}
+inline void TenantChangeEvent::_internal_set_fencing_epoch(::int64_t value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.fencing_epoch_ = value;
+}
+
+// int64 emitted_at_unix_ms = 5;
+inline void TenantChangeEvent::clear_emitted_at_unix_ms() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.emitted_at_unix_ms_ = ::int64_t{0};
+  ClearHasBit(_impl_._has_bits_[0], 0x00000008U);
+}
+inline ::int64_t TenantChangeEvent::emitted_at_unix_ms() const {
+  // @@protoc_insertion_point(field_get:air.db.v1.TenantChangeEvent.emitted_at_unix_ms)
+  return _internal_emitted_at_unix_ms();
+}
+inline void TenantChangeEvent::set_emitted_at_unix_ms(::int64_t value) {
+  _internal_set_emitted_at_unix_ms(value);
+  SetHasBit(_impl_._has_bits_[0], 0x00000008U);
+  // @@protoc_insertion_point(field_set:air.db.v1.TenantChangeEvent.emitted_at_unix_ms)
+}
+inline ::int64_t TenantChangeEvent::_internal_emitted_at_unix_ms() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.emitted_at_unix_ms_;
+}
+inline void TenantChangeEvent::_internal_set_emitted_at_unix_ms(::int64_t value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.emitted_at_unix_ms_ = value;
+}
+
+// -------------------------------------------------------------------
+
+// BatchTouchActivityRequest
+
+// repeated string tenant_ids = 1;
+inline int BatchTouchActivityRequest::_internal_tenant_ids_size() const {
+  return _internal_tenant_ids().size();
+}
+inline int BatchTouchActivityRequest::tenant_ids_size() const {
+  return _internal_tenant_ids_size();
+}
+inline void BatchTouchActivityRequest::clear_tenant_ids() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.tenant_ids_.Clear();
+  ClearHasBit(_impl_._has_bits_[0], 0x00000001U);
+}
+inline ::std::string* PROTOBUF_NONNULL BatchTouchActivityRequest::add_tenant_ids()
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::std::string* _s =
+      _internal_mutable_tenant_ids()->InternalAddWithArena(
+          ::google::protobuf::MessageLite::internal_visibility(), GetArena());
+  SetHasBit(_impl_._has_bits_[0], 0x00000001U);
+  // @@protoc_insertion_point(field_add_mutable:air.db.v1.BatchTouchActivityRequest.tenant_ids)
+  return _s;
+}
+inline const ::std::string& BatchTouchActivityRequest::tenant_ids(int index) const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_get:air.db.v1.BatchTouchActivityRequest.tenant_ids)
+  return _internal_tenant_ids().Get(index);
+}
+inline ::std::string* PROTOBUF_NONNULL BatchTouchActivityRequest::mutable_tenant_ids(int index)
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_mutable:air.db.v1.BatchTouchActivityRequest.tenant_ids)
+  return _internal_mutable_tenant_ids()->Mutable(index);
+}
+template <typename Arg_, typename... Args_>
+inline void BatchTouchActivityRequest::set_tenant_ids(int index, Arg_&& value, Args_... args) {
+  ::google::protobuf::internal::AssignToString(
+      *_internal_mutable_tenant_ids()->Mutable(index),
+      ::std::forward<Arg_>(value), args... );
+  // @@protoc_insertion_point(field_set:air.db.v1.BatchTouchActivityRequest.tenant_ids)
+}
+template <typename Arg_, typename... Args_>
+inline void BatchTouchActivityRequest::add_tenant_ids(Arg_&& value, Args_... args) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::google::protobuf::internal::AddToRepeatedPtrField(
+      ::google::protobuf::MessageLite::internal_visibility(), GetArena(),
+      *_internal_mutable_tenant_ids(), ::std::forward<Arg_>(value),
+      args... );
+  SetHasBit(_impl_._has_bits_[0], 0x00000001U);
+  // @@protoc_insertion_point(field_add:air.db.v1.BatchTouchActivityRequest.tenant_ids)
+}
+inline const ::google::protobuf::RepeatedPtrField<::std::string>& BatchTouchActivityRequest::tenant_ids()
+    const ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_list:air.db.v1.BatchTouchActivityRequest.tenant_ids)
+  return _internal_tenant_ids();
+}
+inline ::google::protobuf::RepeatedPtrField<::std::string>* PROTOBUF_NONNULL
+BatchTouchActivityRequest::mutable_tenant_ids() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  SetHasBit(_impl_._has_bits_[0], 0x00000001U);
+  // @@protoc_insertion_point(field_mutable_list:air.db.v1.BatchTouchActivityRequest.tenant_ids)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  return _internal_mutable_tenant_ids();
+}
+inline const ::google::protobuf::RepeatedPtrField<::std::string>&
+BatchTouchActivityRequest::_internal_tenant_ids() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.tenant_ids_;
+}
+inline ::google::protobuf::RepeatedPtrField<::std::string>* PROTOBUF_NONNULL
+BatchTouchActivityRequest::_internal_mutable_tenant_ids() {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return &_impl_.tenant_ids_;
+}
+
 #ifdef __GNUC__
 #pragma GCC diagnostic pop
 #endif  // __GNUC__
@@ -3856,6 +4942,19 @@ inline void StatusResponse::set_allocated_tenant_id(::std::string* PROTOBUF_NULL
 }  // namespace db
 }  // namespace air
 
+
+namespace google {
+namespace protobuf {
+
+template <>
+struct is_proto_enum<::air::db::v1::TenantEventType> : std::true_type {};
+template <>
+inline const EnumDescriptor* PROTOBUF_NONNULL GetEnumDescriptor<::air::db::v1::TenantEventType>() {
+  return ::air::db::v1::TenantEventType_descriptor();
+}
+
+}  // namespace protobuf
+}  // namespace google
 
 // @@protoc_insertion_point(global_scope)
 

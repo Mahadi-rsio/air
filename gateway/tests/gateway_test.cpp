@@ -5,8 +5,12 @@
 #include "pooler.hpp"
 
 #include <cassert>
+#include <chrono>
+#include <grpcpp/server.h>
+#include <grpcpp/server_builder.h>
 #include <iostream>
 #include <regex>
+#include <thread>
 
 int main() {
     using namespace air::gw;
@@ -192,6 +196,144 @@ int main() {
         reg.release_global();
         reg.release_global();
         reg.release_global();
+    }
+
+    // 7. TenantDiscovery gRPC ListDatabases + WatchTenantChanges + BatchTouchActivity + shared_mutex cache
+    {
+        class MockControlService final : public air::db::v1::AirDBControl::Service {
+        public:
+            std::atomic<int> get_route_calls{0};
+            std::mutex touch_mu;
+            std::vector<std::string> batch_touched;
+
+            grpc::Status ListDatabases(grpc::ServerContext*,
+                                       const air::db::v1::ListDatabasesRequest*,
+                                       air::db::v1::ListDatabasesResponse* resp) override {
+                auto* d = resp->add_databases();
+                d->set_tenant_id("t_init");
+                d->set_state("ACTIVE");
+                d->set_direct_port(15433);
+                resp->set_snapshot_version(10);
+                return grpc::Status::OK;
+            }
+
+            grpc::Status WatchTenantChanges(grpc::ServerContext* ctx,
+                                            const air::db::v1::WatchTenantsRequest* req,
+                                            grpc::ServerWriter<air::db::v1::TenantChangeEvent>* writer) override {
+                if (req->after_version() != 10) {
+                    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "unexpected after_version");
+                }
+                air::db::v1::TenantChangeEvent ev1;
+                ev1.set_version(11);
+                ev1.set_type(air::db::v1::TENANT_EVENT_UPSERT);
+                ev1.mutable_route()->set_tenant_id("t_stream");
+                ev1.mutable_route()->set_state("ACTIVE");
+                ev1.mutable_route()->set_host("127.0.0.1");
+                ev1.mutable_route()->set_port(15434);
+                writer->Write(ev1);
+
+                air::db::v1::TenantChangeEvent ev2;
+                ev2.set_version(12);
+                ev2.set_type(air::db::v1::TENANT_EVENT_DELETE);
+                ev2.mutable_route()->set_tenant_id("t_init");
+                writer->Write(ev2);
+
+                while (!ctx->IsCancelled()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+                return grpc::Status::OK;
+            }
+
+            grpc::Status GetTenantRoute(grpc::ServerContext*,
+                                        const air::db::v1::TenantRequest* req,
+                                        air::db::v1::TenantRouteResponse* resp) override {
+                get_route_calls.fetch_add(1);
+                resp->set_tenant_id(req->tenant_id());
+                resp->set_state("ACTIVE");
+                resp->set_host("127.0.0.1");
+                resp->set_port(15434);
+                resp->set_app_password("secret_pw");
+                return grpc::Status::OK;
+            }
+
+            grpc::Status BatchTouchActivity(grpc::ServerContext*,
+                                            const air::db::v1::BatchTouchActivityRequest* req,
+                                            air::db::v1::Empty*) override {
+                std::lock_guard<std::mutex> lk(touch_mu);
+                for (const auto& id : req->tenant_ids()) {
+                    batch_touched.push_back(id);
+                }
+                return grpc::Status::OK;
+            }
+        };
+
+        MockControlService svc;
+        int bound_port = 0;
+        grpc::ServerBuilder builder;
+        builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MIN_POLLERS, 4);
+        builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MAX_POLLERS, 8);
+        builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &bound_port);
+        builder.RegisterService(&svc);
+        auto server = builder.BuildAndStart();
+        auto require = [](bool cond, const char* msg) {
+            if (!cond) {
+                std::cerr << "FAIL: " << msg << std::endl;
+                std::abort();
+            }
+        };
+        require(server && bound_port > 0, "mock gRPC server started");
+
+        Config cfg;
+        cfg.grpc_addr = "127.0.0.1:" + std::to_string(bound_port);
+        cfg.meta_dsn = "";
+        cfg.backend_host = "127.0.0.1";
+
+        TenantDiscovery disc(cfg);
+        disc.start();
+
+        // Wait for WatchTenantChanges to apply t_stream upsert and t_init delete.
+        bool stream_applied = false;
+        for (int i = 0; i < 200; ++i) {
+            auto cached = disc.list_cached();
+            if (cached.size() == 1 && cached[0].tenant_id == "t_stream" && cached[0].port == 15434) {
+                stream_applied = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        require(stream_applied, "WatchTenantChanges applied upsert and delete");
+
+        // First resolve fetches app_password via GetTenantRoute; second hits shared_mutex cache.
+        TenantRoute r1, r2;
+        std::string err;
+        require(disc.resolve_tenant("t_stream", r1, err), "first resolve_tenant");
+        require(r1.app_password == "secret_pw", "app_password populated");
+        require(disc.resolve_tenant("t_stream", r2, err), "second resolve_tenant");
+        require(r2.app_password == "secret_pw", "cached app_password");
+        require(svc.get_route_calls.load() == 1, "second resolve_tenant used cache without RPC");
+
+        // BatchTouchActivity delivers batched touches.
+        disc.touch_activity("t_stream");
+        disc.touch_activity("t_other");
+        bool touched_ok = false;
+        for (int i = 0; i < 200; ++i) {
+            {
+                std::lock_guard<std::mutex> lk(svc.touch_mu);
+                if (svc.batch_touched.size() >= 2) {
+                    touched_ok = true;
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!touched_ok) {
+            std::lock_guard<std::mutex> lk(svc.touch_mu);
+            std::cerr << "batch_touched.size()=" << svc.batch_touched.size() << std::endl;
+        }
+        require(touched_ok, "BatchTouchActivity delivered batched tenant_ids");
+
+        disc.stop();
+        server->Shutdown();
     }
 
     std::cout << "All C++ air-gateway tests passed!" << std::endl;

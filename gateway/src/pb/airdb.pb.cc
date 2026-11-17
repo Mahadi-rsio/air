@@ -47,12 +47,159 @@ PROTOBUF_CONSTINIT ::google::protobuf::internal::ReflectionData
         {&::_pbi::kDescriptorMethods, &::descriptor_table_airdb_2eproto, /* tracker*/ nullptr,},
         // ::air::db::v1::StatusResponse
         {&::_pbi::kDescriptorMethods, &::descriptor_table_airdb_2eproto, /* tracker*/ nullptr,},
+        // ::air::db::v1::WatchTenantsRequest
+        {&::_pbi::kDescriptorMethods, &::descriptor_table_airdb_2eproto, /* tracker*/ nullptr,},
+        // ::air::db::v1::TenantChangeEvent
+        {&::_pbi::kDescriptorMethods, &::descriptor_table_airdb_2eproto, /* tracker*/ nullptr,},
+        // ::air::db::v1::BatchTouchActivityRequest
+        {&::_pbi::kDescriptorMethods, &::descriptor_table_airdb_2eproto, /* tracker*/ nullptr,},
 };
 }  // namespace
 #endif
 namespace air {
 namespace db {
 namespace v1 {
+class WatchTenantsRequest::_Internal {
+ public:
+  using HasBits = decltype(::std::declval<WatchTenantsRequest>()._impl_._has_bits_);
+  static constexpr ::int32_t kHasBitsOffset =
+      8 * PROTOBUF_FIELD_OFFSET(WatchTenantsRequest, _impl_._has_bits_);
+};
+
+constexpr WatchTenantsRequest::ParseTableT_ WatchTenantsRequest::InternalGenerateParseTable_(const ::_pbi::ClassData* class_data) {
+  return ParseTableT_{
+    {
+      PROTOBUF_FIELD_OFFSET(WatchTenantsRequest, _impl_._has_bits_),
+      0, // no _extensions_
+      1, 0,  // max_field_number, fast_idx_mask
+      offsetof(ParseTableT_, field_lookup_table),
+      4294967294,  // skipmap
+      offsetof(ParseTableT_, field_entries),
+      1,  // num_field_entries
+      0,  // num_aux_entries
+      offsetof(ParseTableT_, field_names),  // no aux_entries
+      class_data,
+      nullptr,  // post_loop_handler
+      ::_pbi::TcParser::GenericFallback,  // fallback
+      #ifdef PROTOBUF_PREFETCH_PARSE_TABLE
+      ::_pbi::TcParser::GetTable<::air::db::v1::WatchTenantsRequest>(),  // to_prefetch
+      #endif  // PROTOBUF_PREFETCH_PARSE_TABLE
+    }, {{
+      // int64 after_version = 1;
+      {::_pbi::TcParser::SingularVarintNoZag1<::uint64_t, offsetof(WatchTenantsRequest, _impl_.after_version_), 0>(),
+       {8, 0, 0,
+        PROTOBUF_FIELD_OFFSET(WatchTenantsRequest, _impl_.after_version_)}},
+    }}, {{
+      65535, 65535
+    }}, {{
+      // int64 after_version = 1;
+      {PROTOBUF_FIELD_OFFSET(WatchTenantsRequest, _impl_.after_version_), _Internal::kHasBitsOffset + 0, 0, (0 | ::_fl::kFcOptional | ::_fl::kInt64)},
+    }},
+    // no aux_entries
+    {{
+    }},
+  };
+}
+
+
+inline constexpr WatchTenantsRequest::Impl_::Impl_(
+    [[maybe_unused]] ::google::protobuf::internal::InternalVisibility visibility,
+    ::_pbi::ConstantInitialized) noexcept
+      : _cached_size_{0},
+        after_version_{::int64_t{0}} {}
+
+template <typename>
+constexpr WatchTenantsRequest::WatchTenantsRequest(::_pbi::ConstantInitialized,
+                       const ::_pbi::ClassData* PROTOBUF_NONNULL class_data)
+    : ::google::protobuf::Message(
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+          class_data
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          ),
+      _impl_(internal_visibility(), ::_pbi::ConstantInitialized()) {
+}
+inline void* PROTOBUF_NONNULL WatchTenantsRequest::PlacementNew_(
+    const void* PROTOBUF_NONNULL, void* PROTOBUF_NONNULL mem,
+    ::google::protobuf::Arena* PROTOBUF_NULLABLE arena) {
+  return ::new (mem) WatchTenantsRequest(arena);
+}
+constexpr auto WatchTenantsRequest::InternalNewImpl_() {
+  return ::google::protobuf::internal::MessageCreator::ZeroInit(sizeof(WatchTenantsRequest), alignof(WatchTenantsRequest));
+}
+constexpr auto WatchTenantsRequest::InternalGenerateClassData_(
+    const MessageLite& prototype,
+    const ::google::protobuf::internal::TcParseTableBase* tc_table) {
+  return ::google::protobuf::internal::ClassDataFull{
+      ::google::protobuf::internal::ClassData{
+          &prototype,
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+          &_table_.header,
+#else
+          tc_table,
+#endif
+          nullptr,  // IsInitialized
+          &WatchTenantsRequest::MergeImpl,
+          ::google::protobuf::Message::GetNewImpl<WatchTenantsRequest>(),
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+          &WatchTenantsRequest::SharedDtor,
+          ::google::protobuf::Message::GetClearImpl<WatchTenantsRequest>(), &WatchTenantsRequest::ByteSizeLong,
+              &WatchTenantsRequest::_InternalSerialize,
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          PROTOBUF_FIELD_OFFSET(WatchTenantsRequest, _impl_._cached_size_),
+          false,
+      },
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+      &file_reflection_data[9],
+#else   // !PROTOBUF_MESSAGE_GLOBALS
+      &::_pbi::kDescriptorMethods,
+      &descriptor_table_airdb_2eproto,
+      nullptr,  // tracker
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+  };
+}
+struct WatchTenantsRequestGlobalsTypeInternal : ::_pbi::MessageGlobalsBase {
+  constexpr WatchTenantsRequestGlobalsTypeInternal()
+      :
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+        _default(::_pbi::ConstantInitialized{},
+                 WatchTenantsRequest_class_data_.base())
+#else   // !PROTOBUF_MESSAGE_GLOBALS
+        MessageGlobalsBase(WatchTenantsRequest::InternalGenerateClassData_(
+            _default, &WatchTenantsRequest_globals_._table.header)),
+        _default(::_pbi::ConstantInitialized{}, GetClassData()),
+        _table(::_pbi::PrivateAccess::GenerateParseTable<WatchTenantsRequest>(
+            GetClassData()))
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+  {
+  }
+  ~WatchTenantsRequestGlobalsTypeInternal() {}
+  union {
+    alignas(::_pbi::kMaxMessageAlignment) WatchTenantsRequest _default;
+  };
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+  decltype(::_pbi::PrivateAccess::GenerateParseTable<WatchTenantsRequest>(
+      ::std::declval<const ::_pbi::ClassData*>())) _table;
+#endif
+};
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+static_assert(PROTOBUF_FIELD_OFFSET(WatchTenantsRequestGlobalsTypeInternal, _default) ==
+              ::_pbi::MessageGlobalsBase::OffsetToDefault());
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+
+PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
+    PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 PROTOBUF_MESSAGE_GLOBALS_CONST WatchTenantsRequestGlobalsTypeInternal WatchTenantsRequest_globals_
+        PROTOBUF_MESSAGE_GLOBALS_SECTION(.data.rel.ro);
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+namespace {
+const ::_pbi::ClassData* WatchTenantsRequest_get_class_data() {
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+  return WatchTenantsRequest_globals_.GetClassData();
+#else
+  return WatchTenantsRequest_class_data_.base();
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+}
+}  // namespace
+#endif  // PROTOBUF_CUSTOM_VTABLE
 class TenantRouteResponse::_Internal {
  public:
   using HasBits = decltype(::std::declval<TenantRouteResponse>()._impl_._has_bits_);
@@ -1383,6 +1530,332 @@ const ::_pbi::ClassData* CreateDatabaseRequest_get_class_data() {
 }
 }  // namespace
 #endif  // PROTOBUF_CUSTOM_VTABLE
+class BatchTouchActivityRequest::_Internal {
+ public:
+  using HasBits = decltype(::std::declval<BatchTouchActivityRequest>()._impl_._has_bits_);
+  static constexpr ::int32_t kHasBitsOffset =
+      8 * PROTOBUF_FIELD_OFFSET(BatchTouchActivityRequest, _impl_._has_bits_);
+};
+
+constexpr BatchTouchActivityRequest::ParseTableT_ BatchTouchActivityRequest::InternalGenerateParseTable_(const ::_pbi::ClassData* class_data) {
+  return ParseTableT_{
+    {
+      PROTOBUF_FIELD_OFFSET(BatchTouchActivityRequest, _impl_._has_bits_),
+      0, // no _extensions_
+      1, 0,  // max_field_number, fast_idx_mask
+      offsetof(ParseTableT_, field_lookup_table),
+      4294967294,  // skipmap
+      offsetof(ParseTableT_, field_entries),
+      1,  // num_field_entries
+      0,  // num_aux_entries
+      offsetof(ParseTableT_, field_names),  // no aux_entries
+      class_data,
+      nullptr,  // post_loop_handler
+      ::_pbi::TcParser::GenericFallback,  // fallback
+      #ifdef PROTOBUF_PREFETCH_PARSE_TABLE
+      ::_pbi::TcParser::GetTable<::air::db::v1::BatchTouchActivityRequest>(),  // to_prefetch
+      #endif  // PROTOBUF_PREFETCH_PARSE_TABLE
+    }, {{
+      // repeated string tenant_ids = 1;
+      {::_pbi::TcParser::FastUR1,
+       {10, 0, 0,
+        PROTOBUF_FIELD_OFFSET(BatchTouchActivityRequest, _impl_.tenant_ids_)}},
+    }}, {{
+      65535, 65535
+    }}, {{
+      // repeated string tenant_ids = 1;
+      {PROTOBUF_FIELD_OFFSET(BatchTouchActivityRequest, _impl_.tenant_ids_), _Internal::kHasBitsOffset + 0, 0, (0 | ::_fl::kFcRepeated | ::_fl::kUtf8String | ::_fl::kRepSString)},
+    }},
+    // no aux_entries
+    {{
+      "\43\12\0\0\0\0\0\0"
+      "air.db.v1.BatchTouchActivityRequest"
+      "tenant_ids"
+    }},
+  };
+}
+
+
+inline constexpr BatchTouchActivityRequest::Impl_::Impl_(
+    [[maybe_unused]] ::google::protobuf::internal::InternalVisibility visibility,
+    ::_pbi::ConstantInitialized) noexcept
+      : _cached_size_{0},
+        tenant_ids_ { visibility, ::_pbi::InternalMetadataOffset::Build<
+            ::air::db::v1::BatchTouchActivityRequest,
+            PROTOBUF_FIELD_OFFSET(::air::db::v1::BatchTouchActivityRequest, _impl_.tenant_ids_)>()
+         }
+     {}
+
+template <typename>
+constexpr BatchTouchActivityRequest::BatchTouchActivityRequest(::_pbi::ConstantInitialized,
+                       const ::_pbi::ClassData* PROTOBUF_NONNULL class_data)
+    : ::google::protobuf::Message(
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+          class_data
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          ),
+      _impl_(internal_visibility(), ::_pbi::ConstantInitialized()) {
+}
+inline void* PROTOBUF_NONNULL BatchTouchActivityRequest::PlacementNew_(
+    const void* PROTOBUF_NONNULL, void* PROTOBUF_NONNULL mem,
+    ::google::protobuf::Arena* PROTOBUF_NULLABLE arena) {
+  return ::new (mem) BatchTouchActivityRequest(arena);
+}
+constexpr auto BatchTouchActivityRequest::InternalNewImpl_() {
+  return ::google::protobuf::internal::MessageCreator::CopyInit(sizeof(BatchTouchActivityRequest), alignof(BatchTouchActivityRequest));
+}
+constexpr auto BatchTouchActivityRequest::InternalGenerateClassData_(
+    const MessageLite& prototype,
+    const ::google::protobuf::internal::TcParseTableBase* tc_table) {
+  return ::google::protobuf::internal::ClassDataFull{
+      ::google::protobuf::internal::ClassData{
+          &prototype,
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+          &_table_.header,
+#else
+          tc_table,
+#endif
+          nullptr,  // IsInitialized
+          &BatchTouchActivityRequest::MergeImpl,
+          ::google::protobuf::Message::GetNewImpl<BatchTouchActivityRequest>(),
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+          &BatchTouchActivityRequest::SharedDtor,
+          ::google::protobuf::Message::GetClearImpl<BatchTouchActivityRequest>(), &BatchTouchActivityRequest::ByteSizeLong,
+              &BatchTouchActivityRequest::_InternalSerialize,
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          PROTOBUF_FIELD_OFFSET(BatchTouchActivityRequest, _impl_._cached_size_),
+          false,
+      },
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+      &file_reflection_data[11],
+#else   // !PROTOBUF_MESSAGE_GLOBALS
+      &::_pbi::kDescriptorMethods,
+      &descriptor_table_airdb_2eproto,
+      nullptr,  // tracker
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+  };
+}
+struct BatchTouchActivityRequestGlobalsTypeInternal : ::_pbi::MessageGlobalsBase {
+  constexpr BatchTouchActivityRequestGlobalsTypeInternal()
+      :
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+        _default(::_pbi::ConstantInitialized{},
+                 BatchTouchActivityRequest_class_data_.base())
+#else   // !PROTOBUF_MESSAGE_GLOBALS
+        MessageGlobalsBase(BatchTouchActivityRequest::InternalGenerateClassData_(
+            _default, &BatchTouchActivityRequest_globals_._table.header)),
+        _default(::_pbi::ConstantInitialized{}, GetClassData()),
+        _table(::_pbi::PrivateAccess::GenerateParseTable<BatchTouchActivityRequest>(
+            GetClassData()))
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+  {
+  }
+  ~BatchTouchActivityRequestGlobalsTypeInternal() {}
+  union {
+    alignas(::_pbi::kMaxMessageAlignment) BatchTouchActivityRequest _default;
+  };
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+  decltype(::_pbi::PrivateAccess::GenerateParseTable<BatchTouchActivityRequest>(
+      ::std::declval<const ::_pbi::ClassData*>())) _table;
+#endif
+};
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+static_assert(PROTOBUF_FIELD_OFFSET(BatchTouchActivityRequestGlobalsTypeInternal, _default) ==
+              ::_pbi::MessageGlobalsBase::OffsetToDefault());
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+
+PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
+    PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 PROTOBUF_MESSAGE_GLOBALS_CONST BatchTouchActivityRequestGlobalsTypeInternal BatchTouchActivityRequest_globals_
+        PROTOBUF_MESSAGE_GLOBALS_SECTION(.data.rel.ro);
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+namespace {
+const ::_pbi::ClassData* BatchTouchActivityRequest_get_class_data() {
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+  return BatchTouchActivityRequest_globals_.GetClassData();
+#else
+  return BatchTouchActivityRequest_class_data_.base();
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+}
+}  // namespace
+#endif  // PROTOBUF_CUSTOM_VTABLE
+class TenantChangeEvent::_Internal {
+ public:
+  using HasBits = decltype(::std::declval<TenantChangeEvent>()._impl_._has_bits_);
+  static constexpr ::int32_t kHasBitsOffset =
+      8 * PROTOBUF_FIELD_OFFSET(TenantChangeEvent, _impl_._has_bits_);
+};
+
+constexpr TenantChangeEvent::ParseTableT_ TenantChangeEvent::InternalGenerateParseTable_(const ::_pbi::ClassData* class_data) {
+  return ParseTableT_{
+    {
+      PROTOBUF_FIELD_OFFSET(TenantChangeEvent, _impl_._has_bits_),
+      0, // no _extensions_
+      5, 56,  // max_field_number, fast_idx_mask
+      offsetof(ParseTableT_, field_lookup_table),
+      4294967264,  // skipmap
+      offsetof(ParseTableT_, field_entries),
+      5,  // num_field_entries
+      1,  // num_aux_entries
+      offsetof(ParseTableT_, aux_entries),
+      class_data,
+      nullptr,  // post_loop_handler
+      ::_pbi::TcParser::GenericFallback,  // fallback
+      #ifdef PROTOBUF_PREFETCH_PARSE_TABLE
+      ::_pbi::TcParser::GetTable<::air::db::v1::TenantChangeEvent>(),  // to_prefetch
+      #endif  // PROTOBUF_PREFETCH_PARSE_TABLE
+    }, {{
+      {::_pbi::TcParser::MiniParse, {}},
+      // int64 version = 1;
+      {::_pbi::TcParser::SingularVarintNoZag1<::uint64_t, offsetof(TenantChangeEvent, _impl_.version_), 1>(),
+       {8, 1, 0,
+        PROTOBUF_FIELD_OFFSET(TenantChangeEvent, _impl_.version_)}},
+      // .air.db.v1.TenantEventType type = 2;
+      {::_pbi::TcParser::SingularVarintNoZag1<::uint32_t, offsetof(TenantChangeEvent, _impl_.type_), 4>(),
+       {16, 4, 0,
+        PROTOBUF_FIELD_OFFSET(TenantChangeEvent, _impl_.type_)}},
+      // .air.db.v1.TenantRouteResponse route = 3;
+      {::_pbi::TcParser::FastMtS1,
+       {26, 0, 0,
+        PROTOBUF_FIELD_OFFSET(TenantChangeEvent, _impl_.route_)}},
+      // int64 fencing_epoch = 4;
+      {::_pbi::TcParser::SingularVarintNoZag1<::uint64_t, offsetof(TenantChangeEvent, _impl_.fencing_epoch_), 2>(),
+       {32, 2, 0,
+        PROTOBUF_FIELD_OFFSET(TenantChangeEvent, _impl_.fencing_epoch_)}},
+      // int64 emitted_at_unix_ms = 5;
+      {::_pbi::TcParser::SingularVarintNoZag1<::uint64_t, offsetof(TenantChangeEvent, _impl_.emitted_at_unix_ms_), 3>(),
+       {40, 3, 0,
+        PROTOBUF_FIELD_OFFSET(TenantChangeEvent, _impl_.emitted_at_unix_ms_)}},
+      {::_pbi::TcParser::MiniParse, {}},
+      {::_pbi::TcParser::MiniParse, {}},
+    }}, {{
+      65535, 65535
+    }}, {{
+      // int64 version = 1;
+      {PROTOBUF_FIELD_OFFSET(TenantChangeEvent, _impl_.version_), _Internal::kHasBitsOffset + 1, 0, (0 | ::_fl::kFcOptional | ::_fl::kInt64)},
+      // .air.db.v1.TenantEventType type = 2;
+      {PROTOBUF_FIELD_OFFSET(TenantChangeEvent, _impl_.type_), _Internal::kHasBitsOffset + 4, 0, (0 | ::_fl::kFcOptional | ::_fl::kOpenEnum)},
+      // .air.db.v1.TenantRouteResponse route = 3;
+      {PROTOBUF_FIELD_OFFSET(TenantChangeEvent, _impl_.route_), _Internal::kHasBitsOffset + 0, 0, (0 | ::_fl::kFcOptional | ::_fl::kMessage | ::_fl::kTvTable)},
+      // int64 fencing_epoch = 4;
+      {PROTOBUF_FIELD_OFFSET(TenantChangeEvent, _impl_.fencing_epoch_), _Internal::kHasBitsOffset + 2, 0, (0 | ::_fl::kFcOptional | ::_fl::kInt64)},
+      // int64 emitted_at_unix_ms = 5;
+      {PROTOBUF_FIELD_OFFSET(TenantChangeEvent, _impl_.emitted_at_unix_ms_), _Internal::kHasBitsOffset + 3, 0, (0 | ::_fl::kFcOptional | ::_fl::kInt64)},
+    }},
+    {{
+        #ifndef PROTOBUF_MESSAGE_GLOBALS
+        {::_pbi::TcParser::GetTable<::air::db::v1::TenantRouteResponse>()},
+        #else
+        {::_pbi::FieldAuxMessageGlobals(), &::air::db::v1::TenantRouteResponse_globals_},
+        #endif
+    }},
+    {{
+    }},
+  };
+}
+
+
+inline constexpr TenantChangeEvent::Impl_::Impl_(
+    [[maybe_unused]] ::google::protobuf::internal::InternalVisibility visibility,
+    ::_pbi::ConstantInitialized) noexcept
+      : _cached_size_{0},
+        route_{nullptr},
+        version_{::int64_t{0}},
+        fencing_epoch_{::int64_t{0}},
+        emitted_at_unix_ms_{::int64_t{0}},
+        type_{static_cast< ::air::db::v1::TenantEventType >(0)} {}
+
+template <typename>
+constexpr TenantChangeEvent::TenantChangeEvent(::_pbi::ConstantInitialized,
+                       const ::_pbi::ClassData* PROTOBUF_NONNULL class_data)
+    : ::google::protobuf::Message(
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+          class_data
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          ),
+      _impl_(internal_visibility(), ::_pbi::ConstantInitialized()) {
+}
+inline void* PROTOBUF_NONNULL TenantChangeEvent::PlacementNew_(
+    const void* PROTOBUF_NONNULL, void* PROTOBUF_NONNULL mem,
+    ::google::protobuf::Arena* PROTOBUF_NULLABLE arena) {
+  return ::new (mem) TenantChangeEvent(arena);
+}
+constexpr auto TenantChangeEvent::InternalNewImpl_() {
+  return ::google::protobuf::internal::MessageCreator::ZeroInit(sizeof(TenantChangeEvent), alignof(TenantChangeEvent));
+}
+constexpr auto TenantChangeEvent::InternalGenerateClassData_(
+    const MessageLite& prototype,
+    const ::google::protobuf::internal::TcParseTableBase* tc_table) {
+  return ::google::protobuf::internal::ClassDataFull{
+      ::google::protobuf::internal::ClassData{
+          &prototype,
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+          &_table_.header,
+#else
+          tc_table,
+#endif
+          nullptr,  // IsInitialized
+          &TenantChangeEvent::MergeImpl,
+          ::google::protobuf::Message::GetNewImpl<TenantChangeEvent>(),
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+          &TenantChangeEvent::SharedDtor,
+          ::google::protobuf::Message::GetClearImpl<TenantChangeEvent>(), &TenantChangeEvent::ByteSizeLong,
+              &TenantChangeEvent::_InternalSerialize,
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          PROTOBUF_FIELD_OFFSET(TenantChangeEvent, _impl_._cached_size_),
+          false,
+      },
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+      &file_reflection_data[10],
+#else   // !PROTOBUF_MESSAGE_GLOBALS
+      &::_pbi::kDescriptorMethods,
+      &descriptor_table_airdb_2eproto,
+      nullptr,  // tracker
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+  };
+}
+struct TenantChangeEventGlobalsTypeInternal : ::_pbi::MessageGlobalsBase {
+  constexpr TenantChangeEventGlobalsTypeInternal()
+      :
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+        _default(::_pbi::ConstantInitialized{},
+                 TenantChangeEvent_class_data_.base())
+#else   // !PROTOBUF_MESSAGE_GLOBALS
+        MessageGlobalsBase(TenantChangeEvent::InternalGenerateClassData_(
+            _default, &TenantChangeEvent_globals_._table.header)),
+        _default(::_pbi::ConstantInitialized{}, GetClassData()),
+        _table(::_pbi::PrivateAccess::GenerateParseTable<TenantChangeEvent>(
+            GetClassData()))
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+  {
+  }
+  ~TenantChangeEventGlobalsTypeInternal() {}
+  union {
+    alignas(::_pbi::kMaxMessageAlignment) TenantChangeEvent _default;
+  };
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+  decltype(::_pbi::PrivateAccess::GenerateParseTable<TenantChangeEvent>(
+      ::std::declval<const ::_pbi::ClassData*>())) _table;
+#endif
+};
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+static_assert(PROTOBUF_FIELD_OFFSET(TenantChangeEventGlobalsTypeInternal, _default) ==
+              ::_pbi::MessageGlobalsBase::OffsetToDefault());
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+
+PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
+    PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 PROTOBUF_MESSAGE_GLOBALS_CONST TenantChangeEventGlobalsTypeInternal TenantChangeEvent_globals_
+        PROTOBUF_MESSAGE_GLOBALS_SECTION(.data.rel.ro);
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+namespace {
+const ::_pbi::ClassData* TenantChangeEvent_get_class_data() {
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+  return TenantChangeEvent_globals_.GetClassData();
+#else
+  return TenantChangeEvent_class_data_.base();
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+}
+}  // namespace
+#endif  // PROTOBUF_CUSTOM_VTABLE
 class ListDatabasesResponse::_Internal {
  public:
   using HasBits = decltype(::std::declval<ListDatabasesResponse>()._impl_._has_bits_);
@@ -1395,11 +1868,11 @@ constexpr ListDatabasesResponse::ParseTableT_ ListDatabasesResponse::InternalGen
     {
       PROTOBUF_FIELD_OFFSET(ListDatabasesResponse, _impl_._has_bits_),
       0, // no _extensions_
-      1, 0,  // max_field_number, fast_idx_mask
+      2, 8,  // max_field_number, fast_idx_mask
       offsetof(ParseTableT_, field_lookup_table),
-      4294967294,  // skipmap
+      4294967292,  // skipmap
       offsetof(ParseTableT_, field_entries),
-      1,  // num_field_entries
+      2,  // num_field_entries
       1,  // num_aux_entries
       offsetof(ParseTableT_, aux_entries),
       class_data,
@@ -1409,6 +1882,10 @@ constexpr ListDatabasesResponse::ParseTableT_ ListDatabasesResponse::InternalGen
       ::_pbi::TcParser::GetTable<::air::db::v1::ListDatabasesResponse>(),  // to_prefetch
       #endif  // PROTOBUF_PREFETCH_PARSE_TABLE
     }, {{
+      // int64 snapshot_version = 2;
+      {::_pbi::TcParser::SingularVarintNoZag1<::uint64_t, offsetof(ListDatabasesResponse, _impl_.snapshot_version_), 1>(),
+       {16, 1, 0,
+        PROTOBUF_FIELD_OFFSET(ListDatabasesResponse, _impl_.snapshot_version_)}},
       // repeated .air.db.v1.DatabaseInfo databases = 1;
       {::_pbi::TcParser::FastMtR1,
        {10, 0, 0,
@@ -1418,6 +1895,8 @@ constexpr ListDatabasesResponse::ParseTableT_ ListDatabasesResponse::InternalGen
     }}, {{
       // repeated .air.db.v1.DatabaseInfo databases = 1;
       {PROTOBUF_FIELD_OFFSET(ListDatabasesResponse, _impl_.databases_), _Internal::kHasBitsOffset + 0, 0, (0 | ::_fl::kFcRepeated | ::_fl::kMessage | ::_fl::kTvTable)},
+      // int64 snapshot_version = 2;
+      {PROTOBUF_FIELD_OFFSET(ListDatabasesResponse, _impl_.snapshot_version_), _Internal::kHasBitsOffset + 1, 0, (0 | ::_fl::kFcOptional | ::_fl::kInt64)},
     }},
     {{
         #ifndef PROTOBUF_MESSAGE_GLOBALS
@@ -1440,7 +1919,8 @@ inline constexpr ListDatabasesResponse::Impl_::Impl_(
             ::air::db::v1::ListDatabasesResponse,
             PROTOBUF_FIELD_OFFSET(::air::db::v1::ListDatabasesResponse, _impl_.databases_)>()
          }
-     {}
+        ,
+        snapshot_version_{::int64_t{0}} {}
 
 template <typename>
 constexpr ListDatabasesResponse::ListDatabasesResponse(::_pbi::ConstantInitialized,
@@ -1537,8 +2017,8 @@ const ::_pbi::ClassData* ListDatabasesResponse_get_class_data() {
 }  // namespace v1
 }  // namespace db
 }  // namespace air
-static constexpr const ::_pb::EnumDescriptor* PROTOBUF_NONNULL* PROTOBUF_NULLABLE
-    file_level_enum_descriptors_airdb_2eproto = nullptr;
+static const ::_pb::EnumDescriptor* PROTOBUF_NONNULL
+    file_level_enum_descriptors_airdb_2eproto[1];
 static constexpr const ::_pb::ServiceDescriptor* PROTOBUF_NONNULL* PROTOBUF_NULLABLE
     file_level_service_descriptors_airdb_2eproto = nullptr;
 const ::uint32_t
@@ -1613,9 +2093,11 @@ const ::uint32_t
         0,
         0x081, // bitmap
         PROTOBUF_FIELD_OFFSET(::air::db::v1::ListDatabasesResponse, _impl_._has_bits_),
-        4, // hasbit index offset
+        5, // hasbit index offset
         PROTOBUF_FIELD_OFFSET(::air::db::v1::ListDatabasesResponse, _impl_.databases_),
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::ListDatabasesResponse, _impl_.snapshot_version_),
         0,
+        1,
         0x081, // bitmap
         PROTOBUF_FIELD_OFFSET(::air::db::v1::StatusResponse, _impl_._has_bits_),
         5, // hasbit index offset
@@ -1623,6 +2105,29 @@ const ::uint32_t
         PROTOBUF_FIELD_OFFSET(::air::db::v1::StatusResponse, _impl_.tenant_id_),
         0,
         1,
+        0x081, // bitmap
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::WatchTenantsRequest, _impl_._has_bits_),
+        4, // hasbit index offset
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::WatchTenantsRequest, _impl_.after_version_),
+        0,
+        0x081, // bitmap
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::TenantChangeEvent, _impl_._has_bits_),
+        8, // hasbit index offset
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::TenantChangeEvent, _impl_.version_),
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::TenantChangeEvent, _impl_.type_),
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::TenantChangeEvent, _impl_.route_),
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::TenantChangeEvent, _impl_.fencing_epoch_),
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::TenantChangeEvent, _impl_.emitted_at_unix_ms_),
+        1,
+        4,
+        0,
+        2,
+        3,
+        0x081, // bitmap
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::BatchTouchActivityRequest, _impl_._has_bits_),
+        4, // hasbit index offset
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::BatchTouchActivityRequest, _impl_.tenant_ids_),
+        0,
 };
 
 static const ::_pbi::MigrationSchema
@@ -1635,7 +2140,10 @@ static const ::_pbi::MigrationSchema
         {47, sizeof(::air::db::v1::DatabaseInfo)},
         {62, sizeof(::air::db::v1::ListDatabasesRequest)},
         {67, sizeof(::air::db::v1::ListDatabasesResponse)},
-        {72, sizeof(::air::db::v1::StatusResponse)},
+        {74, sizeof(::air::db::v1::StatusResponse)},
+        {81, sizeof(::air::db::v1::WatchTenantsRequest)},
+        {86, sizeof(::air::db::v1::TenantChangeEvent)},
+        {99, sizeof(::air::db::v1::BatchTouchActivityRequest)},
 };
 static const ::_pbi::MessageGlobalsBase* PROTOBUF_NONNULL const
     file_message_globals[] = {
@@ -1648,6 +2156,9 @@ static const ::_pbi::MessageGlobalsBase* PROTOBUF_NONNULL const
         &::air::db::v1::ListDatabasesRequest_globals_,
         &::air::db::v1::ListDatabasesResponse_globals_,
         &::air::db::v1::StatusResponse_globals_,
+        &::air::db::v1::WatchTenantsRequest_globals_,
+        &::air::db::v1::TenantChangeEvent_globals_,
+        &::air::db::v1::BatchTouchActivityRequest_globals_,
 };
 const char descriptor_table_protodef_airdb_2eproto[] ABSL_ATTRIBUTE_SECTION_VARIABLE(
     protodesc_cold) = {
@@ -1666,44 +2177,59 @@ const char descriptor_table_protodef_airdb_2eproto[] ABSL_ATTRIBUTE_SECTION_VARI
     "\022\023\n\013direct_port\030\003 \001(\005\022\031\n\021system_identifi"
     "er\030\004 \001(\t\022\025\n\rfencing_epoch\030\005 \001(\003\022\r\n\005state"
     "\030\006 \001(\t\"*\n\024ListDatabasesRequest\022\022\n\naccoun"
-    "t_id\030\001 \001(\t\"C\n\025ListDatabasesResponse\022*\n\td"
-    "atabases\030\001 \003(\0132\027.air.db.v1.DatabaseInfo\""
-    "3\n\016StatusResponse\022\016\n\006status\030\001 \001(\t\022\021\n\tten"
-    "ant_id\030\002 \001(\t2\262\006\n\014AirDBControl\022J\n\016GetTena"
-    "ntRoute\022\030.air.db.v1.TenantRequest\032\036.air."
-    "db.v1.TenantRouteResponse\022F\n\nWakeTenant\022"
-    "\030.air.db.v1.TenantRequest\032\036.air.db.v1.Te"
-    "nantRouteResponse\022;\n\rTouchActivity\022\030.air"
-    ".db.v1.TenantRequest\032\020.air.db.v1.Empty\022U"
-    "\n\016CreateDatabase\022 .air.db.v1.CreateDatab"
-    "aseRequest\032!.air.db.v1.CreateDatabaseRes"
-    "ponse\022R\n\rListDatabases\022\037.air.db.v1.ListD"
-    "atabasesRequest\032 .air.db.v1.ListDatabase"
-    "sResponse\022@\n\013GetDatabase\022\030.air.db.v1.Ten"
-    "antRequest\032\027.air.db.v1.DatabaseInfo\022E\n\016D"
-    "eleteDatabase\022\030.air.db.v1.TenantRequest\032"
-    "\031.air.db.v1.StatusResponse\022F\n\017SuspendDat"
-    "abase\022\030.air.db.v1.TenantRequest\032\031.air.db"
-    ".v1.StatusResponse\022I\n\rStartDatabase\022\030.ai"
-    "r.db.v1.TenantRequest\032\036.air.db.v1.Tenant"
-    "RouteResponse\022C\n\014LockDatabase\022\030.air.db.v"
-    "1.TenantRequest\032\031.air.db.v1.StatusRespon"
-    "se\022E\n\016UnlockDatabase\022\030.air.db.v1.TenantR"
-    "equest\032\031.air.db.v1.StatusResponseB+Z)git"
-    "hub.com/Mahadi-rsio/air/internal/pb;pbb\006"
-    "proto3"
+    "t_id\030\001 \001(\t\"]\n\025ListDatabasesResponse\022*\n\td"
+    "atabases\030\001 \003(\0132\027.air.db.v1.DatabaseInfo\022"
+    "\030\n\020snapshot_version\030\002 \001(\003\"3\n\016StatusRespo"
+    "nse\022\016\n\006status\030\001 \001(\t\022\021\n\ttenant_id\030\002 \001(\t\","
+    "\n\023WatchTenantsRequest\022\025\n\rafter_version\030\001"
+    " \001(\003\"\260\001\n\021TenantChangeEvent\022\017\n\007version\030\001 "
+    "\001(\003\022(\n\004type\030\002 \001(\0162\032.air.db.v1.TenantEven"
+    "tType\022-\n\005route\030\003 \001(\0132\036.air.db.v1.TenantR"
+    "outeResponse\022\025\n\rfencing_epoch\030\004 \001(\003\022\032\n\022e"
+    "mitted_at_unix_ms\030\005 \001(\003\"/\n\031BatchTouchAct"
+    "ivityRequest\022\022\n\ntenant_ids\030\001 \003(\t*\203\001\n\017Ten"
+    "antEventType\022\034\n\030TENANT_EVENT_UNSPECIFIED"
+    "\020\000\022\027\n\023TENANT_EVENT_UPSERT\020\001\022\027\n\023TENANT_EV"
+    "ENT_DELETE\020\002\022 \n\034TENANT_EVENT_RESYNC_REQU"
+    "IRED\020\0032\326\007\n\014AirDBControl\022J\n\016GetTenantRout"
+    "e\022\030.air.db.v1.TenantRequest\032\036.air.db.v1."
+    "TenantRouteResponse\022F\n\nWakeTenant\022\030.air."
+    "db.v1.TenantRequest\032\036.air.db.v1.TenantRo"
+    "uteResponse\022;\n\rTouchActivity\022\030.air.db.v1"
+    ".TenantRequest\032\020.air.db.v1.Empty\022L\n\022Batc"
+    "hTouchActivity\022$.air.db.v1.BatchTouchAct"
+    "ivityRequest\032\020.air.db.v1.Empty\022T\n\022WatchT"
+    "enantChanges\022\036.air.db.v1.WatchTenantsReq"
+    "uest\032\034.air.db.v1.TenantChangeEvent0\001\022U\n\016"
+    "CreateDatabase\022 .air.db.v1.CreateDatabas"
+    "eRequest\032!.air.db.v1.CreateDatabaseRespo"
+    "nse\022R\n\rListDatabases\022\037.air.db.v1.ListDat"
+    "abasesRequest\032 .air.db.v1.ListDatabasesR"
+    "esponse\022@\n\013GetDatabase\022\030.air.db.v1.Tenan"
+    "tRequest\032\027.air.db.v1.DatabaseInfo\022E\n\016Del"
+    "eteDatabase\022\030.air.db.v1.TenantRequest\032\031."
+    "air.db.v1.StatusResponse\022F\n\017SuspendDatab"
+    "ase\022\030.air.db.v1.TenantRequest\032\031.air.db.v"
+    "1.StatusResponse\022I\n\rStartDatabase\022\030.air."
+    "db.v1.TenantRequest\032\036.air.db.v1.TenantRo"
+    "uteResponse\022C\n\014LockDatabase\022\030.air.db.v1."
+    "TenantRequest\032\031.air.db.v1.StatusResponse"
+    "\022E\n\016UnlockDatabase\022\030.air.db.v1.TenantReq"
+    "uest\032\031.air.db.v1.StatusResponseB+Z)githu"
+    "b.com/Mahadi-rsio/air/internal/pb;pbb\006pr"
+    "oto3"
 };
 static ::absl::once_flag descriptor_table_airdb_2eproto_once;
 PROTOBUF_CONSTINIT const ::_pbi::DescriptorTable descriptor_table_airdb_2eproto = {
     false,
     false,
-    1606,
+    2204,
     descriptor_table_protodef_airdb_2eproto,
     "airdb.proto",
     &descriptor_table_airdb_2eproto_once,
     nullptr,
     0,
-    9,
+    12,
     schemas,
     file_message_globals,
     TableStruct_airdb_2eproto::offsets,
@@ -1713,6 +2239,13 @@ PROTOBUF_CONSTINIT const ::_pbi::DescriptorTable descriptor_table_airdb_2eproto 
 namespace air {
 namespace db {
 namespace v1 {
+[[nodiscard]] const ::google::protobuf::EnumDescriptor* PROTOBUF_NONNULL
+TenantEventType_descriptor() {
+  ::google::protobuf::internal::AssignDescriptors(&descriptor_table_airdb_2eproto);
+  return file_level_enum_descriptors_airdb_2eproto[0];
+}
+PROTOBUF_CONSTINIT const uint32_t TenantEventType_internal_data_[] = {
+    262144u, 0u, };
 // ===================================================================
 
 Empty::Empty(::google::protobuf::Arena* PROTOBUF_NULLABLE arena)
@@ -3697,6 +4230,7 @@ ListDatabasesResponse::ListDatabasesResponse(
   _internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
       from._internal_metadata_);
   new (&_impl_) Impl_(internal_visibility(), arena, from._impl_, from);
+  _impl_.snapshot_version_ = from._impl_.snapshot_version_;
 
   // @@protoc_insertion_point(copy_constructor:air.db.v1.ListDatabasesResponse)
 }
@@ -3712,6 +4246,7 @@ PROTOBUF_NDEBUG_INLINE ListDatabasesResponse::Impl_::Impl_(
 
 inline void ListDatabasesResponse::SharedCtor(::_pb::Arena* PROTOBUF_NULLABLE arena) {
   new (&_impl_) Impl_(internal_visibility(), arena);
+  _impl_.snapshot_version_ = {};
 }
 ListDatabasesResponse::~ListDatabasesResponse() {
   // @@protoc_insertion_point(destructor:air.db.v1.ListDatabasesResponse)
@@ -3764,6 +4299,7 @@ PROTOBUF_NOINLINE void ListDatabasesResponse::Clear() {
   if (CheckHasBit(cached_has_bits, 0x00000001U)) {
     _impl_.databases_.Clear();
   }
+  _impl_.snapshot_version_ = ::int64_t{0};
   _impl_._has_bits_.Clear();
   _internal_metadata_.Clear<::google::protobuf::UnknownFieldSet>();
 }
@@ -3800,6 +4336,15 @@ PROTOBUF_NOINLINE void ListDatabasesResponse::Clear() {
     }
   }
 
+  // int64 snapshot_version = 2;
+  if (CheckHasBit(cached_has_bits, 0x00000002U)) {
+    if (this_._internal_snapshot_version() != 0) {
+      target =
+          ::google::protobuf::internal::WireFormatLite::WriteInt64ToArrayWithField<2>(
+              stream, this_._internal_snapshot_version(), target);
+    }
+  }
+
   if (ABSL_PREDICT_FALSE(this_._internal_metadata_.have_unknown_fields())) {
     target =
         ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
@@ -3824,13 +4369,20 @@ PROTOBUF_NOINLINE void ListDatabasesResponse::Clear() {
   (void)cached_has_bits;
 
   ::_pbi::Prefetch5LinesFrom7Lines(&this_);
-   {
+  cached_has_bits = this_._impl_._has_bits_[0];
+  if (BatchCheckHasBit(cached_has_bits, 0x00000003U)) {
     // repeated .air.db.v1.DatabaseInfo databases = 1;
-    cached_has_bits = this_._impl_._has_bits_[0];
     if (CheckHasBit(cached_has_bits, 0x00000001U)) {
       total_size += 1UL * this_._internal_databases_size();
       for (const auto& msg : this_._internal_databases()) {
         total_size += ::google::protobuf::internal::WireFormatLite::MessageSize(msg);
+      }
+    }
+    // int64 snapshot_version = 2;
+    if (CheckHasBit(cached_has_bits, 0x00000002U)) {
+      if (this_._internal_snapshot_version() != 0) {
+        total_size += ::_pbi::WireFormatLite::Int64SizePlusOne(
+            this_._internal_snapshot_version());
       }
     }
   }
@@ -3852,10 +4404,17 @@ void ListDatabasesResponse::MergeImpl(::google::protobuf::MessageLite& to_msg,
   (void)cached_has_bits;
 
   cached_has_bits = from._impl_._has_bits_[0];
-  if (CheckHasBit(cached_has_bits, 0x00000001U)) {
-    _this->_internal_mutable_databases()->InternalMergeFromWithArena(
-        ::google::protobuf::MessageLite::internal_visibility(), arena,
-        from._internal_databases());
+  if (BatchCheckHasBit(cached_has_bits, 0x00000003U)) {
+    if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+      _this->_internal_mutable_databases()->InternalMergeFromWithArena(
+          ::google::protobuf::MessageLite::internal_visibility(), arena,
+          from._internal_databases());
+    }
+    if (CheckHasBit(cached_has_bits, 0x00000002U)) {
+      if (from._internal_snapshot_version() != 0) {
+        _this->_impl_.snapshot_version_ = from._impl_.snapshot_version_;
+      }
+    }
   }
   _this->_impl_._has_bits_[0] |= cached_has_bits;
   _this->_internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
@@ -3875,6 +4434,7 @@ void ListDatabasesResponse::InternalSwap(ListDatabasesResponse* PROTOBUF_RESTRIC
   _internal_metadata_.InternalSwap(&other->_internal_metadata_);
   swap(_impl_._has_bits_[0], other->_impl_._has_bits_[0]);
   _impl_.databases_.InternalSwap(&other->_impl_.databases_);
+  swap(_impl_.snapshot_version_, other->_impl_.snapshot_version_);
 }
 
 ::google::protobuf::Metadata ListDatabasesResponse::GetMetadata() const {
@@ -4130,6 +4690,736 @@ void StatusResponse::InternalSwap(StatusResponse* PROTOBUF_RESTRICT PROTOBUF_NON
 }
 
 ::google::protobuf::Metadata StatusResponse::GetMetadata() const {
+  return ::google::protobuf::Message::GetMetadataImpl(GetClassData()->full());
+}
+// ===================================================================
+
+WatchTenantsRequest::WatchTenantsRequest(::google::protobuf::Arena* PROTOBUF_NULLABLE arena)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, WatchTenantsRequest_get_class_data()) {
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  SharedCtor(arena);
+  // @@protoc_insertion_point(arena_constructor:air.db.v1.WatchTenantsRequest)
+}
+WatchTenantsRequest::WatchTenantsRequest(
+    ::google::protobuf::Arena* PROTOBUF_NULLABLE arena, const WatchTenantsRequest& from)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, WatchTenantsRequest_get_class_data()),
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena),
+#endif  // PROTOBUF_CUSTOM_VTABLE
+      _impl_(from._impl_) {
+  _internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
+      from._internal_metadata_);
+}
+PROTOBUF_NDEBUG_INLINE WatchTenantsRequest::Impl_::Impl_(
+    [[maybe_unused]] ::google::protobuf::internal::InternalVisibility visibility,
+    [[maybe_unused]] ::google::protobuf::Arena* PROTOBUF_NULLABLE arena)
+      : _cached_size_{0} {}
+
+inline void WatchTenantsRequest::SharedCtor(::_pb::Arena* PROTOBUF_NULLABLE arena) {
+  new (&_impl_) Impl_(internal_visibility(), arena);
+  _impl_.after_version_ = {};
+}
+WatchTenantsRequest::~WatchTenantsRequest() {
+  // @@protoc_insertion_point(destructor:air.db.v1.WatchTenantsRequest)
+  SharedDtor(*this);
+}
+inline void WatchTenantsRequest::SharedDtor(MessageLite& self) {
+  WatchTenantsRequest& this_ = static_cast<WatchTenantsRequest&>(self);
+  if constexpr (::_pbi::DebugHardenCheckHasBitConsistency()) {
+    this_.CheckHasBitConsistency();
+  }
+  this_._internal_metadata_.Delete<::google::protobuf::UnknownFieldSet>();
+  ABSL_DCHECK(this_.GetArena() == nullptr);
+  this_._impl_.~Impl_();
+}
+
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 const
+    ::google::protobuf::internal::ClassDataFull WatchTenantsRequest_class_data_ =
+        WatchTenantsRequest::InternalGenerateClassData_(WatchTenantsRequest_globals_._default);
+
+PROTOBUF_ATTRIBUTE_WEAK const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL
+WatchTenantsRequest::GetClassData() const {
+  ::google::protobuf::internal::PrefetchToLocalCache(&WatchTenantsRequest_class_data_);
+  ::google::protobuf::internal::PrefetchToLocalCache(WatchTenantsRequest_class_data_.tc_table);
+  return WatchTenantsRequest_class_data_.base();
+}
+#else
+PROTOBUF_ATTRIBUTE_WEAK const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL
+WatchTenantsRequest::GetClassData() const {
+  ::google::protobuf::internal::PrefetchToLocalCache(&WatchTenantsRequest_globals_);
+  ::google::protobuf::internal::PrefetchToLocalCache(
+      ::google::protobuf::internal::MessageGlobalsBase::ToParseTableBase(&WatchTenantsRequest_globals_));
+  return WatchTenantsRequest_globals_.GetClassData();
+}
+#endif  // !PROTOBUF_MESSAGE_GLOBALS
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+PROTOBUF_CONSTINIT
+PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 const WatchTenantsRequest::ParseTableT_
+    WatchTenantsRequest::_table_ =
+        WatchTenantsRequest::InternalGenerateParseTable_(WatchTenantsRequest_class_data_.base());
+#endif  // !PROTOBUF_MESSAGE_GLOBALS
+PROTOBUF_NOINLINE void WatchTenantsRequest::Clear() {
+// @@protoc_insertion_point(message_clear_start:air.db.v1.WatchTenantsRequest)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void) cached_has_bits;
+
+  _impl_.after_version_ = ::int64_t{0};
+  _impl_._has_bits_.Clear();
+  _internal_metadata_.Clear<::google::protobuf::UnknownFieldSet>();
+}
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+::uint8_t* PROTOBUF_NONNULL WatchTenantsRequest::_InternalSerialize(
+    const ::google::protobuf::MessageLite& base, ::uint8_t* PROTOBUF_NONNULL target,
+    ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) {
+  const WatchTenantsRequest& this_ = static_cast<const WatchTenantsRequest&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+::uint8_t* PROTOBUF_NONNULL WatchTenantsRequest::_InternalSerialize(
+    ::uint8_t* PROTOBUF_NONNULL target,
+    ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) const {
+  const WatchTenantsRequest& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  if constexpr (::_pbi::DebugHardenCheckHasBitConsistency()) {
+    this_.CheckHasBitConsistency();
+  }
+  // @@protoc_insertion_point(serialize_to_array_start:air.db.v1.WatchTenantsRequest)
+  ::uint32_t cached_has_bits = 0;
+  (void)cached_has_bits;
+
+  cached_has_bits = this_._impl_._has_bits_[0];
+  // int64 after_version = 1;
+  if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+    if (this_._internal_after_version() != 0) {
+      target =
+          ::google::protobuf::internal::WireFormatLite::WriteInt64ToArrayWithField<1>(
+              stream, this_._internal_after_version(), target);
+    }
+  }
+
+  if (ABSL_PREDICT_FALSE(this_._internal_metadata_.have_unknown_fields())) {
+    target =
+        ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
+            this_._internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance), target, stream);
+  }
+  // @@protoc_insertion_point(serialize_to_array_end:air.db.v1.WatchTenantsRequest)
+  return target;
+}
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+::size_t WatchTenantsRequest::ByteSizeLong(const MessageLite& base) {
+  const WatchTenantsRequest& this_ = static_cast<const WatchTenantsRequest&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+::size_t WatchTenantsRequest::ByteSizeLong() const {
+  const WatchTenantsRequest& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  // @@protoc_insertion_point(message_byte_size_start:air.db.v1.WatchTenantsRequest)
+  ::size_t total_size = 0;
+
+  ::uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void)cached_has_bits;
+
+   {
+    // int64 after_version = 1;
+    cached_has_bits = this_._impl_._has_bits_[0];
+    if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+      if (this_._internal_after_version() != 0) {
+        total_size += ::_pbi::WireFormatLite::Int64SizePlusOne(
+            this_._internal_after_version());
+      }
+    }
+  }
+  return this_.MaybeComputeUnknownFieldsSize(total_size,
+                                             &this_._impl_._cached_size_);
+}
+
+void WatchTenantsRequest::MergeImpl(::google::protobuf::MessageLite& to_msg,
+                      const ::google::protobuf::MessageLite& from_msg) {
+   auto* const _this = static_cast<WatchTenantsRequest*>(&to_msg);
+  auto& from = static_cast<const WatchTenantsRequest&>(from_msg);
+  if constexpr (::_pbi::DebugHardenCheckHasBitConsistency()) {
+    from.CheckHasBitConsistency();
+  }
+  // @@protoc_insertion_point(class_specific_merge_from_start:air.db.v1.WatchTenantsRequest)
+  ABSL_DCHECK_NE(&from, _this);
+  ::uint32_t cached_has_bits = 0;
+  (void)cached_has_bits;
+
+  cached_has_bits = from._impl_._has_bits_[0];
+  if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+    if (from._internal_after_version() != 0) {
+      _this->_impl_.after_version_ = from._impl_.after_version_;
+    }
+  }
+  _this->_impl_._has_bits_[0] |= cached_has_bits;
+  _this->_internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
+      from._internal_metadata_);
+}
+
+void WatchTenantsRequest::CopyFrom(const WatchTenantsRequest& from) {
+  // @@protoc_insertion_point(class_specific_copy_from_start:air.db.v1.WatchTenantsRequest)
+  if (&from == this) return;
+  Clear();
+  MergeFrom(from);
+}
+
+
+void WatchTenantsRequest::InternalSwap(WatchTenantsRequest* PROTOBUF_RESTRICT PROTOBUF_NONNULL other) {
+  using ::std::swap;
+  _internal_metadata_.InternalSwap(&other->_internal_metadata_);
+  swap(_impl_._has_bits_[0], other->_impl_._has_bits_[0]);
+  swap(_impl_.after_version_, other->_impl_.after_version_);
+}
+
+::google::protobuf::Metadata WatchTenantsRequest::GetMetadata() const {
+  return ::google::protobuf::Message::GetMetadataImpl(GetClassData()->full());
+}
+// ===================================================================
+
+TenantChangeEvent::TenantChangeEvent(::google::protobuf::Arena* PROTOBUF_NULLABLE arena)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, TenantChangeEvent_get_class_data()) {
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  SharedCtor(arena);
+  // @@protoc_insertion_point(arena_constructor:air.db.v1.TenantChangeEvent)
+}
+PROTOBUF_NDEBUG_INLINE TenantChangeEvent::Impl_::Impl_(
+    [[maybe_unused]] ::google::protobuf::internal::InternalVisibility visibility,
+    [[maybe_unused]] ::google::protobuf::Arena* PROTOBUF_NULLABLE arena, const Impl_& from,
+    [[maybe_unused]] const ::air::db::v1::TenantChangeEvent& from_msg)
+      : _has_bits_{from._has_bits_},
+        _cached_size_{0} {}
+
+TenantChangeEvent::TenantChangeEvent(
+    ::google::protobuf::Arena* PROTOBUF_NULLABLE arena,
+    const TenantChangeEvent& from)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, TenantChangeEvent_get_class_data()) {
+
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  TenantChangeEvent* const _this = this;
+  (void)_this;
+  _internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
+      from._internal_metadata_);
+  new (&_impl_) Impl_(internal_visibility(), arena, from._impl_, from);
+  ::uint32_t cached_has_bits = _impl_._has_bits_[0];
+  _impl_.route_ = (CheckHasBit(cached_has_bits, 0x00000001U))
+                ? ::google::protobuf::Message::CopyConstruct(arena, *from._impl_.route_)
+                : nullptr;
+  ::memcpy(reinterpret_cast<char*>(&_impl_) +
+               offsetof(Impl_, version_),
+           reinterpret_cast<const char*>(&from._impl_) +
+               offsetof(Impl_, version_),
+           offsetof(Impl_, type_) -
+               offsetof(Impl_, version_) +
+               sizeof(Impl_::type_));
+
+  // @@protoc_insertion_point(copy_constructor:air.db.v1.TenantChangeEvent)
+}
+PROTOBUF_NDEBUG_INLINE TenantChangeEvent::Impl_::Impl_(
+    [[maybe_unused]] ::google::protobuf::internal::InternalVisibility visibility,
+    [[maybe_unused]] ::google::protobuf::Arena* PROTOBUF_NULLABLE arena)
+      : _cached_size_{0} {}
+
+inline void TenantChangeEvent::SharedCtor(::_pb::Arena* PROTOBUF_NULLABLE arena) {
+  new (&_impl_) Impl_(internal_visibility(), arena);
+  ::memset(reinterpret_cast<char*>(&_impl_) +
+               offsetof(Impl_, route_),
+           0,
+           offsetof(Impl_, type_) -
+               offsetof(Impl_, route_) +
+               sizeof(Impl_::type_));
+}
+TenantChangeEvent::~TenantChangeEvent() {
+  // @@protoc_insertion_point(destructor:air.db.v1.TenantChangeEvent)
+  SharedDtor(*this);
+}
+inline void TenantChangeEvent::SharedDtor(MessageLite& self) {
+  TenantChangeEvent& this_ = static_cast<TenantChangeEvent&>(self);
+  if constexpr (::_pbi::DebugHardenCheckHasBitConsistency()) {
+    this_.CheckHasBitConsistency();
+  }
+  this_._internal_metadata_.Delete<::google::protobuf::UnknownFieldSet>();
+  ABSL_DCHECK(this_.GetArena() == nullptr);
+  delete this_._impl_.route_;
+  this_._impl_.~Impl_();
+}
+
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 const
+    ::google::protobuf::internal::ClassDataFull TenantChangeEvent_class_data_ =
+        TenantChangeEvent::InternalGenerateClassData_(TenantChangeEvent_globals_._default);
+
+PROTOBUF_ATTRIBUTE_WEAK const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL
+TenantChangeEvent::GetClassData() const {
+  ::google::protobuf::internal::PrefetchToLocalCache(&TenantChangeEvent_class_data_);
+  ::google::protobuf::internal::PrefetchToLocalCache(TenantChangeEvent_class_data_.tc_table);
+  return TenantChangeEvent_class_data_.base();
+}
+#else
+PROTOBUF_ATTRIBUTE_WEAK const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL
+TenantChangeEvent::GetClassData() const {
+  ::google::protobuf::internal::PrefetchToLocalCache(&TenantChangeEvent_globals_);
+  ::google::protobuf::internal::PrefetchToLocalCache(
+      ::google::protobuf::internal::MessageGlobalsBase::ToParseTableBase(&TenantChangeEvent_globals_));
+  return TenantChangeEvent_globals_.GetClassData();
+}
+#endif  // !PROTOBUF_MESSAGE_GLOBALS
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+PROTOBUF_CONSTINIT
+PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 const TenantChangeEvent::ParseTableT_
+    TenantChangeEvent::_table_ =
+        TenantChangeEvent::InternalGenerateParseTable_(TenantChangeEvent_class_data_.base());
+#endif  // !PROTOBUF_MESSAGE_GLOBALS
+PROTOBUF_NOINLINE void TenantChangeEvent::Clear() {
+// @@protoc_insertion_point(message_clear_start:air.db.v1.TenantChangeEvent)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void) cached_has_bits;
+
+  cached_has_bits = _impl_._has_bits_[0];
+  if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+    ABSL_DCHECK(_impl_.route_ != nullptr);
+    _impl_.route_->Clear();
+  }
+  if (BatchCheckHasBit(cached_has_bits, 0x0000001eU)) {
+    ::memset(&_impl_.version_, 0, static_cast<::size_t>(
+        reinterpret_cast<char*>(&_impl_.type_) -
+        reinterpret_cast<char*>(&_impl_.version_)) + sizeof(_impl_.type_));
+  }
+  _impl_._has_bits_.Clear();
+  _internal_metadata_.Clear<::google::protobuf::UnknownFieldSet>();
+}
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+::uint8_t* PROTOBUF_NONNULL TenantChangeEvent::_InternalSerialize(
+    const ::google::protobuf::MessageLite& base, ::uint8_t* PROTOBUF_NONNULL target,
+    ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) {
+  const TenantChangeEvent& this_ = static_cast<const TenantChangeEvent&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+::uint8_t* PROTOBUF_NONNULL TenantChangeEvent::_InternalSerialize(
+    ::uint8_t* PROTOBUF_NONNULL target,
+    ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) const {
+  const TenantChangeEvent& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  if constexpr (::_pbi::DebugHardenCheckHasBitConsistency()) {
+    this_.CheckHasBitConsistency();
+  }
+  // @@protoc_insertion_point(serialize_to_array_start:air.db.v1.TenantChangeEvent)
+  ::uint32_t cached_has_bits = 0;
+  (void)cached_has_bits;
+
+  cached_has_bits = this_._impl_._has_bits_[0];
+  // int64 version = 1;
+  if (CheckHasBit(cached_has_bits, 0x00000002U)) {
+    if (this_._internal_version() != 0) {
+      target =
+          ::google::protobuf::internal::WireFormatLite::WriteInt64ToArrayWithField<1>(
+              stream, this_._internal_version(), target);
+    }
+  }
+
+  // .air.db.v1.TenantEventType type = 2;
+  if (CheckHasBit(cached_has_bits, 0x00000010U)) {
+    if (this_._internal_type() != 0) {
+      target = stream->EnsureSpace(target);
+      target = ::_pbi::WireFormatLite::WriteEnumToArray(
+          2, this_._internal_type(), target);
+    }
+  }
+
+  // .air.db.v1.TenantRouteResponse route = 3;
+  if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+    target = ::google::protobuf::internal::WireFormatLite::InternalWriteMessage(
+        3, *this_._impl_.route_, this_._impl_.route_->GetCachedSize(), target,
+        stream);
+  }
+
+  // int64 fencing_epoch = 4;
+  if (CheckHasBit(cached_has_bits, 0x00000004U)) {
+    if (this_._internal_fencing_epoch() != 0) {
+      target =
+          ::google::protobuf::internal::WireFormatLite::WriteInt64ToArrayWithField<4>(
+              stream, this_._internal_fencing_epoch(), target);
+    }
+  }
+
+  // int64 emitted_at_unix_ms = 5;
+  if (CheckHasBit(cached_has_bits, 0x00000008U)) {
+    if (this_._internal_emitted_at_unix_ms() != 0) {
+      target =
+          ::google::protobuf::internal::WireFormatLite::WriteInt64ToArrayWithField<5>(
+              stream, this_._internal_emitted_at_unix_ms(), target);
+    }
+  }
+
+  if (ABSL_PREDICT_FALSE(this_._internal_metadata_.have_unknown_fields())) {
+    target =
+        ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
+            this_._internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance), target, stream);
+  }
+  // @@protoc_insertion_point(serialize_to_array_end:air.db.v1.TenantChangeEvent)
+  return target;
+}
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+::size_t TenantChangeEvent::ByteSizeLong(const MessageLite& base) {
+  const TenantChangeEvent& this_ = static_cast<const TenantChangeEvent&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+::size_t TenantChangeEvent::ByteSizeLong() const {
+  const TenantChangeEvent& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  // @@protoc_insertion_point(message_byte_size_start:air.db.v1.TenantChangeEvent)
+  ::size_t total_size = 0;
+
+  ::uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void)cached_has_bits;
+
+  ::_pbi::Prefetch5LinesFrom7Lines(&this_);
+  cached_has_bits = this_._impl_._has_bits_[0];
+  if (BatchCheckHasBit(cached_has_bits, 0x0000001fU)) {
+    // .air.db.v1.TenantRouteResponse route = 3;
+    if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+      total_size += 1 +
+                    ::google::protobuf::internal::WireFormatLite::MessageSize(*this_._impl_.route_);
+    }
+    // int64 version = 1;
+    if (CheckHasBit(cached_has_bits, 0x00000002U)) {
+      if (this_._internal_version() != 0) {
+        total_size += ::_pbi::WireFormatLite::Int64SizePlusOne(
+            this_._internal_version());
+      }
+    }
+    // int64 fencing_epoch = 4;
+    if (CheckHasBit(cached_has_bits, 0x00000004U)) {
+      if (this_._internal_fencing_epoch() != 0) {
+        total_size += ::_pbi::WireFormatLite::Int64SizePlusOne(
+            this_._internal_fencing_epoch());
+      }
+    }
+    // int64 emitted_at_unix_ms = 5;
+    if (CheckHasBit(cached_has_bits, 0x00000008U)) {
+      if (this_._internal_emitted_at_unix_ms() != 0) {
+        total_size += ::_pbi::WireFormatLite::Int64SizePlusOne(
+            this_._internal_emitted_at_unix_ms());
+      }
+    }
+    // .air.db.v1.TenantEventType type = 2;
+    if (CheckHasBit(cached_has_bits, 0x00000010U)) {
+      if (this_._internal_type() != 0) {
+        total_size += 1 +
+                      ::_pbi::WireFormatLite::EnumSize(this_._internal_type());
+      }
+    }
+  }
+  return this_.MaybeComputeUnknownFieldsSize(total_size,
+                                             &this_._impl_._cached_size_);
+}
+
+void TenantChangeEvent::MergeImpl(::google::protobuf::MessageLite& to_msg,
+                      const ::google::protobuf::MessageLite& from_msg) {
+   auto* const _this = static_cast<TenantChangeEvent*>(&to_msg);
+  auto& from = static_cast<const TenantChangeEvent&>(from_msg);
+  if constexpr (::_pbi::DebugHardenCheckHasBitConsistency()) {
+    from.CheckHasBitConsistency();
+  }
+  ::google::protobuf::Arena* arena = _this->GetArena();
+  // @@protoc_insertion_point(class_specific_merge_from_start:air.db.v1.TenantChangeEvent)
+  ABSL_DCHECK_NE(&from, _this);
+  ::uint32_t cached_has_bits = 0;
+  (void)cached_has_bits;
+
+  cached_has_bits = from._impl_._has_bits_[0];
+  if (BatchCheckHasBit(cached_has_bits, 0x0000001fU)) {
+    if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+      ABSL_DCHECK(from._impl_.route_ != nullptr);
+      if (_this->_impl_.route_ == nullptr) {
+        _this->_impl_.route_ = ::google::protobuf::Message::CopyConstruct(arena, *from._impl_.route_);
+      } else {
+        _this->_impl_.route_->MergeFrom(*from._impl_.route_);
+      }
+    }
+    if (CheckHasBit(cached_has_bits, 0x00000002U)) {
+      if (from._internal_version() != 0) {
+        _this->_impl_.version_ = from._impl_.version_;
+      }
+    }
+    if (CheckHasBit(cached_has_bits, 0x00000004U)) {
+      if (from._internal_fencing_epoch() != 0) {
+        _this->_impl_.fencing_epoch_ = from._impl_.fencing_epoch_;
+      }
+    }
+    if (CheckHasBit(cached_has_bits, 0x00000008U)) {
+      if (from._internal_emitted_at_unix_ms() != 0) {
+        _this->_impl_.emitted_at_unix_ms_ = from._impl_.emitted_at_unix_ms_;
+      }
+    }
+    if (CheckHasBit(cached_has_bits, 0x00000010U)) {
+      if (from._internal_type() != 0) {
+        _this->_impl_.type_ = from._impl_.type_;
+      }
+    }
+  }
+  _this->_impl_._has_bits_[0] |= cached_has_bits;
+  _this->_internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
+      from._internal_metadata_);
+}
+
+void TenantChangeEvent::CopyFrom(const TenantChangeEvent& from) {
+  // @@protoc_insertion_point(class_specific_copy_from_start:air.db.v1.TenantChangeEvent)
+  if (&from == this) return;
+  Clear();
+  MergeFrom(from);
+}
+
+
+void TenantChangeEvent::InternalSwap(TenantChangeEvent* PROTOBUF_RESTRICT PROTOBUF_NONNULL other) {
+  using ::std::swap;
+  _internal_metadata_.InternalSwap(&other->_internal_metadata_);
+  swap(_impl_._has_bits_[0], other->_impl_._has_bits_[0]);
+  ::google::protobuf::internal::memswap<
+      PROTOBUF_FIELD_OFFSET(TenantChangeEvent, _impl_.type_)
+      + sizeof(TenantChangeEvent::_impl_.type_)
+      - PROTOBUF_FIELD_OFFSET(TenantChangeEvent, _impl_.route_)>(
+          reinterpret_cast<char*>(&_impl_.route_),
+          reinterpret_cast<char*>(&other->_impl_.route_));
+}
+
+::google::protobuf::Metadata TenantChangeEvent::GetMetadata() const {
+  return ::google::protobuf::Message::GetMetadataImpl(GetClassData()->full());
+}
+// ===================================================================
+
+BatchTouchActivityRequest::BatchTouchActivityRequest(::google::protobuf::Arena* PROTOBUF_NULLABLE arena)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, BatchTouchActivityRequest_get_class_data()) {
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  SharedCtor(arena);
+  // @@protoc_insertion_point(arena_constructor:air.db.v1.BatchTouchActivityRequest)
+}
+PROTOBUF_NDEBUG_INLINE BatchTouchActivityRequest::Impl_::Impl_(
+    [[maybe_unused]] ::google::protobuf::internal::InternalVisibility visibility,
+    [[maybe_unused]] ::google::protobuf::Arena* PROTOBUF_NULLABLE arena, const Impl_& from,
+    [[maybe_unused]] const ::air::db::v1::BatchTouchActivityRequest& from_msg)
+      : _has_bits_{from._has_bits_},
+        _cached_size_{0},
+        tenant_ids_ {
+          visibility, ::_pbi::InternalMetadataOffset::Build<
+              ::air::db::v1::BatchTouchActivityRequest,
+              PROTOBUF_FIELD_OFFSET(::air::db::v1::BatchTouchActivityRequest, _impl_.tenant_ids_)>()
+          , from.tenant_ids_
+        }
+     {}
+
+BatchTouchActivityRequest::BatchTouchActivityRequest(
+    ::google::protobuf::Arena* PROTOBUF_NULLABLE arena,
+    const BatchTouchActivityRequest& from)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, BatchTouchActivityRequest_get_class_data()) {
+
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  BatchTouchActivityRequest* const _this = this;
+  (void)_this;
+  _internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
+      from._internal_metadata_);
+  new (&_impl_) Impl_(internal_visibility(), arena, from._impl_, from);
+
+  // @@protoc_insertion_point(copy_constructor:air.db.v1.BatchTouchActivityRequest)
+}
+PROTOBUF_NDEBUG_INLINE BatchTouchActivityRequest::Impl_::Impl_(
+    [[maybe_unused]] ::google::protobuf::internal::InternalVisibility visibility,
+    [[maybe_unused]] ::google::protobuf::Arena* PROTOBUF_NULLABLE arena)
+      : _cached_size_{0},
+        tenant_ids_ { visibility, ::_pbi::InternalMetadataOffset::Build<
+            ::air::db::v1::BatchTouchActivityRequest,
+            PROTOBUF_FIELD_OFFSET(::air::db::v1::BatchTouchActivityRequest, _impl_.tenant_ids_)>()
+         }
+     {}
+
+inline void BatchTouchActivityRequest::SharedCtor(::_pb::Arena* PROTOBUF_NULLABLE arena) {
+  new (&_impl_) Impl_(internal_visibility(), arena);
+}
+BatchTouchActivityRequest::~BatchTouchActivityRequest() {
+  // @@protoc_insertion_point(destructor:air.db.v1.BatchTouchActivityRequest)
+  SharedDtor(*this);
+}
+inline void BatchTouchActivityRequest::SharedDtor(MessageLite& self) {
+  BatchTouchActivityRequest& this_ = static_cast<BatchTouchActivityRequest&>(self);
+  if constexpr (::_pbi::DebugHardenCheckHasBitConsistency()) {
+    this_.CheckHasBitConsistency();
+  }
+  this_._internal_metadata_.Delete<::google::protobuf::UnknownFieldSet>();
+  ABSL_DCHECK(this_.GetArena() == nullptr);
+  this_._impl_.~Impl_();
+}
+
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 const
+    ::google::protobuf::internal::ClassDataFull BatchTouchActivityRequest_class_data_ =
+        BatchTouchActivityRequest::InternalGenerateClassData_(BatchTouchActivityRequest_globals_._default);
+
+PROTOBUF_ATTRIBUTE_WEAK const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL
+BatchTouchActivityRequest::GetClassData() const {
+  ::google::protobuf::internal::PrefetchToLocalCache(&BatchTouchActivityRequest_class_data_);
+  ::google::protobuf::internal::PrefetchToLocalCache(BatchTouchActivityRequest_class_data_.tc_table);
+  return BatchTouchActivityRequest_class_data_.base();
+}
+#else
+PROTOBUF_ATTRIBUTE_WEAK const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL
+BatchTouchActivityRequest::GetClassData() const {
+  ::google::protobuf::internal::PrefetchToLocalCache(&BatchTouchActivityRequest_globals_);
+  ::google::protobuf::internal::PrefetchToLocalCache(
+      ::google::protobuf::internal::MessageGlobalsBase::ToParseTableBase(&BatchTouchActivityRequest_globals_));
+  return BatchTouchActivityRequest_globals_.GetClassData();
+}
+#endif  // !PROTOBUF_MESSAGE_GLOBALS
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+PROTOBUF_CONSTINIT
+PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 const BatchTouchActivityRequest::ParseTableT_
+    BatchTouchActivityRequest::_table_ =
+        BatchTouchActivityRequest::InternalGenerateParseTable_(BatchTouchActivityRequest_class_data_.base());
+#endif  // !PROTOBUF_MESSAGE_GLOBALS
+PROTOBUF_NOINLINE void BatchTouchActivityRequest::Clear() {
+// @@protoc_insertion_point(message_clear_start:air.db.v1.BatchTouchActivityRequest)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void) cached_has_bits;
+
+  cached_has_bits = _impl_._has_bits_[0];
+  if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+    _impl_.tenant_ids_.Clear();
+  }
+  _impl_._has_bits_.Clear();
+  _internal_metadata_.Clear<::google::protobuf::UnknownFieldSet>();
+}
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+::uint8_t* PROTOBUF_NONNULL BatchTouchActivityRequest::_InternalSerialize(
+    const ::google::protobuf::MessageLite& base, ::uint8_t* PROTOBUF_NONNULL target,
+    ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) {
+  const BatchTouchActivityRequest& this_ = static_cast<const BatchTouchActivityRequest&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+::uint8_t* PROTOBUF_NONNULL BatchTouchActivityRequest::_InternalSerialize(
+    ::uint8_t* PROTOBUF_NONNULL target,
+    ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) const {
+  const BatchTouchActivityRequest& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  if constexpr (::_pbi::DebugHardenCheckHasBitConsistency()) {
+    this_.CheckHasBitConsistency();
+  }
+  // @@protoc_insertion_point(serialize_to_array_start:air.db.v1.BatchTouchActivityRequest)
+  ::uint32_t cached_has_bits = 0;
+  (void)cached_has_bits;
+
+  cached_has_bits = this_._impl_._has_bits_[0];
+  // repeated string tenant_ids = 1;
+  if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+    for (int i = 0, n = this_._internal_tenant_ids_size(); i < n; ++i) {
+      const auto& s = this_._internal_tenant_ids().Get(i);
+      ::google::protobuf::internal::WireFormatLite::VerifyUtf8String(
+          s.data(), static_cast<int>(s.length()), ::google::protobuf::internal::WireFormatLite::SERIALIZE, "air.db.v1.BatchTouchActivityRequest.tenant_ids");
+      target = stream->WriteString(1, s, target);
+    }
+  }
+
+  if (ABSL_PREDICT_FALSE(this_._internal_metadata_.have_unknown_fields())) {
+    target =
+        ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
+            this_._internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance), target, stream);
+  }
+  // @@protoc_insertion_point(serialize_to_array_end:air.db.v1.BatchTouchActivityRequest)
+  return target;
+}
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+::size_t BatchTouchActivityRequest::ByteSizeLong(const MessageLite& base) {
+  const BatchTouchActivityRequest& this_ = static_cast<const BatchTouchActivityRequest&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+::size_t BatchTouchActivityRequest::ByteSizeLong() const {
+  const BatchTouchActivityRequest& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  // @@protoc_insertion_point(message_byte_size_start:air.db.v1.BatchTouchActivityRequest)
+  ::size_t total_size = 0;
+
+  ::uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void)cached_has_bits;
+
+  ::_pbi::Prefetch5LinesFrom7Lines(&this_);
+   {
+    // repeated string tenant_ids = 1;
+    cached_has_bits = this_._impl_._has_bits_[0];
+    if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+      total_size +=
+          1 * ::google::protobuf::internal::FromIntSize(this_._internal_tenant_ids().size());
+      for (int i = 0, n = this_._internal_tenant_ids().size(); i < n; ++i) {
+        total_size += ::google::protobuf::internal::WireFormatLite::StringSize(
+            this_._internal_tenant_ids().Get(i));
+      }
+    }
+  }
+  return this_.MaybeComputeUnknownFieldsSize(total_size,
+                                             &this_._impl_._cached_size_);
+}
+
+void BatchTouchActivityRequest::MergeImpl(::google::protobuf::MessageLite& to_msg,
+                      const ::google::protobuf::MessageLite& from_msg) {
+   auto* const _this = static_cast<BatchTouchActivityRequest*>(&to_msg);
+  auto& from = static_cast<const BatchTouchActivityRequest&>(from_msg);
+  if constexpr (::_pbi::DebugHardenCheckHasBitConsistency()) {
+    from.CheckHasBitConsistency();
+  }
+  ::google::protobuf::Arena* arena = _this->GetArena();
+  // @@protoc_insertion_point(class_specific_merge_from_start:air.db.v1.BatchTouchActivityRequest)
+  ABSL_DCHECK_NE(&from, _this);
+  ::uint32_t cached_has_bits = 0;
+  (void)cached_has_bits;
+
+  cached_has_bits = from._impl_._has_bits_[0];
+  if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+    _this->_internal_mutable_tenant_ids()->InternalMergeFromWithArena(
+        ::google::protobuf::MessageLite::internal_visibility(), arena,
+        from._internal_tenant_ids());
+  }
+  _this->_impl_._has_bits_[0] |= cached_has_bits;
+  _this->_internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
+      from._internal_metadata_);
+}
+
+void BatchTouchActivityRequest::CopyFrom(const BatchTouchActivityRequest& from) {
+  // @@protoc_insertion_point(class_specific_copy_from_start:air.db.v1.BatchTouchActivityRequest)
+  if (&from == this) return;
+  Clear();
+  MergeFrom(from);
+}
+
+
+void BatchTouchActivityRequest::InternalSwap(BatchTouchActivityRequest* PROTOBUF_RESTRICT PROTOBUF_NONNULL other) {
+  using ::std::swap;
+  _internal_metadata_.InternalSwap(&other->_internal_metadata_);
+  swap(_impl_._has_bits_[0], other->_impl_._has_bits_[0]);
+  _impl_.tenant_ids_.InternalSwap(&other->_impl_.tenant_ids_);
+}
+
+::google::protobuf::Metadata BatchTouchActivityRequest::GetMetadata() const {
   return ::google::protobuf::Message::GetMetadataImpl(GetClassData()->full());
 }
 // @@protoc_insertion_point(namespace_scope)

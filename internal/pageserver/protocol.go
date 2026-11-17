@@ -13,6 +13,13 @@ import (
 	"sync"
 )
 
+var putBatchBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 16*PageSize)
+		return &b
+	},
+}
+
 // Wire protocol constants matching extensions/air_smgr/protocol.h.
 const (
 	ProtocolMagic   uint32 = 0x41495250 // "AIRP"
@@ -415,11 +422,19 @@ func (s *UnixServer) handleConn(ctx context.Context, conn net.Conn) {
 			if n == 0 || int(n) > MaxBatchBlocks {
 				return
 			}
-			inBuf := make([]byte, int(n)*PageSize)
+			need := int(n) * PageSize
+			bufPtr := putBatchBufPool.Get().(*[]byte)
+			if cap(*bufPtr) < need {
+				*bufPtr = make([]byte, need)
+			}
+			inBuf := (*bufPtr)[:need]
 			if _, err := io.ReadFull(conn, inBuf); err != nil {
+				putBatchBufPool.Put(bufPtr)
 				return
 			}
-			if err := s.svc.PutPageBatch(ctx, req.TenantID, req.SpcOID, req.DbOID, req.RelNumber, req.ForkNum, req.BlockNum, n, req.LSN, inBuf); err != nil {
+			err := s.svc.PutPageBatch(ctx, req.TenantID, req.SpcOID, req.DbOID, req.RelNumber, req.ForkNum, req.BlockNum, n, req.LSN, inBuf)
+			putBatchBufPool.Put(bufPtr)
+			if err != nil {
 				status = StatusError
 			} else {
 				nblocksOrVal = n
@@ -434,11 +449,13 @@ func (s *UnixServer) handleConn(ctx context.Context, conn net.Conn) {
 			NBlocksOrVal: nblocksOrVal,
 			U64Val:       u64Val,
 		})
-		if _, err := conn.Write(respHdr); err != nil {
-			return
-		}
 		if len(payload) > 0 {
-			if _, err := conn.Write(payload); err != nil {
+			bufs := net.Buffers{respHdr, payload}
+			if _, err := bufs.WriteTo(conn); err != nil {
+				return
+			}
+		} else {
+			if _, err := conn.Write(respHdr); err != nil {
 				return
 			}
 		}

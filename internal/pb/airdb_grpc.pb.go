@@ -19,17 +19,19 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	AirDBControl_GetTenantRoute_FullMethodName  = "/air.db.v1.AirDBControl/GetTenantRoute"
-	AirDBControl_WakeTenant_FullMethodName      = "/air.db.v1.AirDBControl/WakeTenant"
-	AirDBControl_TouchActivity_FullMethodName   = "/air.db.v1.AirDBControl/TouchActivity"
-	AirDBControl_CreateDatabase_FullMethodName  = "/air.db.v1.AirDBControl/CreateDatabase"
-	AirDBControl_ListDatabases_FullMethodName   = "/air.db.v1.AirDBControl/ListDatabases"
-	AirDBControl_GetDatabase_FullMethodName     = "/air.db.v1.AirDBControl/GetDatabase"
-	AirDBControl_DeleteDatabase_FullMethodName  = "/air.db.v1.AirDBControl/DeleteDatabase"
-	AirDBControl_SuspendDatabase_FullMethodName = "/air.db.v1.AirDBControl/SuspendDatabase"
-	AirDBControl_StartDatabase_FullMethodName   = "/air.db.v1.AirDBControl/StartDatabase"
-	AirDBControl_LockDatabase_FullMethodName    = "/air.db.v1.AirDBControl/LockDatabase"
-	AirDBControl_UnlockDatabase_FullMethodName  = "/air.db.v1.AirDBControl/UnlockDatabase"
+	AirDBControl_GetTenantRoute_FullMethodName     = "/air.db.v1.AirDBControl/GetTenantRoute"
+	AirDBControl_WakeTenant_FullMethodName         = "/air.db.v1.AirDBControl/WakeTenant"
+	AirDBControl_TouchActivity_FullMethodName      = "/air.db.v1.AirDBControl/TouchActivity"
+	AirDBControl_BatchTouchActivity_FullMethodName = "/air.db.v1.AirDBControl/BatchTouchActivity"
+	AirDBControl_WatchTenantChanges_FullMethodName = "/air.db.v1.AirDBControl/WatchTenantChanges"
+	AirDBControl_CreateDatabase_FullMethodName     = "/air.db.v1.AirDBControl/CreateDatabase"
+	AirDBControl_ListDatabases_FullMethodName      = "/air.db.v1.AirDBControl/ListDatabases"
+	AirDBControl_GetDatabase_FullMethodName        = "/air.db.v1.AirDBControl/GetDatabase"
+	AirDBControl_DeleteDatabase_FullMethodName     = "/air.db.v1.AirDBControl/DeleteDatabase"
+	AirDBControl_SuspendDatabase_FullMethodName    = "/air.db.v1.AirDBControl/SuspendDatabase"
+	AirDBControl_StartDatabase_FullMethodName      = "/air.db.v1.AirDBControl/StartDatabase"
+	AirDBControl_LockDatabase_FullMethodName       = "/air.db.v1.AirDBControl/LockDatabase"
+	AirDBControl_UnlockDatabase_FullMethodName     = "/air.db.v1.AirDBControl/UnlockDatabase"
 )
 
 // AirDBControlClient is the client API for AirDBControl service.
@@ -39,6 +41,8 @@ type AirDBControlClient interface {
 	GetTenantRoute(ctx context.Context, in *TenantRequest, opts ...grpc.CallOption) (*TenantRouteResponse, error)
 	WakeTenant(ctx context.Context, in *TenantRequest, opts ...grpc.CallOption) (*TenantRouteResponse, error)
 	TouchActivity(ctx context.Context, in *TenantRequest, opts ...grpc.CallOption) (*Empty, error)
+	BatchTouchActivity(ctx context.Context, in *BatchTouchActivityRequest, opts ...grpc.CallOption) (*Empty, error)
+	WatchTenantChanges(ctx context.Context, in *WatchTenantsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TenantChangeEvent], error)
 	CreateDatabase(ctx context.Context, in *CreateDatabaseRequest, opts ...grpc.CallOption) (*CreateDatabaseResponse, error)
 	ListDatabases(ctx context.Context, in *ListDatabasesRequest, opts ...grpc.CallOption) (*ListDatabasesResponse, error)
 	GetDatabase(ctx context.Context, in *TenantRequest, opts ...grpc.CallOption) (*DatabaseInfo, error)
@@ -86,6 +90,35 @@ func (c *airDBControlClient) TouchActivity(ctx context.Context, in *TenantReques
 	}
 	return out, nil
 }
+
+func (c *airDBControlClient) BatchTouchActivity(ctx context.Context, in *BatchTouchActivityRequest, opts ...grpc.CallOption) (*Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Empty)
+	err := c.cc.Invoke(ctx, AirDBControl_BatchTouchActivity_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *airDBControlClient) WatchTenantChanges(ctx context.Context, in *WatchTenantsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TenantChangeEvent], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &AirDBControl_ServiceDesc.Streams[0], AirDBControl_WatchTenantChanges_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WatchTenantsRequest, TenantChangeEvent]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AirDBControl_WatchTenantChangesClient = grpc.ServerStreamingClient[TenantChangeEvent]
 
 func (c *airDBControlClient) CreateDatabase(ctx context.Context, in *CreateDatabaseRequest, opts ...grpc.CallOption) (*CreateDatabaseResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -174,6 +207,8 @@ type AirDBControlServer interface {
 	GetTenantRoute(context.Context, *TenantRequest) (*TenantRouteResponse, error)
 	WakeTenant(context.Context, *TenantRequest) (*TenantRouteResponse, error)
 	TouchActivity(context.Context, *TenantRequest) (*Empty, error)
+	BatchTouchActivity(context.Context, *BatchTouchActivityRequest) (*Empty, error)
+	WatchTenantChanges(*WatchTenantsRequest, grpc.ServerStreamingServer[TenantChangeEvent]) error
 	CreateDatabase(context.Context, *CreateDatabaseRequest) (*CreateDatabaseResponse, error)
 	ListDatabases(context.Context, *ListDatabasesRequest) (*ListDatabasesResponse, error)
 	GetDatabase(context.Context, *TenantRequest) (*DatabaseInfo, error)
@@ -200,6 +235,12 @@ func (UnimplementedAirDBControlServer) WakeTenant(context.Context, *TenantReques
 }
 func (UnimplementedAirDBControlServer) TouchActivity(context.Context, *TenantRequest) (*Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method TouchActivity not implemented")
+}
+func (UnimplementedAirDBControlServer) BatchTouchActivity(context.Context, *BatchTouchActivityRequest) (*Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method BatchTouchActivity not implemented")
+}
+func (UnimplementedAirDBControlServer) WatchTenantChanges(*WatchTenantsRequest, grpc.ServerStreamingServer[TenantChangeEvent]) error {
+	return status.Error(codes.Unimplemented, "method WatchTenantChanges not implemented")
 }
 func (UnimplementedAirDBControlServer) CreateDatabase(context.Context, *CreateDatabaseRequest) (*CreateDatabaseResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateDatabase not implemented")
@@ -299,6 +340,35 @@ func _AirDBControl_TouchActivity_Handler(srv interface{}, ctx context.Context, d
 	}
 	return interceptor(ctx, in, info, handler)
 }
+
+func _AirDBControl_BatchTouchActivity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchTouchActivityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AirDBControlServer).BatchTouchActivity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AirDBControl_BatchTouchActivity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AirDBControlServer).BatchTouchActivity(ctx, req.(*BatchTouchActivityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AirDBControl_WatchTenantChanges_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WatchTenantsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(AirDBControlServer).WatchTenantChanges(m, &grpc.GenericServerStream[WatchTenantsRequest, TenantChangeEvent]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AirDBControl_WatchTenantChangesServer = grpc.ServerStreamingServer[TenantChangeEvent]
 
 func _AirDBControl_CreateDatabase_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CreateDatabaseRequest)
@@ -464,6 +534,10 @@ var AirDBControl_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _AirDBControl_TouchActivity_Handler,
 		},
 		{
+			MethodName: "BatchTouchActivity",
+			Handler:    _AirDBControl_BatchTouchActivity_Handler,
+		},
+		{
 			MethodName: "CreateDatabase",
 			Handler:    _AirDBControl_CreateDatabase_Handler,
 		},
@@ -496,6 +570,12 @@ var AirDBControl_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _AirDBControl_UnlockDatabase_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "WatchTenantChanges",
+			Handler:       _AirDBControl_WatchTenantChanges_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "airdb.proto",
 }
