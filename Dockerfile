@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # Stage 1: Build air-server Go binary
-FROM golang:1.25-bookworm AS go-builder
+FROM golang:1.26-bookworm AS go-builder
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod \
@@ -21,8 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src/gateway
 COPY gateway/ ./
-RUN make all && cp air-gateway /out-air-gateway && \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/air-gateway ./cmd/air-gateway
+RUN make all && cp air-gateway /out-air-gateway
 
 # Stage 2: Build patched PostgreSQL 17.12 (smgr_hook) + supautils + air_smgr
 FROM debian:bookworm-slim AS pg-builder

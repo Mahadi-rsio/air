@@ -15,7 +15,8 @@ typedef enum AirPsOp
 	AIR_PS_OP_GET_REL_EXISTS = 3,
 	AIR_PS_OP_GET_DB_SIZE = 4,
 	AIR_PS_OP_GET_PAGE_BATCH = 5,
-	AIR_PS_OP_PUT_PAGE_BATCH = 6
+	AIR_PS_OP_PUT_PAGE_BATCH = 6,
+	AIR_PS_OP_UNLINK_REL = 7
 } AirPsOp;
 
 typedef enum AirPsStatus

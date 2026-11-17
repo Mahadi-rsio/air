@@ -8,12 +8,13 @@ import (
 	"time"
 )
 
-// DecodedChunkKey uniquely identifies a decoded V2 chunk scoped to tenant, layer, chunk index, and DEK epoch.
+// DecodedChunkKey uniquely identifies a decoded V2 chunk scoped to tenant, generation, layer, chunk index, and DEK epoch.
 type DecodedChunkKey struct {
-	TenantID string
-	LayerID  string
-	ChunkIdx uint32
-	KeyEpoch uint64
+	TenantID   string
+	Generation string
+	LayerID    string
+	ChunkIdx   uint32
+	KeyEpoch   uint64
 }
 
 // DecodedChunkCacheConfig configures the bounded LRU decoded V2 chunk cache.
@@ -187,6 +188,26 @@ func (c *DecodedChunkCache) InvalidateTenant(tenantID string) {
 	defer c.mu.Unlock()
 	for k, elem := range c.entries {
 		if k.TenantID == tenantID {
+			entry := elem.Value.(*decodedChunkEntry)
+			c.curBytes -= entry.size
+			c.lru.Remove(elem)
+			delete(c.entries, k)
+			c.evictions.Add(1)
+		}
+	}
+}
+
+// InvalidateTenantGeneration removes cached decoded chunks belonging to (tenantID, generation).
+// If generation is empty, it behaves like InvalidateTenant(tenantID).
+func (c *DecodedChunkCache) InvalidateTenantGeneration(tenantID, generation string) {
+	if generation == "" {
+		c.InvalidateTenant(tenantID)
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, elem := range c.entries {
+		if k.TenantID == tenantID && k.Generation == generation {
 			entry := elem.Value.(*decodedChunkEntry)
 			c.curBytes -= entry.size
 			c.lru.Remove(elem)

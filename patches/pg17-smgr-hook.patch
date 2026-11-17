@@ -45,7 +45,7 @@ diff -ruN a/src/backend/storage/smgr/smgr.c b/src/backend/storage/smgr/smgr.c
  		.smgr_init = mdinit,
  		.smgr_shutdown = NULL,
  		.smgr_open = mdopen,
-@@ -124,10 +90,30 @@
+@@ -124,10 +90,31 @@
  		.smgr_truncate = mdtruncate,
  		.smgr_immedsync = mdimmedsync,
  		.smgr_registersync = mdregistersync,
@@ -60,6 +60,7 @@ diff -ruN a/src/backend/storage/smgr/smgr.c b/src/backend/storage/smgr/smgr.c
 +static int NSmgr = 1;
 +
 +smgr_hook_type smgr_hook = NULL;
++smgr_dbsize_hook_type smgr_dbsize_hook = NULL;
 +
 +int
 +smgr_register(const f_smgr *smgr)
@@ -275,7 +276,7 @@ diff -ruN a/src/backend/storage/smgr/smgr.c b/src/backend/storage/smgr/smgr.c
 diff -ruN a/src/include/storage/smgr.h b/src/include/storage/smgr.h
 --- a/src/include/storage/smgr.h	2026-11-16 02:02:01.897647114 +0000
 +++ b/src/include/storage/smgr.h	2026-11-16 02:02:16.389646143 +0000
-@@ -73,6 +73,47 @@
+@@ -73,6 +73,50 @@
  #define SmgrIsTemp(smgr) \
  	RelFileLocatorBackendIsTemp((smgr)->smgr_rlocator)
  
@@ -317,9 +318,52 @@ diff -ruN a/src/include/storage/smgr.h b/src/include/storage/smgr.h
 +typedef int (*smgr_hook_type) (RelFileLocator rlocator, ProcNumber backend);
 +extern PGDLLIMPORT smgr_hook_type smgr_hook;
 +
++typedef int64 (*smgr_dbsize_hook_type) (Oid spcOid, Oid dbOid);
++extern PGDLLIMPORT smgr_dbsize_hook_type smgr_dbsize_hook;
++
 +extern int smgr_register(const f_smgr *smgr);
 +extern const f_smgr *smgr_get_standard(void);
 +
  extern void smgrinit(void);
  extern SMgrRelation smgropen(RelFileLocator rlocator, ProcNumber backend);
  extern bool smgrexists(SMgrRelation reln, ForkNumber forknum);
+diff -ruN a/src/backend/utils/adt/dbsize.c b/src/backend/utils/adt/dbsize.c
+--- a/src/backend/utils/adt/dbsize.c	2026-11-16 02:02:01.978647109 +0000
++++ b/src/backend/utils/adt/dbsize.c	2026-11-17 07:58:00.000000000 +0000
+@@ -23,6 +23,7 @@
+ #include "commands/tablespace.h"
+ #include "miscadmin.h"
+ #include "storage/fd.h"
++#include "storage/smgr.h"
+ #include "utils/acl.h"
+ #include "utils/builtins.h"
+ #include "utils/numeric.h"
+@@ -141,6 +142,13 @@
+ 	/* Include pg_default storage */
+ 	snprintf(pathname, sizeof(pathname), "base/%u", dbOid);
+ 	totalsize = db_dir_size(pathname);
++	if (smgr_dbsize_hook != NULL)
++	{
++		int64		smgr_size = smgr_dbsize_hook(DEFAULTTABLESPACE_OID, dbOid);
++
++		if (smgr_size > 0)
++			totalsize += smgr_size;
++	}
+ 
+ 	/* Scan the non-default tablespaces */
+ 	snprintf(dirpath, MAXPGPATH, "pg_tblspc");
+@@ -312,6 +320,14 @@
+ 	char		pathname[MAXPGPATH];
+ 	unsigned int segcount = 0;
+ 
++	if (backend == INVALID_PROC_NUMBER)
++	{
++		SMgrRelation reln = smgropen(*rfn, backend);
++
++		if (reln->smgr_which != 0)
++			return smgrexists(reln, forknum) ? (int64) smgrnblocks(reln, forknum) * BLCKSZ : 0;
++	}
++
+ 	relationpath = relpathbackend(*rfn, backend, forknum);
+ 
+ 	for (segcount = 0;; segcount++)

@@ -3,6 +3,7 @@ package pageserver
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -21,6 +22,7 @@ type Timeline struct {
 	flushDoneCh   chan struct{}
 	lastFlushErr  error
 	tenantID      string
+	generation    string
 	epoch         int64
 	lastLSN       uint64
 	inMem         *InMemoryLayer
@@ -29,9 +31,10 @@ type Timeline struct {
 	store         *LayerStore
 	redoer        WALRedoer
 	maxInMemBytes int64
-	relSizes      map[Key]uint32
-	relSizeKnown  map[Key]bool
-	layerSeq      uint64
+	relSizes          map[Key]uint32
+	relSizeKnown      map[Key]bool
+	allRelSizesSeeded bool
+	layerSeq          uint64
 }
 
 // NewTimeline initializes a tenant Timeline.
@@ -49,6 +52,20 @@ func NewTimeline(tenantID string, epoch int64, store *LayerStore, redoer WALRedo
 		relSizes:      make(map[Key]uint32),
 		relSizeKnown:  make(map[Key]bool),
 	}
+}
+
+// SetGeneration sets the immutable generation identifier for this Timeline.
+func (t *Timeline) SetGeneration(gen string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.generation = gen
+}
+
+// Generation returns the immutable generation identifier for this Timeline.
+func (t *Timeline) Generation() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.generation
 }
 
 // LastLSN returns the highest WAL LSN ingested into this Timeline.
@@ -79,11 +96,12 @@ func (t *Timeline) AddLayer(meta LayerMeta) {
 func (t *Timeline) LoadLayersFromR2(ctx context.Context) error {
 	t.mu.RLock()
 	hasLayers := len(t.layers) > 0
+	gen := t.generation
 	t.mu.RUnlock()
 	if hasLayers || t.store == nil {
 		return nil
 	}
-	layers, maxSeq, err := t.store.ListLayersFromR2(ctx, t.tenantID, t.epoch)
+	layers, maxSeq, err := t.store.ListLayersFromR2Gen(ctx, t.tenantID, gen, t.epoch)
 	if err != nil {
 		return err
 	}
@@ -378,10 +396,11 @@ func (t *Timeline) PublishNewLayers(ctx context.Context, metas []LayerMeta) erro
 	copy(next, t.layers)
 	copy(next[len(t.layers):], metas)
 	seq := t.layerSeq
+	gen := t.generation
 	t.mu.RUnlock()
 
 	if t.store != nil {
-		if err := t.store.PublishLayerManifest(ctx, t.tenantID, t.epoch, next, seq); err != nil {
+		if err := t.store.PublishLayerManifestGen(ctx, t.tenantID, gen, t.epoch, next, seq); err != nil {
 			return err
 		}
 	}
@@ -412,20 +431,22 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 	seq := t.layerSeq
 	epoch := t.epoch
 	tenantID := t.tenantID
+	gen := t.generation
 	t.mu.Unlock()
 
 	fileName := fmt.Sprintf("l0_%06d_%016x_%016x.layer", seq, startLSN, endLSN)
-	logicalKey := fmt.Sprintf("tenants/%s/timeline_%d/layers/%s", tenantID, epoch, fileName)
+	logicalKey := fmt.Sprintf("%s/timeline_%d/layers/%s", TenantR2Prefix(tenantID, gen), epoch, fileName)
 	meta := LayerMeta{
-		TenantID: tenantID,
-		Epoch:    epoch,
-		Kind:     LayerKindL0,
-		Seq:      seq,
-		FileName: fileName,
-		R2Key:    logicalKey,
-		AADKey:   logicalKey,
-		StartLSN: startLSN,
-		EndLSN:   endLSN,
+		TenantID:   tenantID,
+		Generation: gen,
+		Epoch:      epoch,
+		Kind:       LayerKindL0,
+		Seq:        seq,
+		FileName:   fileName,
+		R2Key:      logicalKey,
+		AADKey:     logicalKey,
+		StartLSN:   startLSN,
+		EndLSN:     endLSN,
 	}
 	written, err := t.store.WriteLayer(ctx, meta, recs)
 	if err != nil {
@@ -433,8 +454,10 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 		// and also re-index entries into inMem if needed on retry.
 		t.mu.Lock()
 		t.removeFrozenMemLocked(oldMem)
-		for _, r := range recs {
-			t.inMem.Put(r.Key, r.Delta)
+		if !errors.Is(err, ErrStaleGeneration) {
+			for _, r := range recs {
+				t.inMem.Put(r.Key, r.Delta)
+			}
 		}
 		t.mu.Unlock()
 		return nil, err
@@ -448,12 +471,14 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 	seq = t.layerSeq
 	t.mu.RUnlock()
 
-	if err = t.store.PublishLayerManifest(ctx, t.tenantID, t.epoch, next, seq); err != nil {
+	if err = t.store.PublishLayerManifestGen(ctx, t.tenantID, gen, t.epoch, next, seq); err != nil {
 		t.manifestMu.Unlock()
 		t.mu.Lock()
 		t.removeFrozenMemLocked(oldMem)
-		for _, r := range recs {
-			t.inMem.Put(r.Key, r.Delta)
+		if !errors.Is(err, ErrStaleGeneration) {
+			for _, r := range recs {
+				t.inMem.Put(r.Key, r.Delta)
+			}
 		}
 		t.mu.Unlock()
 		return nil, err
@@ -765,18 +790,19 @@ func (t *Timeline) GetRelSize(ctx context.Context, spcOID, dbOID, relNumber uint
 			t.mu.RUnlock()
 			return nb, nil
 		}
+		t.mu.RUnlock()
+		return 0, ErrNotFound
 	}
 	if lsn == 0 {
 		lsn = t.lastLSN
 	}
 	inMemDeltas := t.inMem.Lookup(sizeKey, lsn)
-	var frozenSize uint32
-	var hasFrozenSize bool
+	var frozenDelta *WALDelta
 	if len(inMemDeltas) == 0 {
 		for i := len(t.frozenMems) - 1; i >= 0; i-- {
 			if fd := t.frozenMems[i].Lookup(sizeKey, lsn); len(fd) > 0 {
-				frozenSize = fd[len(fd)-1].RelSize
-				hasFrozenSize = true
+				d := fd[len(fd)-1]
+				frozenDelta = &d
 				break
 			}
 		}
@@ -785,6 +811,7 @@ func (t *Timeline) GetRelSize(ctx context.Context, spcOID, dbOID, relNumber uint
 	t.mu.RUnlock()
 
 	if len(inMemDeltas) > 0 && (isLatest || !t.layerLookupNeededForSize(layersCopy, sizeKey, lsn)) {
+		lastD := inMemDeltas[len(inMemDeltas)-1]
 		if isLatest {
 			// Check layers too if relSizeKnown is false, so a lower-block write after restart
 			// cannot mask a larger size in immutable layers.
@@ -792,18 +819,26 @@ func (t *Timeline) GetRelSize(ctx context.Context, spcOID, dbOID, relNumber uint
 			known := t.relSizeKnown[sizeKey]
 			t.mu.RUnlock()
 			if known {
-				return inMemDeltas[len(inMemDeltas)-1].RelSize, nil
+				if (lastD.Flags & EntryFlagRelUnlinked) != 0 {
+					return 0, ErrNotFound
+				}
+				return lastD.RelSize, nil
 			}
 		} else {
-			return inMemDeltas[len(inMemDeltas)-1].RelSize, nil
+			if (lastD.Flags & EntryFlagRelUnlinked) != 0 {
+				return 0, ErrNotFound
+			}
+			return lastD.RelSize, nil
 		}
 	}
-	if hasFrozenSize && !isLatest {
-		return frozenSize, nil
+	if frozenDelta != nil && !isLatest {
+		if (frozenDelta.Flags & EntryFlagRelUnlinked) != 0 {
+			return 0, ErrNotFound
+		}
+		return frozenDelta.RelSize, nil
 	}
 
-	var layerSize uint32
-	var foundInLayer bool
+	var layerDelta *WALDelta
 	for i := len(layersCopy) - 1; i >= 0; i-- {
 		lm := layersCopy[i]
 		if lsn != 0 && lm.StartLSN > lsn {
@@ -814,48 +849,137 @@ func (t *Timeline) GetRelSize(ctx context.Context, spcOID, dbOID, relNumber uint
 			return 0, err
 		}
 		if len(deltas) > 0 {
-			layerSize = deltas[len(deltas)-1].RelSize
-			foundInLayer = true
+			d := deltas[len(deltas)-1]
+			layerDelta = &d
 			break
 		}
 	}
 
 	if isLatest {
 		t.mu.Lock()
-		if foundInLayer {
-			if cur, ok := t.relSizes[sizeKey]; !ok || layerSize > cur {
-				t.relSizes[sizeKey] = layerSize
+		if len(inMemDeltas) > 0 {
+			lastD := inMemDeltas[len(inMemDeltas)-1]
+			if (lastD.Flags & EntryFlagRelUnlinked) != 0 {
+				delete(t.relSizes, sizeKey)
+				t.relSizeKnown[sizeKey] = true
+				t.mu.Unlock()
+				return 0, ErrNotFound
+			}
+			if layerDelta != nil && (layerDelta.Flags&EntryFlagRelUnlinked) == 0 && layerDelta.RelSize > lastD.RelSize {
+				t.relSizes[sizeKey] = layerDelta.RelSize
+			} else {
+				t.relSizes[sizeKey] = lastD.RelSize
 			}
 			t.relSizeKnown[sizeKey] = true
 			nb := t.relSizes[sizeKey]
 			t.mu.Unlock()
 			return nb, nil
 		}
-		if len(inMemDeltas) > 0 {
+		if frozenDelta != nil {
+			if (frozenDelta.Flags & EntryFlagRelUnlinked) != 0 {
+				delete(t.relSizes, sizeKey)
+				t.relSizeKnown[sizeKey] = true
+				t.mu.Unlock()
+				return 0, ErrNotFound
+			}
+			t.relSizes[sizeKey] = frozenDelta.RelSize
 			t.relSizeKnown[sizeKey] = true
-			nb := inMemDeltas[len(inMemDeltas)-1].RelSize
+			t.mu.Unlock()
+			return frozenDelta.RelSize, nil
+		}
+		if layerDelta != nil {
+			if (layerDelta.Flags & EntryFlagRelUnlinked) != 0 {
+				delete(t.relSizes, sizeKey)
+				t.relSizeKnown[sizeKey] = true
+				t.mu.Unlock()
+				return 0, ErrNotFound
+			}
+			if cur, ok := t.relSizes[sizeKey]; !ok || layerDelta.RelSize > cur {
+				t.relSizes[sizeKey] = layerDelta.RelSize
+			}
+			t.relSizeKnown[sizeKey] = true
+			nb := t.relSizes[sizeKey]
 			t.mu.Unlock()
 			return nb, nil
-		}
-		if hasFrozenSize {
-			t.relSizeKnown[sizeKey] = true
-			t.mu.Unlock()
-			return frozenSize, nil
 		}
 		t.mu.Unlock()
 		return 0, ErrNotFound
 	}
 
 	if len(inMemDeltas) > 0 {
-		return inMemDeltas[len(inMemDeltas)-1].RelSize, nil
+		lastD := inMemDeltas[len(inMemDeltas)-1]
+		if (lastD.Flags & EntryFlagRelUnlinked) != 0 {
+			return 0, ErrNotFound
+		}
+		return lastD.RelSize, nil
 	}
-	if hasFrozenSize {
-		return frozenSize, nil
+	if frozenDelta != nil {
+		if (frozenDelta.Flags & EntryFlagRelUnlinked) != 0 {
+			return 0, ErrNotFound
+		}
+		return frozenDelta.RelSize, nil
 	}
-	if foundInLayer {
-		return layerSize, nil
+	if layerDelta != nil {
+		if (layerDelta.Flags & EntryFlagRelUnlinked) != 0 {
+			return 0, ErrNotFound
+		}
+		return layerDelta.RelSize, nil
 	}
 	return 0, ErrNotFound
+}
+
+// UnlinkRel records that a relation fork was dropped/unlinked so future size and existence
+// queries return 0 / ErrNotFound and GetDBSize excludes it.
+func (t *Timeline) UnlinkRel(spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) {
+	sizeKey := RelSizeKey(spcOID, dbOID, relNumber, forkNum)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.relSizes, sizeKey)
+	t.relSizeKnown[sizeKey] = true
+	if lsn == 0 {
+		lsn = t.lastLSN + 1
+	}
+	if lsn > t.lastLSN {
+		t.lastLSN = lsn
+	}
+	t.inMem.Put(sizeKey, WALDelta{
+		LSN:     lsn,
+		Flags:   EntryFlagRelSize | EntryFlagRelUnlinked,
+		RelSize: 0,
+	})
+}
+
+func (t *Timeline) seedAllRelSizes(ctx context.Context) {
+	t.mu.RLock()
+	if t.allRelSizesSeeded || t.store == nil {
+		t.mu.RUnlock()
+		return
+	}
+	layersCopy := append([]LayerMeta(nil), t.layers...)
+	t.mu.RUnlock()
+
+	seen := make(map[Key]bool)
+	for i := len(layersCopy) - 1; i >= 0; i-- {
+		keys, err := t.store.ListRelSizeKeysInLayer(ctx, layersCopy[i])
+		if err != nil {
+			continue
+		}
+		for _, k := range keys {
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			t.mu.RLock()
+			known := t.relSizeKnown[k]
+			t.mu.RUnlock()
+			if !known {
+				_, _ = t.GetRelSize(ctx, k.SpcOID, k.DbOID, k.RelNumber, k.ForkNum, 0)
+			}
+		}
+	}
+	t.mu.Lock()
+	t.allRelSizesSeeded = true
+	t.mu.Unlock()
 }
 
 func (t *Timeline) layerLookupNeededForSize(_ []LayerMeta, _ Key, _ uint64) bool {
@@ -874,8 +998,9 @@ func (t *Timeline) GetRelExists(ctx context.Context, spcOID, dbOID, relNumber ui
 	return true, nil
 }
 
-// GetDBSize returns the approximate byte size of a database across its tracked relations.
-func (t *Timeline) GetDBSize(_ context.Context, spcOID, dbOID uint32, _ uint64) (uint64, error) {
+// GetDBSize returns the byte size of a database across all its live tracked relation forks.
+func (t *Timeline) GetDBSize(ctx context.Context, spcOID, dbOID uint32, _ uint64) (uint64, error) {
+	t.seedAllRelSizes(ctx)
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	var total uint64

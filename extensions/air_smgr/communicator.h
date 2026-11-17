@@ -49,4 +49,21 @@ extern bool air_ps_get_rel_exists(const char *socket_path,
 								  char *errbuf,
 								  size_t errbuf_len);
 
+extern bool air_ps_get_db_size(const char *socket_path,
+							   const char *tenant_id,
+							   Oid spc_oid,
+							   Oid db_oid,
+							   XLogRecPtr lsn,
+							   uint64_t *bytes_out,
+							   char *errbuf,
+							   size_t errbuf_len);
+
+extern bool air_ps_unlink_rel(const char *socket_path,
+							  const char *tenant_id,
+							  RelFileLocator rlocator,
+							  ForkNumber forknum,
+							  XLogRecPtr lsn,
+							  char *errbuf,
+							  size_t errbuf_len);
+
 #endif							/* AIR_SMGR_COMMUNICATOR_H */

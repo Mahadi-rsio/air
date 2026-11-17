@@ -112,9 +112,22 @@ air_exists(SMgrRelation reln, ForkNumber forknum)
 static void
 air_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
-	(void) isRedo;
+	char		errbuf[256];
+
 	air_lfc_invalidate_rel(rlocator.locator, forknum, 0);
 	air_relmeta_unlink(rlocator.locator, forknum);
+	if (!isRedo && air_smgr_enabled && rlocator.backend == INVALID_PROC_NUMBER)
+	{
+		if (!air_ps_unlink_rel(air_pageserver_socket,
+							   air_tenant_id,
+							   rlocator.locator,
+							   forknum,
+							   current_write_lsn(),
+							   errbuf,
+							   sizeof(errbuf)))
+			ereport(WARNING,
+					(errmsg("air_smgr unlink failed: %s", errbuf)));
+	}
 }
 
 static void
@@ -401,6 +414,31 @@ air_smgr_hook(RelFileLocator rlocator, ProcNumber backend)
 	return air_smgr_id;
 }
 
+static int64
+air_dbsize_hook(Oid spcOid, Oid dbOid)
+{
+	uint64_t	db_bytes = 0;
+	char		errbuf[256];
+
+	if (!air_smgr_enabled)
+		return -1;
+
+	if (!air_ps_get_db_size(air_pageserver_socket,
+							air_tenant_id,
+							spcOid,
+							dbOid,
+							current_read_lsn(),
+							&db_bytes,
+							errbuf,
+							sizeof(errbuf)))
+	{
+		ereport(WARNING,
+				(errmsg("air_smgr dbsize failed: %s", errbuf)));
+		return -1;
+	}
+	return (int64) db_bytes;
+}
+
 static void
 air_shmem_request(void)
 {
@@ -474,6 +512,7 @@ _PG_init(void)
 
 	air_smgr_id = smgr_register(&air_smgr_impl);
 	smgr_hook = air_smgr_hook;
+	smgr_dbsize_hook = air_dbsize_hook;
 
 	prev_shmem_request_hook = shmem_request_hook;
 	shmem_request_hook = air_shmem_request;

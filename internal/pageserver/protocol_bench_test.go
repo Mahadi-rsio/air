@@ -38,6 +38,10 @@ func (s *benchService) PutPageBatch(_ context.Context, _ string, _, _, _ uint32,
 	return nil
 }
 
+func (s *benchService) UnlinkRel(_ context.Context, _ string, _, _, _ uint32, _ uint8, _ uint64) error {
+	return nil
+}
+
 func encodeBenchReqHeader(op uint16, tenantID string, nblocks uint32) []byte {
 	buf := make([]byte, ReqHeaderSize)
 	binary.LittleEndian.PutUint32(buf[0:4], ProtocolMagic)

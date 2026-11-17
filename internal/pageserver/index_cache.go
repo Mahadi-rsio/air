@@ -3,6 +3,7 @@ package pageserver
 import (
 	"container/list"
 	"sort"
+	"strings"
 	"sync"
 	"unsafe"
 )
@@ -255,6 +256,24 @@ func (c *boundedIndexCache) evict(r2Key string) {
 		delete(c.items, r2Key)
 	}
 	delete(c.blooms, r2Key)
+}
+
+func (c *boundedIndexCache) evictPrefix(prefix string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, elem := range c.items {
+		if strings.HasPrefix(k, prefix) {
+			old := elem.Value.(*layerIndexData)
+			c.curBytes -= old.bytes
+			c.lru.Remove(elem)
+			delete(c.items, k)
+		}
+	}
+	for k := range c.blooms {
+		if strings.HasPrefix(k, prefix) {
+			delete(c.blooms, k)
+		}
+	}
 }
 
 func (c *boundedIndexCache) clear() {

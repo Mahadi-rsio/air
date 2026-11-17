@@ -284,6 +284,38 @@ func (c *DiskCache) Evict(key string) bool {
 	return true
 }
 
+// EvictPrefix safely removes all entries whose key starts with prefix.
+func (c *DiskCache) EvictPrefix(prefix string) int {
+	if prefix == "" {
+		return 0
+	}
+	var removePaths []string
+	var removed int
+	c.mu.Lock()
+	for hashKey, elem := range c.entries {
+		item := elem.Value.(*cacheItem)
+		if strings.HasPrefix(item.key, prefix) {
+			c.lru.Remove(elem)
+			delete(c.entries, hashKey)
+			c.curBytes -= item.size
+			if item.activeReads > 0 {
+				item.pendingDelete = true
+			} else {
+				removePaths = append(removePaths, item.filePath)
+			}
+			removed++
+		}
+	}
+	c.mu.Unlock()
+	if removed > 0 {
+		c.evictions.Add(int64(removed))
+	}
+	for _, p := range removePaths {
+		_ = os.Remove(p)
+	}
+	return removed
+}
+
 // Evictions returns the number of explicit Evict calls performed on this DiskCache.
 func (c *DiskCache) Evictions() int64 {
 	return c.evictions.Load()

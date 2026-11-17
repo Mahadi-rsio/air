@@ -61,6 +61,7 @@ func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materiali
 	seq := t.layerSeq
 	epoch := t.epoch
 	tenantID := t.tenantID
+	gen := t.generation
 	t.mu.Unlock()
 
 	kind := LayerKindL1
@@ -76,18 +77,19 @@ func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materiali
 	}
 
 	fileName := fmt.Sprintf("%s_%06d_%016x_%016x.layer", prefix, seq, minLSN, maxLSN)
-	logicalKey := fmt.Sprintf("tenants/%s/timeline_%d/layers/%s", tenantID, epoch, fileName)
+	logicalKey := fmt.Sprintf("%s/timeline_%d/layers/%s", TenantR2Prefix(tenantID, gen), epoch, fileName)
 	meta := LayerMeta{
-		TenantID:  tenantID,
-		Epoch:     epoch,
-		Kind:      kind,
-		Seq:       seq,
-		FileName:  fileName,
-		R2Key:     logicalKey,
-		AADKey:    logicalKey,
-		StartLSN:  minLSN,
-		EndLSN:    maxLSN,
-		Encrypted: t.store != nil && t.store.kms != nil,
+		TenantID:   tenantID,
+		Generation: gen,
+		Epoch:      epoch,
+		Kind:       kind,
+		Seq:        seq,
+		FileName:   fileName,
+		R2Key:      logicalKey,
+		AADKey:     logicalKey,
+		StartLSN:   minLSN,
+		EndLSN:     maxLSN,
+		Encrypted:  t.store != nil && t.store.kms != nil,
 	}
 
 	var kms = t.store.kms
@@ -163,7 +165,7 @@ func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materiali
 	t.mu.RUnlock()
 
 	if t.store != nil {
-		if err := t.store.PublishLayerManifest(ctx, tenantID, epoch, updated, curSeq); err != nil {
+		if err := t.store.PublishLayerManifestGen(ctx, tenantID, gen, epoch, updated, curSeq); err != nil {
 			return nil, err
 		}
 	}
@@ -178,12 +180,15 @@ func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materiali
 // writeLayerFromStream streams records produced by feed(sw) directly into a V2 layer file
 // with bounded memory, incremental SHA-256, optional CAU upload, and optional DiskCache population.
 func (s *LayerStore) writeLayerFromStream(ctx context.Context, meta LayerMeta, feed func(sw *v2StreamWriter) error) (LayerMeta, error) {
+	if err := s.checkGeneration(meta.TenantID, meta.Generation); err != nil {
+		return meta, err
+	}
 	meta.Encrypted = s.kms != nil
 	if meta.Encrypted && meta.AADKey == "" {
 		if meta.R2Key != "" {
 			meta.AADKey = meta.R2Key
 		} else {
-			meta.AADKey = fmt.Sprintf("tenants/%s/timeline_%d/layers/%s", meta.TenantID, meta.Epoch, meta.FileName)
+			meta.AADKey = fmt.Sprintf("%s/timeline_%d/layers/%s", TenantR2Prefix(meta.TenantID, meta.Generation), meta.Epoch, meta.FileName)
 		}
 	}
 
@@ -194,7 +199,7 @@ func (s *LayerStore) writeLayerFromStream(ctx context.Context, meta LayerMeta, f
 	var err error
 
 	if s.localDir != "" {
-		localPath = filepath.Join(s.localDir, meta.TenantID, meta.FileName)
+		localPath = s.localLayerPath(meta.TenantID, meta.Generation, meta.FileName)
 		if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
 			return meta, err
 		}

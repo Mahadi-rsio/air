@@ -109,11 +109,27 @@ func saveWALManifestAtomic(path string, m *WALUploadManifest) error {
 // prior to INCR, runs pg_verifybackup, compresses with tar+zstd, encrypts with AES-256-GCM-AAD,
 // uploads to R2 with If-None-Match: "*", and atomically commits the BackupArtifact into
 // TenantFenceManifest via PutManifestCAS (aborting and cleaning up on CAS/epoch conflict).
+func r2TenantPrefix(tenantID, generation string) string {
+	if generation == "" {
+		return fmt.Sprintf("tenants/%s", tenantID)
+	}
+	return fmt.Sprintf("tenants/%s/%s", tenantID, generation)
+}
+
 func RunEncryptedBackupStep(
 	ctx context.Context,
 	agent *cell.Agent,
 	s3c *s3.Client,
 	bucket, tenantID, bkpID, parentID, bkpType, parentManifestPath string,
+) (*fencing.BackupArtifact, string, error) {
+	return RunEncryptedBackupStepGen(ctx, agent, s3c, bucket, tenantID, "", bkpID, parentID, bkpType, parentManifestPath)
+}
+
+func RunEncryptedBackupStepGen(
+	ctx context.Context,
+	agent *cell.Agent,
+	s3c *s3.Client,
+	bucket, tenantID, generation, bkpID, parentID, bkpType, parentManifestPath string,
 ) (*fencing.BackupArtifact, string, error) {
 	if s3c == nil || strings.TrimSpace(bucket) == "" {
 		return nil, "", ErrR2ClientRequired
@@ -134,13 +150,14 @@ func RunEncryptedBackupStep(
 	}
 
 	// Read current manifest + ETag early to fail fast on stale fencing epoch.
-	manifest, etag, err := fencing.ReadManifestWithETag(ctx, s3c, bucket, tenantID)
+	manifest, etag, err := fencing.ReadManifestWithETagGen(ctx, s3c, bucket, tenantID, generation)
 	if err != nil {
 		if !fencing.IsNotFoundErr(err) {
 			return nil, "", fmt.Errorf("read fence manifest: %w", err)
 		}
 		manifest = &fencing.TenantFenceManifest{
 			TenantID:     tenantID,
+			Generation:   generation,
 			FencingEpoch: rt.FencingEpoch,
 			HolderCell:   "cell-local",
 			DEKBundle:    dekBundle,
@@ -209,7 +226,7 @@ func RunEncryptedBackupStep(
 		return nil, "", fmt.Errorf("compress backup tar.zst: %w", err)
 	}
 
-	r2Key := fmt.Sprintf("tenants/%s/epoch_%06d/%s.tar.zst.enc", tenantID, rt.FencingEpoch, bkpID)
+	r2Key := fmt.Sprintf("%s/epoch_%06d/%s.tar.zst.enc", r2TenantPrefix(tenantID, generation), rt.FencingEpoch, bkpID)
 	cipherBytes, err := agent.KMS().EncryptObject(tenantID, rt.FencingEpoch, r2Key, plainBytes)
 	if err != nil {
 		_ = os.RemoveAll(bkpDir)
@@ -322,6 +339,16 @@ func DrainStoppedWALSpoolToR2(
 	bucket, tenantID string,
 	epoch int64,
 ) ([]WALSegmentArtifact, error) {
+	return DrainStoppedWALSpoolToR2Gen(ctx, agent, s3c, bucket, tenantID, "", epoch)
+}
+
+func DrainStoppedWALSpoolToR2Gen(
+	ctx context.Context,
+	agent *cell.Agent,
+	s3c *s3.Client,
+	bucket, tenantID, generation string,
+	epoch int64,
+) ([]WALSegmentArtifact, error) {
 	if s3c == nil || strings.TrimSpace(bucket) == "" {
 		return nil, ErrR2ClientRequired
 	}
@@ -332,7 +359,7 @@ func DrainStoppedWALSpoolToR2(
 	if err != nil {
 		return nil, err
 	}
-	return drainWALSpoolDirWithFault(ctx, agent.KMS(), s3c, bucket, tenantID, epoch, walSpoolDir, nil)
+	return drainWALSpoolDirWithFaultGen(ctx, agent.KMS(), s3c, bucket, tenantID, generation, epoch, walSpoolDir, nil)
 }
 
 func drainWALSpoolDirWithFault(
@@ -340,6 +367,18 @@ func drainWALSpoolDirWithFault(
 	kms *crypto.EnvelopeKMS,
 	s3c *s3.Client,
 	bucket, tenantID string,
+	epoch int64,
+	walSpoolDir string,
+	faultHook func(stage, segName string) error,
+) ([]WALSegmentArtifact, error) {
+	return drainWALSpoolDirWithFaultGen(ctx, kms, s3c, bucket, tenantID, "", epoch, walSpoolDir, faultHook)
+}
+
+func drainWALSpoolDirWithFaultGen(
+	ctx context.Context,
+	kms *crypto.EnvelopeKMS,
+	s3c *s3.Client,
+	bucket, tenantID, generation string,
 	epoch int64,
 	walSpoolDir string,
 	faultHook func(stage, segName string) error,
@@ -409,7 +448,7 @@ func drainWALSpoolDirWithFault(
 			return uploaded, fmt.Errorf("zstd compress wal %s: %w", segName, err)
 		}
 
-		r2Key := fmt.Sprintf("tenants/%s/epoch_%06d/wal/%s.zst.enc", tenantID, epoch, segName)
+		r2Key := fmt.Sprintf("%s/epoch_%06d/wal/%s.zst.enc", r2TenantPrefix(tenantID, generation), epoch, segName)
 		cipherBytes, err := kms.EncryptObject(tenantID, epoch, r2Key, compressedBytes)
 		if err != nil {
 			return uploaded, err
@@ -796,6 +835,15 @@ func HydrateTenantPGDataFromR2(
 	s3c *s3.Client,
 	bucket, tenantID string,
 ) error {
+	return HydrateTenantPGDataFromR2Gen(ctx, agent, s3c, bucket, tenantID, "")
+}
+
+func HydrateTenantPGDataFromR2Gen(
+	ctx context.Context,
+	agent *cell.Agent,
+	s3c *s3.Client,
+	bucket, tenantID, generation string,
+) error {
 	if s3c == nil || strings.TrimSpace(bucket) == "" {
 		return ErrR2ClientRequired
 	}
@@ -811,7 +859,7 @@ func HydrateTenantPGDataFromR2(
 		return nil
 	}
 
-	manifest, _, err := fencing.ReadManifestWithETag(ctx, s3c, bucket, tenantID)
+	manifest, _, err := fencing.ReadManifestWithETagGen(ctx, s3c, bucket, tenantID, generation)
 	if err != nil {
 		return fmt.Errorf("read R2 manifest for %s: %w", tenantID, err)
 	}
@@ -945,8 +993,10 @@ func HydrateTenantPGDataFromR2(
 	}
 	defer func() { _ = os.RemoveAll(sockDir) }()
 
+	pgConfPath := filepath.Join(combinedDir, "postgresql.conf")
+	origPGConf, _ := os.ReadFile(pgConfPath)
 	pitrConf := fmt.Sprintf("\nport = %d\nunix_socket_directories = '%s'\narchive_mode = off\nrestore_command = 'cp %s/%%f %%p'\nrecovery_target_action = 'promote'\n", port, sockDir, walRestoreDir)
-	f, err := os.OpenFile(filepath.Join(combinedDir, "postgresql.conf"), os.O_APPEND|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(pgConfPath, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -970,6 +1020,10 @@ func HydrateTenantPGDataFromR2(
 	}
 	if out, err := agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "pg_ctl"), "-D", combinedDir, "-m", "fast", "-w", "-t", "15", "stop"); err != nil {
 		return fmt.Errorf("hydrate pg_ctl stop failed: %w (%s)", err, out)
+	}
+
+	if len(origPGConf) > 0 {
+		_ = os.WriteFile(pgConfPath, origPGConf, 0o600)
 	}
 
 	_ = os.Remove(filepath.Join(combinedDir, "postmaster.pid"))

@@ -247,3 +247,49 @@ All four P0 blockers identified at commit `c5a98045` were investigated, reproduc
 - **P1 — Async R2 offload visibility to `Suspend` callers:** `F4`/`F5` return `HTTP:200` on `Suspend` while R2 upload errors occur asynchronously (surfaced in Page Server logs/unit tests, not yet exposed as `offload_status` on the HTTP control plane).
 - **P2 — `air_smgr` relation size reporting:** `pg_total_relation_size()` / `pg_database_size()` introspection remains inaccurate (`0` / underreported).
 - **Benchmark Harness Notes:** `benchmarks/phase3_durability` Test E has a pre-existing `SQLSTATE 42P08` parameter type error in `main.go` (covered by `benchmarks/phase3_de` instead); multi-tenant container runs at 50+ active Postgres instances require `--shm-size` > Docker's 64 MiB default.
+
+---
+
+## 13. Phase 12 — Lifecycle Isolation, Offload Reliability, Storage Introspection & Compaction
+
+All remaining P1 and P2 issues from Phase 11 (Tenant ID reuse isolation, `WakeTenant` lock contention during R2 offload, offload error propagation and status tracking, `air_smgr` storage introspection, and L0 fragmentation/compaction) were audited, implemented, and verified with `-race` Go tests and real `air-server:pageserver` PG17 container runs.
+
+### 13A. Root Causes & Architectural Changes
+
+| Area | Root Cause | Implemented Solution | Key Tests |
+|---|---|---|---|
+| **Part 1 (P1): Tenant ID Reuse & Storage Isolation** | `DELETE` + re-`ProvisionDatabase` reused the same `tenantID` across R2 keys, local paths, `Timeline` state, and shared caches (`DecodedChunkCache`, `boundedIndexCache`, `DiskCache`), allowing stale files, cached pages, or delayed uploads from a previous lifecycle to bleed into the new tenant. | Added immutable per-lifecycle `generation` IDs (`gen_<hex>`) stored in control-plane metadata (`clusters.generation`), propagated to `Pageserver` (`RegisterTenantGen`, `PublishLayerManifestGen`, generation-scoped R2/CAU prefixes, local layer paths, `DiskCache`, `DecodedChunkCache`, `boundedIndexCache` keys, and `offload_ops`). Delayed or stale-generation manifest publishes return `ErrStaleGeneration`. | `TestPhase12TenantIDReuseAndGenerationIsolation` (3 full provision/write/offload/delete/recreate cycles) |
+| **Part 2 (P1): `WakeTenant` Lock Contention** | `processColdOffload` held `lockTenantLifecycle(tenantID)` across R2 PUT/network I/O, blocking `WakeTenant` for the entire R2 upload duration (12.87–17.05s in earlier benchmarks). | Replaced coarse lock-across-network-I/O with brief pre- and post-upload lifecycle checks gated by `(tenant_id, generation, lifecycle_seq)` and a cancellable per-offload context. `WakeTenant` cancels any in-flight offload for that tenant immediately without waiting for slow R2 I/O. | `TestPhase12WakeTenantNotBlockedBySlowR2Offload`, `TestPhase12ConcurrentSuspendWakeAndDeleteOffload` |
+| **Part 3 (P1): Offload Reliability & Error Propagation** | Async R2 upload failures were logged without durable state tracking or retry visibility, causing false-success perceptions on `Suspend`. | Added durable `offload_ops` tracking (`op_id`, `tenant_id`, `generation`, `state`, `started_at`, `completed_at`, `uploaded_objects`, `failed_objects`, `error_details`, `retry_count`) with bounded exponential-backoff retries, sync-mode failure propagation, restart reconciliation (`cancelled`/`failed` with error details), and HTTP status endpoints (`GET /v1/databases/:id/offload`, `GET /internal/v1/offloads/:op_id`). | `TestPhase12OffloadReliabilityRetryAndHTTPStatus`, `TestPhase12OffloadStatusAfterRestart` |
+| **Part 4 (P2): Storage Introspection** | `air_smgr` tracked block counts only transiently or returned `0` for `pg_total_relation_size()` / `pg_database_size()`, and `pg_database_size()` bypassed `air_smgr` when local `pgdata` only held metadata skeletons. | Updated `extensions/air_smgr` (`air_smgr.c`, `communicator.c`), `patches/pg17-smgr-hook.patch` (`air_dbsize_hook`), and `Pageserver` (`EntryFlagRelSize`, `GetDatabaseSize`, `GetRelSize`, unlink/truncate accounting) to persist fork sizes (`main`, `fsm`, `vm`, `init`), multi-segment/TOAST/index relations, truncations, and drops across suspend, wake, compaction, and server restarts. | `TestPhase12StorageIntrospectionSizesAcrossForksDropsTruncateAndRestart`, container PG17 verification |
+| **Part 5: L0 Layer Fragmentation & Compaction** | 40 bounded L0 layers kept decode sizes safe in Phase 11, but increased manifest size, R2 GET fan-out, and cold lookup latency on overlapping key ranges. | Investigated 40-L0 fragmentation and verified `CompactIfNeeded` merges L0 layers into a single atomic Image layer while preserving LSN ordering, keeping old layers until manifest publication succeeds, and remaining safe under concurrent reads/writes and R2 failures. | `TestPhase12L0FragmentationAndCompaction`, `TestPhase12CompactionConcurrentReadsAndWrites`, `TestPhase12CompactionR2FailurePreservesOldLayers`, `TestPhase12CompactionRestartAndManifestRecovery` |
+
+### 13B. Measured Before vs. After Results
+
+#### 1. `WakeTenant` Latency & Lifecycle Isolation
+- **`WakeTenant` during 3s slow R2 upload (`TestPhase12WakeTenantNotBlockedBySlowR2Offload`):** **96.51 ms** (down from 12.87–17.05 s when `processColdOffload` held the lifecycle lock across R2 I/O).
+- **Normal R2 `WakeTenant` in `air-server:pageserver` container:** **127 ms** (`NORMAL_R2_SUSPEND_MS=10087`).
+- **Tenant ID reuse (`p12_reuse` delete + recreate in container):** **2,570 ms** recreate latency, **`0` leaked public tables** (`RECREATED_PUBLIC_TABLES=0`), `ErrNotFound` on old-generation pages, and `ErrStaleGeneration` on delayed old-generation manifest publishes.
+- **25-Tenant Container Provisioning & Isolation (`phase12_verify.sh`):** Provision + write across 25 tenants in **59,139 ms**, total suspend/wake/verify cycle **184,482 ms**, **`0` cross-tenant mismatches** (`MISMATCHES=0`), container footprint **`1.583 GiB` RAM / `0.38%` CPU**.
+- **Unavailable R2 (`r2proxy` `unavailable` fault):** `Suspend` returns `offload_op_id` + `offload_state: "pending"`, and `GET /v1/databases/:id/offload` exposes `"state":"running"` during retries and terminal `"state":"failed"` with `error_details` upon exhaustion (no false-success).
+
+#### 2. L0 Compaction Benchmark (`TestPhase12L0FragmentationAndCompaction`, 40 L0s -> 1 Image Layer)
+
+| Metric | Before Compaction (40 L0s) | After Compaction (1 Image) | Improvement |
+|---|---|---|---|
+| **L0 Layer Count** | 40 | 0 (1 compacted Image layer) | 40x fewer layers |
+| **Manifest Size** | 43,161 bytes | 1,244 bytes | **34.7x smaller** |
+| **Cold R2 GET Count** | 100 | 51 | **1.96x fewer GETs** |
+| **Cold Page Lookup `p50`** | 75.361 µs | 42.860 µs | **1.76x faster** |
+| **Cold Page Lookup `p95`** | 3.767 ms | 1.959 ms | **1.92x faster** |
+| **Cold Page Lookup `p99`** | 5.131 ms | 2.735 ms | **1.88x faster** |
+
+#### 3. Real PG17 `air_smgr` Storage Introspection (`air-server:pageserver` Container)
+Measured on `p12_introspect` (`items` table with `TEXT` TOAST column + `idx_items_pad` index):
+- **After 500-row insert + index:** `pg_relation_size('items')` = `180,224 B`, `fsm` = `24,576 B`, `vm` = `0 B`, `pg_table_size('items')` = `212,992 B`, `pg_total_relation_size('items')` = `262,144 B`, `pg_relation_size('idx_items_pad')` = `16,384 B`, `pg_database_size('p12_introspect')` = `7,763,635 B`.
+- **After `UPDATE`/`DELETE`/`VACUUM` + `aux_tbl`:** `pg_relation_size('items')` = `270,336 B`, `pg_table_size('items')` = `311,296 B`, `pg_total_relation_size('items')` = `368,640 B`, `pg_database_size` = `7,771,827 B`.
+- **After `Suspend` + `Wake`:** `270,336 B` / `311,296 B` / `368,640 B` / `8,197,811 B` (no size regression).
+- **After `docker restart` + `Wake`:** `270,336 B` / `311,296 B` / `368,640 B` / `8,197,811 B` (exact match).
+- **After `TRUNCATE TABLE items` + `DROP TABLE aux_tbl`:** `0 B` / `8,192 B` / `24,576 B` / `7,771,827 B`.
+- **Architecture Note:** `pg_database_size()` combines catalog/local PGDATA base metadata with `air_smgr`-managed relation fork sizes tracked in Pageserver; temporary relations created only in local backend temp files outside `air_smgr` remote persistence remain local-only per session.
+

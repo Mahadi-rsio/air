@@ -740,10 +740,11 @@ func (s *LayerStore) lookupKeysInLayerV2(ctx context.Context, meta LayerMeta, id
 		for _, cIdx := range uniqueChunks {
 			cm := idxData.chunks[cIdx]
 			dKey := DecodedChunkKey{
-				TenantID: meta.TenantID,
-				LayerID:  meta.R2Key,
-				ChunkIdx: cIdx,
-				KeyEpoch: keyEpoch,
+				TenantID:   meta.TenantID,
+				Generation: meta.Generation,
+				LayerID:    meta.R2Key,
+				ChunkIdx:   cIdx,
+				KeyEpoch:   keyEpoch,
 			}
 			chunkRaw, err := s.decodedChunks.GetOrDecode(ctx, dKey, func() ([]byte, error) {
 				return s.readAndDecodeV2ChunkWithRecovery(ctx, meta, int(cIdx), cm)
@@ -813,10 +814,11 @@ func (s *LayerStore) lookupKeysInLayerV2(ctx context.Context, meta LayerMeta, id
 		if err != nil {
 			if s.decodedChunks != nil {
 				s.decodedChunks.Evict(DecodedChunkKey{
-					TenantID: meta.TenantID,
-					LayerID:  meta.R2Key,
-					ChunkIdx: m.chunkIdx,
-					KeyEpoch: keyEpoch,
+					TenantID:   meta.TenantID,
+					Generation: meta.Generation,
+					LayerID:    meta.R2Key,
+					ChunkIdx:   m.chunkIdx,
+					KeyEpoch:   keyEpoch,
 				})
 			}
 			cm := idxData.chunks[m.chunkIdx]

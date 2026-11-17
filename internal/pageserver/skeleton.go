@@ -42,10 +42,15 @@ func (p *Pageserver) skeletonPaths(tenantID string) (localPath, r2Key string, en
 	if encrypted {
 		name += ".enc"
 	}
+	gen := p.GetTenantGeneration(tenantID)
 	if p.cfg.LayerDir != "" {
-		localPath = filepath.Join(p.cfg.LayerDir, tenantID, name)
+		if gen != "" {
+			localPath = filepath.Join(p.cfg.LayerDir, tenantID, gen, name)
+		} else {
+			localPath = filepath.Join(p.cfg.LayerDir, tenantID, name)
+		}
 	}
-	r2Key = fmt.Sprintf("tenants/%s/skeleton/%s", tenantID, name)
+	r2Key = fmt.Sprintf("%s/skeleton/%s", TenantR2Prefix(tenantID, gen), name)
 	return localPath, r2Key, encrypted
 }
 

@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/Mahadi-rsio/air/internal/crypto"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -35,8 +36,9 @@ type Pageserver struct {
 	redoer  WALRedoer
 	unixSrv *UnixServer
 
-	mu        sync.RWMutex
-	tenants   map[string]*Timeline
+	mu          sync.RWMutex
+	tenants     map[string]*Timeline
+	generations map[string]string
 }
 
 // New creates a Pageserver instance. Call Start(ctx) to bind the Unix socket.
@@ -58,12 +60,14 @@ func New(cfg Config) (*Pageserver, error) {
 	store := NewLayerStore(cfg.LayerDir, cfg.S3Client, cfg.R2Bucket, cfg.KMS, cache)
 	redoer := NewDefaultWALRedoer(cfg.WalRedoBin)
 	ps := &Pageserver{
-		cfg:     cfg,
-		store:   store,
-		cache:   cache,
-		redoer:  redoer,
-		tenants: make(map[string]*Timeline),
+		cfg:         cfg,
+		store:       store,
+		cache:       cache,
+		redoer:      redoer,
+		tenants:     make(map[string]*Timeline),
+		generations: make(map[string]string),
 	}
+	store.SetGenerationChecker(ps.isGenerationActive)
 	ps.unixSrv = NewUnixServer(cfg.SocketPath, ps)
 	return ps, nil
 }
@@ -82,14 +86,125 @@ func (p *Pageserver) Close() error {
 	return err
 }
 
+// Store returns the underlying LayerStore.
+func (p *Pageserver) Store() *LayerStore {
+	return p.store
+}
+
+// SetTenantGeneration registers the active immutable generation for tenantID.
+// If an existing Timeline belongs to a different generation, it is detached.
+func (p *Pageserver) SetTenantGeneration(tenantID, generation string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if generation == "" {
+		return
+	}
+	if prev, ok := p.generations[tenantID]; ok && prev != generation {
+		delete(p.tenants, tenantID)
+	}
+	p.generations[tenantID] = generation
+	if tl, ok := p.tenants[tenantID]; ok && tl.Generation() != generation {
+		if tl.Generation() == "" {
+			tl.SetGeneration(generation)
+		} else {
+			delete(p.tenants, tenantID)
+		}
+	}
+}
+
+// GetTenantGeneration returns the currently registered generation for tenantID (empty if unset).
+func (p *Pageserver) GetTenantGeneration(tenantID string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.generations[tenantID]
+}
+
+func (p *Pageserver) isGenerationActive(tenantID, generation string) bool {
+	p.mu.RLock()
+	cur, ok := p.generations[tenantID]
+	p.mu.RUnlock()
+	if !ok {
+		// If no generation was ever registered (legacy unit tests), allow empty generation.
+		return generation == ""
+	}
+	return cur == generation
+}
+
+// PurgeTenant removes in-memory timelines, local layer/cache files, decoded/index/disk cache entries,
+// and best-effort R2 objects for (tenantID, generation).
+func (p *Pageserver) PurgeTenant(ctx context.Context, tenantID, generation string) error {
+	p.mu.Lock()
+	curGen := p.generations[tenantID]
+	if generation == "" || curGen == generation {
+		delete(p.generations, tenantID)
+		delete(p.tenants, tenantID)
+	} else if tl, ok := p.tenants[tenantID]; ok && tl.Generation() == generation {
+		delete(p.tenants, tenantID)
+	}
+	p.mu.Unlock()
+
+	if p.store != nil {
+		if p.store.decodedChunks != nil {
+			p.store.decodedChunks.InvalidateTenantGeneration(tenantID, generation)
+		}
+		prefix := TenantR2Prefix(tenantID, generation) + "/"
+		if p.store.idxCache != nil {
+			p.store.idxCache.evictPrefix(prefix)
+		}
+		if p.cache != nil {
+			p.cache.EvictPrefix(prefix)
+		}
+		if p.store.s3c != nil && p.store.bucket != "" {
+			var token *string
+			for {
+				out, err := p.store.s3c.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+					Bucket:            aws.String(p.store.bucket),
+					Prefix:            aws.String(prefix),
+					ContinuationToken: token,
+				})
+				if err != nil {
+					break
+				}
+				for _, obj := range out.Contents {
+					if obj.Key != nil {
+						_, _ = p.store.s3c.DeleteObject(ctx, &s3.DeleteObjectInput{
+							Bucket: aws.String(p.store.bucket),
+							Key:    obj.Key,
+						})
+					}
+				}
+				if !aws.ToBool(out.IsTruncated) || out.NextContinuationToken == nil {
+					break
+				}
+				token = out.NextContinuationToken
+			}
+		}
+	}
+
+	if p.cfg.LayerDir != "" {
+		if generation != "" {
+			_ = os.RemoveAll(filepath.Join(p.cfg.LayerDir, tenantID, generation))
+		} else {
+			_ = os.RemoveAll(filepath.Join(p.cfg.LayerDir, tenantID))
+		}
+	}
+	return nil
+}
+
 // EnsureTenant returns an existing Timeline for tenantID or creates one at epoch.
 func (p *Pageserver) EnsureTenant(tenantID string, epoch int64) *Timeline {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	gen := p.generations[tenantID]
 	if tl, ok := p.tenants[tenantID]; ok {
-		return tl
+		if gen == "" || tl.Generation() == gen {
+			return tl
+		}
 	}
 	tl := NewTimeline(tenantID, epoch, p.store, p.redoer)
+	if gen != "" {
+		tl.SetGeneration(gen)
+	}
 	p.tenants[tenantID] = tl
 	return tl
 }
@@ -187,6 +302,16 @@ func (p *Pageserver) PutPageBatch(ctx context.Context, tenantID string, spcOID, 
 	return tl.PutPageBatch(ctx, spcOID, dbOID, relNumber, forkNum, startBlock, nblocks, lsn, pages)
 }
 
+// UnlinkRel implements Service.
+func (p *Pageserver) UnlinkRel(_ context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) error {
+	tl, err := p.getTimeline(tenantID)
+	if err != nil {
+		return err
+	}
+	tl.UnlinkRel(spcOID, dbOID, relNumber, forkNum, lsn)
+	return nil
+}
+
 // BootstrapTenantFromPGData imports an existing PGDATA base/ and global/ directory into an Image layer at initLSN
 // using bounded-memory streaming file traversal and V2 encoding.
 func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID string, epoch int64, pgDataDir string, initLSN uint64) (*LayerMeta, error) {
@@ -281,17 +406,19 @@ func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID str
 		return files[i].segNum < files[j].segNum
 	})
 
+	gen := tl.Generation()
 	fileName := fmt.Sprintf("img_bootstrap_%016x.layer", initLSN)
-	logicalKey := fmt.Sprintf("tenants/%s/timeline_%d/layers/%s", tenantID, epoch, fileName)
+	logicalKey := fmt.Sprintf("%s/timeline_%d/layers/%s", TenantR2Prefix(tenantID, gen), epoch, fileName)
 	meta := LayerMeta{
-		TenantID: tenantID,
-		Epoch:    epoch,
-		Kind:     LayerKindImage,
-		FileName: fileName,
-		R2Key:    logicalKey,
-		AADKey:   logicalKey,
-		StartLSN: initLSN,
-		EndLSN:   initLSN,
+		TenantID:   tenantID,
+		Generation: gen,
+		Epoch:      epoch,
+		Kind:       LayerKindImage,
+		FileName:   fileName,
+		R2Key:      logicalKey,
+		AADKey:     logicalKey,
+		StartLSN:   initLSN,
+		EndLSN:     initLSN,
 	}
 
 	var wroteAny bool

@@ -378,6 +378,51 @@ air_ps_get_rel_exists(const char *socket_path,
 }
 
 bool
+air_ps_get_db_size(const char *socket_path,
+				   const char *tenant_id,
+				   Oid spc_oid,
+				   Oid db_oid,
+				   XLogRecPtr lsn,
+				   uint64_t *bytes_out,
+				   char *errbuf,
+				   size_t errbuf_len)
+{
+	AirPsReqHeader req;
+	AirPsRespHeader resp;
+	RelFileLocator rlocator;
+
+	rlocator.spcOid = spc_oid;
+	rlocator.dbOid = db_oid;
+	rlocator.relNumber = 0;
+
+	fill_req_header(&req, AIR_PS_OP_GET_DB_SIZE, tenant_id, rlocator, 0, 0, 0, lsn);
+	if (!do_rpc(socket_path, &req, &resp, NULL, 0, errbuf, errbuf_len))
+		return false;
+
+	*bytes_out = (resp.status == AIR_PS_STATUS_OK) ? resp.u64_val : 0;
+	return true;
+}
+
+bool
+air_ps_unlink_rel(const char *socket_path,
+				  const char *tenant_id,
+				  RelFileLocator rlocator,
+				  ForkNumber forknum,
+				  XLogRecPtr lsn,
+				  char *errbuf,
+				  size_t errbuf_len)
+{
+	AirPsReqHeader req;
+	AirPsRespHeader resp;
+
+	fill_req_header(&req, AIR_PS_OP_UNLINK_REL, tenant_id, rlocator, forknum, 0, 0, lsn);
+	if (!do_rpc(socket_path, &req, &resp, NULL, 0, errbuf, errbuf_len))
+		return false;
+
+	return resp.status == AIR_PS_STATUS_OK || resp.status == AIR_PS_STATUS_NOT_FOUND;
+}
+
+bool
 air_ps_put_pages(const char *socket_path,
 				 const char *tenant_id,
 				 RelFileLocator rlocator,

@@ -46,6 +46,7 @@ type BackupArtifact struct {
 // and guarded by HTTP ETag conditional writes (If-None-Match / If-Match).
 type TenantFenceManifest struct {
 	TenantID     string                  `json:"tenant_id"`
+	Generation   string                  `json:"generation,omitempty"`
 	FencingEpoch int64                   `json:"fencing_epoch"`
 	HolderCell   string                  `json:"holder_cell"`
 	UpdatedAt    string                  `json:"updated_at"`
@@ -55,7 +56,14 @@ type TenantFenceManifest struct {
 }
 
 func ManifestR2Key(tenantID string) string {
-	return fmt.Sprintf("tenants/%s/manifest.json", tenantID)
+	return ManifestR2KeyGen(tenantID, "")
+}
+
+func ManifestR2KeyGen(tenantID, generation string) string {
+	if generation == "" {
+		return fmt.Sprintf("tenants/%s/manifest.json", tenantID)
+	}
+	return fmt.Sprintf("tenants/%s/%s/manifest.json", tenantID, generation)
 }
 
 // IsNotFoundErr reports whether err represents a missing S3/R2 object (HTTP 404 / NoSuchKey).
@@ -89,13 +97,18 @@ func isPreconditionErr(err error) bool {
 
 // ReadManifestWithETag fetches the current TenantFenceManifest and its HTTP ETag from R2.
 func ReadManifestWithETag(ctx context.Context, s3c *s3.Client, bucket, tenantID string) (*TenantFenceManifest, string, error) {
+	return ReadManifestWithETagGen(ctx, s3c, bucket, tenantID, "")
+}
+
+// ReadManifestWithETagGen fetches the generation-scoped TenantFenceManifest and its HTTP ETag from R2.
+func ReadManifestWithETagGen(ctx context.Context, s3c *s3.Client, bucket, tenantID, generation string) (*TenantFenceManifest, string, error) {
 	if s3c == nil || strings.TrimSpace(bucket) == "" {
 		return nil, "", ErrR2ClientRequired
 	}
 	if err := tenant.ValidateID(tenantID); err != nil {
 		return nil, "", err
 	}
-	key := ManifestR2Key(tenantID)
+	key := ManifestR2KeyGen(tenantID, generation)
 	out, err := s3c.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -133,7 +146,7 @@ func PutManifestCAS(ctx context.Context, s3c *s3.Client, bucket string, m *Tenan
 	}
 
 	if expectedETag != "" {
-		remote, _, err := ReadManifestWithETag(ctx, s3c, bucket, m.TenantID)
+		remote, _, err := ReadManifestWithETagGen(ctx, s3c, bucket, m.TenantID, m.Generation)
 		if err == nil && remote != nil && m.FencingEpoch < remote.FencingEpoch {
 			return "", fmt.Errorf("%w: writer epoch=%d < remote epoch=%d", ErrStaleFencingEpoch, m.FencingEpoch, remote.FencingEpoch)
 		}
@@ -146,7 +159,7 @@ func PutManifestCAS(ctx context.Context, s3c *s3.Client, bucket string, m *Tenan
 	}
 	input := &s3.PutObjectInput{
 		Bucket:      aws.String(bucket),
-		Key:         aws.String(ManifestR2Key(m.TenantID)),
+		Key:         aws.String(ManifestR2KeyGen(m.TenantID, m.Generation)),
 		Body:        bytes.NewReader(body),
 		ContentType: aws.String("application/json"),
 	}

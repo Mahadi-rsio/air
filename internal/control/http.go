@@ -129,6 +129,15 @@ func (cp *ControlPlane) HTTPHandler() http.Handler {
 			}
 			c.JSON(http.StatusOK, resp)
 		})
+
+		v1.GET("/databases/:id/offload", func(c *gin.Context) {
+			st, err := cp.GetLatestOffloadStatus(c.Request.Context(), c.GetString(accountIDContextKey), c.Param("id"))
+			if err != nil {
+				writeControlError(c, err)
+				return
+			}
+			c.JSON(http.StatusOK, st)
+		})
 	}
 
 	cp.registerInternalRoutes(r)
@@ -211,7 +220,31 @@ func (cp *ControlPlane) registerInternalRoutes(r *gin.Engine) {
 				writeControlError(c, err)
 				return
 			}
-			c.JSON(http.StatusOK, gin.H{"status": "SUSPENDED", "tenant_id": id})
+			resp := gin.H{"status": "SUSPENDED", "tenant_id": id}
+			if st, err := cp.GetLatestOffloadStatus(c.Request.Context(), "", id); err == nil && st != nil {
+				resp["generation"] = st.Generation
+				resp["offload_op_id"] = st.OpID
+				resp["offload_state"] = st.State
+			}
+			c.JSON(http.StatusOK, resp)
+		})
+
+		internal.GET("/databases/:id/offload", func(c *gin.Context) {
+			st, err := cp.GetLatestOffloadStatus(c.Request.Context(), "", c.Param("id"))
+			if err != nil {
+				writeControlError(c, err)
+				return
+			}
+			c.JSON(http.StatusOK, st)
+		})
+
+		internal.GET("/offloads/:op_id", func(c *gin.Context) {
+			st, err := cp.GetOffloadStatus(c.Request.Context(), c.Param("op_id"))
+			if err != nil {
+				writeControlError(c, err)
+				return
+			}
+			c.JSON(http.StatusOK, st)
 		})
 
 		internal.POST("/databases/:id/start", func(c *gin.Context) {

@@ -58,10 +58,11 @@ func (k LayerKind) String() string {
 
 // Entry flags inside a layer file.
 const (
-	EntryFlagPageImage uint32 = 1 << 0
-	EntryFlagWALRecord uint32 = 1 << 1
-	EntryFlagWillInit  uint32 = 1 << 2
-	EntryFlagRelSize   uint32 = 1 << 3
+	EntryFlagPageImage   uint32 = 1 << 0
+	EntryFlagWALRecord   uint32 = 1 << 1
+	EntryFlagWillInit    uint32 = 1 << 2
+	EntryFlagRelSize     uint32 = 1 << 3
+	EntryFlagRelUnlinked uint32 = 1 << 4
 )
 
 // WALDelta represents a single versioned state entry at a given LSN.
@@ -168,9 +169,13 @@ type LayerFooter struct {
 	EndLSN      uint64
 }
 
+// ErrStaleGeneration is returned when an operation attempts to write or publish for a superseded/purged tenant generation.
+var ErrStaleGeneration = errors.New("pageserver: stale tenant generation")
+
 // LayerMeta describes an immutable layer file in the LayerMap.
 type LayerMeta struct {
 	TenantID          string    `json:"tenant_id"`
+	Generation        string    `json:"generation,omitempty"`
 	Epoch             int64     `json:"epoch"`
 	Kind              LayerKind `json:"kind"`
 	Seq               uint64    `json:"seq,omitempty"`
@@ -393,8 +398,47 @@ type LayerStore struct {
 	prefetchSem        chan struct{}
 	readLimiter        *ReadLimiter
 	decodedChunks      *DecodedChunkCache
+	generationCheck    func(tenantID, generation string) bool
 	metricsMu          sync.Mutex
 	lastMetrics        UploadMetrics
+}
+
+// SetGenerationChecker registers a callback that validates whether (tenantID, generation) is still active.
+func (s *LayerStore) SetGenerationChecker(fn func(tenantID, generation string) bool) {
+	s.generationCheck = fn
+}
+
+func (s *LayerStore) checkGeneration(tenantID, generation string) error {
+	if s.generationCheck != nil && !s.generationCheck(tenantID, generation) {
+		return fmt.Errorf("%w: tenant=%s generation=%s", ErrStaleGeneration, tenantID, generation)
+	}
+	return nil
+}
+
+func (s *LayerStore) localLayerDir(tenantID, generation string) string {
+	if s.localDir == "" {
+		return ""
+	}
+	if generation != "" {
+		return filepath.Join(s.localDir, tenantID, generation)
+	}
+	return filepath.Join(s.localDir, tenantID)
+}
+
+func (s *LayerStore) localLayerPath(tenantID, generation, fileName string) string {
+	dir := s.localLayerDir(tenantID, generation)
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, fileName)
+}
+
+func (s *LayerStore) localManifestPath(tenantID, generation string, epoch int64) string {
+	dir := s.localLayerDir(tenantID, generation)
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, fmt.Sprintf("timeline_%d_layer_manifest.json", epoch))
 }
 
 // NewLayerStore creates a LayerStore backed by localDir, optional S3/R2, optional KMS, and optional DiskCache.
@@ -534,12 +578,15 @@ func (s *LayerStore) recordMetrics(m UploadMetrics) {
 // WriteLayer encodes recs into an immutable layer file, finalizes it atomically on disk,
 // and uploads it to R2 using content-addressed storage if configured.
 func (s *LayerStore) WriteLayer(ctx context.Context, meta LayerMeta, recs []LayerRecord) (LayerMeta, error) {
+	if err := s.checkGeneration(meta.TenantID, meta.Generation); err != nil {
+		return meta, err
+	}
 	meta.Encrypted = s.kms != nil
 	if meta.Encrypted && meta.AADKey == "" {
 		if meta.R2Key != "" {
 			meta.AADKey = meta.R2Key
 		} else {
-			meta.AADKey = fmt.Sprintf("tenants/%s/timeline_%d/layers/%s", meta.TenantID, meta.Epoch, meta.FileName)
+			meta.AADKey = fmt.Sprintf("%s/timeline_%d/layers/%s", TenantR2Prefix(meta.TenantID, meta.Generation), meta.Epoch, meta.FileName)
 		}
 	}
 
@@ -560,7 +607,7 @@ func (s *LayerStore) WriteLayer(ctx context.Context, meta LayerMeta, recs []Laye
 		}
 
 		if s.localDir != "" {
-			localPath = filepath.Join(s.localDir, meta.TenantID, meta.FileName)
+			localPath = s.localLayerPath(meta.TenantID, meta.Generation, meta.FileName)
 			if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
 				return meta, err
 			}
@@ -595,7 +642,7 @@ func (s *LayerStore) WriteLayer(ctx context.Context, meta LayerMeta, recs []Laye
 		var tmpPath string
 		var err error
 		if s.localDir != "" {
-			localPath = filepath.Join(s.localDir, meta.TenantID, meta.FileName)
+			localPath = s.localLayerPath(meta.TenantID, meta.Generation, meta.FileName)
 			if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
 				return meta, err
 			}
@@ -679,7 +726,7 @@ func (s *LayerStore) WriteLayer(ctx context.Context, meta LayerMeta, recs []Laye
 			sum := sha256.Sum256(memData)
 			meta.SHA256 = hex.EncodeToString(sum[:])
 		}
-		if cauKey, kErr := ContentAddressedLayerKey(meta.TenantID, meta.SHA256); kErr == nil {
+		if cauKey, kErr := ContentAddressedLayerKeyGen(meta.TenantID, meta.Generation, meta.SHA256); kErr == nil {
 			meta.R2Key = cauKey
 		}
 	}
@@ -744,7 +791,10 @@ func (s *LayerStore) uploadLayerFilePrehashed(ctx context.Context, meta LayerMet
 		return meta, err
 	}
 
-	cauKey, err := ContentAddressedLayerKey(meta.TenantID, sha256Hex)
+	if err := s.checkGeneration(meta.TenantID, meta.Generation); err != nil {
+		return meta, err
+	}
+	cauKey, err := ContentAddressedLayerKeyGen(meta.TenantID, meta.Generation, sha256Hex)
 	if err != nil {
 		return meta, err
 	}
@@ -1115,7 +1165,7 @@ func (s *LayerStore) readRangeLocalOrR2Direct(ctx context.Context, meta LayerMet
 		}
 	}
 	if s.localDir != "" {
-		localPath := filepath.Join(s.localDir, meta.TenantID, meta.FileName)
+		localPath := s.localLayerPath(meta.TenantID, meta.Generation, meta.FileName)
 		if f, err := os.Open(localPath); err == nil {
 			defer f.Close()
 			buf := make([]byte, length)
@@ -1304,7 +1354,7 @@ func (s *LayerStore) ReadRange(ctx context.Context, meta LayerMeta, offset, leng
 		}
 	}
 	if s.localDir != "" {
-		localPath := filepath.Join(s.localDir, meta.TenantID, meta.FileName)
+		localPath := s.localLayerPath(meta.TenantID, meta.Generation, meta.FileName)
 		if f, err := os.Open(localPath); err == nil {
 			defer f.Close()
 			buf := make([]byte, length)
@@ -1481,6 +1531,31 @@ func (s *LayerStore) LookupKeyInLayer(ctx context.Context, meta LayerMeta, key K
 		return nil, err
 	}
 	return res[0], nil
+}
+
+// ListRelSizeKeysInLayer returns all unique KeyKindRelSize keys present in meta's index.
+func (s *LayerStore) ListRelSizeKeysInLayer(ctx context.Context, meta LayerMeta) ([]Key, error) {
+	if meta.FileSize < int64(LayerFooterSize) {
+		return nil, nil
+	}
+	idxData, err := s.loadLayerIndex(ctx, meta)
+	if err != nil {
+		return nil, err
+	}
+	entries := idxData.entries
+	start := sort.Search(len(entries), func(i int) bool {
+		return entries[i].Key.Kind >= KeyKindRelSize
+	})
+	var keys []Key
+	for i := start; i < len(entries); i++ {
+		if entries[i].Key.Kind != KeyKindRelSize {
+			break
+		}
+		if len(keys) == 0 || keys[len(keys)-1] != entries[i].Key {
+			keys = append(keys, entries[i].Key)
+		}
+	}
+	return keys, nil
 }
 
 // LookupKeysInLayer resolves a batch of keys against a single layer using Bloom pruning,
@@ -1688,13 +1763,30 @@ func (s *LayerStore) DownloadLayer(ctx context.Context, meta LayerMeta, dstPath 
 // PublishLayerManifest atomically persists the timeline's layer manifest to local disk (if configured)
 // and R2 (using ETag CAS when updating an existing manifest).
 func (s *LayerStore) PublishLayerManifest(ctx context.Context, tenantID string, epoch int64, layers []LayerMeta, maxSeq uint64) error {
+	var gen string
+	for _, lm := range layers {
+		if lm.Generation != "" {
+			gen = lm.Generation
+			break
+		}
+	}
+	return s.PublishLayerManifestGen(ctx, tenantID, gen, epoch, layers, maxSeq)
+}
+
+// PublishLayerManifestGen atomically persists the generation-scoped layer manifest,
+// rejecting stale generations if a generation checker is registered.
+func (s *LayerStore) PublishLayerManifestGen(ctx context.Context, tenantID, generation string, epoch int64, layers []LayerMeta, maxSeq uint64) error {
+	if err := s.checkGeneration(tenantID, generation); err != nil {
+		return err
+	}
 	manifest := TimelineLayerManifest{
-		TenantID:  tenantID,
-		Epoch:     epoch,
-		Version:   1,
-		MaxSeq:    maxSeq,
-		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
-		Layers:    layers,
+		TenantID:   tenantID,
+		Generation: generation,
+		Epoch:      epoch,
+		Version:    1,
+		MaxSeq:     maxSeq,
+		UpdatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+		Layers:     layers,
 	}
 	body, err := json.MarshalIndent(&manifest, "", "  ")
 	if err != nil {
@@ -1702,7 +1794,7 @@ func (s *LayerStore) PublishLayerManifest(ctx context.Context, tenantID string, 
 	}
 
 	if s.s3c != nil && s.bucket != "" {
-		key := LayerManifestR2Key(tenantID, epoch)
+		key := LayerManifestR2KeyGen(tenantID, generation, epoch)
 		var expectedETag string
 		headOut, headErr := s.s3c.HeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(s.bucket),
@@ -1736,7 +1828,7 @@ func (s *LayerStore) PublishLayerManifest(ctx context.Context, tenantID string, 
 	}
 
 	if s.localDir != "" {
-		localManifest := filepath.Join(s.localDir, tenantID, fmt.Sprintf("timeline_%d_layer_manifest.json", epoch))
+		localManifest := s.localManifestPath(tenantID, generation, epoch)
 		if err := os.MkdirAll(filepath.Dir(localManifest), 0o755); err != nil {
 			return err
 		}
@@ -1771,8 +1863,13 @@ func (s *LayerStore) PublishLayerManifest(ctx context.Context, tenantID string, 
 
 // LoadLayerManifest loads the published TimelineLayerManifest from R2 (or local disk if R2 is not configured).
 func (s *LayerStore) LoadLayerManifest(ctx context.Context, tenantID string, epoch int64) (*TimelineLayerManifest, error) {
+	return s.LoadLayerManifestGen(ctx, tenantID, "", epoch)
+}
+
+// LoadLayerManifestGen loads the generation-scoped TimelineLayerManifest from R2 or local disk.
+func (s *LayerStore) LoadLayerManifestGen(ctx context.Context, tenantID, generation string, epoch int64) (*TimelineLayerManifest, error) {
 	if s.s3c != nil && s.bucket != "" {
-		key := LayerManifestR2Key(tenantID, epoch)
+		key := LayerManifestR2KeyGen(tenantID, generation, epoch)
 		out, err := s.s3c.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(s.bucket),
 			Key:    aws.String(key),
@@ -1795,7 +1892,7 @@ func (s *LayerStore) LoadLayerManifest(ctx context.Context, tenantID string, epo
 		return &m, nil
 	}
 	if s.localDir != "" {
-		localManifest := filepath.Join(s.localDir, tenantID, fmt.Sprintf("timeline_%d_layer_manifest.json", epoch))
+		localManifest := s.localManifestPath(tenantID, generation, epoch)
 		raw, err := os.ReadFile(localManifest)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -1815,8 +1912,13 @@ func (s *LayerStore) LoadLayerManifest(ctx context.Context, tenantID string, epo
 // ListLayersFromR2 loads published content-addressed layers from the timeline manifest
 // and merges any legacy layers stored under tenants/{tenant}/timeline_{epoch}/layers/.
 func (s *LayerStore) ListLayersFromR2(ctx context.Context, tenantID string, epoch int64) ([]LayerMeta, uint64, error) {
+	return s.ListLayersFromR2Gen(ctx, tenantID, "", epoch)
+}
+
+// ListLayersFromR2Gen loads published layers for a specific (tenantID, generation, epoch).
+func (s *LayerStore) ListLayersFromR2Gen(ctx context.Context, tenantID, generation string, epoch int64) ([]LayerMeta, uint64, error) {
 	if s.s3c == nil || s.bucket == "" {
-		manifest, err := s.LoadLayerManifest(ctx, tenantID, epoch)
+		manifest, err := s.LoadLayerManifestGen(ctx, tenantID, generation, epoch)
 		if err != nil || manifest == nil {
 			return nil, 0, err
 		}
@@ -1830,12 +1932,12 @@ func (s *LayerStore) ListLayersFromR2(ctx context.Context, tenantID string, epoc
 		listErr  error
 		wg       sync.WaitGroup
 	)
-	prefix := fmt.Sprintf("tenants/%s/timeline_%d/layers/", tenantID, epoch)
+	prefix := fmt.Sprintf("%s/timeline_%d/layers/", TenantR2Prefix(tenantID, generation), epoch)
 
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		manifest, manErr = s.LoadLayerManifest(ctx, tenantID, epoch)
+		manifest, manErr = s.LoadLayerManifestGen(ctx, tenantID, generation, epoch)
 	}()
 	go func() {
 		defer wg.Done()
@@ -1861,6 +1963,7 @@ func (s *LayerStore) ListLayersFromR2(ctx context.Context, tenantID string, epoc
 				}
 				legacy = append(legacy, LayerMeta{
 					TenantID:          tenantID,
+					Generation:        generation,
 					Epoch:             epoch,
 					Kind:              kind,
 					Seq:               seq,

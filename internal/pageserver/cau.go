@@ -55,12 +55,13 @@ type UploadMetrics struct {
 // TimelineLayerManifest is the durable per-timeline layer index published to R2
 // after each layer object is uploaded and verified.
 type TimelineLayerManifest struct {
-	TenantID  string      `json:"tenant_id"`
-	Epoch     int64       `json:"epoch"`
-	Version   int         `json:"version"`
-	MaxSeq    uint64      `json:"max_seq"`
-	UpdatedAt string      `json:"updated_at"`
-	Layers    []LayerMeta `json:"layers"`
+	TenantID   string      `json:"tenant_id"`
+	Generation string      `json:"generation,omitempty"`
+	Epoch      int64       `json:"epoch"`
+	Version    int         `json:"version"`
+	MaxSeq     uint64      `json:"max_seq"`
+	UpdatedAt  string      `json:"updated_at"`
+	Layers     []LayerMeta `json:"layers"`
 }
 
 // ValidateSHA256Hex verifies that h is a 64-character hexadecimal SHA-256 digest
@@ -79,25 +80,59 @@ func ValidateSHA256Hex(h string) (string, error) {
 	return lower, nil
 }
 
+// TenantR2Prefix returns the R2 key prefix for a tenant, scoped by generation when non-empty.
+func TenantR2Prefix(tenantID, generation string) string {
+	if generation == "" {
+		return fmt.Sprintf("tenants/%s", tenantID)
+	}
+	return fmt.Sprintf("tenants/%s/%s", tenantID, generation)
+}
+
 // ContentAddressedLayerKey returns the canonical tenant-scoped R2 object key for a layer:
 //
 //	tenants/{tenant_id}/layers/sha256/{first_two_hex}/{full_sha256}
 //
 // Key generation is isolated here so future deduplication policies can be evaluated independently.
 func ContentAddressedLayerKey(tenantID, sha256Hex string) (string, error) {
+	return ContentAddressedLayerKeyGen(tenantID, "", sha256Hex)
+}
+
+// ContentAddressedLayerKeyGen returns a generation-isolated CAU R2 key when generation is non-empty.
+func ContentAddressedLayerKeyGen(tenantID, generation, sha256Hex string) (string, error) {
 	if err := tenant.ValidateID(tenantID); err != nil {
 		return "", err
+	}
+	if generation != "" {
+		if err := tenant.ValidateID(generation); err != nil {
+			return "", err
+		}
 	}
 	norm, err := ValidateSHA256Hex(sha256Hex)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("tenants/%s/layers/sha256/%s/%s", tenantID, norm[:2], norm), nil
+	return fmt.Sprintf("%s/layers/sha256/%s/%s", TenantR2Prefix(tenantID, generation), norm[:2], norm), nil
 }
 
 // IsContentAddressedLayerKey reports whether key matches the tenant-scoped CAU layer key format.
 func IsContentAddressedLayerKey(key string) bool {
 	parts := strings.Split(key, "/")
+	if len(parts) == 7 {
+		if parts[0] != "tenants" || parts[3] != "layers" || parts[4] != "sha256" {
+			return false
+		}
+		if err := tenant.ValidateID(parts[1]); err != nil {
+			return false
+		}
+		if err := tenant.ValidateID(parts[2]); err != nil {
+			return false
+		}
+		norm, err := ValidateSHA256Hex(parts[6])
+		if err != nil {
+			return false
+		}
+		return len(parts[5]) == 2 && parts[5] == norm[:2]
+	}
 	if len(parts) != 6 {
 		return false
 	}
@@ -116,7 +151,12 @@ func IsContentAddressedLayerKey(key string) bool {
 
 // LayerManifestR2Key returns the R2 key for a tenant timeline's layer manifest.
 func LayerManifestR2Key(tenantID string, epoch int64) string {
-	return fmt.Sprintf("tenants/%s/timeline_%d/layer_manifest.json", tenantID, epoch)
+	return LayerManifestR2KeyGen(tenantID, "", epoch)
+}
+
+// LayerManifestR2KeyGen returns the generation-isolated R2 key for a tenant timeline's layer manifest.
+func LayerManifestR2KeyGen(tenantID, generation string, epoch int64) string {
+	return fmt.Sprintf("%s/timeline_%d/layer_manifest.json", TenantR2Prefix(tenantID, generation), epoch)
 }
 
 // StreamSHA256 computes the lowercase hex SHA-256 digest and byte count of r in a single streaming pass.
