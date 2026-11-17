@@ -1,15 +1,19 @@
 #pragma once
 
 #include "config.hpp"
+#include "metrics.hpp"
+#include "pb/airdb.grpc.pb.h"
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <curl/curl.h>
 #include <functional>
+#include <grpcpp/grpcpp.h>
 #include <iostream>
 #include <libpq-fe.h>
+#include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -28,12 +32,6 @@ struct TenantRoute {
 };
 
 namespace detail {
-
-inline size_t curl_write_cb(void* ptr, size_t size, size_t nmemb, void* userdata) {
-    auto* out = static_cast<std::string*>(userdata);
-    out->append(static_cast<const char*>(ptr), size * nmemb);
-    return size * nmemb;
-}
 
 inline std::string json_extract_string(const std::string& json, const std::string& key) {
     std::string pat = "\"" + key + "\"";
@@ -107,7 +105,9 @@ public:
     using TenantRemovedCallback = std::function<void(const std::string&)>;
 
     explicit TenantDiscovery(const Config& cfg)
-        : cfg_(cfg) {}
+        : cfg_(cfg),
+          channel_(grpc::CreateChannel(cfg_.grpc_addr, grpc::InsecureChannelCredentials())),
+          stub_(air::db::v1::AirDBControl::NewStub(channel_)) {}
 
     ~TenantDiscovery() {
         stop();
@@ -162,13 +162,17 @@ public:
             poll_metadata_once();
         }
 
-        std::string url = cfg_.control_plane_url + "/internal/v1/tenants/" + tenant_id + "/route";
-        if (!http_route_request("GET", url, route_out, err_out)) {
+        air::db::v1::TenantRequest req;
+        req.set_tenant_id(tenant_id);
+        air::db::v1::TenantRouteResponse resp;
+        grpc::ClientContext ctx;
+        prepare_ctx(ctx, 10);
+        grpc::Status st = stub_->GetTenantRoute(&ctx, req, &resp);
+        if (!st.ok()) {
+            err_out = st.error_message();
             return false;
         }
-        if (!cfg_.backend_host.empty()) {
-            route_out.host = cfg_.backend_host;
-        }
+        route_out = from_proto_route(resp);
         if (route_out.state == "SUSPENDED") {
             if (!wake_tenant(tenant_id, route_out, err_out)) {
                 return false;
@@ -179,18 +183,236 @@ public:
     }
 
     bool wake_tenant(const std::string& tenant_id, TenantRoute& route_out, std::string& err_out) {
-        std::string url = cfg_.control_plane_url + "/internal/v1/tenants/" + tenant_id + "/wake";
-        if (!http_route_request("POST", url, route_out, err_out)) {
+        air::db::v1::TenantRequest req;
+        req.set_tenant_id(tenant_id);
+        air::db::v1::TenantRouteResponse resp;
+        grpc::ClientContext ctx;
+        prepare_ctx(ctx, 35);
+        grpc::Status st = stub_->WakeTenant(&ctx, req, &resp);
+        if (!st.ok()) {
+            err_out = st.error_message();
             return false;
         }
-        if (!cfg_.backend_host.empty()) {
-            route_out.host = cfg_.backend_host;
-        }
-        if (route_out.state.empty()) {
-            route_out.state = "ACTIVE";
-        }
+        route_out = from_proto_route(resp);
+        if (route_out.state.empty()) route_out.state = "ACTIVE";
         upsert_cache(route_out);
         return true;
+    }
+
+    bool create_database(const std::string& tenant_id,
+                         const std::string& account_id,
+                         const std::string& idem_key,
+                         int& http_code_out,
+                         std::string& json_out) {
+        air::db::v1::CreateDatabaseRequest req;
+        req.set_tenant_id(tenant_id);
+        req.set_account_id(account_id);
+        req.set_idempotency_key(idem_key);
+        air::db::v1::CreateDatabaseResponse resp;
+        grpc::ClientContext ctx;
+        prepare_ctx(ctx, 60);
+        grpc::Status st = stub_->CreateDatabase(&ctx, req, &resp);
+        if (!st.ok()) {
+            http_code_out = grpc_to_http(st.error_code());
+            json_out = std::string(R"({"error":")") + json_escape(st.error_message()) + R"("})";
+            return false;
+        }
+        http_code_out = 201;
+        std::ostringstream oss;
+        oss << "{\"tenant_id\":\"" << json_escape(resp.tenant_id())
+            << "\",\"state\":\"" << json_escape(resp.state())
+            << "\",\"direct_port\":" << resp.direct_port()
+            << ",\"host\":\"" << json_escape(resp.host())
+            << "\",\"user\":\"" << json_escape(resp.user())
+            << "\",\"password\":\"" << json_escape(resp.password()) << "\"}";
+        json_out = oss.str();
+        TenantRoute r;
+        std::string rerr;
+        resolve_tenant(resp.tenant_id(), r, rerr);
+        return true;
+    }
+
+    bool list_databases(const std::string& account_id, int& http_code_out, std::string& json_out) {
+        air::db::v1::ListDatabasesRequest req;
+        req.set_account_id(account_id);
+        air::db::v1::ListDatabasesResponse resp;
+        grpc::ClientContext ctx;
+        prepare_ctx(ctx, 15);
+        grpc::Status st = stub_->ListDatabases(&ctx, req, &resp);
+        if (!st.ok()) {
+            http_code_out = grpc_to_http(st.error_code());
+            json_out = std::string(R"({"error":")") + json_escape(st.error_message()) + R"("})";
+            return false;
+        }
+        http_code_out = 200;
+        std::ostringstream oss;
+        oss << "{\"databases\":[";
+        for (int i = 0; i < resp.databases_size(); ++i) {
+            if (i > 0) oss << ",";
+            append_db_info_json(oss, resp.databases(i));
+        }
+        oss << "]}";
+        json_out = oss.str();
+        return true;
+    }
+
+    bool get_database(const std::string& tenant_id, int& http_code_out, std::string& json_out) {
+        air::db::v1::TenantRequest req;
+        req.set_tenant_id(tenant_id);
+        air::db::v1::DatabaseInfo resp;
+        grpc::ClientContext ctx;
+        prepare_ctx(ctx, 15);
+        grpc::Status st = stub_->GetDatabase(&ctx, req, &resp);
+        if (!st.ok()) {
+            http_code_out = grpc_to_http(st.error_code());
+            json_out = std::string(R"({"error":")") + json_escape(st.error_message()) + R"("})";
+            return false;
+        }
+        http_code_out = 200;
+        std::ostringstream oss;
+        append_db_info_json(oss, resp);
+        json_out = oss.str();
+        return true;
+    }
+
+    bool delete_database(const std::string& tenant_id, int& http_code_out, std::string& json_out) {
+        air::db::v1::TenantRequest req;
+        req.set_tenant_id(tenant_id);
+        air::db::v1::StatusResponse resp;
+        grpc::ClientContext ctx;
+        prepare_ctx(ctx, 30);
+        grpc::Status st = stub_->DeleteDatabase(&ctx, req, &resp);
+        if (!st.ok()) {
+            http_code_out = grpc_to_http(st.error_code());
+            json_out = std::string(R"({"error":")") + json_escape(st.error_message()) + R"("})";
+            return false;
+        }
+        http_code_out = 200;
+        json_out = std::string(R"({"status":")") + json_escape(resp.status()) +
+                   R"(","tenant_id":")" + json_escape(resp.tenant_id()) + R"("})";
+        return true;
+    }
+
+    bool suspend_database(const std::string& tenant_id, int& http_code_out, std::string& json_out) {
+        air::db::v1::TenantRequest req;
+        req.set_tenant_id(tenant_id);
+        air::db::v1::StatusResponse resp;
+        grpc::ClientContext ctx;
+        prepare_ctx(ctx, 30);
+        grpc::Status st = stub_->SuspendDatabase(&ctx, req, &resp);
+        if (!st.ok()) {
+            http_code_out = grpc_to_http(st.error_code());
+            json_out = std::string(R"({"error":")") + json_escape(st.error_message()) + R"("})";
+            return false;
+        }
+        http_code_out = 200;
+        set_cached_state(tenant_id, "SUSPENDED");
+        json_out = std::string(R"({"status":")") + json_escape(resp.status()) +
+                   R"(","tenant_id":")" + json_escape(resp.tenant_id()) + R"("})";
+        return true;
+    }
+
+    bool start_database(const std::string& tenant_id, int& http_code_out, std::string& json_out) {
+        air::db::v1::TenantRequest req;
+        req.set_tenant_id(tenant_id);
+        air::db::v1::TenantRouteResponse resp;
+        grpc::ClientContext ctx;
+        prepare_ctx(ctx, 35);
+        grpc::Status st = stub_->StartDatabase(&ctx, req, &resp);
+        if (!st.ok()) {
+            http_code_out = grpc_to_http(st.error_code());
+            json_out = std::string(R"({"error":")") + json_escape(st.error_message()) + R"("})";
+            return false;
+        }
+        TenantRoute r = from_proto_route(resp);
+        if (r.state.empty()) r.state = "ACTIVE";
+        upsert_cache(r);
+        http_code_out = 200;
+        std::ostringstream oss;
+        oss << "{\"tenant_id\":\"" << json_escape(r.tenant_id)
+            << "\",\"state\":\"" << json_escape(r.state)
+            << "\",\"host\":\"" << json_escape(r.host)
+            << "\",\"port\":" << r.port << "}";
+        json_out = oss.str();
+        return true;
+    }
+
+    bool lock_database(const std::string& tenant_id, int& http_code_out, std::string& json_out) {
+        air::db::v1::TenantRequest req;
+        req.set_tenant_id(tenant_id);
+        air::db::v1::StatusResponse resp;
+        grpc::ClientContext ctx;
+        prepare_ctx(ctx, 30);
+        grpc::Status st = stub_->LockDatabase(&ctx, req, &resp);
+        if (!st.ok()) {
+            http_code_out = grpc_to_http(st.error_code());
+            json_out = std::string(R"({"error":")") + json_escape(st.error_message()) + R"("})";
+            return false;
+        }
+        http_code_out = 200;
+        set_cached_state(tenant_id, "LOCKED");
+        json_out = std::string(R"({"status":")") + json_escape(resp.status()) +
+                   R"(","tenant_id":")" + json_escape(resp.tenant_id()) + R"("})";
+        return true;
+    }
+
+    bool unlock_database(const std::string& tenant_id, int& http_code_out, std::string& json_out) {
+        air::db::v1::TenantRequest req;
+        req.set_tenant_id(tenant_id);
+        air::db::v1::StatusResponse resp;
+        grpc::ClientContext ctx;
+        prepare_ctx(ctx, 15);
+        grpc::Status st = stub_->UnlockDatabase(&ctx, req, &resp);
+        if (!st.ok()) {
+            http_code_out = grpc_to_http(st.error_code());
+            json_out = std::string(R"({"error":")") + json_escape(st.error_message()) + R"("})";
+            return false;
+        }
+        http_code_out = 200;
+        set_cached_state(tenant_id, "SUSPENDED");
+        json_out = std::string(R"({"status":")") + json_escape(resp.status()) +
+                   R"(","tenant_id":")" + json_escape(resp.tenant_id()) + R"("})";
+        return true;
+    }
+
+    void set_cached_state(const std::string& tenant_id, const std::string& state) {
+        TenantRoute updated;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lk(cache_mu_);
+            auto it = cache_.find(tenant_id);
+            if (it != cache_.end()) {
+                it->second.state = state;
+                if (state != "ACTIVE") it->second.port = 0;
+                updated = it->second;
+                found = true;
+            }
+        }
+        if (found) {
+            TenantCallback cb;
+            {
+                std::lock_guard<std::mutex> lk(cb_mu_);
+                cb = on_upsert_;
+            }
+            if (cb) cb(updated);
+        }
+    }
+
+    void evict_cache(const std::string& tenant_id) {
+        {
+            std::lock_guard<std::mutex> lk(cache_mu_);
+            cache_.erase(tenant_id);
+        }
+        TenantRemovedCallback cb;
+        {
+            std::lock_guard<std::mutex> lk(cb_mu_);
+            cb = on_remove_;
+        }
+        if (cb) cb(tenant_id);
+    }
+
+    void upsert_route(const TenantRoute& r) {
+        upsert_cache(r);
     }
 
     void touch_activity(const std::string& tenant_id) {
@@ -206,29 +428,63 @@ public:
             last_touch_[tenant_id] = now;
         }
 
-        std::string url = cfg_.control_plane_url + "/internal/v1/tenants/" + tenant_id + "/activity";
+        auto stub = stub_;
         std::string token = cfg_.internal_token;
-        std::thread([url, token]() {
-            CURL* curl = curl_easy_init();
-            if (!curl) return;
-            struct curl_slist* hdrs = nullptr;
-            if (!token.empty()) {
-                std::string h = "X-Air-Internal-Token: " + token;
-                hdrs = curl_slist_append(hdrs, h.c_str());
-            }
-            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-            curl_easy_setopt(curl, CURLOPT_POST, 1L);
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
-            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 2L);
-            if (hdrs) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-            curl_easy_perform(curl);
-            if (hdrs) curl_slist_free_all(hdrs);
-            curl_easy_cleanup(curl);
+        std::thread([stub, token, tenant_id]() {
+            air::db::v1::TenantRequest req;
+            req.set_tenant_id(tenant_id);
+            air::db::v1::Empty resp;
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+            if (!token.empty()) ctx.AddMetadata("x-air-internal-token", token);
+            stub->TouchActivity(&ctx, req, &resp);
         }).detach();
     }
 
 private:
     Config cfg_;
+    std::shared_ptr<grpc::Channel> channel_;
+    std::shared_ptr<air::db::v1::AirDBControl::Stub> stub_;
+
+    void prepare_ctx(grpc::ClientContext& ctx, int timeout_sec) const {
+        ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(timeout_sec));
+        if (!cfg_.internal_token.empty()) {
+            ctx.AddMetadata("x-air-internal-token", cfg_.internal_token);
+        }
+    }
+
+    TenantRoute from_proto_route(const air::db::v1::TenantRouteResponse& resp) const {
+        TenantRoute r;
+        r.tenant_id = resp.tenant_id();
+        r.state = resp.state();
+        r.host = cfg_.backend_host.empty() ? resp.host() : cfg_.backend_host;
+        r.port = resp.port();
+        r.sock_dir = resp.sock_dir();
+        r.app_password = resp.app_password();
+        return r;
+    }
+
+    static int grpc_to_http(grpc::StatusCode c) {
+        switch (c) {
+            case grpc::StatusCode::NOT_FOUND: return 404;
+            case grpc::StatusCode::PERMISSION_DENIED: return 403;
+            case grpc::StatusCode::UNAUTHENTICATED: return 401;
+            case grpc::StatusCode::ALREADY_EXISTS:
+            case grpc::StatusCode::FAILED_PRECONDITION: return 409;
+            case grpc::StatusCode::INVALID_ARGUMENT: return 400;
+            case grpc::StatusCode::UNAVAILABLE: return 503;
+            default: return 502;
+        }
+    }
+
+    static void append_db_info_json(std::ostringstream& oss, const air::db::v1::DatabaseInfo& d) {
+        oss << "{\"account_id\":\"" << json_escape(d.account_id())
+            << "\",\"tenant_id\":\"" << json_escape(d.tenant_id())
+            << "\",\"direct_port\":" << d.direct_port()
+            << ",\"system_identifier\":\"" << json_escape(d.system_identifier())
+            << "\",\"fencing_epoch\":" << d.fencing_epoch()
+            << ",\"state\":\"" << json_escape(d.state()) << "\"}";
+    }
     std::atomic<bool> running_{false};
     std::thread worker_;
     std::mutex cv_mu_;
@@ -362,50 +618,6 @@ private:
         if (remove_cb) {
             for (const auto& tid : removed) remove_cb(tid);
         }
-    }
-
-    bool http_route_request(const std::string& method, const std::string& url,
-                            TenantRoute& route_out, std::string& err_out) {
-        CURL* curl = curl_easy_init();
-        if (!curl) {
-            err_out = "curl_easy_init failed";
-            return false;
-        }
-        std::string resp_body;
-        struct curl_slist* hdrs = nullptr;
-        if (!cfg_.internal_token.empty()) {
-            std::string h = "X-Air-Internal-Token: " + cfg_.internal_token;
-            hdrs = curl_slist_append(hdrs, h.c_str());
-        }
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        if (method == "POST") {
-            curl_easy_setopt(curl, CURLOPT_POST, 1L);
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
-        }
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 35L);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, detail::curl_write_cb);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp_body);
-        if (hdrs) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-
-        CURLcode rc = curl_easy_perform(curl);
-        long http_code = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-        if (hdrs) curl_slist_free_all(hdrs);
-        curl_easy_cleanup(curl);
-
-        if (rc != CURLE_OK) {
-            err_out = std::string("control plane request failed: ") + curl_easy_strerror(rc);
-            return false;
-        }
-        if (http_code != 200) {
-            err_out = "control plane returned HTTP " + std::to_string(http_code) + ": " + resp_body;
-            return false;
-        }
-        if (!detail::parse_route_json(resp_body, route_out)) {
-            err_out = "invalid route JSON from control plane";
-            return false;
-        }
-        return true;
     }
 };
 

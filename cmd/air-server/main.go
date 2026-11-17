@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -127,8 +128,21 @@ func main() {
 		}
 	}()
 
+	grpcLis, err := net.Listen("tcp", cfg.GRPCAddr)
+	if err != nil {
+		log.Fatalf("grpc listen %s: %v", cfg.GRPCAddr, err)
+	}
+	grpcSrv := control.NewGRPCServer(cp)
+	go func() {
+		log.Printf("[air-server] Air DB gRPC listening on %s", cfg.GRPCAddr)
+		if err := grpcSrv.Serve(grpcLis); err != nil {
+			log.Fatalf("grpc serve: %v", err)
+		}
+	}()
+
 	<-ctx.Done()
 	log.Println("[air-server] shutting down...")
+	grpcSrv.GracefulStop()
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutCtx)

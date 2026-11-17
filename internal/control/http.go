@@ -23,7 +23,8 @@ const (
 )
 
 type createDatabaseReq struct {
-	TenantID string `json:"tenant_id"`
+	TenantID  string `json:"tenant_id"`
+	AccountID string `json:"account_id,omitempty"`
 }
 
 type triggerBackupReq struct {
@@ -130,8 +131,125 @@ func (cp *ControlPlane) HTTPHandler() http.Handler {
 		})
 	}
 
+	cp.registerInternalRoutes(r)
+	return r
+}
+
+// RunnerHTTPHandler exposes only /healthz and /internal/v1/* so Air DB acts solely
+// as a database runner controlled by air-gateway.
+func (cp *ControlPlane) RunnerHTTPHandler() http.Handler {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Recovery())
+
+	r.GET("/healthz", func(c *gin.Context) {
+		if err := cp.db.Ping(c.Request.Context()); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unhealthy", "error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+
+	cp.registerInternalRoutes(r)
+	return r
+}
+
+func (cp *ControlPlane) registerInternalRoutes(r *gin.Engine) {
 	internal := r.Group("/internal/v1", cp.internalAuthMiddleware())
 	{
+		internal.POST("/databases", func(c *gin.Context) {
+			var req createDatabaseReq
+			if !decodeJSONBody(c, &req, false) {
+				return
+			}
+			accountID := strings.TrimSpace(req.AccountID)
+			if accountID == "" {
+				accountID = "acc_gateway"
+			}
+			idemKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+			if idemKey == "" {
+				idemKey = "gw-" + req.TenantID
+			}
+			resp, err := cp.ProvisionDatabase(c.Request.Context(), accountID, idemKey, req.TenantID)
+			if err != nil {
+				writeControlError(c, err)
+				return
+			}
+			c.JSON(http.StatusCreated, resp)
+		})
+
+		internal.GET("/databases", func(c *gin.Context) {
+			list, err := cp.ListDatabases(c.Request.Context(), strings.TrimSpace(c.Query("account_id")))
+			if err != nil {
+				writeControlError(c, err)
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"databases": list})
+		})
+
+		internal.GET("/databases/:id", func(c *gin.Context) {
+			info, err := cp.GetDatabase(c.Request.Context(), "", c.Param("id"))
+			if err != nil {
+				writeControlError(c, err)
+				return
+			}
+			c.JSON(http.StatusOK, info)
+		})
+
+		internal.DELETE("/databases/:id", func(c *gin.Context) {
+			id := c.Param("id")
+			if err := cp.DeleteDatabase(c.Request.Context(), "", id); err != nil {
+				writeControlError(c, err)
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"status": "purged", "tenant_id": id})
+		})
+
+		internal.POST("/databases/:id/suspend", func(c *gin.Context) {
+			id := c.Param("id")
+			if err := cp.SuspendTenant(c.Request.Context(), id, 3*time.Second, nil); err != nil {
+				writeControlError(c, err)
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"status": "SUSPENDED", "tenant_id": id})
+		})
+
+		internal.POST("/databases/:id/start", func(c *gin.Context) {
+			id := c.Param("id")
+			port, sockDir, appPass, err := cp.WakeTenant(c.Request.Context(), id)
+			if err != nil {
+				writeControlError(c, err)
+				return
+			}
+			cp.TouchTenantActivity(id)
+			c.JSON(http.StatusOK, gin.H{
+				"tenant_id":    id,
+				"state":        "ACTIVE",
+				"host":         cp.backendHost,
+				"port":         port,
+				"sock_dir":     sockDir,
+				"app_password": appPass,
+			})
+		})
+
+		internal.POST("/databases/:id/lock", func(c *gin.Context) {
+			id := c.Param("id")
+			if err := cp.LockDatabase(c.Request.Context(), id, 3*time.Second, nil); err != nil {
+				writeControlError(c, err)
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"status": "LOCKED", "tenant_id": id})
+		})
+
+		internal.POST("/databases/:id/unlock", func(c *gin.Context) {
+			id := c.Param("id")
+			if err := cp.UnlockDatabase(c.Request.Context(), id); err != nil {
+				writeControlError(c, err)
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"status": "SUSPENDED", "tenant_id": id})
+		})
+
 		internal.GET("/tenants/:id/route", func(c *gin.Context) {
 			id := c.Param("id")
 			state, port, sockDir, appPass, err := cp.GetTenantRouteAndCredentials(c.Request.Context(), id)
@@ -185,8 +303,6 @@ func (cp *ControlPlane) HTTPHandler() http.Handler {
 			c.Status(http.StatusNoContent)
 		})
 	}
-
-	return r
 }
 
 func (cp *ControlPlane) internalAuthMiddleware() gin.HandlerFunc {

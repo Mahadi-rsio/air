@@ -11,6 +11,7 @@ struct Config {
     std::string meta_dsn;
     int meta_port = 15432;
     std::string control_plane_url = "http://127.0.0.1:8080";
+    std::string grpc_addr = "127.0.0.1:9090";
     std::string internal_token;
     std::string backend_host;
     bool require_tls = false;
@@ -56,6 +57,7 @@ struct Config {
         c.meta_dsn = env_or("AIR_META_DSN", "");
         c.meta_port = env_int("AIR_META_PORT", c.meta_port);
         c.control_plane_url = env_or("AIR_CONTROL_PLANE_URL", c.control_plane_url);
+        c.grpc_addr = env_or("AIR_DB_GRPC_ADDR", c.grpc_addr);
         c.internal_token = env_or("AIR_INTERNAL_TOKEN", "");
         c.backend_host = env_or("AIR_BACKEND_HOST", "");
         c.require_tls = env_bool("AIR_REQUIRE_TLS", c.require_tls);
@@ -77,6 +79,7 @@ struct Config {
             else if (arg == "--gateway-admin-addr") next_val(c.admin_addr);
             else if (arg == "--meta-dsn") next_val(c.meta_dsn);
             else if (arg == "--control-plane-url") next_val(c.control_plane_url);
+            else if (arg == "--db-grpc-addr") next_val(c.grpc_addr);
             else if (arg == "--internal-token") next_val(c.internal_token);
             else if (arg == "--backend-host") next_val(c.backend_host);
             else if (arg == "--tls-cert") next_val(c.tls_cert_path);

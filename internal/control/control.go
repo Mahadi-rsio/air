@@ -861,8 +861,10 @@ func (cp *ControlPlane) RecoverProvisioningOperations(ctx context.Context) (int,
 }
 
 func (cp *ControlPlane) GetDatabase(ctx context.Context, accountID, tenantID string) (*DatabaseInfo, error) {
-	if err := tenant.ValidateAccountID(accountID); err != nil {
-		return nil, err
+	if accountID != "" {
+		if err := tenant.ValidateAccountID(accountID); err != nil {
+			return nil, err
+		}
 	}
 	if err := tenant.ValidateID(tenantID); err != nil {
 		return nil, err
@@ -878,15 +880,49 @@ func (cp *ControlPlane) GetDatabase(ctx context.Context, accountID, tenantID str
 	if err != nil {
 		return nil, err
 	}
-	if info.AccountID != accountID {
+	if accountID != "" && info.AccountID != accountID {
 		return nil, ErrForbidden
 	}
 	return &info, nil
 }
 
+func (cp *ControlPlane) ListDatabases(ctx context.Context, accountID string) ([]DatabaseInfo, error) {
+	if accountID != "" {
+		if err := tenant.ValidateAccountID(accountID); err != nil {
+			return nil, err
+		}
+	}
+	var rows pgx.Rows
+	var err error
+	if accountID != "" {
+		rows, err = cp.db.Query(ctx,
+			`SELECT account_id, tenant_id, direct_port, system_identifier, fencing_epoch, state
+			 FROM clusters WHERE account_id = $1 AND state <> 'PURGED' ORDER BY created_at DESC`, accountID)
+	} else {
+		rows, err = cp.db.Query(ctx,
+			`SELECT account_id, tenant_id, direct_port, system_identifier, fencing_epoch, state
+			 FROM clusters WHERE state <> 'PURGED' ORDER BY created_at DESC`)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]DatabaseInfo, 0)
+	for rows.Next() {
+		var info DatabaseInfo
+		if err := rows.Scan(&info.AccountID, &info.TenantID, &info.DirectPort, &info.SystemIdentifier, &info.FencingEpoch, &info.State); err != nil {
+			return nil, err
+		}
+		out = append(out, info)
+	}
+	return out, rows.Err()
+}
+
 func (cp *ControlPlane) DeleteDatabase(ctx context.Context, accountID, tenantID string) error {
-	if err := tenant.ValidateAccountID(accountID); err != nil {
-		return err
+	if accountID != "" {
+		if err := tenant.ValidateAccountID(accountID); err != nil {
+			return err
+		}
 	}
 	if err := tenant.ValidateID(tenantID); err != nil {
 		return err
@@ -899,7 +935,7 @@ func (cp *ControlPlane) DeleteDatabase(ctx context.Context, accountID, tenantID 
 	if err != nil {
 		return err
 	}
-	if owner != accountID {
+	if accountID != "" && owner != accountID {
 		return ErrForbidden
 	}
 
@@ -1429,6 +1465,73 @@ func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drai
 		`UPDATE clusters SET state = 'SUSPENDED', updated_at = NOW() WHERE tenant_id = $1 AND state = 'ACTIVE'`,
 		tenantID,
 	)
+	return err
+}
+
+// LockDatabase stops an ACTIVE tenant if running and transitions it to LOCKED,
+// preventing any client connections or auto-wake until UnlockDatabase is called.
+func (cp *ControlPlane) LockDatabase(ctx context.Context, tenantID string, drainTimeout time.Duration, poolDrainFn func(tenantID string, timeout time.Duration) error) error {
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return err
+	}
+	if drainTimeout <= 0 {
+		drainTimeout = 3 * time.Second
+	}
+	unlock := cp.lockTenantLifecycle(tenantID)
+	defer unlock()
+
+	var state string
+	err := cp.db.QueryRow(ctx, `SELECT state FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&state)
+	if errors.Is(err, pgx.ErrNoRows) || state == "PURGED" {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if state == "LOCKED" {
+		return nil
+	}
+	if state != "ACTIVE" && state != "SUSPENDED" {
+		return fmt.Errorf("cannot lock tenant %s in state %s", tenantID, state)
+	}
+	if state == "ACTIVE" {
+		if poolDrainFn != nil {
+			_ = poolDrainFn(tenantID, drainTimeout)
+		}
+		cp.stopWALReceiver(tenantID)
+		if cp.agent != nil {
+			if err := cp.agent.StopTenantClean(tenantID); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = cp.db.Exec(ctx, `UPDATE clusters SET state = 'LOCKED', updated_at = NOW() WHERE tenant_id = $1`, tenantID)
+	return err
+}
+
+// UnlockDatabase transitions a LOCKED tenant back to SUSPENDED so it can be started/woken.
+func (cp *ControlPlane) UnlockDatabase(ctx context.Context, tenantID string) error {
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return err
+	}
+	unlock := cp.lockTenantLifecycle(tenantID)
+	defer unlock()
+
+	var state string
+	err := cp.db.QueryRow(ctx, `SELECT state FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&state)
+	if errors.Is(err, pgx.ErrNoRows) || state == "PURGED" {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if state == "ACTIVE" || state == "SUSPENDED" {
+		return nil
+	}
+	if state != "LOCKED" {
+		return fmt.Errorf("cannot unlock tenant %s in state %s", tenantID, state)
+	}
+	_, err = cp.db.Exec(ctx, `UPDATE clusters SET state = 'SUSPENDED', updated_at = NOW() WHERE tenant_id = $1 AND state = 'LOCKED'`, tenantID)
 	return err
 }
 

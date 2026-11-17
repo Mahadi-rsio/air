@@ -146,8 +146,7 @@ private:
             return;
         }
 
-        auto is_authorized = [&]() -> bool {
-            if (internal_token_.empty()) return true;
+        auto get_header = [&](const std::string& name) -> std::string {
             std::istringstream hs(req);
             std::string line;
             std::getline(hs, line);
@@ -157,12 +156,19 @@ private:
                 auto col = line.find(':');
                 if (col == std::string::npos) continue;
                 std::string k = trim_ascii(line.substr(0, col));
-                std::string v = trim_ascii(line.substr(col + 1));
-                if (iequals(k, "X-Air-Internal-Token") && v == internal_token_) return true;
-                if (iequals(k, "Authorization") && v.size() > 7 &&
-                    iequals(v.substr(0, 7), "Bearer ") && trim_ascii(v.substr(7)) == internal_token_) {
-                    return true;
-                }
+                if (iequals(k, name)) return trim_ascii(line.substr(col + 1));
+            }
+            return "";
+        };
+
+        auto is_authorized = [&]() -> bool {
+            if (internal_token_.empty()) return true;
+            std::string tok = get_header("X-Air-Internal-Token");
+            if (tok == internal_token_) return true;
+            std::string auth = get_header("Authorization");
+            if (auth.size() > 7 && iequals(auth.substr(0, 7), "Bearer ") &&
+                trim_ascii(auth.substr(7)) == internal_token_) {
+                return true;
             }
             return false;
         };
@@ -179,6 +185,126 @@ private:
             }
             return "";
         };
+
+        std::string req_body;
+        if (auto hdr_end = req.find("\r\n\r\n"); hdr_end != std::string::npos) {
+            req_body = req.substr(hdr_end + 4);
+        }
+
+        auto status_text = [](int code) -> std::string {
+            switch (code) {
+                case 200: return "OK";
+                case 201: return "Created";
+                case 400: return "Bad Request";
+                case 401: return "Unauthorized";
+                case 403: return "Forbidden";
+                case 404: return "Not Found";
+                case 409: return "Conflict";
+                case 502: return "Bad Gateway";
+                case 503: return "Service Unavailable";
+                default: return "OK";
+            }
+        };
+
+        // Normalize /admin/v1/databases* -> /v1/databases*
+        std::string db_path = path;
+        if (db_path.rfind("/admin/v1/databases", 0) == 0) {
+            db_path = db_path.substr(6); // strip "/admin"
+        }
+
+        if (db_path == "/v1/databases" && (method == "POST" || method == "GET")) {
+            if (!is_authorized()) {
+                send_http(fd, 401, "Unauthorized", R"({"error":"unauthorized"})");
+                ::close(fd);
+                return;
+            }
+            int code = 0;
+            std::string resp;
+            if (method == "POST") {
+                std::string tid = detail::json_extract_string(req_body, "tenant_id");
+                std::string aid = detail::json_extract_string(req_body, "account_id");
+                std::string idem_key = get_header("Idempotency-Key");
+                discovery_.create_database(tid, aid, idem_key, code, resp);
+            } else {
+                std::string aid = parse_query_param("account_id");
+                discovery_.list_databases(aid, code, resp);
+            }
+            send_http(fd, code, status_text(code), resp.empty() ? "{}" : resp);
+            ::close(fd);
+            return;
+        }
+
+        const std::string db_prefix = "/v1/databases/";
+        if (db_path.rfind(db_prefix, 0) == 0 && db_path.size() > db_prefix.size()) {
+            if (!is_authorized()) {
+                send_http(fd, 401, "Unauthorized", R"({"error":"unauthorized"})");
+                ::close(fd);
+                return;
+            }
+            std::string rest = db_path.substr(db_prefix.size());
+            std::string tid = rest;
+            std::string action;
+            if (auto slash = rest.find('/'); slash != std::string::npos) {
+                tid = rest.substr(0, slash);
+                action = rest.substr(slash + 1);
+            }
+            if (!validate_tenant_id(tid)) {
+                send_http(fd, 400, "Bad Request", R"({"error":"invalid tenant id"})");
+                ::close(fd);
+                return;
+            }
+
+            if (action.empty() && (method == "GET" || method == "DELETE")) {
+                int code = 0;
+                std::string resp;
+                if (method == "DELETE") {
+                    std::string derr;
+                    if (!pools_.request_drain(tid, 2000, derr)) {
+                        send_http(fd, 409, "Conflict", std::string(R"({"error":")") + json_escape(derr) + R"("})");
+                        ::close(fd);
+                        return;
+                    }
+                    pools_.remove_tenant(tid);
+                    discovery_.evict_cache(tid);
+                    discovery_.delete_database(tid, code, resp);
+                } else {
+                    discovery_.get_database(tid, code, resp);
+                }
+                send_http(fd, code, status_text(code), resp.empty() ? "{}" : resp);
+                ::close(fd);
+                return;
+            }
+
+            if (method == "POST" && (action == "suspend" || action == "start" || action == "wake" ||
+                                     action == "lock" || action == "unlock")) {
+                if (action == "wake") action = "start";
+                if (action == "suspend" || action == "lock") {
+                    std::string derr;
+                    if (!pools_.request_drain(tid, 3000, derr)) {
+                        send_http(fd, 409, "Conflict", std::string(R"({"error":")") + json_escape(derr) + R"("})");
+                        ::close(fd);
+                        return;
+                    }
+                    if (action == "lock") {
+                        pools_.remove_tenant(tid);
+                    }
+                }
+                int code = 0;
+                std::string resp;
+                if (action == "suspend") {
+                    discovery_.suspend_database(tid, code, resp);
+                } else if (action == "start") {
+                    discovery_.start_database(tid, code, resp);
+                } else if (action == "lock") {
+                    discovery_.lock_database(tid, code, resp);
+                } else if (action == "unlock") {
+                    discovery_.unlock_database(tid, code, resp);
+                }
+                send_http(fd, code, status_text(code), resp.empty() ? "{}" : resp);
+                ::close(fd);
+                return;
+            }
+        }
 
         if (method == "GET" && path == "/metrics") {
             if (!is_authorized()) {
@@ -242,10 +368,6 @@ private:
                 send_http(fd, 400, "Bad Request", R"({"error":"invalid tenant id"})");
                 ::close(fd);
                 return;
-            }
-            std::string req_body;
-            if (auto hdr_end = req.find("\r\n\r\n"); hdr_end != std::string::npos) {
-                req_body = req.substr(hdr_end + 4);
             }
             int max_client_conns = detail::json_extract_int(req_body, "max_client_conns");
             int max_backends = detail::json_extract_int(req_body, "max_backends");

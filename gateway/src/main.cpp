@@ -7,7 +7,6 @@
 
 #include <atomic>
 #include <csignal>
-#include <curl/curl.h>
 #include <iostream>
 #include <poll.h>
 #include <thread>
@@ -213,14 +212,11 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    curl_global_init(CURL_GLOBAL_ALL);
-
     air::gw::Config cfg = air::gw::Config::load(argc, argv);
     air::gw::TLSContext tls_ctx;
     std::string tls_err;
     if (!tls_ctx.init(cfg.tls_cert_path, cfg.tls_key_path, tls_err)) {
         std::cerr << "[air-gateway] TLS init failed: " << tls_err << std::endl;
-        curl_global_cleanup();
         return 1;
     }
 
@@ -238,7 +234,6 @@ int main(int argc, char** argv) {
     if (!admin_srv.start()) {
         std::cerr << "[air-gateway] failed to bind admin HTTP on " << cfg.admin_addr << std::endl;
         discovery.stop();
-        curl_global_cleanup();
         return 1;
     }
 
@@ -247,13 +242,12 @@ int main(int argc, char** argv) {
         std::cerr << "[air-gateway] failed to listen on " << cfg.gateway_addr << std::endl;
         admin_srv.stop();
         discovery.stop();
-        curl_global_cleanup();
         return 1;
     }
 
     std::cout << "[air-gateway] C++ PG Gateway listening on " << cfg.gateway_addr
               << " (admin=" << cfg.admin_addr
-              << ", control_plane=" << cfg.control_plane_url
+              << ", db_grpc=" << cfg.grpc_addr
               << ", pool_mode=" << (cfg.pool_mode ? "true" : "false")
               << ", max_client_conns=" << cfg.max_client_conns
               << ", max_tenant_client_conns=" << cfg.max_tenant_client_conns
@@ -283,6 +277,5 @@ int main(int argc, char** argv) {
     admin_srv.stop();
     discovery.stop();
     pools.close_all();
-    curl_global_cleanup();
     return 0;
 }

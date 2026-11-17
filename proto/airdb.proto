@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package air.db.v1;
+
+option go_package = "github.com/Mahadi-rsio/air/internal/pb;pb";
+
+service AirDBControl {
+  rpc GetTenantRoute(TenantRequest) returns (TenantRouteResponse);
+  rpc WakeTenant(TenantRequest) returns (TenantRouteResponse);
+  rpc TouchActivity(TenantRequest) returns (Empty);
+
+  rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
+  rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
+  rpc GetDatabase(TenantRequest) returns (DatabaseInfo);
+  rpc DeleteDatabase(TenantRequest) returns (StatusResponse);
+  rpc SuspendDatabase(TenantRequest) returns (StatusResponse);
+  rpc StartDatabase(TenantRequest) returns (TenantRouteResponse);
+  rpc LockDatabase(TenantRequest) returns (StatusResponse);
+  rpc UnlockDatabase(TenantRequest) returns (StatusResponse);
+}
+
+message Empty {}
+
+message TenantRequest {
+  string tenant_id = 1;
+}
+
+message TenantRouteResponse {
+  string tenant_id = 1;
+  string state = 2;
+  string host = 3;
+  int32 port = 4;
+  string sock_dir = 5;
+  string app_password = 6;
+}
+
+message CreateDatabaseRequest {
+  string tenant_id = 1;
+  string account_id = 2;
+  string idempotency_key = 3;
+}
+
+message CreateDatabaseResponse {
+  string tenant_id = 1;
+  string state = 2;
+  int32 direct_port = 3;
+  string host = 4;
+  string user = 5;
+  string password = 6;
+  string dsn = 7;
+}
+
+message DatabaseInfo {
+  string account_id = 1;
+  string tenant_id = 2;
+  int32 direct_port = 3;
+  string system_identifier = 4;
+  int64 fencing_epoch = 5;
+  string state = 6;
+}
+
+message ListDatabasesRequest {
+  string account_id = 1;
+}
+
+message ListDatabasesResponse {
+  repeated DatabaseInfo databases = 1;
+}
+
+message StatusResponse {
+  string status = 1;
+  string tenant_id = 2;
+}

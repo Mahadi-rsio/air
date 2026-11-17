@@ -1,25 +1,30 @@
 CXX ?= g++
-PKG_CFLAGS := $(shell pkg-config --cflags libpq libcurl openssl 2>/dev/null)
-PKG_LIBS := $(shell pkg-config --libs libpq libcurl openssl 2>/dev/null)
+PKG_CONFIG_PATH_EXT := /opt/conda/lib/pkgconfig:$(PKG_CONFIG_PATH)
+PKG_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH_EXT) pkg-config --cflags libpq openssl grpc++ protobuf 2>/dev/null)
+PKG_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH_EXT) pkg-config --libs libpq openssl grpc++ protobuf 2>/dev/null)
 ifeq ($(strip $(PKG_CFLAGS)),)
-PKG_CFLAGS := -I/usr/include/postgresql
+PKG_CFLAGS := -I/usr/include/postgresql -I/opt/conda/include
 endif
 ifeq ($(strip $(PKG_LIBS)),)
-PKG_LIBS := -lpq -lcurl -lssl -lcrypto
+PKG_LIBS := -lpq -lssl -lcrypto -lgrpc++ -lprotobuf
 endif
-CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -pthread $(PKG_CFLAGS)
-LDFLAGS ?= $(PKG_LIBS) -pthread
+RPATH_FLAGS := -Wl,-rpath,/opt/conda/lib
+CXXFLAGS ?= -std=c++20 -O2 -DNDEBUG -Wall -Wextra -pthread $(PKG_CFLAGS)
+LDFLAGS ?= $(PKG_LIBS) $(RPATH_FLAGS) -pthread
+
+PB_SRCS := src/pb/airdb.pb.cc src/pb/airdb.grpc.pb.cc
+HEADERS := src/config.hpp src/pg_wire.hpp src/discovery.hpp src/pooler.hpp src/admin_http.hpp src/metrics.hpp
 
 all: air-gateway
 
-air-gateway: src/main.cpp src/config.hpp src/pg_wire.hpp src/discovery.hpp src/pooler.hpp src/admin_http.hpp src/metrics.hpp
-	$(CXX) $(CXXFLAGS) -Isrc -o $@ src/main.cpp $(LDFLAGS)
+air-gateway: src/main.cpp $(PB_SRCS) $(HEADERS)
+	$(CXX) $(CXXFLAGS) -Isrc -o $@ src/main.cpp $(PB_SRCS) $(LDFLAGS)
 
 test: gateway_test
 	./gateway_test
 
-gateway_test: tests/gateway_test.cpp src/config.hpp src/pg_wire.hpp src/discovery.hpp src/pooler.hpp src/admin_http.hpp src/metrics.hpp
-	$(CXX) $(CXXFLAGS) -Isrc -o $@ tests/gateway_test.cpp $(LDFLAGS)
+gateway_test: tests/gateway_test.cpp $(PB_SRCS) $(HEADERS)
+	$(CXX) $(CXXFLAGS) -Isrc -o $@ tests/gateway_test.cpp $(PB_SRCS) $(LDFLAGS)
 
 clean:
 	rm -f air-gateway gateway_test

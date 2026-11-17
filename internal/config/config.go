@@ -18,6 +18,7 @@ type Config struct {
 	PGBinDir           string
 	MetaPort           int
 	HTTPAddr           string
+	GRPCAddr           string
 	GatewayAddr        string
 	GatewayAdminAddr   string
 	GatewayAdminURL    string
@@ -57,6 +58,7 @@ func Default(dataDir string) Config {
 		MetaPort:           15432,
 		HTTPAddr:           "127.0.0.1:8080",
 		GatewayAddr:        "127.0.0.1:5432",
+		GRPCAddr:           "127.0.0.1:9090",
 		GatewayAdminAddr:   "127.0.0.1:8081",
 		ControlPlaneURL:    "http://127.0.0.1:8080",
 		BootstrapAccountID: "acct_default",
@@ -75,6 +77,7 @@ func Load(args []string) (Config, error) {
 	cfg.MasterKeyPath = envOr("AIR_MASTER_KEY_PATH", cfg.MasterKeyPath)
 	cfg.PGBinDir = envOr("AIR_PG_BIN_DIR", cfg.PGBinDir)
 	cfg.HTTPAddr = envOr("AIR_HTTP_ADDR", cfg.HTTPAddr)
+	cfg.GRPCAddr = envOr("AIR_GRPC_ADDR", cfg.GRPCAddr)
 	cfg.GatewayAddr = envOr("AIR_GATEWAY_ADDR", cfg.GatewayAddr)
 	cfg.GatewayAdminAddr = envOr("AIR_GATEWAY_ADMIN_ADDR", cfg.GatewayAdminAddr)
 	cfg.GatewayAdminURL = envOr("AIR_GATEWAY_ADMIN_URL", cfg.GatewayAdminURL)
@@ -135,6 +138,7 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&cfg.PGBinDir, "pg-bin-dir", cfg.PGBinDir, "Path to PostgreSQL 17 bin directory")
 	fs.IntVar(&cfg.MetaPort, "meta-port", cfg.MetaPort, "TCP port for internal Control Plane metadata PostgreSQL instance")
 	fs.StringVar(&cfg.HTTPAddr, "http-addr", cfg.HTTPAddr, "Control Plane HTTP API listen address")
+	fs.StringVar(&cfg.GRPCAddr, "grpc-addr", cfg.GRPCAddr, "Air DB gRPC server listen address for air-gateway")
 	fs.StringVar(&cfg.GatewayAddr, "gateway-addr", cfg.GatewayAddr, "PostgreSQL wire-protocol gateway listen address")
 	fs.StringVar(&cfg.GatewayAdminAddr, "gateway-admin-addr", cfg.GatewayAdminAddr, "Gateway internal admin HTTP listen address (healthz and drain)")
 	fs.StringVar(&cfg.GatewayAdminURL, "gateway-admin-url", cfg.GatewayAdminURL, "Optional Gateway admin HTTP base URL used by air-server for cooperative pool draining")

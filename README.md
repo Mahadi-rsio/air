@@ -1,6 +1,6 @@
 # AIR — Multi-Tenant PostgreSQL 17 Platform (`v2.0`)
 
-AIR is a production-oriented, multi-tenant PostgreSQL 17 platform built in Go with a transaction-mode wire pooler, cooperative scale-to-zero, encrypted R2 backups/PITR, and a custom Neon-style Pageserver (`air_smgr`) with Content-Addressed Upload (CAU).
+AIR is a production-oriented, multi-tenant PostgreSQL 17 platform featuring a Go database engine/control plane (`air-server`), a standalone **C++20 PG gateway & connection pooler** (`air-gateway`) communicating over **gRPC**, cooperative scale-to-zero, encrypted R2 backups/PITR, and a custom Neon-style Pageserver (`air_smgr`) with Content-Addressed Upload (CAU).
 
 > **Docs & Architecture:** [phase.md](file:///workspaces/air/phase.md) · [todo.md](file:///workspaces/air/todo.md) · [pageserver.md](file:///workspaces/air/pageserver.md) · [smgr.md](file:///workspaces/air/smgr.md)
 
@@ -8,14 +8,16 @@ AIR is a production-oriented, multi-tenant PostgreSQL 17 platform built in Go wi
 
 ```text
 .
-├── cmd/air-server/          # Single-cell server entrypoint (Control Plane + Cell Agent + Pageserver + PG Gateway)
+├── cmd/air-server/          # Air DB server entrypoint (Control Plane HTTP + gRPC server + Cell Agent + Pageserver)
+├── gateway/                 # Standalone C++20 PG Gateway & Pooler (PG wire :5432, Admin API :8081, gRPC client)
+├── proto/                   # Protobuf / gRPC contract (airdb.proto: AirDBControl)
 ├── internal/
 │   ├── config/              # Runtime flags and environment configuration
 │   ├── crypto/              # EnvelopeKMS (persistent 256-bit KEK + wrapped per-tenant DEKs)
 │   ├── tenant/              # Canonical tenant/account ID validation & symlink-safe path containment
 │   ├── cell/                # PG17 lifecycle, warm initdb pool, cgroup v2, supautils hardening, flock ownership
-│   ├── control/             # Durable PG17 metadata, schema_migrations, Bearer API key auth, provisioning & wake/reconcile
-│   ├── gateway/             # PostgreSQL wire-protocol gateway & transaction-mode pooler (TLS/SNI, SCRAM, wake-on-connect)
+│   ├── control/             # Durable PG17 metadata, schema_migrations, Bearer API key auth, HTTP & gRPC servers
+│   ├── pb/                  # Generated Go protobuf & gRPC stubs
 │   ├── pageserver/          # Go Pageserver (WAL receiver/parser, L0/L1/Image layers, CAU R2 upload, GetPage@LSN, walredo)
 │   ├── backup/              # Encrypted full/incremental PG17 backups, WAL spooling, PITR & DAG GC
 │   └── fencing/             # CLOCK_MONOTONIC lease watchdog & R2 ETag CAS fencing manifests
@@ -23,7 +25,7 @@ AIR is a production-oriented, multi-tenant PostgreSQL 17 platform built in Go wi
 ├── patches/                 # PG17 smgr_hook source patch (pg17-smgr-hook.patch)
 ├── migrations/              # SQL schema reference (001_initial_schema.sql, 002_api_keys.sql)
 ├── tests/e2e/               # Real PostgreSQL 17 end-to-end tests (e2e, phase_f/g/h, pageserver_cau)
-├── Dockerfile               # Container image build (PG17 + smgr_hook + supautils + air_smgr + air-server)
+├── Dockerfile               # Multi-stage container build (Go air-server + C++ air-gateway + PG17 + air_smgr)
 └── fly.toml                 # Fly.io deployment configuration
 ```
 
@@ -40,10 +42,12 @@ AIR is a production-oriented, multi-tenant PostgreSQL 17 platform built in Go wi
    - All `/v1/*` endpoints require `Authorization: Bearer <token>`.
    - Tokens are stored only as SHA-256 digests (`key_sha256 UNIQUE`) bound to `account_id`, with instant revocation via `DELETE /v1/api-keys/{id}`.
    - Supports external HA metadata PostgreSQL via `--meta-dsn` (`AIR_META_DSN`) or an embedded local metadata PG17 instance.
-2. **Gateway Wire-Protocol, Mandatory TLS & Transaction Pooler ([gateway.go](file:///workspaces/air/internal/gateway/gateway.go), [pooler.go](file:///workspaces/air/internal/gateway/pooler.go))**:
-   - Enforces an 8 KB `StartupMessage` limit, TLS 1.2+ (`SSLRequest = 80877103`), cryptographic `SNI == database` tenant binding (when SNI is present), and blocks reserved `postgres` superuser connections (`SQLSTATE 28000`).
-   - Supports `--require-tls` (`AIR_REQUIRE_TLS`) to reject any plaintext connection with `SQLSTATE 28000`.
-   - Optional transaction-mode pooling (`--pool-mode` / `AIR_POOL_MODE`, `--pool-max-backends` / `AIR_POOL_MAX_BACKENDS`) with `DISCARD ALL;` session isolation, Extended Query support, `COPY` streaming, and session pinning.
+2. **Standalone C++20 Gateway, Transaction Pooler & Metrics ([gateway/src/](file:///workspaces/air/gateway/src))**:
+   - Auto-discovers newly created tenant databases from internal metadata PG (`clusters`) and communicates with `air-server` over **gRPC** (`--db-grpc-addr` / `AIR_DB_GRPC_ADDR`, default `127.0.0.1:9090`).
+   - Enforces an 8 KB `StartupMessage` limit, TLS 1.2+ (`SSLRequest = 80877103`), cryptographic `SNI == database` tenant binding, and blocks reserved `postgres` superuser connections (`SQLSTATE 28000`).
+   - Enforces global, per-tenant, and per-user client connection limits (`--max-client-conns`, `--max-tenant-client-conns`, `--max-user-client-conns`) plus runtime per-tenant overrides via `POST /internal/v1/tenants/{id}/limits`.
+   - Tracks per-user and per-tenant query count, error count, latency (`min`/`avg`/`max`/`p50`/`p95`/`p99`), pool wait time, and data size (`bytes_in`, `bytes_out`, `rows_returned`, `data_row_bytes`) exposed at `GET /internal/v1/metrics` (JSON) and `GET /metrics` (Prometheus).
+   - Exposes Gateway Admin DB lifecycle endpoints (`POST /v1/databases`, `GET /v1/databases`, `GET/DELETE /v1/databases/{id}`, `POST /v1/databases/{id}/{suspend,start,lock,unlock}`) backed by `AirDBControl` gRPC calls.
 3. **Cooperative Scale-to-Zero & Warm `initdb` Pool ([agent.go](file:///workspaces/air/internal/cell/agent.go), [control.go](file:///workspaces/air/internal/control/control.go))**:
    - Suspends idle `ACTIVE` tenants after `--idle-timeout` (`AIR_IDLE_TIMEOUT`) only after cooperative drain guards pass (`ErrDrainVetoed` on active txns, prepared xacts, `LISTEN`, temp tables, or advisory locks).
    - Coalesces concurrent wake-on-connect requests via `singleflight` and accelerates provisioning with a pre-warmed `initdb` pool.
@@ -64,17 +68,27 @@ Runs the suites in [tests/e2e/](file:///workspaces/air/tests/e2e) against real P
 go test -v -race -count=1 ./...
 ```
 
-### Running `air-server` Locally
+### Running `air-server` and C++ `air-gateway` Locally
 
 ```bash
+# 1. Start air-server (Control Plane HTTP :8080 + Air DB gRPC :9090)
 go run ./cmd/air-server \
   -data-dir /tmp/air-live \
   -http-addr 127.0.0.1:8080 \
-  -gateway-addr 127.0.0.1:5432 \
+  -grpc-addr 127.0.0.1:9090 \
   -meta-port 15432 \
   -bootstrap-account-id acct_demo \
   -bootstrap-api-key air_live_demo_secret_token_12345 \
-  -require-tls=false
+  -internal-token air_internal_secret
+
+# 2. Build and start C++ air-gateway (PG Pooler :5432 + Admin API :8081)
+make -C gateway all test
+./gateway/air-gateway \
+  --gateway-addr 127.0.0.1:5432 \
+  --gateway-admin-addr 127.0.0.1:8081 \
+  --db-grpc-addr 127.0.0.1:9090 \
+  --meta-dsn "host=127.0.0.1 port=15432 user=postgres dbname=postgres" \
+  --internal-token air_internal_secret
 ```
 
 ### Fly.io Deployment ([fly.toml](file:///workspaces/air/fly.toml))
