@@ -290,6 +290,13 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 
 // GetPageAtLSN reconstructs the 8192-byte page for key as of lsn (0 = latest).
 func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byte, error) {
+	if t.store != nil && t.store.readLimiter != nil {
+		release, err := t.store.readLimiter.Acquire(ctx, t.tenantID)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+	}
 	t.mu.RLock()
 	inMemDeltas := t.inMem.Lookup(key, lsn)
 	layersCopy := append([]LayerMeta(nil), t.layers...)
@@ -371,6 +378,13 @@ func (t *Timeline) GetPageBatch(ctx context.Context, spcOID, dbOID, relNumber ui
 	if nblocks == 0 {
 		return nil, 0, nil
 	}
+	if t.store != nil && t.store.readLimiter != nil {
+		release, err := t.store.readLimiter.Acquire(ctx, t.tenantID)
+		if err != nil {
+			return nil, 0, err
+		}
+		defer release()
+	}
 	n := int(nblocks)
 	keys := make([]Key, n)
 	collected := make([][]WALDelta, n)
@@ -450,27 +464,44 @@ func (t *Timeline) GetPageBatch(ctx context.Context, spcOID, dbOID, relNumber ui
 	}
 
 	if batchRedoer, ok := t.redoer.(BatchWALRedoer); ok && validN > 1 {
-		reqs := make([]WALRedoRequest, validN)
+		basePages := make([][]byte, validN)
+		var redoReqs []WALRedoRequest
+		var redoIdx []int
 		for i := 0; i < validN; i++ {
 			base, deltas := prepareCollectedForRedo(collected[i])
-			reqs[i] = WALRedoRequest{
-				Key:      keys[i],
-				BasePage: base,
-				Deltas:   deltas,
+			if len(deltas) == 0 && len(base) == PageSize {
+				basePages[i] = base
+			} else {
+				redoIdx = append(redoIdx, i)
+				redoReqs = append(redoReqs, WALRedoRequest{
+					Key:      keys[i],
+					BasePage: base,
+					Deltas:   deltas,
+				})
 			}
 		}
-		pages, errs := batchRedoer.RedoBatch(ctx, reqs)
-		for i := 0; i < validN; i++ {
-			if errs[i] != nil {
-				if errs[i] == ErrNotFound {
-					if i == 0 {
-						return nil, 0, ErrNotFound
+		if len(redoReqs) > 0 {
+			pages, errs := batchRedoer.RedoBatch(ctx, redoReqs)
+			for ri, origIdx := range redoIdx {
+				if errs[ri] != nil {
+					if errs[ri] == ErrNotFound {
+						// Truncate at first ErrNotFound; handled below.
+						basePages[origIdx] = nil
+						continue
 					}
-					break
+					return nil, 0, errs[ri]
 				}
-				return nil, 0, errs[i]
+				basePages[origIdx] = pages[ri]
 			}
-			out = append(out, pages[i]...)
+		}
+		for i := 0; i < validN; i++ {
+			if len(basePages[i]) != PageSize {
+				if i == 0 {
+					return nil, 0, ErrNotFound
+				}
+				break
+			}
+			out = append(out, basePages[i]...)
 			count++
 		}
 		return out, count, nil

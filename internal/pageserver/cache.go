@@ -19,19 +19,23 @@ import (
 // Disk I/O (WriteFile, pread, Remove) is performed outside the metadata mutex so concurrent
 // readers never block on disk writes or evictions.
 type DiskCache struct {
-	mu       sync.Mutex
-	dir      string
-	maxBytes int64
-	curBytes int64
-	lru      *list.List
-	entries  map[string]*list.Element
-	tmpSeq   atomic.Uint64
+	mu        sync.Mutex
+	dir       string
+	maxBytes  int64
+	curBytes  int64
+	lru       *list.List
+	entries   map[string]*list.Element
+	tmpSeq    atomic.Uint64
+	genSeq    uint64
+	evictions atomic.Int64
 }
 
 type cacheItem struct {
-	key      string
-	filePath string
-	size     int64
+	key           string
+	filePath      string
+	size          int64
+	activeReads   int
+	pendingDelete bool
 }
 
 // NewDiskCache initializes a bounded LRU disk cache under dir and recovers any
@@ -83,6 +87,9 @@ func (c *DiskCache) recoverFromDisk() {
 			continue
 		}
 		hashKey := strings.TrimSuffix(name, ".layer")
+		if dot := strings.IndexByte(hashKey, '.'); dot > 0 {
+			hashKey = hashKey[:dot]
+		}
 		found = append(found, recoveredFile{
 			hashKey: hashKey,
 			path:    fullPath,
@@ -98,6 +105,12 @@ func (c *DiskCache) recoverFromDisk() {
 		if rf.size > c.maxBytes {
 			_ = os.Remove(rf.path)
 			continue
+		}
+		if prevElem, dup := c.entries[rf.hashKey]; dup {
+			c.lru.Remove(prevElem)
+			prevItem := prevElem.Value.(*cacheItem)
+			c.curBytes -= prevItem.size
+			_ = os.Remove(prevItem.filePath)
 		}
 		item := &cacheItem{key: rf.hashKey, filePath: rf.path, size: rf.size}
 		elem := c.lru.PushFront(item)
@@ -133,7 +146,19 @@ func (c *DiskCache) Put(key string, data []byte) error {
 		return nil
 	}
 	hashKey := cacheKeyHash(key)
+
+	c.mu.Lock()
+	c.genSeq++
+	gen := c.genSeq
 	p := c.pathForHash(hashKey)
+	if elem, ok := c.entries[hashKey]; ok {
+		old := elem.Value.(*cacheItem)
+		if old.activeReads > 0 {
+			p = filepath.Join(c.dir, fmt.Sprintf("%s.%d.layer", hashKey, gen))
+		}
+	}
+	c.mu.Unlock()
+
 	tmp := fmt.Sprintf("%s.%d.tmp", p, c.tmpSeq.Add(1))
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
@@ -150,6 +175,13 @@ func (c *DiskCache) Put(key string, data []byte) error {
 		c.curBytes -= old.size
 		c.lru.Remove(elem)
 		delete(c.entries, hashKey)
+		if old.filePath != p {
+			if old.activeReads > 0 {
+				old.pendingDelete = true
+			} else {
+				evictPaths = append(evictPaths, old.filePath)
+			}
+		}
 	}
 	item := &cacheItem{key: hashKey, filePath: p, size: int64(len(data))}
 	elem := c.lru.PushFront(item)
@@ -166,7 +198,11 @@ func (c *DiskCache) Put(key string, data []byte) error {
 		delete(c.entries, oldItem.key)
 		c.curBytes -= oldItem.size
 		if oldItem.filePath != p {
-			evictPaths = append(evictPaths, oldItem.filePath)
+			if oldItem.activeReads > 0 {
+				oldItem.pendingDelete = true
+			} else {
+				evictPaths = append(evictPaths, oldItem.filePath)
+			}
 		}
 	}
 	c.mu.Unlock()
@@ -178,6 +214,7 @@ func (c *DiskCache) Put(key string, data []byte) error {
 }
 
 // GetRange reads [offset, offset+length) if key is cached locally.
+// Active reads pin the underlying file so concurrent Evict calls defer deletion until readers finish.
 func (c *DiskCache) GetRange(key string, offset, length int64) ([]byte, bool) {
 	hashKey := cacheKeyHash(key)
 	c.mu.Lock()
@@ -187,8 +224,24 @@ func (c *DiskCache) GetRange(key string, offset, length int64) ([]byte, bool) {
 		return nil, false
 	}
 	c.lru.MoveToFront(elem)
-	p := elem.Value.(*cacheItem).filePath
+	item := elem.Value.(*cacheItem)
+	item.activeReads++
+	p := item.filePath
 	c.mu.Unlock()
+
+	var deletePath string
+	defer func() {
+		c.mu.Lock()
+		item.activeReads--
+		if item.pendingDelete && item.activeReads == 0 {
+			deletePath = item.filePath
+			item.pendingDelete = false
+		}
+		c.mu.Unlock()
+		if deletePath != "" {
+			_ = os.Remove(deletePath)
+		}
+	}()
 
 	f, err := os.Open(p)
 	if err != nil {
@@ -201,6 +254,39 @@ func (c *DiskCache) GetRange(key string, offset, length int64) ([]byte, bool) {
 		return nil, false
 	}
 	return buf[:n], true
+}
+
+// Evict safely removes key from the cache. If readers are currently active on the
+// underlying file, deletion is deferred until the last active reader finishes.
+func (c *DiskCache) Evict(key string) bool {
+	hashKey := cacheKeyHash(key)
+	var removePath string
+	c.mu.Lock()
+	elem, ok := c.entries[hashKey]
+	if !ok {
+		c.mu.Unlock()
+		return false
+	}
+	c.lru.Remove(elem)
+	delete(c.entries, hashKey)
+	item := elem.Value.(*cacheItem)
+	c.curBytes -= item.size
+	if item.activeReads > 0 {
+		item.pendingDelete = true
+	} else {
+		removePath = item.filePath
+	}
+	c.mu.Unlock()
+	c.evictions.Add(1)
+	if removePath != "" {
+		_ = os.Remove(removePath)
+	}
+	return true
+}
+
+// Evictions returns the number of explicit Evict calls performed on this DiskCache.
+func (c *DiskCache) Evictions() int64 {
+	return c.evictions.Load()
 }
 
 // Stats returns the current cached byte count and entry count.

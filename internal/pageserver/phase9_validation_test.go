@@ -623,9 +623,17 @@ func TestPhase9_Part6_FailureAndRecovery(t *testing.T) {
 			}
 		}
 	}
-	// Corrupted cached file must NEVER silently return bad plaintext!
-	if _, err := tl1.GetPageAtLSN(ctx, k, 0); err == nil {
-		t.Fatalf("expected authentication/decode failure on corrupted cached file")
+	// Phase 10: Corrupted cached file must auto-evict and recover exact plaintext from R2 when available,
+	// and never silently return bad plaintext.
+	got, err := tl1.GetPageAtLSN(ctx, k, 0)
+	if err != nil {
+		t.Fatalf("expected auto-recovery from R2 on corrupted cached file, got: %v", err)
+	}
+	if !bytes.Equal(got, wantPage) {
+		t.Fatalf("recovered page mismatch after cache corruption")
+	}
+	if cache1.Evictions() == 0 {
+		t.Fatalf("expected DiskCache eviction on corrupted cached file")
 	}
 
 	// 3. Simulated Pageserver restart: new DiskCache + new EnvelopeKMS with imported bundle + LoadLayersFromR2.

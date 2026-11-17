@@ -391,12 +391,18 @@ type LayerStore struct {
 	seqMu              sync.Mutex
 	lastReadEnd        map[string]int64
 	prefetchSem        chan struct{}
+	readLimiter        *ReadLimiter
+	decodedChunks      *DecodedChunkCache
 	metricsMu          sync.Mutex
 	lastMetrics        UploadMetrics
 }
 
 // NewLayerStore creates a LayerStore backed by localDir, optional S3/R2, optional KMS, and optional DiskCache.
 func NewLayerStore(localDir string, s3c *s3.Client, bucket string, kms *crypto.EnvelopeKMS, cache *DiskCache) *LayerStore {
+	dc := NewDecodedChunkCache(DecodedChunkCacheConfig{})
+	if kms != nil {
+		kms.OnKeyInvalidated(dc.InvalidateTenant)
+	}
 	return &LayerStore{
 		localDir:           localDir,
 		s3c:                s3c,
@@ -412,7 +418,61 @@ func NewLayerStore(localDir string, s3c *s3.Client, bucket string, kms *crypto.E
 		dlFlight:           make(map[string]*layerDownload),
 		lastReadEnd:        make(map[string]int64),
 		prefetchSem:        make(chan struct{}, 4),
+		readLimiter:        NewReadLimiter(ReadLimiterConfig{}),
+		decodedChunks:      dc,
 	}
+}
+
+// SetReadLimiter configures bounded read admission control (nil disables limiting).
+func (s *LayerStore) SetReadLimiter(rl *ReadLimiter) {
+	s.readLimiter = rl
+}
+
+// ReadLimiter returns the configured ReadLimiter (may be nil).
+func (s *LayerStore) ReadLimiter() *ReadLimiter {
+	return s.readLimiter
+}
+
+// SetDecodedChunkCache configures the decoded V2 chunk cache (nil disables caching).
+func (s *LayerStore) SetDecodedChunkCache(dc *DecodedChunkCache) {
+	s.decodedChunks = dc
+	if dc != nil && s.kms != nil {
+		s.kms.OnKeyInvalidated(dc.InvalidateTenant)
+	}
+}
+
+// DecodedChunkCache returns the configured DecodedChunkCache (may be nil).
+func (s *LayerStore) DecodedChunkCache() *DecodedChunkCache {
+	return s.decodedChunks
+}
+
+// evictCorruptDiskCache safely removes any cached full-layer or chunked DiskCache entries
+// overlapping [offset, offset+length) and invalidates the in-memory index cache for meta.R2Key.
+func (s *LayerStore) evictCorruptDiskCache(meta LayerMeta, offset, length int64) bool {
+	evicted := false
+	if s.cache != nil {
+		if s.cache.Evict(meta.R2Key) {
+			evicted = true
+		}
+		if length > 0 && meta.FileSize > 0 {
+			end := offset + length
+			if end > meta.FileSize {
+				end = meta.FileSize
+			}
+			firstChunk := offset / layerCacheChunkSize
+			lastChunk := (end - 1) / layerCacheChunkSize
+			for ci := firstChunk; ci <= lastChunk; ci++ {
+				chunkKey := fmt.Sprintf("%s#chunk=%d", meta.R2Key, ci)
+				if s.cache.Evict(chunkKey) {
+					evicted = true
+				}
+			}
+		}
+	}
+	if s.idxCache != nil {
+		s.idxCache.evict(meta.R2Key)
+	}
+	return evicted
 }
 
 // SetLayerFormatVersion configures the layer format version used for new writes (1 or 2).
@@ -1332,63 +1392,11 @@ func (s *LayerStore) loadLayerIndex(ctx context.Context, meta LayerMeta) (*layer
 	s.idxFlight[meta.R2Key] = f
 	s.idxFlightMu.Unlock()
 
-	var loaded *layerIndexData
-	var loadErr error
-
-	// Read tail window (up to 64 KiB) in a single range request to fetch footer + index together when possible.
-	tailLen := tailReadWindowBytes
-	if meta.FileSize < tailLen {
-		tailLen = meta.FileSize
-	}
-	tailStart := meta.FileSize - tailLen
-	tailRaw, err := s.readRangeLocalOrR2Direct(ctx, meta, tailStart, tailLen)
-	if err != nil {
-		loadErr = err
-	} else {
-		footerRaw := tailRaw[len(tailRaw)-LayerFooterSize:]
-		footer, fErr := DecodeLayerFooter(footerRaw)
-		if fErr != nil {
-			loadErr = fErr
-		} else if footer.EntryCount == 0 {
-			loaded = s.idxCache.putVersioned(meta.R2Key, footer.Version, []LayerIndexEntry{}, nil, v2WALTableMeta{})
-		} else {
-			idxStart := int64(footer.IndexOffset)
-			idxLen := int64(footer.IndexLen)
-			var idxRaw []byte
-			if idxStart >= tailStart && idxStart+idxLen <= meta.FileSize-int64(LayerFooterSize) {
-				rel := idxStart - tailStart
-				idxRaw = tailRaw[rel : rel+idxLen]
-			} else if idxStart < tailStart && idxStart+idxLen > tailStart {
-				prefixLen := tailStart - idxStart
-				prefixRaw, pErr := s.readRangeLocalOrR2Direct(ctx, meta, idxStart, prefixLen)
-				if pErr != nil {
-					loadErr = pErr
-				} else {
-					overlap := idxLen - prefixLen
-					idxRaw = make([]byte, idxLen)
-					copy(idxRaw, prefixRaw)
-					copy(idxRaw[prefixLen:], tailRaw[:overlap])
-				}
-			} else {
-				idxRaw, loadErr = s.readRangeLocalOrR2Direct(ctx, meta, idxStart, idxLen)
-			}
-			if loadErr == nil {
-				if footer.Version == LayerVersionV2 {
-					v2, dErr := decodeLayerV2Index(idxRaw, meta, footer.EntryCount, s.kms)
-					if dErr != nil {
-						loadErr = dErr
-					} else {
-						loaded = s.idxCache.putVersioned(meta.R2Key, LayerVersionV2, v2.entries, v2.chunks, v2.walTable)
-					}
-				} else {
-					entries, dErr := DecodeLayerIndex(idxRaw, meta, footer.EntryCount, s.kms)
-					if dErr != nil {
-						loadErr = dErr
-					} else {
-						loaded = s.idxCache.putVersioned(meta.R2Key, LayerVersion, entries, nil, v2WALTableMeta{})
-					}
-				}
-			}
+	loaded, loadErr := s.loadLayerIndexOnce(ctx, meta)
+	if loadErr != nil && !errors.Is(loadErr, crypto.ErrDEKMissing) && !errors.Is(loadErr, context.Canceled) && !errors.Is(loadErr, context.DeadlineExceeded) {
+		if s.cache != nil && s.s3c != nil && s.bucket != "" {
+			s.evictCorruptDiskCache(meta, 0, meta.FileSize)
+			loaded, loadErr = s.loadLayerIndexOnce(ctx, meta)
 		}
 	}
 
@@ -1400,6 +1408,62 @@ func (s *LayerStore) loadLayerIndex(ctx context.Context, meta LayerMeta) (*layer
 	s.idxFlightMu.Unlock()
 
 	return loaded, loadErr
+}
+
+func (s *LayerStore) loadLayerIndexOnce(ctx context.Context, meta LayerMeta) (*layerIndexData, error) {
+	// Read tail window (up to 64 KiB) in a single range request to fetch footer + index together when possible.
+	tailLen := tailReadWindowBytes
+	if meta.FileSize < tailLen {
+		tailLen = meta.FileSize
+	}
+	tailStart := meta.FileSize - tailLen
+	tailRaw, err := s.readRangeLocalOrR2Direct(ctx, meta, tailStart, tailLen)
+	if err != nil {
+		return nil, err
+	}
+	footerRaw := tailRaw[len(tailRaw)-LayerFooterSize:]
+	footer, fErr := DecodeLayerFooter(footerRaw)
+	if fErr != nil {
+		return nil, fErr
+	}
+	if footer.EntryCount == 0 {
+		return s.idxCache.putVersioned(meta.R2Key, footer.Version, []LayerIndexEntry{}, nil, v2WALTableMeta{}), nil
+	}
+	idxStart := int64(footer.IndexOffset)
+	idxLen := int64(footer.IndexLen)
+	var idxRaw []byte
+	if idxStart >= tailStart && idxStart+idxLen <= meta.FileSize-int64(LayerFooterSize) {
+		rel := idxStart - tailStart
+		idxRaw = tailRaw[rel : rel+idxLen]
+	} else if idxStart < tailStart && idxStart+idxLen > tailStart {
+		prefixLen := tailStart - idxStart
+		prefixRaw, pErr := s.readRangeLocalOrR2Direct(ctx, meta, idxStart, prefixLen)
+		if pErr != nil {
+			return nil, pErr
+		}
+		overlap := idxLen - prefixLen
+		idxRaw = make([]byte, idxLen)
+		copy(idxRaw, prefixRaw)
+		copy(idxRaw[prefixLen:], tailRaw[:overlap])
+	} else {
+		var rErr error
+		idxRaw, rErr = s.readRangeLocalOrR2Direct(ctx, meta, idxStart, idxLen)
+		if rErr != nil {
+			return nil, rErr
+		}
+	}
+	if footer.Version == LayerVersionV2 {
+		v2, dErr := decodeLayerV2Index(idxRaw, meta, footer.EntryCount, s.kms)
+		if dErr != nil {
+			return nil, dErr
+		}
+		return s.idxCache.putVersioned(meta.R2Key, LayerVersionV2, v2.entries, v2.chunks, v2.walTable), nil
+	}
+	entries, dErr := DecodeLayerIndex(idxRaw, meta, footer.EntryCount, s.kms)
+	if dErr != nil {
+		return nil, dErr
+	}
+	return s.idxCache.putVersioned(meta.R2Key, LayerVersion, entries, nil, v2WALTableMeta{}), nil
 }
 
 // LookupKeyInLayer reads only the footer, index (cached in bounded LRU), and matching entry ranges for key <= lsn.
@@ -1510,21 +1574,36 @@ func (s *LayerStore) LookupKeysInLayer(ctx context.Context, meta LayerMeta, keys
 			m := matches[k]
 			relOff := int64(m.entry.Offset) - spanStart
 			raw := spanBuf[relOff : relOff+int64(m.entry.Length)]
-			if meta.Encrypted {
-				raw, err = s.kms.DecryptObject(meta.TenantID, meta.Epoch, fmt.Sprintf("%s#e%d", meta.aadKey(), m.entryIdx), raw)
-				if err != nil {
-					return nil, err
+			delta, dErr := s.decodeV1Entry(meta, m.entryIdx, m.entry, raw)
+			if dErr != nil {
+				if !errors.Is(dErr, crypto.ErrDEKMissing) && !errors.Is(dErr, context.Canceled) && !errors.Is(dErr, context.DeadlineExceeded) {
+					if s.cache != nil && s.s3c != nil && s.bucket != "" {
+						s.evictCorruptDiskCache(meta, int64(m.entry.Offset), int64(m.entry.Length))
+						if fresh, rErr := s.ReadRange(ctx, meta, int64(m.entry.Offset), int64(m.entry.Length)); rErr == nil {
+							delta, dErr = s.decodeV1Entry(meta, m.entryIdx, m.entry, fresh)
+						}
+					}
 				}
-			}
-			delta, err := decodeDeltaPayload(raw, m.entry.LSN, m.entry.Flags)
-			if err != nil {
-				return nil, err
+				if dErr != nil {
+					return nil, dErr
+				}
 			}
 			out[m.keySlot] = append(out[m.keySlot], delta)
 		}
 		i = j
 	}
 	return out, nil
+}
+
+func (s *LayerStore) decodeV1Entry(meta LayerMeta, entryIdx int, entry LayerIndexEntry, raw []byte) (WALDelta, error) {
+	if meta.Encrypted {
+		var err error
+		raw, err = s.kms.DecryptObject(meta.TenantID, meta.Epoch, fmt.Sprintf("%s#e%d", meta.aadKey(), entryIdx), raw)
+		if err != nil {
+			return WALDelta{}, err
+		}
+	}
+	return decodeDeltaPayload(raw, entry.LSN, entry.Flags)
 }
 
 // DownloadLayer streams a layer from R2 to dstPath (or verifies in-memory if dstPath == ""),

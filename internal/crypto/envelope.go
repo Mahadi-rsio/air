@@ -31,10 +31,46 @@ type WrappedDEKBundle struct {
 
 // EnvelopeKMS manages a 256-bit master KEK and per-tenant 256-bit DEKs wrapped with AES-256-GCM.
 type EnvelopeKMS struct {
-	mu          sync.RWMutex
-	kek         []byte
-	wrappedDEKs map[string][]byte
-	aeadCache   map[string]cipher.AEAD
+	mu           sync.RWMutex
+	kek          []byte
+	wrappedDEKs  map[string][]byte
+	aeadCache    map[string]cipher.AEAD
+	keyEpochs    map[string]uint64
+	onInvalidate []func(tenantID string)
+}
+
+// OnKeyInvalidated registers a callback invoked whenever a tenant's DEK is rotated, reloaded, or shredded.
+func (k *EnvelopeKMS) OnKeyInvalidated(fn func(tenantID string)) {
+	if fn == nil {
+		return
+	}
+	k.mu.Lock()
+	k.onInvalidate = append(k.onInvalidate, fn)
+	k.mu.Unlock()
+}
+
+func (k *EnvelopeKMS) notifyInvalidated(tenantID string, hooks []func(string)) {
+	for _, fn := range hooks {
+		fn(tenantID)
+	}
+}
+
+// TenantKeyEpoch returns the monotonic key epoch for tenantID, or ErrDEKMissing if not loaded/shredded.
+func (k *EnvelopeKMS) TenantKeyEpoch(tenantID string) (uint64, error) {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	w, ok := k.wrappedDEKs[tenantID]
+	if !ok || len(w) == 0 {
+		return 0, ErrDEKMissing
+	}
+	if k.keyEpochs == nil {
+		return 1, nil
+	}
+	ep := k.keyEpochs[tenantID]
+	if ep == 0 {
+		return 1, nil
+	}
+	return ep, nil
 }
 
 // NewEnvelopeKMS creates an in-memory KMS with a fresh 256-bit KEK (primarily for tests).
@@ -99,6 +135,10 @@ func (k *EnvelopeKMS) EnsureTenantDEK(tenantID string) (string, error) {
 		return "", err
 	}
 	k.wrappedDEKs[tenantID] = wrapped
+	if k.keyEpochs == nil {
+		k.keyEpochs = make(map[string]uint64)
+	}
+	k.keyEpochs[tenantID]++
 	return base64.StdEncoding.EncodeToString(wrapped), nil
 }
 
@@ -121,7 +161,13 @@ func (k *EnvelopeKMS) LoadWrappedDEK(tenantID, wrappedB64 string) error {
 	if k.aeadCache != nil {
 		delete(k.aeadCache, tenantID)
 	}
+	if k.keyEpochs == nil {
+		k.keyEpochs = make(map[string]uint64)
+	}
+	k.keyEpochs[tenantID]++
+	hooks := append(([]func(string))(nil), k.onInvalidate...)
 	k.mu.Unlock()
+	k.notifyInvalidated(tenantID, hooks)
 	return nil
 }
 
@@ -164,7 +210,6 @@ func (k *EnvelopeKMS) UnwrapDEK(tenantID string) ([]byte, error) {
 // handle before ShredDEK completes that single operation and cannot be reused.
 func (k *EnvelopeKMS) ShredDEK(tenantID string) {
 	k.mu.Lock()
-	defer k.mu.Unlock()
 	if w, ok := k.wrappedDEKs[tenantID]; ok {
 		zeroBytes(w)
 		delete(k.wrappedDEKs, tenantID)
@@ -172,6 +217,13 @@ func (k *EnvelopeKMS) ShredDEK(tenantID string) {
 	if k.aeadCache != nil {
 		delete(k.aeadCache, tenantID)
 	}
+	if k.keyEpochs == nil {
+		k.keyEpochs = make(map[string]uint64)
+	}
+	k.keyEpochs[tenantID]++
+	hooks := append(([]func(string))(nil), k.onInvalidate...)
+	k.mu.Unlock()
+	k.notifyInvalidated(tenantID, hooks)
 }
 
 func (k *EnvelopeKMS) tenantAEAD(tenantID string) (cipher.AEAD, error) {

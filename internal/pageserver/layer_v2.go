@@ -616,7 +616,17 @@ func (s *LayerStore) loadV2WALTable(ctx context.Context, meta LayerMeta, idxData
 	}
 	wt, err := decodeV2WALTable(raw, meta, idxData.walMeta, s.kms)
 	if err != nil {
-		return nil, err
+		if !errors.Is(err, crypto.ErrDEKMissing) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			if s.cache != nil && s.s3c != nil && s.bucket != "" {
+				s.evictCorruptDiskCache(meta, int64(idxData.walMeta.Offset), int64(idxData.walMeta.CipherLen))
+				if raw2, rErr := s.ReadRange(ctx, meta, int64(idxData.walMeta.Offset), int64(idxData.walMeta.CipherLen)); rErr == nil {
+					wt, err = decodeV2WALTable(raw2, meta, idxData.walMeta, s.kms)
+				}
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	idxData.walMu.Lock()
@@ -681,42 +691,78 @@ func (s *LayerStore) lookupKeysInLayerV2(ctx context.Context, meta LayerMeta, id
 		return idxData.chunks[uniqueChunks[i]].Offset < idxData.chunks[uniqueChunks[j]].Offset
 	})
 
-	decompressedChunks := make(map[uint32][]byte, len(uniqueChunks))
-	i := 0
-	for i < len(uniqueChunks) {
-		firstMeta := idxData.chunks[uniqueChunks[i]]
-		spanStart := int64(firstMeta.Offset)
-		spanEnd := spanStart + int64(firstMeta.CipherLen)
-		j := i + 1
-		for j < len(uniqueChunks) {
-			cm := idxData.chunks[uniqueChunks[j]]
-			nextStart := int64(cm.Offset)
-			nextEnd := nextStart + int64(cm.CipherLen)
-			if nextStart-spanEnd > coalesceGapBytes || nextEnd-spanStart > maxCoalescedSpan {
-				break
-			}
-			if nextEnd > spanEnd {
-				spanEnd = nextEnd
-			}
-			j++
-		}
-
-		spanBuf, err := s.ReadRange(ctx, meta, spanStart, spanEnd-spanStart)
+	var keyEpoch uint64
+	if s.decodedChunks != nil && s.kms != nil {
+		ep, err := s.kms.TenantKeyEpoch(meta.TenantID)
 		if err != nil {
 			return nil, err
 		}
-		for k := i; k < j; k++ {
-			cIdx := uniqueChunks[k]
+		keyEpoch = ep
+	}
+
+	decompressedChunks := make(map[uint32][]byte, len(uniqueChunks))
+	if s.decodedChunks != nil {
+		for _, cIdx := range uniqueChunks {
 			cm := idxData.chunks[cIdx]
-			relOff := int64(cm.Offset) - spanStart
-			cipherSlice := spanBuf[relOff : relOff+int64(cm.CipherLen)]
-			chunkRaw, err := decodeV2ChunkRaw(cipherSlice, meta, int(cIdx), cm, s.kms)
+			dKey := DecodedChunkKey{
+				TenantID: meta.TenantID,
+				LayerID:  meta.R2Key,
+				ChunkIdx: cIdx,
+				KeyEpoch: keyEpoch,
+			}
+			chunkRaw, err := s.decodedChunks.GetOrDecode(ctx, dKey, func() ([]byte, error) {
+				return s.readAndDecodeV2ChunkWithRecovery(ctx, meta, int(cIdx), cm)
+			})
 			if err != nil {
 				return nil, err
 			}
 			decompressedChunks[cIdx] = chunkRaw
 		}
-		i = j
+	} else {
+		i := 0
+		for i < len(uniqueChunks) {
+			firstMeta := idxData.chunks[uniqueChunks[i]]
+			spanStart := int64(firstMeta.Offset)
+			spanEnd := spanStart + int64(firstMeta.CipherLen)
+			j := i + 1
+			for j < len(uniqueChunks) {
+				cm := idxData.chunks[uniqueChunks[j]]
+				nextStart := int64(cm.Offset)
+				nextEnd := nextStart + int64(cm.CipherLen)
+				if nextStart-spanEnd > coalesceGapBytes || nextEnd-spanStart > maxCoalescedSpan {
+					break
+				}
+				if nextEnd > spanEnd {
+					spanEnd = nextEnd
+				}
+				j++
+			}
+
+			spanBuf, err := s.ReadRange(ctx, meta, spanStart, spanEnd-spanStart)
+			if err != nil {
+				return nil, err
+			}
+			for k := i; k < j; k++ {
+				cIdx := uniqueChunks[k]
+				cm := idxData.chunks[cIdx]
+				relOff := int64(cm.Offset) - spanStart
+				cipherSlice := spanBuf[relOff : relOff+int64(cm.CipherLen)]
+				chunkRaw, err := decodeV2ChunkRaw(cipherSlice, meta, int(cIdx), cm, s.kms)
+				if err != nil {
+					if !errors.Is(err, crypto.ErrDEKMissing) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+						if s.cache != nil && s.s3c != nil && s.bucket != "" {
+							s.evictCorruptDiskCache(meta, int64(cm.Offset), int64(cm.CipherLen))
+							chunkRaw, err = s.readAndDecodeV2ChunkOnce(ctx, meta, int(cIdx), cm)
+						}
+					}
+					if err != nil {
+						return nil, err
+					}
+				}
+				decompressedChunks[cIdx] = chunkRaw
+			}
+			i = j
+		}
 	}
 
 	type resolvedMatch struct {
@@ -730,6 +776,16 @@ func (s *LayerStore) lookupKeysInLayerV2(ctx context.Context, meta LayerMeta, id
 	for _, m := range matches {
 		delta, walIDPlusOne, err := extractV2RecordFromChunk(decompressedChunks[m.chunkIdx], m.recIdx, m.lsn, uint64(m.flags))
 		if err != nil {
+			if s.decodedChunks != nil {
+				s.decodedChunks.Evict(DecodedChunkKey{
+					TenantID: meta.TenantID,
+					LayerID:  meta.R2Key,
+					ChunkIdx: m.chunkIdx,
+					KeyEpoch: keyEpoch,
+				})
+			}
+			cm := idxData.chunks[m.chunkIdx]
+			s.evictCorruptDiskCache(meta, int64(cm.Offset), int64(cm.CipherLen))
 			return nil, err
 		}
 		if walIDPlusOne > 0 {
@@ -763,4 +819,27 @@ func (s *LayerStore) lookupKeysInLayerV2(ctx context.Context, meta LayerMeta, id
 		out[rm.keySlot] = append(out[rm.keySlot], rm.delta)
 	}
 	return out, nil
+}
+
+func (s *LayerStore) readAndDecodeV2ChunkOnce(ctx context.Context, meta LayerMeta, chunkIdx int, cm v2ChunkMeta) ([]byte, error) {
+	cipherSlice, err := s.ReadRange(ctx, meta, int64(cm.Offset), int64(cm.CipherLen))
+	if err != nil {
+		return nil, err
+	}
+	return decodeV2ChunkRaw(cipherSlice, meta, chunkIdx, cm, s.kms)
+}
+
+func (s *LayerStore) readAndDecodeV2ChunkWithRecovery(ctx context.Context, meta LayerMeta, chunkIdx int, cm v2ChunkMeta) ([]byte, error) {
+	chunkRaw, err := s.readAndDecodeV2ChunkOnce(ctx, meta, chunkIdx, cm)
+	if err == nil {
+		return chunkRaw, nil
+	}
+	if errors.Is(err, crypto.ErrDEKMissing) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil, err
+	}
+	if s.cache != nil && s.s3c != nil && s.bucket != "" {
+		s.evictCorruptDiskCache(meta, int64(cm.Offset), int64(cm.CipherLen))
+		return s.readAndDecodeV2ChunkOnce(ctx, meta, chunkIdx, cm)
+	}
+	return nil, err
 }

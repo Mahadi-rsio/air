@@ -301,3 +301,69 @@ Do not start all phases simultaneously.
 2. **Real R2 / Multi-Process / Long-Running Soak Tests**: Current environment has no live R2 credentials/endpoint; real R2 multipart/CAS latency, multi-process manifest contention, and 24h+ soak memory stability remain unexecuted.
 3. **High-concurrency large-batch heap spike (`1.61 GiB` at `128 readers * 512 pages`)**: `GetPageBatch` decodes chunks per request without a decoded-chunk cache or per-tenant read concurrency semaphore.
 4. **External `walredo` process crash-loop testing**: `WALRedoPool` request cancellation and timeout paths are tested, but repeated external PG17 worker `SIGKILL` recovery requires the compiled PG17 `walredo` binary.
+
+---
+
+## Phase 10 — Bounded Memory, Cache Resilience & External Validation
+
+### 1. Root-Cause Profiling of the Heap Spike (`128 readers × 512-page batches`)
+
+Profiled `TestPhase10_Part1_BaselineCold` and `TestPhase10_Part1_BaselineWarm` (`internal/pageserver/phase10_profile_test.go`, no `-race`, 2 vCPUs, 7.8 GiB RAM) using `pprof` (`-alloc_space`, CPU) and `GODEBUG=gctrace=1`:
+
+- **Baseline Warm Cache**: `elapsed=933.1ms`, `70,237 pages/s`, peak live heap `617 MB`, peak total heap `1,214 MB` (`Sys=1,248 MiB`), `TotalAllocDelta=2,161 MiB` (`16.89 MiB/req`).
+- **Baseline Cold Cache**: `elapsed=885.9ms`, `73,974 pages/s`, peak live heap `498 MB`, peak total heap `986 MB` (`Sys=1,013 MiB`), `TotalAllocDelta=2,164 MiB` (`16.91 MiB/req`).
+- **Allocation Breakdown (`2,610.75 MB` sampled)**:
+  1. `decompressV2Payload` (`layer_v2.go`): `622.21 MB` (`23.83%`) — 128 readers independently decompressing identical chunks (`22.19%` of CPU in `zstd`/`xxhash`).
+  2. `extractV2RecordFromChunk` (`layer_v2.go`): `532.64 MB` (`20.40%`) — per-page `8 KiB` slice copies.
+  3. `(*Timeline).GetPageBatch` (`readpath.go`): `528.18 MB` (`20.23%`) — `4 MiB` `out` buffers per concurrent reader.
+  4. `prepareRedo` (`walredo.go`): `524.07 MB` (`20.07%`) — redundant `8 KiB` `BasePage` copy even when `len(deltas) == 0`.
+  5. Per-request slice headers & index lookups: `~44.9 MB` (`1.72%`).
+
+### 2. Implemented Remediations
+
+1. **Bounded, Tenant-Fair Read Admission Control** (`internal/pageserver/read_limiter.go`, `internal/pageserver/readpath.go`, `internal/pageserver/layers.go`):
+   - `ReadLimiter` enforces `MaxActive` (`max(GOMAXPROCS*8, 16)`), `MaxPending` (`256`, returning `ErrReadQueueFull`), `MaxPerTenantActive` with round-robin fairness across waiting tenants, `ctx.Done()` waiter removal without slot leaks, and `Shutdown(ctx)`.
+   - `GetPageBatch` also bypasses `RedoBatch` (and `prepareRedo` copies) for direct `PageImage` hits where `len(deltas) == 0`.
+2. **Bounded Decoded V2 Chunk Cache** (`internal/pageserver/decoded_chunk_cache.go`, `internal/pageserver/layer_v2.go`, `internal/crypto/envelope.go`):
+   - `DecodedChunkCache` enforces a strict byte budget (`64 MiB` default) with LRU eviction, per-key single-flight decoding, corrupt chunk rejection, and atomic metrics (`Hits`, `Misses`, `Evictions`, `Bytes`, `DecodeTimeNs`, `SingleflightWaits`).
+   - Cache keys include `(TenantID, LayerID, ChunkIdx, KeyEpoch)`; `EnvelopeKMS` exposes `TenantKeyEpoch` and `OnKeyInvalidated` hooks so `ShredDEK` and `LoadWrappedDEK` immediately invalidate cached chunks and prevent reads after key shredding (`ErrDEKMissing`).
+3. **Refcounted `DiskCache` Corruption Recovery** (`internal/pageserver/cache.go`, `internal/pageserver/layers.go`, `internal/pageserver/layer_v2.go`):
+   - `DiskCache` tracks `activeReads` and `pendingDelete` per entry; `Evict(key)` removes the entry from lookup immediately and defers `os.Remove` until the last active reader finishes.
+   - Footer, index, WAL-table, AEAD, and V2 chunk decode failures automatically evict the corrupt `DiskCache` entry (plus `idxCache`) and coalesce a single fallback retry from R2 via `idxFlight`/`dlFlight`.
+
+### 3. Before / After Measurements (No `-race`)
+
+- **Isolated 128-Reader × 512-Page Profile (`TestPhase10_Part1_BaselineCold` / `Warm`)**:
+  - **Warm**: `933.1ms -> 323.0ms` (**2.89x**), throughput `70,236.9 -> 202,924.9 pages/s`, peak live heap `617 MB -> 80 MB` (**7.7x reduction**), peak total heap `1,214 MB -> 152 MB` (**8.0x**), `Sys` `1,248 MiB -> 183 MiB` (**6.8x**), `TotalAllocDelta` `2,161 -> 1,060 MiB` (`16.89 -> 8.28 MiB/req`), GC pause `6.08ms -> 2.56ms`.
+  - **Cold**: `885.9ms -> 359.2ms` (**2.47x**), throughput `73,973.5 -> 182,438.5 pages/s`, peak live heap `498 MB -> 73 MB` (**6.8x reduction**), peak total heap `986 MB -> 138 MB` (**7.1x**), `Sys` `1,013 MiB -> 151 MiB` (**6.7x**), `TotalAllocDelta` `2,164 -> 1,082 MiB` (`16.91 -> 8.46 MiB/req`).
+- **Scale & Regression Matrix (`TestPhase10_Part5_ScaleAndRegressionMatrix`, 0 errors)**:
+  - `base_cold_128r_b512_64l0` vs `p10_cold_128r_b512_64l0`: `40,758.6 -> 100,235.7 p/s` (**2.46x**), `p50=1.499s -> 422.8ms`, `p99=1.598s -> 644.7ms`, `chunkHit=0.97`, `r2Gets=16`.
+  - `base_warm_128r_b512_64l0` vs `p10_warm_128r_b512_64l0`: `36,679.1 -> 92,080.6 p/s` (`119,158.9 p/s` isolated), `p50=1.519s -> 197.3ms`, `p99=1.758s -> 555.3ms`, isolated Peak RSS (`VmHWM`) **`1,199 MiB -> 160 MiB`** (**7.5x reduction**), `chunkHit=0.97`, `r2Gets=0`.
+  - `p10_1r_b128_16l0`: `150,042.9 p/s`, `p50=438µs`, `heapAlloc=16 MiB`, `chunkHit=0.50`.
+  - `p10_8r_b128_16l0`: `60,202.3 p/s`, `p50=1.77ms`, `p99=23.58ms`, `heapAlloc=30 MiB`, `chunkHit=0.89`.
+  - `p10_32r_b128_16l0`: `124,891.6 p/s`, `p50=13.50ms`, `p99=99.48ms`, `heapAlloc=16 MiB`, `chunkHit=0.97`.
+  - `p10_64r_b128_16l0`: `115,139.1 p/s`, `p50=37.37ms`, `p99=120.29ms`, `heapAlloc=15 MiB`, `chunkHit=0.97`.
+  - `p10_random_32r_b16_1l0`: `19,363.1 p/s`, `p50=8.88ms`, `p99=84.24ms`, `heapAlloc=31 MiB`, `chunkHit=0.42`.
+  - `p10_hot_32r_b16_256l0`: `43,597.4 p/s`, `p50=347µs`, `p99=14.39ms`, `heapAlloc=12 MiB`, `chunkHit=0.99`.
+- **Random vs Hot Chunk Microbenchmark (`BenchmarkPhase10_Part5_RandomVsHotChunk`, `-count=3`)**:
+  - `HotChunk`: `143.5–152.0 µs/op` (`420,620 B/op`, `109 allocs/op`) -> `63.1–149.6 µs/op` (`270,880 B/op`, `84 allocs/op`, **35.6% fewer bytes**).
+  - `Random`: `352.8–450.5 µs/op` (`486,170 B/op`, `118 allocs/op`) -> `107.4–197.4 µs/op` (**~2.8x faster**, `271,243 B/op`, `84 allocs/op`, **44.2% fewer bytes**).
+- **Race Detector Verification**: `go test -race -count=1 ./internal/crypto/...` (`1.052s`) and `go test -race -count=1 ./internal/pageserver/...` (split across non-matrix `25.952s` and scale matrices `56.559s`) passed with 0 data races and 0 errors.
+
+### 4. Unresolved Risks & External Validation Status
+
+- **External Tests Not Executed Here**: Real R2, multi-process `SIGKILL`, 24h+ soak, and live PG17 `walredo` worker crash-loop tests in `internal/pageserver/phase10_external_test.go` were **not executed** in this sandbox (no live R2 credentials or compiled external PG17 `air-walredo` binary present).
+- **Remaining Risks**:
+  - Without external R2/PG17 execution, real network tail latency and OS-level `SIGKILL` recovery under live Postgres WAL redo remain validated only via mock R2 and in-process tests.
+  - Per-request `out` (`4 MiB` per 512-page batch) and `extractV2RecordFromChunk` (`8 KiB` slice copies) remain proportional to active concurrency (`MaxActive`), so tuning `MaxActive` and `DecodedChunkCache.MaxBytes` for the target host RAM budget is required in production.
+
+### 4. External Validation Suite & Unexecuted Prerequisites
+
+Executable external tests are implemented in `internal/pageserver/phase10_external_test.go` (skipped automatically when environment prerequisites are absent; **not executed in this sandbox**):
+
+- **Real R2 + Manifest Recovery / Multi-Process Crash**: Requires `AIR_R2_ENDPOINT`, `AIR_R2_BUCKET`, `AIR_R2_ACCESS_KEY`, `AIR_R2_SECRET_KEY`, and `AIR_RUN_EXTERNAL=1`:
+  `AIR_RUN_EXTERNAL=1 AIR_R2_ENDPOINT=... AIR_R2_BUCKET=... AIR_R2_ACCESS_KEY=... AIR_R2_SECRET_KEY=... go test -v -run "TestPhase10_External_RealR2AndManifestRecovery|TestPhase10_External_MultiProcessCrashAndRestart" ./internal/pageserver/...`
+- **24h+ Soak Test**:
+  `AIR_SOAK_DURATION=24h go test -v -timeout=25h -run TestPhase10_External_Soak ./internal/pageserver/...`
+- **Live PG17 WAL Redo Worker SIGKILL**: Requires compiled PG17 `air-walredo` binary:
+  `AIR_WALREDO_BIN=/path/to/air-walredo go test -v -run TestPhase10_External_LiveWALRedoWorkerSIGKILL ./internal/pageserver/...`

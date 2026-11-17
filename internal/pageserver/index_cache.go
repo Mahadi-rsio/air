@@ -245,6 +245,18 @@ func (c *boundedIndexCache) putVersioned(r2Key string, version uint16, entries [
 	return data
 }
 
+func (c *boundedIndexCache) evict(r2Key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if elem, ok := c.items[r2Key]; ok {
+		old := elem.Value.(*layerIndexData)
+		c.curBytes -= old.bytes
+		c.lru.Remove(elem)
+		delete(c.items, r2Key)
+	}
+	delete(c.blooms, r2Key)
+}
+
 func (c *boundedIndexCache) clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
