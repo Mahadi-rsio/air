@@ -29,11 +29,8 @@ func readProcStartTime(pid int) (string, error) {
 }
 
 func verifyPostgresProcessIdentity(pid int, expectedPGData string) error {
-	if pid <= 1 {
-		return fmt.Errorf("invalid pid %d", pid)
-	}
-	if err := syscall.Kill(pid, 0); err != nil {
-		return fmt.Errorf("pid %d not alive: %w", pid, err)
+	if !isProcessAlive(pid) {
+		return fmt.Errorf("pid %d not alive", pid)
 	}
 	exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
 	if err != nil {
@@ -178,4 +175,30 @@ func waitForPIDsExit(pids []int, timeout time.Duration) bool {
 		}
 		time.Sleep(15 * time.Millisecond)
 	}
+}
+
+// CleanupStalePostmasterLocks checks postmaster.pid in pgData; if the recorded PID is not
+// a live postgres process owning pgData, it reaps any zombie child, removes stale postmaster.pid,
+// and removes stale Unix socket lock files in sockDir. Returns true if a live postgres owns pgData.
+func CleanupStalePostmasterLocks(pgData, sockDir string, expectedPort int) bool {
+	pid, port, pidPGData := readPostmasterDetails(pgData)
+	if pid > 0 && (pidPGData == "" || pidPGData == pgData) && verifyPostgresProcessIdentity(pid, pgData) == nil {
+		return true
+	}
+	if pid > 1 {
+		var ws syscall.WaitStatus
+		_, _ = syscall.Wait4(pid, &ws, syscall.WNOHANG, nil)
+	}
+	_ = os.Remove(filepath.Join(pgData, "postmaster.pid"))
+	if sockDir != "" {
+		if port > 0 {
+			_ = os.Remove(filepath.Join(sockDir, fmt.Sprintf(".s.PGSQL.%d.lock", port)))
+			_ = os.Remove(filepath.Join(sockDir, fmt.Sprintf(".s.PGSQL.%d", port)))
+		}
+		if expectedPort > 0 && expectedPort != port {
+			_ = os.Remove(filepath.Join(sockDir, fmt.Sprintf(".s.PGSQL.%d.lock", expectedPort)))
+			_ = os.Remove(filepath.Join(sockDir, fmt.Sprintf(".s.PGSQL.%d", expectedPort)))
+		}
+	}
+	return false
 }

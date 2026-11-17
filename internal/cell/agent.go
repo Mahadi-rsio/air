@@ -523,6 +523,7 @@ func (a *Agent) StartOrAdoptTenant(tenantID string, epoch int64) (*TenantRuntime
 		adopted = true
 	} else {
 		port = a.allocOrReusePort(tenantID)
+		CleanupStalePostmasterLocks(pgData, sockDir, port)
 		logFile := filepath.Join(activeBase, "postgresql.log")
 		if out, err := a.runPostgresCmd(
 			filepath.Join(a.pgBin, "pg_ctl"),

@@ -40,7 +40,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("init cell agent: %v", err)
 	}
-	defer ag.Close()
 
 	cp, err := control.NewControlPlaneWithConfig(ctx, control.ControlPlaneConfig{
 		MetaDir:        cfg.MetaDir,
@@ -55,17 +54,21 @@ func main() {
 		BackendHost:    cfg.BackendHost,
 	})
 	if err != nil {
+		ag.Close()
 		log.Fatalf("init control plane: %v", err)
 	}
-	defer cp.Close()
 
 	s3c, err := configureBackupStore(cp, cfg)
 	if err != nil {
+		cp.Close()
+		ag.Close()
 		log.Fatalf("init backup store: %v", err)
 	}
 
+	var ps *pageserver.Pageserver
 	if cfg.PageserverEnabled {
-		ps, psErr := pageserver.New(pageserver.Config{
+		var psErr error
+		ps, psErr = pageserver.New(pageserver.Config{
 			SocketPath:    cfg.PageserverSocket,
 			LayerDir:      filepath.Join(cfg.DataDir, "ps_layers"),
 			CacheDir:      filepath.Join(cfg.DataDir, "ps_cache"),
@@ -75,12 +78,16 @@ func main() {
 			KMS:           kms,
 		})
 		if psErr != nil {
+			cp.Close()
+			ag.Close()
 			log.Fatalf("init pageserver: %v", psErr)
 		}
 		if psErr := ps.Start(ctx); psErr != nil {
+			_ = ps.Close()
+			cp.Close()
+			ag.Close()
 			log.Fatalf("start pageserver: %v", psErr)
 		}
-		defer ps.Close()
 		ag.SetPageserverConfig(true, cfg.PageserverSocket, cfg.PageserverCacheMB)
 		cp.SetPageserver(ps)
 		log.Printf("[air-server] pageserver listening on %s (cache_mb=%d)", cfg.PageserverSocket, cfg.PageserverCacheMB)
@@ -151,10 +158,23 @@ func main() {
 
 	<-ctx.Done()
 	log.Println("[air-server] shutting down...")
-	grpcSrv.GracefulStop()
-	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	grpcSrv.GracefulStop()
 	_ = srv.Shutdown(shutCtx)
+	if err := cp.ShutdownActiveTenants(shutCtx); err != nil {
+		log.Printf("[air-server] shutdown active tenants error: %v", err)
+	}
+	if ps != nil {
+		if err := ps.FlushAll(shutCtx); err != nil {
+			log.Printf("[air-server] pageserver flush all error: %v", err)
+		}
+		if err := ps.Close(); err != nil {
+			log.Printf("[air-server] pageserver close error: %v", err)
+		}
+	}
+	cp.Close()
+	ag.Close()
 }
 
 func configureBackupStore(cp *control.ControlPlane, cfg config.Config) (*s3.Client, error) {

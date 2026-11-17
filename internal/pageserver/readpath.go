@@ -8,21 +8,30 @@ import (
 	"sync"
 )
 
+const defaultMaxInMemBytes int64 = 16 * 1024 * 1024
+
 // Timeline manages the 2D (Key, LSN) storage state for a single tenant.
 type Timeline struct {
 	mu            sync.RWMutex
 	manifestMu    sync.Mutex
 	compactMu     sync.Mutex
+	flushMu       sync.Mutex
+	bgFlushMu     sync.Mutex
+	bgFlushing    bool
+	flushDoneCh   chan struct{}
+	lastFlushErr  error
 	tenantID      string
-	epoch       int64
-	lastLSN     uint64
-	inMem       *InMemoryLayer
-	layers      []LayerMeta // ordered oldest -> newest
-	store       *LayerStore
-	redoer      WALRedoer
+	epoch         int64
+	lastLSN       uint64
+	inMem         *InMemoryLayer
+	frozenMems    []*InMemoryLayer // ordered oldest -> newest, currently flushing
+	layers        []LayerMeta      // ordered oldest -> newest
+	store         *LayerStore
+	redoer        WALRedoer
 	maxInMemBytes int64
-	relSizes    map[Key]uint32
-	layerSeq    uint64
+	relSizes      map[Key]uint32
+	relSizeKnown  map[Key]bool
+	layerSeq      uint64
 }
 
 // NewTimeline initializes a tenant Timeline.
@@ -36,8 +45,9 @@ func NewTimeline(tenantID string, epoch int64, store *LayerStore, redoer WALRedo
 		inMem:         NewInMemoryLayer(0),
 		store:         store,
 		redoer:        redoer,
-		maxInMemBytes: 64 * 1024 * 1024,
+		maxInMemBytes: defaultMaxInMemBytes,
 		relSizes:      make(map[Key]uint32),
+		relSizeKnown:  make(map[Key]bool),
 	}
 }
 
@@ -97,8 +107,23 @@ func (t *Timeline) LoadLayersFromR2(ctx context.Context) error {
 	return nil
 }
 
+// EnsureRelSizeSeeded ensures t.relSizes[sizeKey] is seeded from immutable layers
+// if not already known in memory, preventing post-restart writes to lower block
+// numbers from regressing the tracked relation size.
+func (t *Timeline) EnsureRelSizeSeeded(ctx context.Context, spcOID, dbOID, relNumber uint32, forkNum uint8) {
+	sizeKey := RelSizeKey(spcOID, dbOID, relNumber, forkNum)
+	t.mu.RLock()
+	known := t.relSizeKnown[sizeKey] || len(t.layers) == 0
+	t.mu.RUnlock()
+	if known {
+		return
+	}
+	_, _ = t.GetRelSize(ctx, spcOID, dbOID, relNumber, forkNum, 0)
+}
+
 // PutPage inserts a full 8192-byte page snapshot into the active InMemoryLayer.
 func (t *Timeline) PutPage(key Key, lsn uint64, page []byte) {
+	t.EnsureRelSizeSeeded(context.Background(), key.SpcOID, key.DbOID, key.RelNumber, key.ForkNum)
 	p := make([]byte, PageSize)
 	copy(p, page)
 
@@ -120,7 +145,136 @@ func (t *Timeline) PutPage(key Key, lsn uint64, page []byte) {
 	if lsn > t.lastLSN {
 		t.lastLSN = lsn
 	}
+	approx := t.inMem.ApproxBytes
 	t.mu.Unlock()
+	if approx >= t.maxInMemBytes {
+		t.MaybeFlushAsync()
+	}
+}
+
+// InMemBytes returns the approximate byte size of the active and flushing InMemoryLayers.
+func (t *Timeline) InMemBytes() int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	total := t.inMem.ApproxBytes
+	for _, fm := range t.frozenMems {
+		total += fm.ApproxBytes
+	}
+	return total
+}
+
+func (t *Timeline) lookupInMemLayersLocked(key Key, lsn uint64) ([]WALDelta, bool) {
+	deltas := t.inMem.Lookup(key, lsn)
+	if len(deltas) > 0 {
+		last := deltas[len(deltas)-1]
+		if (last.Flags&EntryFlagPageImage) != 0 && len(last.PageImage) == PageSize {
+			return deltas, true
+		}
+	}
+	var out []WALDelta
+	if len(deltas) > 0 {
+		out = append(out, deltas...)
+	}
+	for i := len(t.frozenMems) - 1; i >= 0; i-- {
+		fd := t.frozenMems[i].Lookup(key, lsn)
+		if len(fd) == 0 {
+			continue
+		}
+		out = append(out, fd...)
+		last := fd[len(fd)-1]
+		if (last.Flags&EntryFlagPageImage) != 0 && len(last.PageImage) == PageSize {
+			return out, true
+		}
+	}
+	return out, false
+}
+
+func (t *Timeline) removeFrozenMemLocked(target *InMemoryLayer) {
+	for i, fm := range t.frozenMems {
+		if fm == target {
+			t.frozenMems = append(t.frozenMems[:i], t.frozenMems[i+1:]...)
+			return
+		}
+	}
+}
+
+func (t *Timeline) hardMaxInMemBytes() int64 {
+	if t.maxInMemBytes <= 0 {
+		return 0
+	}
+	return t.maxInMemBytes * 2
+}
+
+// MaybeFlushAsync triggers a non-blocking background FlushInMemory if one is not already running.
+func (t *Timeline) MaybeFlushAsync() {
+	if t.store == nil {
+		return
+	}
+	t.bgFlushMu.Lock()
+	if t.bgFlushing {
+		t.bgFlushMu.Unlock()
+		return
+	}
+	t.bgFlushing = true
+	done := make(chan struct{})
+	t.flushDoneCh = done
+	t.bgFlushMu.Unlock()
+
+	go func() {
+		_, err := t.FlushInMemory(context.Background())
+		t.bgFlushMu.Lock()
+		t.lastFlushErr = err
+		t.bgFlushing = false
+		close(done)
+		t.bgFlushMu.Unlock()
+	}()
+}
+
+// EnforceInMemBudget triggers an async flush at the soft limit and applies backpressure
+// at the hard limit (2x maxInMemBytes) until the flush completes.
+func (t *Timeline) EnforceInMemBudget(ctx context.Context) error {
+	if t.store == nil || t.maxInMemBytes <= 0 {
+		return nil
+	}
+	cur := t.InMemBytes()
+	if cur < t.maxInMemBytes {
+		return nil
+	}
+	t.MaybeFlushAsync()
+	hard := t.hardMaxInMemBytes()
+	for cur >= hard {
+		t.bgFlushMu.Lock()
+		flushing := t.bgFlushing
+		done := t.flushDoneCh
+		lastErr := t.lastFlushErr
+		t.bgFlushMu.Unlock()
+
+		if !flushing {
+			if lastErr != nil {
+				return lastErr
+			}
+			t.MaybeFlushAsync()
+			t.bgFlushMu.Lock()
+			done = t.flushDoneCh
+			t.bgFlushMu.Unlock()
+			if done == nil {
+				return nil
+			}
+		}
+		select {
+		case <-done:
+			t.bgFlushMu.Lock()
+			lastErr = t.lastFlushErr
+			t.bgFlushMu.Unlock()
+			if lastErr != nil {
+				return lastErr
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		cur = t.InMemBytes()
+	}
+	return nil
 }
 
 // ApplyWALRecord ingests a decoded PG17 WAL record into the Timeline's InMemoryLayer.
@@ -171,6 +325,7 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 			if _, ok := t.relSizes[sizeKey]; !ok {
 				t.relSizes[sizeKey] = 0
 			}
+			t.relSizeKnown[sizeKey] = true
 			t.inMem.Put(sizeKey, WALDelta{
 				LSN:     rec.EndLSN,
 				Flags:   EntryFlagRelSize,
@@ -188,6 +343,7 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 				if (flags & (1 << fork)) != 0 {
 					sizeKey := RelSizeKey(rel.SpcOID, rel.DbOID, rel.RelNumber, fork)
 					t.relSizes[sizeKey] = blkno
+					t.relSizeKnown[sizeKey] = true
 					t.inMem.Put(sizeKey, WALDelta{
 						LSN:     rec.EndLSN,
 						Flags:   EntryFlagRelSize,
@@ -237,6 +393,12 @@ func (t *Timeline) PublishNewLayers(ctx context.Context, metas []LayerMeta) erro
 
 // FlushInMemory freezes the current InMemoryLayer and writes it as an immutable L0 layer.
 func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
+	if t.store == nil {
+		return nil, nil
+	}
+	t.flushMu.Lock()
+	defer t.flushMu.Unlock()
+
 	t.mu.Lock()
 	recs, startLSN, endLSN := t.inMem.SnapshotAll()
 	if len(recs) == 0 {
@@ -244,6 +406,7 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 		return nil, nil
 	}
 	oldMem := t.inMem
+	t.frozenMems = append(t.frozenMems, oldMem)
 	t.inMem = NewInMemoryLayer(endLSN)
 	t.layerSeq++
 	seq := t.layerSeq
@@ -266,25 +429,43 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 	}
 	written, err := t.store.WriteLayer(ctx, meta, recs)
 	if err != nil {
-		// Restore in-memory entries on failure.
+		// Keep oldMem in frozenMems so concurrent reads never lose visibility,
+		// and also re-index entries into inMem if needed on retry.
 		t.mu.Lock()
+		t.removeFrozenMemLocked(oldMem)
 		for _, r := range recs {
 			t.inMem.Put(r.Key, r.Delta)
 		}
-		_ = oldMem
 		t.mu.Unlock()
 		return nil, err
 	}
 
-	if err := t.PublishNewLayer(ctx, written); err != nil {
-		// Restore in-memory entries on manifest publication failure.
+	t.manifestMu.Lock()
+	t.mu.RLock()
+	next := make([]LayerMeta, len(t.layers)+1)
+	copy(next, t.layers)
+	next[len(t.layers)] = written
+	seq = t.layerSeq
+	t.mu.RUnlock()
+
+	if err = t.store.PublishLayerManifest(ctx, t.tenantID, t.epoch, next, seq); err != nil {
+		t.manifestMu.Unlock()
 		t.mu.Lock()
+		t.removeFrozenMemLocked(oldMem)
 		for _, r := range recs {
 			t.inMem.Put(r.Key, r.Delta)
 		}
 		t.mu.Unlock()
 		return nil, err
 	}
+	t.mu.Lock()
+	t.layers = append(t.layers, written)
+	if written.EndLSN > t.lastLSN {
+		t.lastLSN = written.EndLSN
+	}
+	t.removeFrozenMemLocked(oldMem)
+	t.mu.Unlock()
+	t.manifestMu.Unlock()
 	return &written, nil
 }
 
@@ -298,8 +479,11 @@ func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byt
 		defer release()
 	}
 	t.mu.RLock()
-	inMemDeltas := t.inMem.Lookup(key, lsn)
-	layersCopy := append([]LayerMeta(nil), t.layers...)
+	inMemDeltas, foundBase := t.lookupInMemLayersLocked(key, lsn)
+	var layersCopy []LayerMeta
+	if !foundBase {
+		layersCopy = append([]LayerMeta(nil), t.layers...)
+	}
 	t.mu.RUnlock()
 
 	// Collect deltas from InMemoryLayer + relevant immutable layers.
@@ -307,7 +491,6 @@ func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byt
 	collected = append(collected, inMemDeltas...)
 
 	// Walk layers from newest to oldest; stop once we hit an Image layer or FPI.
-	foundBase := false
 	for i := len(layersCopy) - 1; i >= 0; i-- {
 		lm := layersCopy[i]
 		if lsn != 0 && lm.StartLSN > lsn {
@@ -394,11 +577,10 @@ func (t *Timeline) GetPageBatch(ctx context.Context, spcOID, dbOID, relNumber ui
 	t.mu.RLock()
 	for i := 0; i < n; i++ {
 		keys[i] = RelBlockKey(spcOID, dbOID, relNumber, forkNum, startBlock+uint32(i))
-		deltas := t.inMem.Lookup(keys[i], lsn)
+		deltas, isBase := t.lookupInMemLayersLocked(keys[i], lsn)
 		if len(deltas) > 0 {
 			collected[i] = deltas
-			last := deltas[len(deltas)-1]
-			if (last.Flags&EntryFlagPageImage) != 0 && len(last.PageImage) == PageSize {
+			if isBase {
 				resolved[i] = true
 				pendingCount--
 			}
@@ -525,12 +707,15 @@ func (t *Timeline) GetPageBatch(ctx context.Context, spcOID, dbOID, relNumber ui
 }
 
 // PutPageBatch ingests materialized 8192-byte pages flushed by air_smgr into the InMemoryLayer.
-func (t *Timeline) PutPageBatch(_ context.Context, spcOID, dbOID, relNumber uint32, forkNum uint8, startBlock, nblocks uint32, lsn uint64, pages []byte) error {
+func (t *Timeline) PutPageBatch(ctx context.Context, spcOID, dbOID, relNumber uint32, forkNum uint8, startBlock, nblocks uint32, lsn uint64, pages []byte) error {
 	if len(pages) != int(nblocks)*PageSize {
 		return fmt.Errorf("pageserver: PutPageBatch size mismatch: got %d want %d", len(pages), int(nblocks)*PageSize)
 	}
+	if err := t.EnforceInMemBudget(ctx); err != nil {
+		return err
+	}
+	t.EnsureRelSizeSeeded(ctx, spcOID, dbOID, relNumber, forkNum)
 	t.mu.Lock()
-	defer t.mu.Unlock()
 
 	useLSN := lsn
 	if useLSN == 0 {
@@ -561,15 +746,21 @@ func (t *Timeline) PutPageBatch(_ context.Context, spcOID, dbOID, relNumber uint
 			RelSize: endBlk,
 		})
 	}
+	approx := t.inMem.ApproxBytes
+	t.mu.Unlock()
+	if approx >= t.maxInMemBytes {
+		t.MaybeFlushAsync()
+	}
 	return nil
 }
 
 // GetRelSize returns the number of blocks in a relation fork as of lsn.
 func (t *Timeline) GetRelSize(ctx context.Context, spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) (uint32, error) {
 	sizeKey := RelSizeKey(spcOID, dbOID, relNumber, forkNum)
+	isLatest := lsn == 0
 
 	t.mu.RLock()
-	if lsn == 0 || lsn >= t.lastLSN {
+	if (isLatest || lsn >= t.lastLSN) && t.relSizeKnown[sizeKey] {
 		if nb, ok := t.relSizes[sizeKey]; ok {
 			t.mu.RUnlock()
 			return nb, nil
@@ -579,12 +770,40 @@ func (t *Timeline) GetRelSize(ctx context.Context, spcOID, dbOID, relNumber uint
 		lsn = t.lastLSN
 	}
 	inMemDeltas := t.inMem.Lookup(sizeKey, lsn)
+	var frozenSize uint32
+	var hasFrozenSize bool
+	if len(inMemDeltas) == 0 {
+		for i := len(t.frozenMems) - 1; i >= 0; i-- {
+			if fd := t.frozenMems[i].Lookup(sizeKey, lsn); len(fd) > 0 {
+				frozenSize = fd[len(fd)-1].RelSize
+				hasFrozenSize = true
+				break
+			}
+		}
+	}
 	layersCopy := append([]LayerMeta(nil), t.layers...)
 	t.mu.RUnlock()
 
-	if len(inMemDeltas) > 0 {
-		return inMemDeltas[len(inMemDeltas)-1].RelSize, nil
+	if len(inMemDeltas) > 0 && (isLatest || !t.layerLookupNeededForSize(layersCopy, sizeKey, lsn)) {
+		if isLatest {
+			// Check layers too if relSizeKnown is false, so a lower-block write after restart
+			// cannot mask a larger size in immutable layers.
+			t.mu.RLock()
+			known := t.relSizeKnown[sizeKey]
+			t.mu.RUnlock()
+			if known {
+				return inMemDeltas[len(inMemDeltas)-1].RelSize, nil
+			}
+		} else {
+			return inMemDeltas[len(inMemDeltas)-1].RelSize, nil
+		}
 	}
+	if hasFrozenSize && !isLatest {
+		return frozenSize, nil
+	}
+
+	var layerSize uint32
+	var foundInLayer bool
 	for i := len(layersCopy) - 1; i >= 0; i-- {
 		lm := layersCopy[i]
 		if lsn != 0 && lm.StartLSN > lsn {
@@ -595,10 +814,52 @@ func (t *Timeline) GetRelSize(ctx context.Context, spcOID, dbOID, relNumber uint
 			return 0, err
 		}
 		if len(deltas) > 0 {
-			return deltas[len(deltas)-1].RelSize, nil
+			layerSize = deltas[len(deltas)-1].RelSize
+			foundInLayer = true
+			break
 		}
 	}
+
+	if isLatest {
+		t.mu.Lock()
+		if foundInLayer {
+			if cur, ok := t.relSizes[sizeKey]; !ok || layerSize > cur {
+				t.relSizes[sizeKey] = layerSize
+			}
+			t.relSizeKnown[sizeKey] = true
+			nb := t.relSizes[sizeKey]
+			t.mu.Unlock()
+			return nb, nil
+		}
+		if len(inMemDeltas) > 0 {
+			t.relSizeKnown[sizeKey] = true
+			nb := inMemDeltas[len(inMemDeltas)-1].RelSize
+			t.mu.Unlock()
+			return nb, nil
+		}
+		if hasFrozenSize {
+			t.relSizeKnown[sizeKey] = true
+			t.mu.Unlock()
+			return frozenSize, nil
+		}
+		t.mu.Unlock()
+		return 0, ErrNotFound
+	}
+
+	if len(inMemDeltas) > 0 {
+		return inMemDeltas[len(inMemDeltas)-1].RelSize, nil
+	}
+	if hasFrozenSize {
+		return frozenSize, nil
+	}
+	if foundInLayer {
+		return layerSize, nil
+	}
 	return 0, ErrNotFound
+}
+
+func (t *Timeline) layerLookupNeededForSize(_ []LayerMeta, _ Key, _ uint64) bool {
+	return false
 }
 
 // GetRelExists reports whether the relation fork exists in the Timeline.

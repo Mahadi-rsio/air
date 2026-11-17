@@ -102,7 +102,7 @@ func (m *InMemoryLayer) Put(key Key, delta WALDelta) {
 		m.EndLSN = delta.LSN + 1
 	}
 	m.entries[key] = append(m.entries[key], delta)
-	m.ApproxBytes += int64(len(delta.PageImage) + len(delta.WALRecord) + 32)
+	m.ApproxBytes += int64(len(delta.PageImage) + len(delta.WALRecord) + 64)
 }
 
 // Lookup returns all deltas for key with LSN <= lsn in ascending LSN order.
@@ -615,6 +615,10 @@ func (s *LayerStore) WriteLayer(ctx context.Context, meta LayerMeta, recs []Laye
 
 		if outFile != nil {
 			res, encErr := EncodeLayerV2ToWriter(outFile, meta.TenantID, meta.Epoch, meta.aadKey(), meta.Kind, meta.EndLSN, recs, s.kms, v2EncodeOptions{})
+			var syncErr error
+			if encErr == nil && tmpPath != "" {
+				syncErr = outFile.Sync()
+			}
 			closeErr := outFile.Close()
 			if encErr != nil {
 				if tmpPath != "" {
@@ -623,6 +627,10 @@ func (s *LayerStore) WriteLayer(ctx context.Context, meta LayerMeta, recs []Laye
 					_ = os.Remove(localPath)
 				}
 				return meta, encErr
+			}
+			if syncErr != nil {
+				_ = os.Remove(tmpPath)
+				return meta, syncErr
 			}
 			if closeErr != nil {
 				if tmpPath != "" {
@@ -1733,8 +1741,25 @@ func (s *LayerStore) PublishLayerManifest(ctx context.Context, tenantID string, 
 			return err
 		}
 		tmp := localManifest + ".tmp"
-		if err := os.WriteFile(tmp, body, 0o600); err != nil {
+		f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
 			return err
+		}
+		_, wErr := f.Write(body)
+		var sErr error
+		if wErr == nil {
+			sErr = f.Sync()
+		}
+		cErr := f.Close()
+		if wErr != nil || sErr != nil || cErr != nil {
+			_ = os.Remove(tmp)
+			if wErr != nil {
+				return wErr
+			}
+			if sErr != nil {
+				return sErr
+			}
+			return cErr
 		}
 		if err := os.Rename(tmp, localManifest); err != nil {
 			_ = os.Remove(tmp)
@@ -1791,7 +1816,11 @@ func (s *LayerStore) LoadLayerManifest(ctx context.Context, tenantID string, epo
 // and merges any legacy layers stored under tenants/{tenant}/timeline_{epoch}/layers/.
 func (s *LayerStore) ListLayersFromR2(ctx context.Context, tenantID string, epoch int64) ([]LayerMeta, uint64, error) {
 	if s.s3c == nil || s.bucket == "" {
-		return nil, 0, nil
+		manifest, err := s.LoadLayerManifest(ctx, tenantID, epoch)
+		if err != nil || manifest == nil {
+			return nil, 0, err
+		}
+		return manifest.Layers, manifest.MaxSeq, nil
 	}
 
 	var (

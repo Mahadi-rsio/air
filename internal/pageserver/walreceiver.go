@@ -129,8 +129,25 @@ func (r *WALReceiver) Run(ctx context.Context) error {
 				}
 				return fmt.Errorf("pageserver: parse wal stream at %x (len=%d head=%x): %w", binary.BigEndian.Uint64(cd.Data[1:9]), len(walPayload), walPayload[:n], pErr)
 			}
+			sawCheckpoint := false
 			for _, rec := range recs {
+				for _, blk := range rec.Blocks {
+					r.timeline.EnsureRelSizeSeeded(ctx, blk.Rel.SpcOID, blk.Rel.DbOID, blk.Rel.RelNumber, blk.ForkNum)
+				}
 				r.timeline.ApplyWALRecord(rec)
+				if rec.Rmid == RmXLogID {
+					op := rec.Info & XLogInfoOpMask
+					if op == 0x00 || op == 0x10 {
+						sawCheckpoint = true
+					}
+				}
+			}
+			if sawCheckpoint {
+				if _, fErr := r.timeline.FlushInMemory(ctx); fErr != nil {
+					return fmt.Errorf("pageserver: checkpoint flush: %w", fErr)
+				}
+			} else if err := r.timeline.EnforceInMemBudget(ctx); err != nil {
+				return fmt.Errorf("pageserver: walreceiver budget flush: %w", err)
 			}
 			_ = walEnd
 		case 'k':

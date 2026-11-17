@@ -105,6 +105,24 @@ func (p *Pageserver) FlushTenant(ctx context.Context, tenantID string) (*LayerMe
 	return tl.FlushInMemory(ctx)
 }
 
+// FlushAll flushes all active tenant InMemoryLayers to immutable L0 layers and returns the first error.
+func (p *Pageserver) FlushAll(ctx context.Context) error {
+	p.mu.RLock()
+	timelines := make([]*Timeline, 0, len(p.tenants))
+	for _, tl := range p.tenants {
+		timelines = append(timelines, tl)
+	}
+	p.mu.RUnlock()
+
+	var firstErr error
+	for _, tl := range timelines {
+		if _, err := tl.FlushInMemory(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 func (p *Pageserver) getTimeline(tenantID string) (*Timeline, error) {
 	p.mu.RLock()
 	tl, ok := p.tenants[tenantID]

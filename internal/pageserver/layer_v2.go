@@ -30,6 +30,7 @@ const (
 	v2IndexHeaderSize     = 8
 	v2IndexEntrySize      = 44
 	maxV2DecompressedSize = 256 * 1024 * 1024
+	maxV2WALTableSize     = 1024 * 1024 * 1024
 )
 
 var (
@@ -508,6 +509,9 @@ func decodeV2WALTable(raw []byte, meta LayerMeta, wm v2WALTableMeta, kms *crypto
 	if wm.CipherLen == 0 {
 		return nil, nil
 	}
+	if uint64(wm.RawLen) > maxV2WALTableSize {
+		return nil, fmt.Errorf("pageserver: v2 wal table rawLen %d exceeds max %d", wm.RawLen, maxV2WALTableSize)
+	}
 	payload := raw
 	if meta.Encrypted {
 		if kms == nil {
@@ -519,32 +523,63 @@ func decodeV2WALTable(raw []byte, meta LayerMeta, wm v2WALTableMeta, kms *crypto
 			return nil, err
 		}
 	}
-	data, err := decompressV2Payload(payload, wm.Codec, wm.RawLen)
-	if err != nil {
-		return nil, err
+
+	var r io.Reader
+	var closeFn func()
+	switch wm.Codec {
+	case LayerCodecNone:
+		if uint32(len(payload)) != wm.RawLen {
+			return nil, fmt.Errorf("pageserver: v2 raw length mismatch got=%d want=%d", len(payload), wm.RawLen)
+		}
+		r = bytes.NewReader(payload)
+	case LayerCodecZstd:
+		zr, err := zstd.NewReader(bytes.NewReader(payload))
+		if err != nil {
+			return nil, fmt.Errorf("pageserver: v2 zstd reader: %w", err)
+		}
+		closeFn = zr.Close
+		r = io.LimitReader(zr, int64(wm.RawLen)+1)
+	default:
+		return nil, fmt.Errorf("pageserver: unsupported v2 codec %d", wm.Codec)
 	}
-	if len(data) < 4 {
+	if closeFn != nil {
+		defer closeFn()
+	}
+
+	if wm.RawLen < 4 {
 		return nil, errors.New("pageserver: truncated v2 WAL table")
 	}
-	count := uint64(binary.LittleEndian.Uint32(data[0:4]))
-	if count*4 > uint64(len(data)-4) {
-		return nil, fmt.Errorf("pageserver: malformed v2 WAL table count=%d len=%d", count, len(data))
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, fmt.Errorf("pageserver: v2 wal table header: %w", err)
+	}
+	readBytes := uint64(4)
+	count := uint64(binary.LittleEndian.Uint32(hdr[:]))
+	if count*4 > uint64(wm.RawLen)-4 {
+		return nil, fmt.Errorf("pageserver: malformed v2 WAL table count=%d len=%d", count, wm.RawLen)
 	}
 	out := make([][]byte, int(count))
-	pos := 4
 	for i := 0; i < int(count); i++ {
-		if pos+4 > len(data) {
-			return nil, errors.New("pageserver: truncated v2 WAL entry length")
+		if _, err := io.ReadFull(r, hdr[:]); err != nil {
+			return nil, fmt.Errorf("pageserver: truncated v2 WAL entry length: %w", err)
 		}
-		n := int(binary.LittleEndian.Uint32(data[pos : pos+4]))
-		pos += 4
-		if pos+n > len(data) {
+		n := uint64(binary.LittleEndian.Uint32(hdr[:]))
+		readBytes += 4
+		if readBytes+n > uint64(wm.RawLen) {
 			return nil, errors.New("pageserver: truncated v2 WAL entry body")
 		}
 		if n > 0 {
-			out[i] = append([]byte(nil), data[pos:pos+n]...)
+			entry := make([]byte, n)
+			if _, err := io.ReadFull(r, entry); err != nil {
+				return nil, fmt.Errorf("pageserver: truncated v2 WAL entry body: %w", err)
+			}
+			out[i] = entry
+			readBytes += n
 		}
-		pos += n
+	}
+	var extra [1]byte
+	if n, _ := r.Read(extra[:]); n > 0 || readBytes != uint64(wm.RawLen) {
+		return nil, fmt.Errorf("pageserver: v2 wal table length mismatch got=%d want=%d", readBytes+uint64(n), wm.RawLen)
 	}
 	return out, nil
 }

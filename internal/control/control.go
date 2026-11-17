@@ -182,7 +182,7 @@ func NewControlPlaneWithConfig(ctx context.Context, cfg ControlPlaneConfig) (*Co
 			}
 		}
 
-		if _, err := os.Stat(filepath.Join(pgData, "postmaster.pid")); err != nil {
+		if !cell.CleanupStalePostmasterLocks(pgData, sockDir, cfg.MetaPort) {
 			logFile := filepath.Join(cfg.MetaDir, "control-pg.log")
 			if out, err := runPostgres(pgBinDir, "pg_ctl", "-D", pgData, "-l", logFile, "-w", "-t", "15", "start"); err != nil {
 				return nil, fmt.Errorf("control metadata start: %w (%s)", err, out)
@@ -1937,6 +1937,51 @@ func (cp *ControlPlane) RevokeAPIKey(ctx context.Context, accountID, keyID strin
 	}
 	_, err = cp.db.Exec(ctx, `UPDATE api_keys SET revoked_at = now() WHERE key_id = $1`, keyID)
 	return err
+}
+
+// ShutdownActiveTenants cleanly stops all active tenant PostgreSQL instances,
+// stops their WAL receivers, and flushes their Pageserver InMemoryLayers to disk/R2.
+func (cp *ControlPlane) ShutdownActiveTenants(ctx context.Context) error {
+	if cp.db == nil || cp.agent == nil {
+		return nil
+	}
+	rows, err := cp.db.Query(ctx, `SELECT tenant_id, fencing_epoch FROM clusters WHERE state = 'ACTIVE'`)
+	if err != nil {
+		return err
+	}
+	type activeTenant struct {
+		id    string
+		epoch int64
+	}
+	var active []activeTenant
+	for rows.Next() {
+		var t activeTenant
+		if scanErr := rows.Scan(&t.id, &t.epoch); scanErr == nil {
+			active = append(active, t)
+		}
+	}
+	rows.Close()
+
+	ps := cp.getPageserver()
+	var firstErr error
+	for _, t := range active {
+		if stopErr := cp.agent.StopTenantClean(t.id); stopErr != nil {
+			log.Printf("[shutdown] clean stop failed for tenant %s: %v", t.id, stopErr)
+			if firstErr == nil {
+				firstErr = stopErr
+			}
+		}
+		cp.stopWALReceiver(t.id)
+		if ps != nil {
+			if _, fErr := ps.FlushTenant(ctx, t.id); fErr != nil {
+				log.Printf("[shutdown] pageserver flush failed for tenant %s: %v", t.id, fErr)
+				if firstErr == nil {
+					firstErr = fErr
+				}
+			}
+		}
+	}
+	return firstErr
 }
 
 func (cp *ControlPlane) Close() {

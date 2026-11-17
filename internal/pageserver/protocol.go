@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -368,6 +369,7 @@ func (s *UnixServer) handleConn(ctx context.Context, conn net.Conn) {
 			if errors.Is(err, ErrNotFound) {
 				status = StatusNotFound
 			} else if err != nil {
+				log.Printf("[pageserver] OpGetPageAtLSN tenant=%s key=%s lsn=%x err=%v", req.TenantID, key, req.LSN, err)
 				status = StatusError
 			} else {
 				payload = page
@@ -385,6 +387,7 @@ func (s *UnixServer) handleConn(ctx context.Context, conn net.Conn) {
 			if errors.Is(err, ErrNotFound) {
 				status = StatusNotFound
 			} else if err != nil {
+				log.Printf("[pageserver] OpGetPageBatch tenant=%s rel=%d/%d/%d.%d blk=%d+%d lsn=%x err=%v", req.TenantID, req.SpcOID, req.DbOID, req.RelNumber, req.ForkNum, req.BlockNum, n, req.LSN, err)
 				status = StatusError
 			} else {
 				payload = pages
@@ -395,6 +398,7 @@ func (s *UnixServer) handleConn(ctx context.Context, conn net.Conn) {
 			if errors.Is(err, ErrNotFound) {
 				status = StatusNotFound
 			} else if err != nil {
+				log.Printf("[pageserver] OpGetRelSize tenant=%s rel=%d/%d/%d.%d lsn=%x err=%v", req.TenantID, req.SpcOID, req.DbOID, req.RelNumber, req.ForkNum, req.LSN, err)
 				status = StatusError
 			} else {
 				nblocksOrVal = nb
@@ -402,6 +406,7 @@ func (s *UnixServer) handleConn(ctx context.Context, conn net.Conn) {
 		case OpGetRelExists:
 			exists, err := s.svc.GetRelExists(ctx, req.TenantID, req.SpcOID, req.DbOID, req.RelNumber, req.ForkNum, req.LSN)
 			if err != nil {
+				log.Printf("[pageserver] OpGetRelExists tenant=%s rel=%d/%d/%d.%d lsn=%x err=%v", req.TenantID, req.SpcOID, req.DbOID, req.RelNumber, req.ForkNum, req.LSN, err)
 				status = StatusError
 			} else if exists {
 				nblocksOrVal = 1
@@ -413,6 +418,7 @@ func (s *UnixServer) handleConn(ctx context.Context, conn net.Conn) {
 			if errors.Is(err, ErrNotFound) {
 				status = StatusNotFound
 			} else if err != nil {
+				log.Printf("[pageserver] OpGetDBSize tenant=%s db=%d/%d lsn=%x err=%v", req.TenantID, req.SpcOID, req.DbOID, req.LSN, err)
 				status = StatusError
 			} else {
 				u64Val = sz
@@ -435,6 +441,7 @@ func (s *UnixServer) handleConn(ctx context.Context, conn net.Conn) {
 			err := s.svc.PutPageBatch(ctx, req.TenantID, req.SpcOID, req.DbOID, req.RelNumber, req.ForkNum, req.BlockNum, n, req.LSN, inBuf)
 			putBatchBufPool.Put(bufPtr)
 			if err != nil {
+				log.Printf("[pageserver] OpPutPageBatch tenant=%s rel=%d/%d/%d.%d blk=%d+%d lsn=%x err=%v", req.TenantID, req.SpcOID, req.DbOID, req.RelNumber, req.ForkNum, req.BlockNum, n, req.LSN, err)
 				status = StatusError
 			} else {
 				nblocksOrVal = n
