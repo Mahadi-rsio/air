@@ -18,6 +18,9 @@ struct Config {
     std::string tls_key_path;
     bool pool_mode = true;
     int pool_max_backends = 16;
+    int max_client_conns = 1024;
+    int max_tenant_client_conns = 128;
+    int max_user_client_conns = 0;
     int discovery_interval_ms = 2000;
 
     static std::string env_or(const char* key, const std::string& fallback) {
@@ -60,6 +63,9 @@ struct Config {
         c.tls_key_path = env_or("AIR_TLS_KEY", "");
         c.pool_mode = env_bool("AIR_POOL_MODE", c.pool_mode);
         c.pool_max_backends = env_int("AIR_POOL_MAX_BACKENDS", c.pool_max_backends);
+        c.max_client_conns = env_int("AIR_MAX_CLIENT_CONNS", c.max_client_conns);
+        c.max_tenant_client_conns = env_int("AIR_MAX_TENANT_CLIENT_CONNS", c.max_tenant_client_conns);
+        c.max_user_client_conns = env_int("AIR_MAX_USER_CLIENT_CONNS", c.max_user_client_conns);
         c.discovery_interval_ms = env_int("AIR_DISCOVERY_INTERVAL_MS", c.discovery_interval_ms);
 
         for (int i = 1; i < argc; ++i) {
@@ -80,6 +86,12 @@ struct Config {
             else if (arg == "--no-pool-mode") c.pool_mode = false;
             else if (arg == "--pool-max-backends" && i + 1 < argc) {
                 try { c.pool_max_backends = std::stoi(argv[++i]); } catch (...) {}
+            } else if (arg == "--max-client-conns" && i + 1 < argc) {
+                try { c.max_client_conns = std::stoi(argv[++i]); } catch (...) {}
+            } else if (arg == "--max-tenant-client-conns" && i + 1 < argc) {
+                try { c.max_tenant_client_conns = std::stoi(argv[++i]); } catch (...) {}
+            } else if (arg == "--max-user-client-conns" && i + 1 < argc) {
+                try { c.max_user_client_conns = std::stoi(argv[++i]); } catch (...) {}
             }
         }
 

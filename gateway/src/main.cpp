@@ -1,6 +1,7 @@
 #include "admin_http.hpp"
 #include "config.hpp"
 #include "discovery.hpp"
+#include "metrics.hpp"
 #include "pg_wire.hpp"
 #include "pooler.hpp"
 
@@ -71,11 +72,28 @@ void proxy_bidirectional(air::gw::Stream& client, air::gw::Stream& backend) {
     }
 }
 
+struct GlobalConnGuard {
+    air::gw::MetricsRegistry& metrics;
+    ~GlobalConnGuard() { metrics.release_global(); }
+};
+
+struct TenantUserConnGuard {
+    air::gw::MetricsRegistry& metrics;
+    std::string tenant_id;
+    std::string user;
+    bool active = false;
+    ~TenantUserConnGuard() {
+        if (active) metrics.release_tenant_user(tenant_id, user);
+    }
+};
+
 void handle_client(int cfd,
                    const air::gw::Config& cfg,
                    air::gw::TLSContext& tls_ctx,
                    air::gw::TenantDiscovery& discovery,
-                   air::gw::PoolManager& pools) {
+                   air::gw::PoolManager& pools,
+                   air::gw::MetricsRegistry& metrics) {
+    GlobalConnGuard global_guard{metrics};
     air::gw::Stream client(cfd);
     client.set_timeouts(5000, 5000);
 
@@ -144,6 +162,13 @@ void handle_client(int cfd,
         }
     }
 
+    std::string limit_err;
+    if (!metrics.try_acquire_tenant_user(startup_tenant, req_user, limit_err)) {
+        client.write_all(air::gw::build_error_response("FATAL", "53300", limit_err));
+        return;
+    }
+    TenantUserConnGuard tu_guard{metrics, startup_tenant, req_user, true};
+
     air::gw::TenantRoute route;
     std::string resolve_err;
     if (!discovery.resolve_tenant(startup_tenant, route, resolve_err)) {
@@ -166,7 +191,7 @@ void handle_client(int cfd,
         });
         pool->serve_client(client, req_user, route.app_password, [&discovery, startup_tenant]() {
             discovery.touch_activity(startup_tenant);
-        });
+        }, &metrics);
         return;
     }
 
@@ -199,6 +224,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    air::gw::MetricsRegistry metrics(
+        cfg.max_client_conns, cfg.max_tenant_client_conns, cfg.max_user_client_conns);
     air::gw::PoolManager pools(cfg.pool_max_backends);
     air::gw::TenantDiscovery discovery(cfg);
     discovery.set_callbacks(
@@ -206,7 +233,8 @@ int main(int argc, char** argv) {
         [&pools](const std::string& tid) { pools.remove_tenant(tid); });
     discovery.start();
 
-    air::gw::AdminHTTPServer admin_srv(cfg.admin_addr, cfg.internal_token, discovery, pools);
+    air::gw::AdminHTTPServer admin_srv(
+        cfg.admin_addr, cfg.internal_token, discovery, pools, metrics);
     if (!admin_srv.start()) {
         std::cerr << "[air-gateway] failed to bind admin HTTP on " << cfg.admin_addr << std::endl;
         discovery.stop();
@@ -227,6 +255,9 @@ int main(int argc, char** argv) {
               << " (admin=" << cfg.admin_addr
               << ", control_plane=" << cfg.control_plane_url
               << ", pool_mode=" << (cfg.pool_mode ? "true" : "false")
+              << ", max_client_conns=" << cfg.max_client_conns
+              << ", max_tenant_client_conns=" << cfg.max_tenant_client_conns
+              << ", max_user_client_conns=" << cfg.max_user_client_conns
               << ", require_tls=" << (cfg.require_tls ? "true" : "false") << ")" << std::endl;
 
     while (g_running.load()) {
@@ -236,8 +267,15 @@ int main(int argc, char** argv) {
             if (errno == EINTR) continue;
             break;
         }
-        std::thread([cfd, &cfg, &tls_ctx, &discovery, &pools]() {
-            handle_client(cfd, cfg, tls_ctx, discovery, pools);
+        if (!metrics.try_acquire_global()) {
+            air::gw::Stream tmp(cfd);
+            tmp.set_timeouts(1000, 1000);
+            tmp.write_all(air::gw::build_error_response(
+                "FATAL", "53300", "sorry, too many clients already (gateway global connection limit reached)"));
+            continue;
+        }
+        std::thread([cfd, &cfg, &tls_ctx, &discovery, &pools, &metrics]() {
+            handle_client(cfd, cfg, tls_ctx, discovery, pools, metrics);
         }).detach();
     }
 

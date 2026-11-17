@@ -12,13 +12,13 @@ LDFLAGS ?= $(PKG_LIBS) -pthread
 
 all: air-gateway
 
-air-gateway: src/main.cpp src/config.hpp src/pg_wire.hpp src/discovery.hpp src/pooler.hpp src/admin_http.hpp
+air-gateway: src/main.cpp src/config.hpp src/pg_wire.hpp src/discovery.hpp src/pooler.hpp src/admin_http.hpp src/metrics.hpp
 	$(CXX) $(CXXFLAGS) -Isrc -o $@ src/main.cpp $(LDFLAGS)
 
 test: gateway_test
 	./gateway_test
 
-gateway_test: tests/gateway_test.cpp src/config.hpp src/pg_wire.hpp src/discovery.hpp src/pooler.hpp src/admin_http.hpp
+gateway_test: tests/gateway_test.cpp src/config.hpp src/pg_wire.hpp src/discovery.hpp src/pooler.hpp src/admin_http.hpp src/metrics.hpp
 	$(CXX) $(CXXFLAGS) -Isrc -o $@ tests/gateway_test.cpp $(LDFLAGS)
 
 clean:

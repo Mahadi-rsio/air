@@ -1,6 +1,7 @@
 #pragma once
 
 #include "discovery.hpp"
+#include "metrics.hpp"
 #include "pg_wire.hpp"
 #include "pooler.hpp"
 
@@ -49,11 +50,13 @@ inline int listen_tcp_addr(const std::string& addr_str) {
 class AdminHTTPServer {
 public:
     AdminHTTPServer(std::string addr, std::string internal_token,
-                    TenantDiscovery& discovery, PoolManager& pools)
+                    TenantDiscovery& discovery, PoolManager& pools,
+                    MetricsRegistry& metrics)
         : addr_(std::move(addr)),
           internal_token_(std::move(internal_token)),
           discovery_(discovery),
-          pools_(pools) {}
+          pools_(pools),
+          metrics_(metrics) {}
 
     ~AdminHTTPServer() { stop(); }
 
@@ -81,6 +84,7 @@ private:
     std::string internal_token_;
     TenantDiscovery& discovery_;
     PoolManager& pools_;
+    MetricsRegistry& metrics_;
     int listen_fd_ = -1;
     std::atomic<bool> running_{false};
     std::thread worker_;
@@ -96,10 +100,12 @@ private:
         }
     }
 
-    static void send_http(int fd, int code, const std::string& status, const std::string& body) {
+    static void send_http(int fd, int code, const std::string& status,
+                          const std::string& body,
+                          const std::string& content_type = "application/json") {
         std::ostringstream oss;
         oss << "HTTP/1.1 " << code << " " << status << "\r\n"
-            << "Content-Type: application/json\r\n"
+            << "Content-Type: " << content_type << "\r\n"
             << "Content-Length: " << body.size() << "\r\n"
             << "Connection: close\r\n\r\n"
             << body;
@@ -161,6 +167,44 @@ private:
             return false;
         };
 
+        auto parse_query_param = [&](const std::string& key) -> std::string {
+            std::string needle = key + "=";
+            size_t pos = 0;
+            while (pos < query.size()) {
+                size_t amp = query.find('&', pos);
+                std::string part = (amp == std::string::npos) ? query.substr(pos) : query.substr(pos, amp - pos);
+                if (part.rfind(needle, 0) == 0) return part.substr(needle.size());
+                if (amp == std::string::npos) break;
+                pos = amp + 1;
+            }
+            return "";
+        };
+
+        if (method == "GET" && path == "/metrics") {
+            if (!is_authorized()) {
+                send_http(fd, 401, "Unauthorized", R"({"error":"unauthorized"})");
+                ::close(fd);
+                return;
+            }
+            send_http(fd, 200, "OK", metrics_.to_prometheus(pools_.snapshots()),
+                      "text/plain; version=0.0.4; charset=utf-8");
+            ::close(fd);
+            return;
+        }
+
+        if (method == "GET" && path == "/internal/v1/metrics") {
+            if (!is_authorized()) {
+                send_http(fd, 401, "Unauthorized", R"({"error":"unauthorized"})");
+                ::close(fd);
+                return;
+            }
+            std::string tf = parse_query_param("tenant_id");
+            std::string uf = parse_query_param("user");
+            send_http(fd, 200, "OK", metrics_.to_json(pools_.snapshots(), tf, uf));
+            ::close(fd);
+            return;
+        }
+
         if (method == "GET" && path == "/internal/v1/tenants") {
             if (!is_authorized()) {
                 send_http(fd, 401, "Unauthorized", R"({"error":"unauthorized"})");
@@ -183,6 +227,42 @@ private:
         }
 
         const std::string prefix = "/internal/v1/tenants/";
+        const std::string limits_suffix = "/limits";
+        if (method == "POST" &&
+            path.rfind(prefix, 0) == 0 &&
+            path.size() > prefix.size() + limits_suffix.size() &&
+            path.compare(path.size() - limits_suffix.size(), limits_suffix.size(), limits_suffix) == 0) {
+            if (!is_authorized()) {
+                send_http(fd, 401, "Unauthorized", R"({"error":"unauthorized"})");
+                ::close(fd);
+                return;
+            }
+            std::string tenant_id = path.substr(prefix.size(), path.size() - prefix.size() - limits_suffix.size());
+            if (!validate_tenant_id(tenant_id)) {
+                send_http(fd, 400, "Bad Request", R"({"error":"invalid tenant id"})");
+                ::close(fd);
+                return;
+            }
+            std::string req_body;
+            if (auto hdr_end = req.find("\r\n\r\n"); hdr_end != std::string::npos) {
+                req_body = req.substr(hdr_end + 4);
+            }
+            int max_client_conns = detail::json_extract_int(req_body, "max_client_conns");
+            int max_backends = detail::json_extract_int(req_body, "max_backends");
+            if (max_client_conns > 0) {
+                metrics_.set_tenant_client_limit(tenant_id, max_client_conns);
+            }
+            if (max_backends > 0) {
+                pools_.set_tenant_max_backends(tenant_id, max_backends);
+            }
+            std::ostringstream out;
+            out << "{\"status\":\"updated\",\"tenant_id\":\"" << json_escape(tenant_id)
+                << "\",\"max_client_conns\":" << metrics_.get_tenant_client_limit(tenant_id) << "}";
+            send_http(fd, 200, "OK", out.str());
+            ::close(fd);
+            return;
+        }
+
         const std::string suffix = "/drain";
         if (method == "POST" &&
             path.rfind(prefix, 0) == 0 &&

@@ -1,5 +1,6 @@
 #include "config.hpp"
 #include "discovery.hpp"
+#include "metrics.hpp"
 #include "pg_wire.hpp"
 #include "pooler.hpp"
 
@@ -17,10 +18,19 @@ int main() {
         char arg2[] = "0.0.0.0:6432";
         char arg3[] = "--pool-max-backends";
         char arg4[] = "32";
-        char* argv[] = {arg0, arg1, arg2, arg3, arg4};
-        Config cfg = Config::load(5, argv);
+        char arg5[] = "--max-client-conns";
+        char arg6[] = "256";
+        char arg7[] = "--max-tenant-client-conns";
+        char arg8[] = "64";
+        char arg9[] = "--max-user-client-conns";
+        char arg10[] = "16";
+        char* argv[] = {arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10};
+        Config cfg = Config::load(11, argv);
         assert(cfg.gateway_addr == "0.0.0.0:6432");
         assert(cfg.pool_max_backends == 32);
+        assert(cfg.max_client_conns == 256);
+        assert(cfg.max_tenant_client_conns == 64);
+        assert(cfg.max_user_client_conns == 16);
         assert(!cfg.meta_dsn.empty());
     }
 
@@ -120,6 +130,68 @@ int main() {
         assert(r.state == "ACTIVE");
         assert(r.port == 15445);
         assert(r.app_password == "secret");
+    }
+
+    // 7. Connection limits & query performance metrics
+    {
+        MetricsRegistry reg(3, 2, 1);
+        std::string err;
+
+        // Global + tenant + user limits
+        assert(reg.try_acquire_global());
+        assert(reg.try_acquire_tenant_user("t_a", "alice", err));
+
+        // Second connection for alice on t_a hits max_user_conns=1
+        assert(reg.try_acquire_global());
+        assert(!reg.try_acquire_tenant_user("t_a", "alice", err));
+        assert(err.find("user \"alice\"") != std::string::npos);
+
+        // bob on t_a succeeds (t_a now has 2 connections: alice + bob)
+        assert(reg.try_acquire_tenant_user("t_a", "bob", err));
+
+        // charlie on t_a hits max_tenant_conns=2
+        assert(reg.try_acquire_global());
+        assert(!reg.try_acquire_tenant_user("t_a", "charlie", err));
+        assert(err.find("tenant \"t_a\"") != std::string::npos);
+
+        // 4th global connection hits max_global_conns=3
+        assert(!reg.try_acquire_global());
+
+        // Dynamic per-tenant limit override
+        reg.set_tenant_client_limit("t_a", 5);
+        assert(reg.get_tenant_client_limit("t_a") == 5);
+        assert(reg.try_acquire_tenant_user("t_a", "charlie", err));
+
+        // Record queries (time, count, data size, pool wait, errors)
+        reg.record_query("t_a", "alice", 1200, 150, 64, 512, 10, 400, false, 1);
+        reg.record_query("t_a", "alice", 4800, 50, 128, 1024, 20, 800, true, 1);
+        reg.record_query("t_a", "bob", 600, 0, 32, 128, 1, 64, false, 1);
+
+        PoolManager pm(8);
+        TenantRoute r{"t_a", "ACTIVE", "127.0.0.1", 15444, "", "pw"};
+        pm.get_or_create(r, nullptr);
+        pm.set_tenant_max_backends("t_a", 24);
+        auto snaps = pm.snapshots();
+        assert(snaps.size() == 1 && snaps[0].max_backends == 24);
+
+        std::string js = reg.to_json(snaps);
+        assert(js.find("\"query_count\":3") != std::string::npos);
+        assert(js.find("\"error_count\":1") != std::string::npos);
+        assert(js.find("\"bytes_in\":224") != std::string::npos);
+        assert(js.find("\"bytes_out\":1664") != std::string::npos);
+        assert(js.find("\"rows_returned\":31") != std::string::npos);
+        assert(js.find("\"rejected_connections\":3") != std::string::npos);
+
+        std::string prom = reg.to_prometheus(snaps);
+        assert(prom.find("air_gateway_queries_total{tenant=\"t_a\",user=\"alice\"} 2") != std::string::npos);
+        assert(prom.find("air_gateway_bytes_out_total{tenant=\"t_a\",user=\"bob\"} 128") != std::string::npos);
+
+        reg.release_tenant_user("t_a", "alice");
+        reg.release_tenant_user("t_a", "bob");
+        reg.release_tenant_user("t_a", "charlie");
+        reg.release_global();
+        reg.release_global();
+        reg.release_global();
     }
 
     std::cout << "All C++ air-gateway tests passed!" << std::endl;
