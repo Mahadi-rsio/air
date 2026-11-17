@@ -8,6 +8,7 @@ namespace air::gw {
 struct Config {
     std::string gateway_addr = "127.0.0.1:5432";
     std::string admin_addr = "127.0.0.1:8081";
+    std::string admin_grpc_addr;
     std::string meta_dsn;
     int meta_port = 15432;
     std::string control_plane_url = "http://127.0.0.1:8080";
@@ -54,6 +55,7 @@ struct Config {
         Config c;
         c.gateway_addr = env_or("AIR_GATEWAY_ADDR", c.gateway_addr);
         c.admin_addr = env_or("AIR_GATEWAY_ADMIN_ADDR", c.admin_addr);
+        c.admin_grpc_addr = env_or("AIR_GATEWAY_ADMIN_GRPC_ADDR", c.admin_grpc_addr);
         c.meta_dsn = env_or("AIR_META_DSN", "");
         c.meta_port = env_int("AIR_META_PORT", c.meta_port);
         c.control_plane_url = env_or("AIR_CONTROL_PLANE_URL", c.control_plane_url);
@@ -77,6 +79,7 @@ struct Config {
             };
             if (arg == "--gateway-addr") next_val(c.gateway_addr);
             else if (arg == "--gateway-admin-addr") next_val(c.admin_addr);
+            else if (arg == "--gateway-admin-grpc-addr") next_val(c.admin_grpc_addr);
             else if (arg == "--meta-dsn") next_val(c.meta_dsn);
             else if (arg == "--control-plane-url") next_val(c.control_plane_url);
             else if (arg == "--db-grpc-addr") next_val(c.grpc_addr);

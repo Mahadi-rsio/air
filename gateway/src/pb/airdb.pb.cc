@@ -53,6 +53,10 @@ PROTOBUF_CONSTINIT ::google::protobuf::internal::ReflectionData
         {&::_pbi::kDescriptorMethods, &::descriptor_table_airdb_2eproto, /* tracker*/ nullptr,},
         // ::air::db::v1::BatchTouchActivityRequest
         {&::_pbi::kDescriptorMethods, &::descriptor_table_airdb_2eproto, /* tracker*/ nullptr,},
+        // ::air::db::v1::DrainTenantRequest
+        {&::_pbi::kDescriptorMethods, &::descriptor_table_airdb_2eproto, /* tracker*/ nullptr,},
+        // ::air::db::v1::SetTenantLimitsRequest
+        {&::_pbi::kDescriptorMethods, &::descriptor_table_airdb_2eproto, /* tracker*/ nullptr,},
 };
 }  // namespace
 #endif
@@ -697,6 +701,167 @@ const ::_pbi::ClassData* StatusResponse_get_class_data() {
 }
 }  // namespace
 #endif  // PROTOBUF_CUSTOM_VTABLE
+class SetTenantLimitsRequest::_Internal {
+ public:
+  using HasBits = decltype(::std::declval<SetTenantLimitsRequest>()._impl_._has_bits_);
+  static constexpr ::int32_t kHasBitsOffset =
+      8 * PROTOBUF_FIELD_OFFSET(SetTenantLimitsRequest, _impl_._has_bits_);
+};
+
+constexpr SetTenantLimitsRequest::ParseTableT_ SetTenantLimitsRequest::InternalGenerateParseTable_(const ::_pbi::ClassData* class_data) {
+  return ParseTableT_{
+    {
+      PROTOBUF_FIELD_OFFSET(SetTenantLimitsRequest, _impl_._has_bits_),
+      0, // no _extensions_
+      3, 24,  // max_field_number, fast_idx_mask
+      offsetof(ParseTableT_, field_lookup_table),
+      4294967288,  // skipmap
+      offsetof(ParseTableT_, field_entries),
+      3,  // num_field_entries
+      0,  // num_aux_entries
+      offsetof(ParseTableT_, field_names),  // no aux_entries
+      class_data,
+      nullptr,  // post_loop_handler
+      ::_pbi::TcParser::GenericFallback,  // fallback
+      #ifdef PROTOBUF_PREFETCH_PARSE_TABLE
+      ::_pbi::TcParser::GetTable<::air::db::v1::SetTenantLimitsRequest>(),  // to_prefetch
+      #endif  // PROTOBUF_PREFETCH_PARSE_TABLE
+    }, {{
+      {::_pbi::TcParser::MiniParse, {}},
+      // string tenant_id = 1;
+      {::_pbi::TcParser::FastUS1,
+       {10, 0, 0,
+        PROTOBUF_FIELD_OFFSET(SetTenantLimitsRequest, _impl_.tenant_id_)}},
+      // int32 max_client_conns = 2;
+      {::_pbi::TcParser::SingularVarintNoZag1<::uint32_t, offsetof(SetTenantLimitsRequest, _impl_.max_client_conns_), 1>(),
+       {16, 1, 0,
+        PROTOBUF_FIELD_OFFSET(SetTenantLimitsRequest, _impl_.max_client_conns_)}},
+      // int32 max_backends = 3;
+      {::_pbi::TcParser::SingularVarintNoZag1<::uint32_t, offsetof(SetTenantLimitsRequest, _impl_.max_backends_), 2>(),
+       {24, 2, 0,
+        PROTOBUF_FIELD_OFFSET(SetTenantLimitsRequest, _impl_.max_backends_)}},
+    }}, {{
+      65535, 65535
+    }}, {{
+      // string tenant_id = 1;
+      {PROTOBUF_FIELD_OFFSET(SetTenantLimitsRequest, _impl_.tenant_id_), _Internal::kHasBitsOffset + 0, 0, (0 | ::_fl::kFcOptional | ::_fl::kUtf8String | ::_fl::kRepAString)},
+      // int32 max_client_conns = 2;
+      {PROTOBUF_FIELD_OFFSET(SetTenantLimitsRequest, _impl_.max_client_conns_), _Internal::kHasBitsOffset + 1, 0, (0 | ::_fl::kFcOptional | ::_fl::kInt32)},
+      // int32 max_backends = 3;
+      {PROTOBUF_FIELD_OFFSET(SetTenantLimitsRequest, _impl_.max_backends_), _Internal::kHasBitsOffset + 2, 0, (0 | ::_fl::kFcOptional | ::_fl::kInt32)},
+    }},
+    // no aux_entries
+    {{
+      "\40\11\0\0\0\0\0\0"
+      "air.db.v1.SetTenantLimitsRequest"
+      "tenant_id"
+    }},
+  };
+}
+
+
+inline constexpr SetTenantLimitsRequest::Impl_::Impl_(
+    [[maybe_unused]] ::google::protobuf::internal::InternalVisibility visibility,
+    ::_pbi::ConstantInitialized) noexcept
+      : _cached_size_{0},
+        tenant_id_(
+            &::google::protobuf::internal::fixed_address_empty_string,
+            ::_pbi::ConstantInitialized()),
+        max_client_conns_{0},
+        max_backends_{0} {}
+
+template <typename>
+constexpr SetTenantLimitsRequest::SetTenantLimitsRequest(::_pbi::ConstantInitialized,
+                       const ::_pbi::ClassData* PROTOBUF_NONNULL class_data)
+    : ::google::protobuf::Message(
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+          class_data
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          ),
+      _impl_(internal_visibility(), ::_pbi::ConstantInitialized()) {
+}
+inline void* PROTOBUF_NONNULL SetTenantLimitsRequest::PlacementNew_(
+    const void* PROTOBUF_NONNULL, void* PROTOBUF_NONNULL mem,
+    ::google::protobuf::Arena* PROTOBUF_NULLABLE arena) {
+  return ::new (mem) SetTenantLimitsRequest(arena);
+}
+constexpr auto SetTenantLimitsRequest::InternalNewImpl_() {
+  return ::google::protobuf::internal::MessageCreator::CopyInit(sizeof(SetTenantLimitsRequest), alignof(SetTenantLimitsRequest));
+}
+constexpr auto SetTenantLimitsRequest::InternalGenerateClassData_(
+    const MessageLite& prototype,
+    const ::google::protobuf::internal::TcParseTableBase* tc_table) {
+  return ::google::protobuf::internal::ClassDataFull{
+      ::google::protobuf::internal::ClassData{
+          &prototype,
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+          &_table_.header,
+#else
+          tc_table,
+#endif
+          nullptr,  // IsInitialized
+          &SetTenantLimitsRequest::MergeImpl,
+          ::google::protobuf::Message::GetNewImpl<SetTenantLimitsRequest>(),
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+          &SetTenantLimitsRequest::SharedDtor,
+          ::google::protobuf::Message::GetClearImpl<SetTenantLimitsRequest>(), &SetTenantLimitsRequest::ByteSizeLong,
+              &SetTenantLimitsRequest::_InternalSerialize,
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          PROTOBUF_FIELD_OFFSET(SetTenantLimitsRequest, _impl_._cached_size_),
+          false,
+      },
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+      &file_reflection_data[13],
+#else   // !PROTOBUF_MESSAGE_GLOBALS
+      &::_pbi::kDescriptorMethods,
+      &descriptor_table_airdb_2eproto,
+      nullptr,  // tracker
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+  };
+}
+struct SetTenantLimitsRequestGlobalsTypeInternal : ::_pbi::MessageGlobalsBase {
+  constexpr SetTenantLimitsRequestGlobalsTypeInternal()
+      :
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+        _default(::_pbi::ConstantInitialized{},
+                 SetTenantLimitsRequest_class_data_.base())
+#else   // !PROTOBUF_MESSAGE_GLOBALS
+        MessageGlobalsBase(SetTenantLimitsRequest::InternalGenerateClassData_(
+            _default, &SetTenantLimitsRequest_globals_._table.header)),
+        _default(::_pbi::ConstantInitialized{}, GetClassData()),
+        _table(::_pbi::PrivateAccess::GenerateParseTable<SetTenantLimitsRequest>(
+            GetClassData()))
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+  {
+  }
+  ~SetTenantLimitsRequestGlobalsTypeInternal() {}
+  union {
+    alignas(::_pbi::kMaxMessageAlignment) SetTenantLimitsRequest _default;
+  };
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+  decltype(::_pbi::PrivateAccess::GenerateParseTable<SetTenantLimitsRequest>(
+      ::std::declval<const ::_pbi::ClassData*>())) _table;
+#endif
+};
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+static_assert(PROTOBUF_FIELD_OFFSET(SetTenantLimitsRequestGlobalsTypeInternal, _default) ==
+              ::_pbi::MessageGlobalsBase::OffsetToDefault());
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+
+PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
+    PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 PROTOBUF_MESSAGE_GLOBALS_CONST SetTenantLimitsRequestGlobalsTypeInternal SetTenantLimitsRequest_globals_
+        PROTOBUF_MESSAGE_GLOBALS_SECTION(.data.rel.ro);
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+namespace {
+const ::_pbi::ClassData* SetTenantLimitsRequest_get_class_data() {
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+  return SetTenantLimitsRequest_globals_.GetClassData();
+#else
+  return SetTenantLimitsRequest_class_data_.base();
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+}
+}  // namespace
+#endif  // PROTOBUF_CUSTOM_VTABLE
 class ListDatabasesRequest::_Internal {
  public:
   using HasBits = decltype(::std::declval<ListDatabasesRequest>()._impl_._has_bits_);
@@ -963,6 +1128,159 @@ const ::_pbi::ClassData* Empty_get_class_data() {
   return Empty_globals_.GetClassData();
 #else
   return Empty_class_data_.base();
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+}
+}  // namespace
+#endif  // PROTOBUF_CUSTOM_VTABLE
+class DrainTenantRequest::_Internal {
+ public:
+  using HasBits = decltype(::std::declval<DrainTenantRequest>()._impl_._has_bits_);
+  static constexpr ::int32_t kHasBitsOffset =
+      8 * PROTOBUF_FIELD_OFFSET(DrainTenantRequest, _impl_._has_bits_);
+};
+
+constexpr DrainTenantRequest::ParseTableT_ DrainTenantRequest::InternalGenerateParseTable_(const ::_pbi::ClassData* class_data) {
+  return ParseTableT_{
+    {
+      PROTOBUF_FIELD_OFFSET(DrainTenantRequest, _impl_._has_bits_),
+      0, // no _extensions_
+      2, 8,  // max_field_number, fast_idx_mask
+      offsetof(ParseTableT_, field_lookup_table),
+      4294967292,  // skipmap
+      offsetof(ParseTableT_, field_entries),
+      2,  // num_field_entries
+      0,  // num_aux_entries
+      offsetof(ParseTableT_, field_names),  // no aux_entries
+      class_data,
+      nullptr,  // post_loop_handler
+      ::_pbi::TcParser::GenericFallback,  // fallback
+      #ifdef PROTOBUF_PREFETCH_PARSE_TABLE
+      ::_pbi::TcParser::GetTable<::air::db::v1::DrainTenantRequest>(),  // to_prefetch
+      #endif  // PROTOBUF_PREFETCH_PARSE_TABLE
+    }, {{
+      // int32 timeout_ms = 2;
+      {::_pbi::TcParser::SingularVarintNoZag1<::uint32_t, offsetof(DrainTenantRequest, _impl_.timeout_ms_), 1>(),
+       {16, 1, 0,
+        PROTOBUF_FIELD_OFFSET(DrainTenantRequest, _impl_.timeout_ms_)}},
+      // string tenant_id = 1;
+      {::_pbi::TcParser::FastUS1,
+       {10, 0, 0,
+        PROTOBUF_FIELD_OFFSET(DrainTenantRequest, _impl_.tenant_id_)}},
+    }}, {{
+      65535, 65535
+    }}, {{
+      // string tenant_id = 1;
+      {PROTOBUF_FIELD_OFFSET(DrainTenantRequest, _impl_.tenant_id_), _Internal::kHasBitsOffset + 0, 0, (0 | ::_fl::kFcOptional | ::_fl::kUtf8String | ::_fl::kRepAString)},
+      // int32 timeout_ms = 2;
+      {PROTOBUF_FIELD_OFFSET(DrainTenantRequest, _impl_.timeout_ms_), _Internal::kHasBitsOffset + 1, 0, (0 | ::_fl::kFcOptional | ::_fl::kInt32)},
+    }},
+    // no aux_entries
+    {{
+      "\34\11\0\0\0\0\0\0"
+      "air.db.v1.DrainTenantRequest"
+      "tenant_id"
+    }},
+  };
+}
+
+
+inline constexpr DrainTenantRequest::Impl_::Impl_(
+    [[maybe_unused]] ::google::protobuf::internal::InternalVisibility visibility,
+    ::_pbi::ConstantInitialized) noexcept
+      : _cached_size_{0},
+        tenant_id_(
+            &::google::protobuf::internal::fixed_address_empty_string,
+            ::_pbi::ConstantInitialized()),
+        timeout_ms_{0} {}
+
+template <typename>
+constexpr DrainTenantRequest::DrainTenantRequest(::_pbi::ConstantInitialized,
+                       const ::_pbi::ClassData* PROTOBUF_NONNULL class_data)
+    : ::google::protobuf::Message(
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+          class_data
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          ),
+      _impl_(internal_visibility(), ::_pbi::ConstantInitialized()) {
+}
+inline void* PROTOBUF_NONNULL DrainTenantRequest::PlacementNew_(
+    const void* PROTOBUF_NONNULL, void* PROTOBUF_NONNULL mem,
+    ::google::protobuf::Arena* PROTOBUF_NULLABLE arena) {
+  return ::new (mem) DrainTenantRequest(arena);
+}
+constexpr auto DrainTenantRequest::InternalNewImpl_() {
+  return ::google::protobuf::internal::MessageCreator::CopyInit(sizeof(DrainTenantRequest), alignof(DrainTenantRequest));
+}
+constexpr auto DrainTenantRequest::InternalGenerateClassData_(
+    const MessageLite& prototype,
+    const ::google::protobuf::internal::TcParseTableBase* tc_table) {
+  return ::google::protobuf::internal::ClassDataFull{
+      ::google::protobuf::internal::ClassData{
+          &prototype,
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+          &_table_.header,
+#else
+          tc_table,
+#endif
+          nullptr,  // IsInitialized
+          &DrainTenantRequest::MergeImpl,
+          ::google::protobuf::Message::GetNewImpl<DrainTenantRequest>(),
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+          &DrainTenantRequest::SharedDtor,
+          ::google::protobuf::Message::GetClearImpl<DrainTenantRequest>(), &DrainTenantRequest::ByteSizeLong,
+              &DrainTenantRequest::_InternalSerialize,
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          PROTOBUF_FIELD_OFFSET(DrainTenantRequest, _impl_._cached_size_),
+          false,
+      },
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+      &file_reflection_data[12],
+#else   // !PROTOBUF_MESSAGE_GLOBALS
+      &::_pbi::kDescriptorMethods,
+      &descriptor_table_airdb_2eproto,
+      nullptr,  // tracker
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+  };
+}
+struct DrainTenantRequestGlobalsTypeInternal : ::_pbi::MessageGlobalsBase {
+  constexpr DrainTenantRequestGlobalsTypeInternal()
+      :
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+        _default(::_pbi::ConstantInitialized{},
+                 DrainTenantRequest_class_data_.base())
+#else   // !PROTOBUF_MESSAGE_GLOBALS
+        MessageGlobalsBase(DrainTenantRequest::InternalGenerateClassData_(
+            _default, &DrainTenantRequest_globals_._table.header)),
+        _default(::_pbi::ConstantInitialized{}, GetClassData()),
+        _table(::_pbi::PrivateAccess::GenerateParseTable<DrainTenantRequest>(
+            GetClassData()))
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+  {
+  }
+  ~DrainTenantRequestGlobalsTypeInternal() {}
+  union {
+    alignas(::_pbi::kMaxMessageAlignment) DrainTenantRequest _default;
+  };
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+  decltype(::_pbi::PrivateAccess::GenerateParseTable<DrainTenantRequest>(
+      ::std::declval<const ::_pbi::ClassData*>())) _table;
+#endif
+};
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+static_assert(PROTOBUF_FIELD_OFFSET(DrainTenantRequestGlobalsTypeInternal, _default) ==
+              ::_pbi::MessageGlobalsBase::OffsetToDefault());
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+
+PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
+    PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 PROTOBUF_MESSAGE_GLOBALS_CONST DrainTenantRequestGlobalsTypeInternal DrainTenantRequest_globals_
+        PROTOBUF_MESSAGE_GLOBALS_SECTION(.data.rel.ro);
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+namespace {
+const ::_pbi::ClassData* DrainTenantRequest_get_class_data() {
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+  return DrainTenantRequest_globals_.GetClassData();
+#else
+  return DrainTenantRequest_class_data_.base();
 #endif  // PROTOBUF_MESSAGE_GLOBALS
 }
 }  // namespace
@@ -2128,6 +2446,22 @@ const ::uint32_t
         4, // hasbit index offset
         PROTOBUF_FIELD_OFFSET(::air::db::v1::BatchTouchActivityRequest, _impl_.tenant_ids_),
         0,
+        0x081, // bitmap
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::DrainTenantRequest, _impl_._has_bits_),
+        5, // hasbit index offset
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::DrainTenantRequest, _impl_.tenant_id_),
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::DrainTenantRequest, _impl_.timeout_ms_),
+        0,
+        1,
+        0x081, // bitmap
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::SetTenantLimitsRequest, _impl_._has_bits_),
+        6, // hasbit index offset
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::SetTenantLimitsRequest, _impl_.tenant_id_),
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::SetTenantLimitsRequest, _impl_.max_client_conns_),
+        PROTOBUF_FIELD_OFFSET(::air::db::v1::SetTenantLimitsRequest, _impl_.max_backends_),
+        0,
+        1,
+        2,
 };
 
 static const ::_pbi::MigrationSchema
@@ -2144,6 +2478,8 @@ static const ::_pbi::MigrationSchema
         {81, sizeof(::air::db::v1::WatchTenantsRequest)},
         {86, sizeof(::air::db::v1::TenantChangeEvent)},
         {99, sizeof(::air::db::v1::BatchTouchActivityRequest)},
+        {104, sizeof(::air::db::v1::DrainTenantRequest)},
+        {111, sizeof(::air::db::v1::SetTenantLimitsRequest)},
 };
 static const ::_pbi::MessageGlobalsBase* PROTOBUF_NONNULL const
     file_message_globals[] = {
@@ -2159,6 +2495,8 @@ static const ::_pbi::MessageGlobalsBase* PROTOBUF_NONNULL const
         &::air::db::v1::WatchTenantsRequest_globals_,
         &::air::db::v1::TenantChangeEvent_globals_,
         &::air::db::v1::BatchTouchActivityRequest_globals_,
+        &::air::db::v1::DrainTenantRequest_globals_,
+        &::air::db::v1::SetTenantLimitsRequest_globals_,
 };
 const char descriptor_table_protodef_airdb_2eproto[] ABSL_ATTRIBUTE_SECTION_VARIABLE(
     protodesc_cold) = {
@@ -2187,49 +2525,57 @@ const char descriptor_table_protodef_airdb_2eproto[] ABSL_ATTRIBUTE_SECTION_VARI
     "tType\022-\n\005route\030\003 \001(\0132\036.air.db.v1.TenantR"
     "outeResponse\022\025\n\rfencing_epoch\030\004 \001(\003\022\032\n\022e"
     "mitted_at_unix_ms\030\005 \001(\003\"/\n\031BatchTouchAct"
-    "ivityRequest\022\022\n\ntenant_ids\030\001 \003(\t*\203\001\n\017Ten"
-    "antEventType\022\034\n\030TENANT_EVENT_UNSPECIFIED"
-    "\020\000\022\027\n\023TENANT_EVENT_UPSERT\020\001\022\027\n\023TENANT_EV"
-    "ENT_DELETE\020\002\022 \n\034TENANT_EVENT_RESYNC_REQU"
-    "IRED\020\0032\326\007\n\014AirDBControl\022J\n\016GetTenantRout"
-    "e\022\030.air.db.v1.TenantRequest\032\036.air.db.v1."
-    "TenantRouteResponse\022F\n\nWakeTenant\022\030.air."
-    "db.v1.TenantRequest\032\036.air.db.v1.TenantRo"
-    "uteResponse\022;\n\rTouchActivity\022\030.air.db.v1"
-    ".TenantRequest\032\020.air.db.v1.Empty\022L\n\022Batc"
-    "hTouchActivity\022$.air.db.v1.BatchTouchAct"
-    "ivityRequest\032\020.air.db.v1.Empty\022T\n\022WatchT"
-    "enantChanges\022\036.air.db.v1.WatchTenantsReq"
-    "uest\032\034.air.db.v1.TenantChangeEvent0\001\022U\n\016"
-    "CreateDatabase\022 .air.db.v1.CreateDatabas"
-    "eRequest\032!.air.db.v1.CreateDatabaseRespo"
-    "nse\022R\n\rListDatabases\022\037.air.db.v1.ListDat"
-    "abasesRequest\032 .air.db.v1.ListDatabasesR"
-    "esponse\022@\n\013GetDatabase\022\030.air.db.v1.Tenan"
-    "tRequest\032\027.air.db.v1.DatabaseInfo\022E\n\016Del"
-    "eteDatabase\022\030.air.db.v1.TenantRequest\032\031."
-    "air.db.v1.StatusResponse\022F\n\017SuspendDatab"
-    "ase\022\030.air.db.v1.TenantRequest\032\031.air.db.v"
-    "1.StatusResponse\022I\n\rStartDatabase\022\030.air."
-    "db.v1.TenantRequest\032\036.air.db.v1.TenantRo"
-    "uteResponse\022C\n\014LockDatabase\022\030.air.db.v1."
-    "TenantRequest\032\031.air.db.v1.StatusResponse"
-    "\022E\n\016UnlockDatabase\022\030.air.db.v1.TenantReq"
-    "uest\032\031.air.db.v1.StatusResponseB+Z)githu"
-    "b.com/Mahadi-rsio/air/internal/pb;pbb\006pr"
-    "oto3"
+    "ivityRequest\022\022\n\ntenant_ids\030\001 \003(\t\";\n\022Drai"
+    "nTenantRequest\022\021\n\ttenant_id\030\001 \001(\t\022\022\n\ntim"
+    "eout_ms\030\002 \001(\005\"[\n\026SetTenantLimitsRequest\022"
+    "\021\n\ttenant_id\030\001 \001(\t\022\030\n\020max_client_conns\030\002"
+    " \001(\005\022\024\n\014max_backends\030\003 \001(\005*\203\001\n\017TenantEve"
+    "ntType\022\034\n\030TENANT_EVENT_UNSPECIFIED\020\000\022\027\n\023"
+    "TENANT_EVENT_UPSERT\020\001\022\027\n\023TENANT_EVENT_DE"
+    "LETE\020\002\022 \n\034TENANT_EVENT_RESYNC_REQUIRED\020\003"
+    "2\326\007\n\014AirDBControl\022J\n\016GetTenantRoute\022\030.ai"
+    "r.db.v1.TenantRequest\032\036.air.db.v1.Tenant"
+    "RouteResponse\022F\n\nWakeTenant\022\030.air.db.v1."
+    "TenantRequest\032\036.air.db.v1.TenantRouteRes"
+    "ponse\022;\n\rTouchActivity\022\030.air.db.v1.Tenan"
+    "tRequest\032\020.air.db.v1.Empty\022L\n\022BatchTouch"
+    "Activity\022$.air.db.v1.BatchTouchActivityR"
+    "equest\032\020.air.db.v1.Empty\022T\n\022WatchTenantC"
+    "hanges\022\036.air.db.v1.WatchTenantsRequest\032\034"
+    ".air.db.v1.TenantChangeEvent0\001\022U\n\016Create"
+    "Database\022 .air.db.v1.CreateDatabaseReque"
+    "st\032!.air.db.v1.CreateDatabaseResponse\022R\n"
+    "\rListDatabases\022\037.air.db.v1.ListDatabases"
+    "Request\032 .air.db.v1.ListDatabasesRespons"
+    "e\022@\n\013GetDatabase\022\030.air.db.v1.TenantReque"
+    "st\032\027.air.db.v1.DatabaseInfo\022E\n\016DeleteDat"
+    "abase\022\030.air.db.v1.TenantRequest\032\031.air.db"
+    ".v1.StatusResponse\022F\n\017SuspendDatabase\022\030."
+    "air.db.v1.TenantRequest\032\031.air.db.v1.Stat"
+    "usResponse\022I\n\rStartDatabase\022\030.air.db.v1."
+    "TenantRequest\032\036.air.db.v1.TenantRouteRes"
+    "ponse\022C\n\014LockDatabase\022\030.air.db.v1.Tenant"
+    "Request\032\031.air.db.v1.StatusResponse\022E\n\016Un"
+    "lockDatabase\022\030.air.db.v1.TenantRequest\032\031"
+    ".air.db.v1.StatusResponse2\250\001\n\014GatewayAdm"
+    "in\022G\n\013DrainTenant\022\035.air.db.v1.DrainTenan"
+    "tRequest\032\031.air.db.v1.StatusResponse\022O\n\017S"
+    "etTenantLimits\022!.air.db.v1.SetTenantLimi"
+    "tsRequest\032\031.air.db.v1.StatusResponseB+Z)"
+    "github.com/Mahadi-rsio/air/internal/pb;p"
+    "bb\006proto3"
 };
 static ::absl::once_flag descriptor_table_airdb_2eproto_once;
 PROTOBUF_CONSTINIT const ::_pbi::DescriptorTable descriptor_table_airdb_2eproto = {
     false,
     false,
-    2204,
+    2529,
     descriptor_table_protodef_airdb_2eproto,
     "airdb.proto",
     &descriptor_table_airdb_2eproto_once,
     nullptr,
     0,
-    12,
+    14,
     schemas,
     file_message_globals,
     TableStruct_airdb_2eproto::offsets,
@@ -5420,6 +5766,531 @@ void BatchTouchActivityRequest::InternalSwap(BatchTouchActivityRequest* PROTOBUF
 }
 
 ::google::protobuf::Metadata BatchTouchActivityRequest::GetMetadata() const {
+  return ::google::protobuf::Message::GetMetadataImpl(GetClassData()->full());
+}
+// ===================================================================
+
+DrainTenantRequest::DrainTenantRequest(::google::protobuf::Arena* PROTOBUF_NULLABLE arena)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, DrainTenantRequest_get_class_data()) {
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  SharedCtor(arena);
+  // @@protoc_insertion_point(arena_constructor:air.db.v1.DrainTenantRequest)
+}
+PROTOBUF_NDEBUG_INLINE DrainTenantRequest::Impl_::Impl_(
+    [[maybe_unused]] ::google::protobuf::internal::InternalVisibility visibility,
+    [[maybe_unused]] ::google::protobuf::Arena* PROTOBUF_NULLABLE arena, const Impl_& from,
+    [[maybe_unused]] const ::air::db::v1::DrainTenantRequest& from_msg)
+      : _has_bits_{from._has_bits_},
+        _cached_size_{0},
+        tenant_id_(arena, from.tenant_id_) {}
+
+DrainTenantRequest::DrainTenantRequest(
+    ::google::protobuf::Arena* PROTOBUF_NULLABLE arena,
+    const DrainTenantRequest& from)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, DrainTenantRequest_get_class_data()) {
+
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  DrainTenantRequest* const _this = this;
+  (void)_this;
+  _internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
+      from._internal_metadata_);
+  new (&_impl_) Impl_(internal_visibility(), arena, from._impl_, from);
+  _impl_.timeout_ms_ = from._impl_.timeout_ms_;
+
+  // @@protoc_insertion_point(copy_constructor:air.db.v1.DrainTenantRequest)
+}
+PROTOBUF_NDEBUG_INLINE DrainTenantRequest::Impl_::Impl_(
+    [[maybe_unused]] ::google::protobuf::internal::InternalVisibility visibility,
+    [[maybe_unused]] ::google::protobuf::Arena* PROTOBUF_NULLABLE arena)
+      : _cached_size_{0},
+        tenant_id_(arena) {}
+
+inline void DrainTenantRequest::SharedCtor(::_pb::Arena* PROTOBUF_NULLABLE arena) {
+  new (&_impl_) Impl_(internal_visibility(), arena);
+  _impl_.timeout_ms_ = {};
+}
+DrainTenantRequest::~DrainTenantRequest() {
+  // @@protoc_insertion_point(destructor:air.db.v1.DrainTenantRequest)
+  SharedDtor(*this);
+}
+inline void DrainTenantRequest::SharedDtor(MessageLite& self) {
+  DrainTenantRequest& this_ = static_cast<DrainTenantRequest&>(self);
+  if constexpr (::_pbi::DebugHardenCheckHasBitConsistency()) {
+    this_.CheckHasBitConsistency();
+  }
+  this_._internal_metadata_.Delete<::google::protobuf::UnknownFieldSet>();
+  ABSL_DCHECK(this_.GetArena() == nullptr);
+  this_._impl_.tenant_id_.Destroy();
+  this_._impl_.~Impl_();
+}
+
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 const
+    ::google::protobuf::internal::ClassDataFull DrainTenantRequest_class_data_ =
+        DrainTenantRequest::InternalGenerateClassData_(DrainTenantRequest_globals_._default);
+
+PROTOBUF_ATTRIBUTE_WEAK const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL
+DrainTenantRequest::GetClassData() const {
+  ::google::protobuf::internal::PrefetchToLocalCache(&DrainTenantRequest_class_data_);
+  ::google::protobuf::internal::PrefetchToLocalCache(DrainTenantRequest_class_data_.tc_table);
+  return DrainTenantRequest_class_data_.base();
+}
+#else
+PROTOBUF_ATTRIBUTE_WEAK const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL
+DrainTenantRequest::GetClassData() const {
+  ::google::protobuf::internal::PrefetchToLocalCache(&DrainTenantRequest_globals_);
+  ::google::protobuf::internal::PrefetchToLocalCache(
+      ::google::protobuf::internal::MessageGlobalsBase::ToParseTableBase(&DrainTenantRequest_globals_));
+  return DrainTenantRequest_globals_.GetClassData();
+}
+#endif  // !PROTOBUF_MESSAGE_GLOBALS
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+PROTOBUF_CONSTINIT
+PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 const DrainTenantRequest::ParseTableT_
+    DrainTenantRequest::_table_ =
+        DrainTenantRequest::InternalGenerateParseTable_(DrainTenantRequest_class_data_.base());
+#endif  // !PROTOBUF_MESSAGE_GLOBALS
+PROTOBUF_NOINLINE void DrainTenantRequest::Clear() {
+// @@protoc_insertion_point(message_clear_start:air.db.v1.DrainTenantRequest)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void) cached_has_bits;
+
+  cached_has_bits = _impl_._has_bits_[0];
+  if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+    _impl_.tenant_id_.ClearNonDefaultToEmpty();
+  }
+  _impl_.timeout_ms_ = 0;
+  _impl_._has_bits_.Clear();
+  _internal_metadata_.Clear<::google::protobuf::UnknownFieldSet>();
+}
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+::uint8_t* PROTOBUF_NONNULL DrainTenantRequest::_InternalSerialize(
+    const ::google::protobuf::MessageLite& base, ::uint8_t* PROTOBUF_NONNULL target,
+    ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) {
+  const DrainTenantRequest& this_ = static_cast<const DrainTenantRequest&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+::uint8_t* PROTOBUF_NONNULL DrainTenantRequest::_InternalSerialize(
+    ::uint8_t* PROTOBUF_NONNULL target,
+    ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) const {
+  const DrainTenantRequest& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  if constexpr (::_pbi::DebugHardenCheckHasBitConsistency()) {
+    this_.CheckHasBitConsistency();
+  }
+  // @@protoc_insertion_point(serialize_to_array_start:air.db.v1.DrainTenantRequest)
+  ::uint32_t cached_has_bits = 0;
+  (void)cached_has_bits;
+
+  cached_has_bits = this_._impl_._has_bits_[0];
+  // string tenant_id = 1;
+  if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+    if (!this_._internal_tenant_id().empty()) {
+      const ::std::string& _s = this_._internal_tenant_id();
+      ::google::protobuf::internal::WireFormatLite::VerifyUtf8String(
+          _s.data(), static_cast<int>(_s.length()), ::google::protobuf::internal::WireFormatLite::SERIALIZE, "air.db.v1.DrainTenantRequest.tenant_id");
+      target = stream->WriteStringMaybeAliased(1, _s, target);
+    }
+  }
+
+  // int32 timeout_ms = 2;
+  if (CheckHasBit(cached_has_bits, 0x00000002U)) {
+    if (this_._internal_timeout_ms() != 0) {
+      target =
+          ::google::protobuf::internal::WireFormatLite::WriteInt32ToArrayWithField<2>(
+              stream, this_._internal_timeout_ms(), target);
+    }
+  }
+
+  if (ABSL_PREDICT_FALSE(this_._internal_metadata_.have_unknown_fields())) {
+    target =
+        ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
+            this_._internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance), target, stream);
+  }
+  // @@protoc_insertion_point(serialize_to_array_end:air.db.v1.DrainTenantRequest)
+  return target;
+}
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+::size_t DrainTenantRequest::ByteSizeLong(const MessageLite& base) {
+  const DrainTenantRequest& this_ = static_cast<const DrainTenantRequest&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+::size_t DrainTenantRequest::ByteSizeLong() const {
+  const DrainTenantRequest& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  // @@protoc_insertion_point(message_byte_size_start:air.db.v1.DrainTenantRequest)
+  ::size_t total_size = 0;
+
+  ::uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void)cached_has_bits;
+
+  ::_pbi::Prefetch5LinesFrom7Lines(&this_);
+  cached_has_bits = this_._impl_._has_bits_[0];
+  if (BatchCheckHasBit(cached_has_bits, 0x00000003U)) {
+    // string tenant_id = 1;
+    if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+      if (!this_._internal_tenant_id().empty()) {
+        total_size += 1 + ::google::protobuf::internal::WireFormatLite::StringSize(
+                                        this_._internal_tenant_id());
+      }
+    }
+    // int32 timeout_ms = 2;
+    if (CheckHasBit(cached_has_bits, 0x00000002U)) {
+      if (this_._internal_timeout_ms() != 0) {
+        total_size += ::_pbi::WireFormatLite::Int32SizePlusOne(
+            this_._internal_timeout_ms());
+      }
+    }
+  }
+  return this_.MaybeComputeUnknownFieldsSize(total_size,
+                                             &this_._impl_._cached_size_);
+}
+
+void DrainTenantRequest::MergeImpl(::google::protobuf::MessageLite& to_msg,
+                      const ::google::protobuf::MessageLite& from_msg) {
+   auto* const _this = static_cast<DrainTenantRequest*>(&to_msg);
+  auto& from = static_cast<const DrainTenantRequest&>(from_msg);
+  if constexpr (::_pbi::DebugHardenCheckHasBitConsistency()) {
+    from.CheckHasBitConsistency();
+  }
+  // @@protoc_insertion_point(class_specific_merge_from_start:air.db.v1.DrainTenantRequest)
+  ABSL_DCHECK_NE(&from, _this);
+  ::uint32_t cached_has_bits = 0;
+  (void)cached_has_bits;
+
+  cached_has_bits = from._impl_._has_bits_[0];
+  if (BatchCheckHasBit(cached_has_bits, 0x00000003U)) {
+    if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+      if (!from._internal_tenant_id().empty()) {
+        _this->_internal_set_tenant_id(from._internal_tenant_id());
+      } else {
+        if (_this->_impl_.tenant_id_.IsDefault()) {
+          _this->_internal_set_tenant_id("");
+        }
+      }
+    }
+    if (CheckHasBit(cached_has_bits, 0x00000002U)) {
+      if (from._internal_timeout_ms() != 0) {
+        _this->_impl_.timeout_ms_ = from._impl_.timeout_ms_;
+      }
+    }
+  }
+  _this->_impl_._has_bits_[0] |= cached_has_bits;
+  _this->_internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
+      from._internal_metadata_);
+}
+
+void DrainTenantRequest::CopyFrom(const DrainTenantRequest& from) {
+  // @@protoc_insertion_point(class_specific_copy_from_start:air.db.v1.DrainTenantRequest)
+  if (&from == this) return;
+  Clear();
+  MergeFrom(from);
+}
+
+
+void DrainTenantRequest::InternalSwap(DrainTenantRequest* PROTOBUF_RESTRICT PROTOBUF_NONNULL other) {
+  using ::std::swap;
+  auto* arena = GetArena();
+  ABSL_DCHECK_EQ(arena, other->GetArena());
+  _internal_metadata_.InternalSwap(&other->_internal_metadata_);
+  swap(_impl_._has_bits_[0], other->_impl_._has_bits_[0]);
+  ::_pbi::ArenaStringPtr::InternalSwap(&_impl_.tenant_id_, &other->_impl_.tenant_id_, arena);
+  swap(_impl_.timeout_ms_, other->_impl_.timeout_ms_);
+}
+
+::google::protobuf::Metadata DrainTenantRequest::GetMetadata() const {
+  return ::google::protobuf::Message::GetMetadataImpl(GetClassData()->full());
+}
+// ===================================================================
+
+SetTenantLimitsRequest::SetTenantLimitsRequest(::google::protobuf::Arena* PROTOBUF_NULLABLE arena)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, SetTenantLimitsRequest_get_class_data()) {
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  SharedCtor(arena);
+  // @@protoc_insertion_point(arena_constructor:air.db.v1.SetTenantLimitsRequest)
+}
+PROTOBUF_NDEBUG_INLINE SetTenantLimitsRequest::Impl_::Impl_(
+    [[maybe_unused]] ::google::protobuf::internal::InternalVisibility visibility,
+    [[maybe_unused]] ::google::protobuf::Arena* PROTOBUF_NULLABLE arena, const Impl_& from,
+    [[maybe_unused]] const ::air::db::v1::SetTenantLimitsRequest& from_msg)
+      : _has_bits_{from._has_bits_},
+        _cached_size_{0},
+        tenant_id_(arena, from.tenant_id_) {}
+
+SetTenantLimitsRequest::SetTenantLimitsRequest(
+    ::google::protobuf::Arena* PROTOBUF_NULLABLE arena,
+    const SetTenantLimitsRequest& from)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, SetTenantLimitsRequest_get_class_data()) {
+
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  SetTenantLimitsRequest* const _this = this;
+  (void)_this;
+  _internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
+      from._internal_metadata_);
+  new (&_impl_) Impl_(internal_visibility(), arena, from._impl_, from);
+  ::memcpy(reinterpret_cast<char*>(&_impl_) +
+               offsetof(Impl_, max_client_conns_),
+           reinterpret_cast<const char*>(&from._impl_) +
+               offsetof(Impl_, max_client_conns_),
+           offsetof(Impl_, max_backends_) -
+               offsetof(Impl_, max_client_conns_) +
+               sizeof(Impl_::max_backends_));
+
+  // @@protoc_insertion_point(copy_constructor:air.db.v1.SetTenantLimitsRequest)
+}
+PROTOBUF_NDEBUG_INLINE SetTenantLimitsRequest::Impl_::Impl_(
+    [[maybe_unused]] ::google::protobuf::internal::InternalVisibility visibility,
+    [[maybe_unused]] ::google::protobuf::Arena* PROTOBUF_NULLABLE arena)
+      : _cached_size_{0},
+        tenant_id_(arena) {}
+
+inline void SetTenantLimitsRequest::SharedCtor(::_pb::Arena* PROTOBUF_NULLABLE arena) {
+  new (&_impl_) Impl_(internal_visibility(), arena);
+  ::memset(reinterpret_cast<char*>(&_impl_) +
+               offsetof(Impl_, max_client_conns_),
+           0,
+           offsetof(Impl_, max_backends_) -
+               offsetof(Impl_, max_client_conns_) +
+               sizeof(Impl_::max_backends_));
+}
+SetTenantLimitsRequest::~SetTenantLimitsRequest() {
+  // @@protoc_insertion_point(destructor:air.db.v1.SetTenantLimitsRequest)
+  SharedDtor(*this);
+}
+inline void SetTenantLimitsRequest::SharedDtor(MessageLite& self) {
+  SetTenantLimitsRequest& this_ = static_cast<SetTenantLimitsRequest&>(self);
+  if constexpr (::_pbi::DebugHardenCheckHasBitConsistency()) {
+    this_.CheckHasBitConsistency();
+  }
+  this_._internal_metadata_.Delete<::google::protobuf::UnknownFieldSet>();
+  ABSL_DCHECK(this_.GetArena() == nullptr);
+  this_._impl_.tenant_id_.Destroy();
+  this_._impl_.~Impl_();
+}
+
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 const
+    ::google::protobuf::internal::ClassDataFull SetTenantLimitsRequest_class_data_ =
+        SetTenantLimitsRequest::InternalGenerateClassData_(SetTenantLimitsRequest_globals_._default);
+
+PROTOBUF_ATTRIBUTE_WEAK const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL
+SetTenantLimitsRequest::GetClassData() const {
+  ::google::protobuf::internal::PrefetchToLocalCache(&SetTenantLimitsRequest_class_data_);
+  ::google::protobuf::internal::PrefetchToLocalCache(SetTenantLimitsRequest_class_data_.tc_table);
+  return SetTenantLimitsRequest_class_data_.base();
+}
+#else
+PROTOBUF_ATTRIBUTE_WEAK const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL
+SetTenantLimitsRequest::GetClassData() const {
+  ::google::protobuf::internal::PrefetchToLocalCache(&SetTenantLimitsRequest_globals_);
+  ::google::protobuf::internal::PrefetchToLocalCache(
+      ::google::protobuf::internal::MessageGlobalsBase::ToParseTableBase(&SetTenantLimitsRequest_globals_));
+  return SetTenantLimitsRequest_globals_.GetClassData();
+}
+#endif  // !PROTOBUF_MESSAGE_GLOBALS
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+PROTOBUF_CONSTINIT
+PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 const SetTenantLimitsRequest::ParseTableT_
+    SetTenantLimitsRequest::_table_ =
+        SetTenantLimitsRequest::InternalGenerateParseTable_(SetTenantLimitsRequest_class_data_.base());
+#endif  // !PROTOBUF_MESSAGE_GLOBALS
+PROTOBUF_NOINLINE void SetTenantLimitsRequest::Clear() {
+// @@protoc_insertion_point(message_clear_start:air.db.v1.SetTenantLimitsRequest)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void) cached_has_bits;
+
+  cached_has_bits = _impl_._has_bits_[0];
+  if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+    _impl_.tenant_id_.ClearNonDefaultToEmpty();
+  }
+  if (BatchCheckHasBit(cached_has_bits, 0x00000006U)) {
+    ::memset(&_impl_.max_client_conns_, 0, static_cast<::size_t>(
+        reinterpret_cast<char*>(&_impl_.max_backends_) -
+        reinterpret_cast<char*>(&_impl_.max_client_conns_)) + sizeof(_impl_.max_backends_));
+  }
+  _impl_._has_bits_.Clear();
+  _internal_metadata_.Clear<::google::protobuf::UnknownFieldSet>();
+}
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+::uint8_t* PROTOBUF_NONNULL SetTenantLimitsRequest::_InternalSerialize(
+    const ::google::protobuf::MessageLite& base, ::uint8_t* PROTOBUF_NONNULL target,
+    ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) {
+  const SetTenantLimitsRequest& this_ = static_cast<const SetTenantLimitsRequest&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+::uint8_t* PROTOBUF_NONNULL SetTenantLimitsRequest::_InternalSerialize(
+    ::uint8_t* PROTOBUF_NONNULL target,
+    ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) const {
+  const SetTenantLimitsRequest& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  if constexpr (::_pbi::DebugHardenCheckHasBitConsistency()) {
+    this_.CheckHasBitConsistency();
+  }
+  // @@protoc_insertion_point(serialize_to_array_start:air.db.v1.SetTenantLimitsRequest)
+  ::uint32_t cached_has_bits = 0;
+  (void)cached_has_bits;
+
+  cached_has_bits = this_._impl_._has_bits_[0];
+  // string tenant_id = 1;
+  if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+    if (!this_._internal_tenant_id().empty()) {
+      const ::std::string& _s = this_._internal_tenant_id();
+      ::google::protobuf::internal::WireFormatLite::VerifyUtf8String(
+          _s.data(), static_cast<int>(_s.length()), ::google::protobuf::internal::WireFormatLite::SERIALIZE, "air.db.v1.SetTenantLimitsRequest.tenant_id");
+      target = stream->WriteStringMaybeAliased(1, _s, target);
+    }
+  }
+
+  // int32 max_client_conns = 2;
+  if (CheckHasBit(cached_has_bits, 0x00000002U)) {
+    if (this_._internal_max_client_conns() != 0) {
+      target =
+          ::google::protobuf::internal::WireFormatLite::WriteInt32ToArrayWithField<2>(
+              stream, this_._internal_max_client_conns(), target);
+    }
+  }
+
+  // int32 max_backends = 3;
+  if (CheckHasBit(cached_has_bits, 0x00000004U)) {
+    if (this_._internal_max_backends() != 0) {
+      target =
+          ::google::protobuf::internal::WireFormatLite::WriteInt32ToArrayWithField<3>(
+              stream, this_._internal_max_backends(), target);
+    }
+  }
+
+  if (ABSL_PREDICT_FALSE(this_._internal_metadata_.have_unknown_fields())) {
+    target =
+        ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
+            this_._internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance), target, stream);
+  }
+  // @@protoc_insertion_point(serialize_to_array_end:air.db.v1.SetTenantLimitsRequest)
+  return target;
+}
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+::size_t SetTenantLimitsRequest::ByteSizeLong(const MessageLite& base) {
+  const SetTenantLimitsRequest& this_ = static_cast<const SetTenantLimitsRequest&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+::size_t SetTenantLimitsRequest::ByteSizeLong() const {
+  const SetTenantLimitsRequest& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  // @@protoc_insertion_point(message_byte_size_start:air.db.v1.SetTenantLimitsRequest)
+  ::size_t total_size = 0;
+
+  ::uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void)cached_has_bits;
+
+  ::_pbi::Prefetch5LinesFrom7Lines(&this_);
+  cached_has_bits = this_._impl_._has_bits_[0];
+  if (BatchCheckHasBit(cached_has_bits, 0x00000007U)) {
+    // string tenant_id = 1;
+    if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+      if (!this_._internal_tenant_id().empty()) {
+        total_size += 1 + ::google::protobuf::internal::WireFormatLite::StringSize(
+                                        this_._internal_tenant_id());
+      }
+    }
+    // int32 max_client_conns = 2;
+    if (CheckHasBit(cached_has_bits, 0x00000002U)) {
+      if (this_._internal_max_client_conns() != 0) {
+        total_size += ::_pbi::WireFormatLite::Int32SizePlusOne(
+            this_._internal_max_client_conns());
+      }
+    }
+    // int32 max_backends = 3;
+    if (CheckHasBit(cached_has_bits, 0x00000004U)) {
+      if (this_._internal_max_backends() != 0) {
+        total_size += ::_pbi::WireFormatLite::Int32SizePlusOne(
+            this_._internal_max_backends());
+      }
+    }
+  }
+  return this_.MaybeComputeUnknownFieldsSize(total_size,
+                                             &this_._impl_._cached_size_);
+}
+
+void SetTenantLimitsRequest::MergeImpl(::google::protobuf::MessageLite& to_msg,
+                      const ::google::protobuf::MessageLite& from_msg) {
+   auto* const _this = static_cast<SetTenantLimitsRequest*>(&to_msg);
+  auto& from = static_cast<const SetTenantLimitsRequest&>(from_msg);
+  if constexpr (::_pbi::DebugHardenCheckHasBitConsistency()) {
+    from.CheckHasBitConsistency();
+  }
+  // @@protoc_insertion_point(class_specific_merge_from_start:air.db.v1.SetTenantLimitsRequest)
+  ABSL_DCHECK_NE(&from, _this);
+  ::uint32_t cached_has_bits = 0;
+  (void)cached_has_bits;
+
+  cached_has_bits = from._impl_._has_bits_[0];
+  if (BatchCheckHasBit(cached_has_bits, 0x00000007U)) {
+    if (CheckHasBit(cached_has_bits, 0x00000001U)) {
+      if (!from._internal_tenant_id().empty()) {
+        _this->_internal_set_tenant_id(from._internal_tenant_id());
+      } else {
+        if (_this->_impl_.tenant_id_.IsDefault()) {
+          _this->_internal_set_tenant_id("");
+        }
+      }
+    }
+    if (CheckHasBit(cached_has_bits, 0x00000002U)) {
+      if (from._internal_max_client_conns() != 0) {
+        _this->_impl_.max_client_conns_ = from._impl_.max_client_conns_;
+      }
+    }
+    if (CheckHasBit(cached_has_bits, 0x00000004U)) {
+      if (from._internal_max_backends() != 0) {
+        _this->_impl_.max_backends_ = from._impl_.max_backends_;
+      }
+    }
+  }
+  _this->_impl_._has_bits_[0] |= cached_has_bits;
+  _this->_internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
+      from._internal_metadata_);
+}
+
+void SetTenantLimitsRequest::CopyFrom(const SetTenantLimitsRequest& from) {
+  // @@protoc_insertion_point(class_specific_copy_from_start:air.db.v1.SetTenantLimitsRequest)
+  if (&from == this) return;
+  Clear();
+  MergeFrom(from);
+}
+
+
+void SetTenantLimitsRequest::InternalSwap(SetTenantLimitsRequest* PROTOBUF_RESTRICT PROTOBUF_NONNULL other) {
+  using ::std::swap;
+  auto* arena = GetArena();
+  ABSL_DCHECK_EQ(arena, other->GetArena());
+  _internal_metadata_.InternalSwap(&other->_internal_metadata_);
+  swap(_impl_._has_bits_[0], other->_impl_._has_bits_[0]);
+  ::_pbi::ArenaStringPtr::InternalSwap(&_impl_.tenant_id_, &other->_impl_.tenant_id_, arena);
+  ::google::protobuf::internal::memswap<
+      PROTOBUF_FIELD_OFFSET(SetTenantLimitsRequest, _impl_.max_backends_)
+      + sizeof(SetTenantLimitsRequest::_impl_.max_backends_)
+      - PROTOBUF_FIELD_OFFSET(SetTenantLimitsRequest, _impl_.max_client_conns_)>(
+          reinterpret_cast<char*>(&_impl_.max_client_conns_),
+          reinterpret_cast<char*>(&other->_impl_.max_client_conns_));
+}
+
+::google::protobuf::Metadata SetTenantLimitsRequest::GetMetadata() const {
   return ::google::protobuf::Message::GetMetadataImpl(GetClassData()->full());
 }
 // @@protoc_insertion_point(namespace_scope)

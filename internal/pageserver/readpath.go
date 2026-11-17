@@ -12,6 +12,7 @@ import (
 type Timeline struct {
 	mu            sync.RWMutex
 	manifestMu    sync.Mutex
+	compactMu     sync.Mutex
 	tenantID      string
 	epoch       int64
 	lastLSN     uint64
@@ -204,13 +205,22 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 
 // PublishNewLayer publishes meta to the durable timeline layer manifest before making it visible in t.layers.
 func (t *Timeline) PublishNewLayer(ctx context.Context, meta LayerMeta) error {
+	return t.PublishNewLayers(ctx, []LayerMeta{meta})
+}
+
+// PublishNewLayers publishes a batch of already-uploaded layers in a single atomic manifest update,
+// preserving manifest durability ordering while amortizing manifest PutObject overhead.
+func (t *Timeline) PublishNewLayers(ctx context.Context, metas []LayerMeta) error {
+	if len(metas) == 0 {
+		return nil
+	}
 	t.manifestMu.Lock()
 	defer t.manifestMu.Unlock()
 
 	t.mu.RLock()
-	next := make([]LayerMeta, len(t.layers)+1)
+	next := make([]LayerMeta, len(t.layers)+len(metas))
 	copy(next, t.layers)
-	next[len(t.layers)] = meta
+	copy(next[len(t.layers):], metas)
 	seq := t.layerSeq
 	t.mu.RUnlock()
 
@@ -219,7 +229,9 @@ func (t *Timeline) PublishNewLayer(ctx context.Context, meta LayerMeta) error {
 			return err
 		}
 	}
-	t.AddLayer(meta)
+	for _, meta := range metas {
+		t.AddLayer(meta)
+	}
 	return nil
 }
 
@@ -288,7 +300,6 @@ func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byt
 	collected = append(collected, inMemDeltas...)
 
 	// Walk layers from newest to oldest; stop once we hit an Image layer or FPI.
-	var basePage []byte
 	foundBase := false
 	for i := len(layersCopy) - 1; i >= 0; i-- {
 		lm := layersCopy[i]
@@ -309,7 +320,6 @@ func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byt
 		// Check if the newest delta in this layer is a full page image.
 		last := deltas[len(deltas)-1]
 		if (last.Flags&EntryFlagPageImage) != 0 && len(last.PageImage) == PageSize {
-			basePage = last.PageImage
 			foundBase = true
 			break
 		}
@@ -321,7 +331,10 @@ func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byt
 	if len(collected) == 0 && !foundBase {
 		return nil, ErrNotFound
 	}
+	return reconstructPage(ctx, t.redoer, key, collected)
+}
 
+func prepareCollectedForRedo(collected []WALDelta) ([]byte, []WALDelta) {
 	// Sort all collected deltas by LSN ascending and keep only from last FPI onward.
 	sort.SliceStable(collected, func(i, j int) bool {
 		if collected[i].LSN != collected[j].LSN {
@@ -332,6 +345,7 @@ func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byt
 		jImg := (collected[j].Flags & EntryFlagPageImage) != 0
 		return !iImg && jImg
 	})
+	var basePage []byte
 	startIdx := 0
 	for i := len(collected) - 1; i >= 0; i-- {
 		if (collected[i].Flags&EntryFlagPageImage) != 0 && len(collected[i].PageImage) == PageSize {
@@ -340,26 +354,137 @@ func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byt
 			break
 		}
 	}
-	if startIdx >= len(collected) && len(basePage) == PageSize {
-		return append([]byte(nil), basePage...), nil
-	}
-	return t.redoer.Redo(ctx, key, basePage, collected[startIdx:])
+	return basePage, collected[startIdx:]
 }
 
-// GetPageBatch fetches up to nblocks consecutive blocks starting at startBlock.
+func reconstructPage(ctx context.Context, redoer WALRedoer, key Key, collected []WALDelta) ([]byte, error) {
+	basePage, tail := prepareCollectedForRedo(collected)
+	if len(tail) == 0 && len(basePage) == PageSize {
+		return append([]byte(nil), basePage...), nil
+	}
+	return redoer.Redo(ctx, key, basePage, tail)
+}
+
+// GetPageBatch fetches up to nblocks consecutive blocks starting at startBlock
+// using batched layer lookups and coalesced range reads.
 func (t *Timeline) GetPageBatch(ctx context.Context, spcOID, dbOID, relNumber uint32, forkNum uint8, startBlock, nblocks uint32, lsn uint64) ([]byte, uint32, error) {
-	out := make([]byte, 0, int(nblocks)*PageSize)
-	var count uint32
-	for i := uint32(0); i < nblocks; i++ {
-		key := RelBlockKey(spcOID, dbOID, relNumber, forkNum, startBlock+i)
-		page, err := t.GetPageAtLSN(ctx, key, lsn)
-		if err == ErrNotFound {
-			if i == 0 {
-				return nil, 0, ErrNotFound
+	if nblocks == 0 {
+		return nil, 0, nil
+	}
+	n := int(nblocks)
+	keys := make([]Key, n)
+	collected := make([][]WALDelta, n)
+	resolved := make([]bool, n)
+	pendingCount := n
+
+	t.mu.RLock()
+	for i := 0; i < n; i++ {
+		keys[i] = RelBlockKey(spcOID, dbOID, relNumber, forkNum, startBlock+uint32(i))
+		deltas := t.inMem.Lookup(keys[i], lsn)
+		if len(deltas) > 0 {
+			collected[i] = deltas
+			last := deltas[len(deltas)-1]
+			if (last.Flags&EntryFlagPageImage) != 0 && len(last.PageImage) == PageSize {
+				resolved[i] = true
+				pendingCount--
 			}
-			break
 		}
+	}
+	layersCopy := append([]LayerMeta(nil), t.layers...)
+	t.mu.RUnlock()
+
+	if pendingCount > 0 && t.store != nil {
+		queryKeys := make([]Key, 0, pendingCount)
+		queryIdx := make([]int, 0, pendingCount)
+
+		for li := len(layersCopy) - 1; li >= 0 && pendingCount > 0; li-- {
+			lm := layersCopy[li]
+			if lsn != 0 && lm.StartLSN > lsn {
+				continue
+			}
+			hasKeyRange := lm.EndKey != (Key{})
+			queryKeys = queryKeys[:0]
+			queryIdx = queryIdx[:0]
+			for i := 0; i < n; i++ {
+				if resolved[i] {
+					continue
+				}
+				if hasKeyRange && (keys[i].Compare(lm.StartKey) < 0 || keys[i].Compare(lm.EndKey) > 0) {
+					continue
+				}
+				queryKeys = append(queryKeys, keys[i])
+				queryIdx = append(queryIdx, i)
+			}
+			if len(queryKeys) == 0 {
+				continue
+			}
+			batchDeltas, err := t.store.LookupKeysInLayer(ctx, lm, queryKeys, lsn)
+			if err != nil {
+				return nil, 0, err
+			}
+			for qi, deltas := range batchDeltas {
+				if len(deltas) == 0 {
+					continue
+				}
+				bi := queryIdx[qi]
+				collected[bi] = append(collected[bi], deltas...)
+				last := deltas[len(deltas)-1]
+				if ((last.Flags&EntryFlagPageImage) != 0 && len(last.PageImage) == PageSize) || lm.Kind == LayerKindImage {
+					resolved[bi] = true
+					pendingCount--
+				}
+			}
+		}
+	}
+
+	out := make([]byte, 0, n*PageSize)
+	var count uint32
+
+	// Determine the contiguous prefix of blocks that have at least one delta.
+	validN := 0
+	for validN < n && len(collected[validN]) > 0 {
+		validN++
+	}
+	if validN == 0 {
+		return nil, 0, ErrNotFound
+	}
+
+	if batchRedoer, ok := t.redoer.(BatchWALRedoer); ok && validN > 1 {
+		reqs := make([]WALRedoRequest, validN)
+		for i := 0; i < validN; i++ {
+			base, deltas := prepareCollectedForRedo(collected[i])
+			reqs[i] = WALRedoRequest{
+				Key:      keys[i],
+				BasePage: base,
+				Deltas:   deltas,
+			}
+		}
+		pages, errs := batchRedoer.RedoBatch(ctx, reqs)
+		for i := 0; i < validN; i++ {
+			if errs[i] != nil {
+				if errs[i] == ErrNotFound {
+					if i == 0 {
+						return nil, 0, ErrNotFound
+					}
+					break
+				}
+				return nil, 0, errs[i]
+			}
+			out = append(out, pages[i]...)
+			count++
+		}
+		return out, count, nil
+	}
+
+	for i := 0; i < validN; i++ {
+		page, err := reconstructPage(ctx, t.redoer, keys[i], collected[i])
 		if err != nil {
+			if err == ErrNotFound {
+				if i == 0 {
+					return nil, 0, ErrNotFound
+				}
+				break
+			}
 			return nil, 0, err
 		}
 		out = append(out, page...)

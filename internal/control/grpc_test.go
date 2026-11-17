@@ -268,3 +268,66 @@ func BenchmarkGRPCProtoMarshalUnmarshalRoute(b *testing.B) {
 		}
 	}
 }
+
+type mockGatewayAdminServer struct {
+	pb.UnimplementedGatewayAdminServer
+	token     string
+	vetoNext  bool
+	lastReq   *pb.DrainTenantRequest
+}
+
+func (m *mockGatewayAdminServer) DrainTenant(ctx context.Context, req *pb.DrainTenantRequest) (*pb.StatusResponse, error) {
+	if m.token != "" {
+		md, ok := metadata.FromIncomingContext(ctx)
+		if !ok || len(md.Get("x-internal-token")) == 0 || md.Get("x-internal-token")[0] != m.token {
+			return nil, status.Error(codes.PermissionDenied, "unauthorized")
+		}
+	}
+	m.lastReq = req
+	if m.vetoNext {
+		return nil, status.Error(codes.FailedPrecondition, "drain vetoed: 1 active tx")
+	}
+	return &pb.StatusResponse{Status: "drained", TenantId: req.GetTenantId()}, nil
+}
+
+func TestNewGRPCPoolDrainFn(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	mock := &mockGatewayAdminServer{token: "gw-secret"}
+	srv := grpc.NewServer()
+	pb.RegisterGatewayAdminServer(srv, mock)
+	go func() { _ = srv.Serve(lis) }()
+	defer srv.Stop()
+
+	drainFn, closeFn, err := NewGRPCPoolDrainFn(lis.Addr().String(), "gw-secret")
+	if err != nil {
+		t.Fatalf("NewGRPCPoolDrainFn: %v", err)
+	}
+	defer func() { _ = closeFn() }()
+
+	if err := drainFn("tenant_drain_1", 1500*time.Millisecond); err != nil {
+		t.Fatalf("expected drain success, got: %v", err)
+	}
+	if mock.lastReq == nil || mock.lastReq.GetTenantId() != "tenant_drain_1" || mock.lastReq.GetTimeoutMs() != 1500 {
+		t.Fatalf("unexpected DrainTenantRequest: %+v", mock.lastReq)
+	}
+
+	mock.vetoNext = true
+	err = drainFn("tenant_drain_1", 500*time.Millisecond)
+	if !errors.Is(err, cell.ErrDrainVetoed) {
+		t.Fatalf("expected ErrDrainVetoed on FailedPrecondition, got: %v", err)
+	}
+
+	// Wrong token should fail with non-ErrDrainVetoed error.
+	badDrainFn, badCloseFn, err := NewGRPCPoolDrainFn(lis.Addr().String(), "wrong")
+	if err != nil {
+		t.Fatalf("NewGRPCPoolDrainFn bad token: %v", err)
+	}
+	defer func() { _ = badCloseFn() }()
+	mock.vetoNext = false
+	if err := badDrainFn("tenant_drain_1", 500*time.Millisecond); err == nil || errors.Is(err, cell.ErrDrainVetoed) {
+		t.Fatalf("expected permission denied error, got: %v", err)
+	}
+}

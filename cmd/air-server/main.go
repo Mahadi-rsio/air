@@ -106,7 +106,16 @@ func main() {
 	log.Printf("[air-server] async R2 cold-offload queue started (workers=2, evict_on_suspend=%v)", cfg.EvictOnSuspend)
 
 	var poolDrainFn func(tenantID string, timeout time.Duration) error
-	if cfg.GatewayAdminURL != "" {
+	var closePoolDrain func() error
+	if cfg.GatewayAdminGRPCAddr != "" {
+		var drainErr error
+		poolDrainFn, closePoolDrain, drainErr = control.NewGRPCPoolDrainFn(cfg.GatewayAdminGRPCAddr, cfg.InternalToken)
+		if drainErr != nil {
+			log.Fatalf("init gateway admin gRPC drain client: %v", drainErr)
+		}
+		defer func() { _ = closePoolDrain() }()
+		log.Printf("[air-server] cooperative gateway gRPC drain enabled (gateway_admin_grpc=%s)", cfg.GatewayAdminGRPCAddr)
+	} else if cfg.GatewayAdminURL != "" {
 		poolDrainFn = control.NewHTTPPoolDrainFn(cfg.GatewayAdminURL, cfg.InternalToken)
 		log.Printf("[air-server] cooperative gateway drain enabled (gateway_admin_url=%s)", cfg.GatewayAdminURL)
 	}

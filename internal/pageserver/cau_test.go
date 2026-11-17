@@ -47,11 +47,12 @@ type mockR2Server struct {
 	multiparts map[string]*mockMultipart
 	nextUpload atomic.Int64
 
-	headCount     atomic.Int64
-	putCount      atomic.Int64
-	getCount      atomic.Int64
-	bytesUploaded atomic.Int64
-	abortCount    atomic.Int64
+	headCount       atomic.Int64
+	putCount        atomic.Int64
+	getCount        atomic.Int64
+	bytesUploaded   atomic.Int64
+	bytesDownloaded atomic.Int64
+	abortCount      atomic.Int64
 
 	// Fault injection hooks
 	failPut        atomic.Bool
@@ -169,12 +170,14 @@ func (m *mockR2Server) handle(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(obj.data)))
 			w.Header().Set("Content-Length", strconv.Itoa(len(slice)))
 			w.WriteHeader(http.StatusPartialContent)
+			m.bytesDownloaded.Add(int64(len(slice)))
 			_, _ = w.Write(slice)
 			return
 		}
 		w.Header().Set("ETag", obj.etag)
 		w.Header().Set("Content-Length", strconv.Itoa(len(obj.data)))
 		w.WriteHeader(http.StatusOK)
+		m.bytesDownloaded.Add(int64(len(obj.data)))
 		_, _ = w.Write(obj.data)
 
 	case http.MethodPost:
@@ -475,9 +478,13 @@ func TestCAU_MultipartAndAbortOnFailure(t *testing.T) {
 	store := NewLayerStore(tmp, s3c, "test-bucket", nil, nil)
 	store.SetMultipartConfig(2048, 1024) // force multipart on ~8 KiB layer
 
+	incompressible := make([]byte, PageSize)
+	for i := range incompressible {
+		incompressible[i] = byte((i*73 + i*i*13 + 0x77) ^ (i >> 3))
+	}
 	recs := []LayerRecord{{
 		Key:   RelBlockKey(1663, 5, 200, 0, 0),
-		Delta: WALDelta{LSN: 50, Flags: EntryFlagPageImage, PageImage: bytes.Repeat([]byte{0x77}, PageSize)},
+		Delta: WALDelta{LSN: 50, Flags: EntryFlagPageImage, PageImage: incompressible},
 	}}
 	meta := LayerMeta{TenantID: "tenant_mp", Epoch: 1, Kind: LayerKindL0, FileName: "l0_000001_0000000000000032_0000000000000033.layer", EndLSN: 51}
 
@@ -612,9 +619,9 @@ func TestCAU_CrashOrderingAndOrphanReuse(t *testing.T) {
 		t.Fatalf("expected 1 remotely available layer, count=%d meta=%+v", tl.LayerCount(), flushed)
 	}
 	// Only the small manifest JSON was uploaded on retry, NOT the layer bytes again.
-	deltaBytes := mock.bytesUploaded.Load() - prevBytes
-	if deltaBytes >= flushed.FileSize {
-		t.Fatalf("expected orphan layer reuse without re-uploading layer bytes (delta=%d fileSize=%d)", deltaBytes, flushed.FileSize)
+	stats := store.LastUploadMetrics()
+	if !stats.Deduplicated {
+		t.Fatalf("expected orphan layer reuse (Deduplicated=true), got %+v (delta=%d fileSize=%d)", stats, mock.bytesUploaded.Load()-prevBytes, flushed.FileSize)
 	}
 }
 

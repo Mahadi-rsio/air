@@ -579,3 +579,143 @@ var AirDBControl_ServiceDesc = grpc.ServiceDesc{
 	},
 	Metadata: "airdb.proto",
 }
+
+const (
+	GatewayAdmin_DrainTenant_FullMethodName     = "/air.db.v1.GatewayAdmin/DrainTenant"
+	GatewayAdmin_SetTenantLimits_FullMethodName = "/air.db.v1.GatewayAdmin/SetTenantLimits"
+)
+
+// GatewayAdminClient is the client API for GatewayAdmin service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type GatewayAdminClient interface {
+	DrainTenant(ctx context.Context, in *DrainTenantRequest, opts ...grpc.CallOption) (*StatusResponse, error)
+	SetTenantLimits(ctx context.Context, in *SetTenantLimitsRequest, opts ...grpc.CallOption) (*StatusResponse, error)
+}
+
+type gatewayAdminClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewGatewayAdminClient(cc grpc.ClientConnInterface) GatewayAdminClient {
+	return &gatewayAdminClient{cc}
+}
+
+func (c *gatewayAdminClient) DrainTenant(ctx context.Context, in *DrainTenantRequest, opts ...grpc.CallOption) (*StatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StatusResponse)
+	err := c.cc.Invoke(ctx, GatewayAdmin_DrainTenant_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayAdminClient) SetTenantLimits(ctx context.Context, in *SetTenantLimitsRequest, opts ...grpc.CallOption) (*StatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StatusResponse)
+	err := c.cc.Invoke(ctx, GatewayAdmin_SetTenantLimits_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GatewayAdminServer is the server API for GatewayAdmin service.
+// All implementations must embed UnimplementedGatewayAdminServer
+// for forward compatibility.
+type GatewayAdminServer interface {
+	DrainTenant(context.Context, *DrainTenantRequest) (*StatusResponse, error)
+	SetTenantLimits(context.Context, *SetTenantLimitsRequest) (*StatusResponse, error)
+	mustEmbedUnimplementedGatewayAdminServer()
+}
+
+// UnimplementedGatewayAdminServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedGatewayAdminServer struct{}
+
+func (UnimplementedGatewayAdminServer) DrainTenant(context.Context, *DrainTenantRequest) (*StatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DrainTenant not implemented")
+}
+func (UnimplementedGatewayAdminServer) SetTenantLimits(context.Context, *SetTenantLimitsRequest) (*StatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetTenantLimits not implemented")
+}
+func (UnimplementedGatewayAdminServer) mustEmbedUnimplementedGatewayAdminServer() {}
+func (UnimplementedGatewayAdminServer) testEmbeddedByValue()                      {}
+
+// UnsafeGatewayAdminServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to GatewayAdminServer will
+// result in compilation errors.
+type UnsafeGatewayAdminServer interface {
+	mustEmbedUnimplementedGatewayAdminServer()
+}
+
+func RegisterGatewayAdminServer(s grpc.ServiceRegistrar, srv GatewayAdminServer) {
+	// If the following call panics, it indicates UnimplementedGatewayAdminServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&GatewayAdmin_ServiceDesc, srv)
+}
+
+func _GatewayAdmin_DrainTenant_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DrainTenantRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayAdminServer).DrainTenant(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayAdmin_DrainTenant_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayAdminServer).DrainTenant(ctx, req.(*DrainTenantRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayAdmin_SetTenantLimits_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetTenantLimitsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayAdminServer).SetTenantLimits(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayAdmin_SetTenantLimits_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayAdminServer).SetTenantLimits(ctx, req.(*SetTenantLimitsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// GatewayAdmin_ServiceDesc is the grpc.ServiceDesc for GatewayAdmin service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var GatewayAdmin_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "air.db.v1.GatewayAdmin",
+	HandlerType: (*GatewayAdminServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "DrainTenant",
+			Handler:    _GatewayAdmin_DrainTenant_Handler,
+		},
+		{
+			MethodName: "SetTenantLimits",
+			Handler:    _GatewayAdmin_SetTenantLimits_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "airdb.proto",
+}

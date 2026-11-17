@@ -582,6 +582,109 @@ AirDBControl::Service::~Service() {
 }
 
 
+static const char* GatewayAdmin_method_names[] = {
+  "/air.db.v1.GatewayAdmin/DrainTenant",
+  "/air.db.v1.GatewayAdmin/SetTenantLimits",
+};
+
+std::unique_ptr< GatewayAdmin::Stub> GatewayAdmin::NewStub(const std::shared_ptr< ::grpc::ChannelInterface>& channel, const ::grpc::StubOptions& options) {
+  (void)options;
+  std::unique_ptr< GatewayAdmin::Stub> stub(new GatewayAdmin::Stub(channel, options));
+  return stub;
+}
+
+GatewayAdmin::Stub::Stub(const std::shared_ptr< ::grpc::ChannelInterface>& channel, const ::grpc::StubOptions& options)
+  : channel_(channel), rpcmethod_DrainTenant_(GatewayAdmin_method_names[0], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_SetTenantLimits_(GatewayAdmin_method_names[1], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  {}
+
+::grpc::Status GatewayAdmin::Stub::DrainTenant(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest& request, ::air::db::v1::StatusResponse* response) {
+  return ::grpc::internal::BlockingUnaryCall< ::air::db::v1::DrainTenantRequest, ::air::db::v1::StatusResponse, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(channel_.get(), rpcmethod_DrainTenant_, context, request, response);
+}
+
+void GatewayAdmin::Stub::async::DrainTenant(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest* request, ::air::db::v1::StatusResponse* response, std::function<void(::grpc::Status)> f) {
+  ::grpc::internal::CallbackUnaryCall< ::air::db::v1::DrainTenantRequest, ::air::db::v1::StatusResponse, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(stub_->channel_.get(), stub_->rpcmethod_DrainTenant_, context, request, response, std::move(f));
+}
+
+void GatewayAdmin::Stub::async::DrainTenant(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest* request, ::air::db::v1::StatusResponse* response, ::grpc::ClientUnaryReactor* reactor) {
+  ::grpc::internal::ClientCallbackUnaryFactory::Create< ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(stub_->channel_.get(), stub_->rpcmethod_DrainTenant_, context, request, response, reactor);
+}
+
+::grpc::ClientAsyncResponseReader< ::air::db::v1::StatusResponse>* GatewayAdmin::Stub::PrepareAsyncDrainTenantRaw(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest& request, ::grpc::CompletionQueue* cq) {
+  return ::grpc::internal::ClientAsyncResponseReaderHelper::Create< ::air::db::v1::StatusResponse, ::air::db::v1::DrainTenantRequest, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(channel_.get(), cq, rpcmethod_DrainTenant_, context, request);
+}
+
+::grpc::ClientAsyncResponseReader< ::air::db::v1::StatusResponse>* GatewayAdmin::Stub::AsyncDrainTenantRaw(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest& request, ::grpc::CompletionQueue* cq) {
+  auto* result =
+    this->PrepareAsyncDrainTenantRaw(context, request, cq);
+  result->StartCall();
+  return result;
+}
+
+::grpc::Status GatewayAdmin::Stub::SetTenantLimits(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest& request, ::air::db::v1::StatusResponse* response) {
+  return ::grpc::internal::BlockingUnaryCall< ::air::db::v1::SetTenantLimitsRequest, ::air::db::v1::StatusResponse, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(channel_.get(), rpcmethod_SetTenantLimits_, context, request, response);
+}
+
+void GatewayAdmin::Stub::async::SetTenantLimits(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest* request, ::air::db::v1::StatusResponse* response, std::function<void(::grpc::Status)> f) {
+  ::grpc::internal::CallbackUnaryCall< ::air::db::v1::SetTenantLimitsRequest, ::air::db::v1::StatusResponse, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(stub_->channel_.get(), stub_->rpcmethod_SetTenantLimits_, context, request, response, std::move(f));
+}
+
+void GatewayAdmin::Stub::async::SetTenantLimits(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest* request, ::air::db::v1::StatusResponse* response, ::grpc::ClientUnaryReactor* reactor) {
+  ::grpc::internal::ClientCallbackUnaryFactory::Create< ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(stub_->channel_.get(), stub_->rpcmethod_SetTenantLimits_, context, request, response, reactor);
+}
+
+::grpc::ClientAsyncResponseReader< ::air::db::v1::StatusResponse>* GatewayAdmin::Stub::PrepareAsyncSetTenantLimitsRaw(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest& request, ::grpc::CompletionQueue* cq) {
+  return ::grpc::internal::ClientAsyncResponseReaderHelper::Create< ::air::db::v1::StatusResponse, ::air::db::v1::SetTenantLimitsRequest, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(channel_.get(), cq, rpcmethod_SetTenantLimits_, context, request);
+}
+
+::grpc::ClientAsyncResponseReader< ::air::db::v1::StatusResponse>* GatewayAdmin::Stub::AsyncSetTenantLimitsRaw(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest& request, ::grpc::CompletionQueue* cq) {
+  auto* result =
+    this->PrepareAsyncSetTenantLimitsRaw(context, request, cq);
+  result->StartCall();
+  return result;
+}
+
+GatewayAdmin::Service::Service() {
+  AddMethod(new ::grpc::internal::RpcServiceMethod(
+      GatewayAdmin_method_names[0],
+      ::grpc::internal::RpcMethod::NORMAL_RPC,
+      new ::grpc::internal::RpcMethodHandler< GatewayAdmin::Service, ::air::db::v1::DrainTenantRequest, ::air::db::v1::StatusResponse, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
+          [](GatewayAdmin::Service* service,
+             ::grpc::ServerContext* ctx,
+             const ::air::db::v1::DrainTenantRequest* req,
+             ::air::db::v1::StatusResponse* resp) {
+               return service->DrainTenant(ctx, req, resp);
+             }, this)));
+  AddMethod(new ::grpc::internal::RpcServiceMethod(
+      GatewayAdmin_method_names[1],
+      ::grpc::internal::RpcMethod::NORMAL_RPC,
+      new ::grpc::internal::RpcMethodHandler< GatewayAdmin::Service, ::air::db::v1::SetTenantLimitsRequest, ::air::db::v1::StatusResponse, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
+          [](GatewayAdmin::Service* service,
+             ::grpc::ServerContext* ctx,
+             const ::air::db::v1::SetTenantLimitsRequest* req,
+             ::air::db::v1::StatusResponse* resp) {
+               return service->SetTenantLimits(ctx, req, resp);
+             }, this)));
+}
+
+GatewayAdmin::Service::~Service() {
+}
+
+::grpc::Status GatewayAdmin::Service::DrainTenant(::grpc::ServerContext* context, const ::air::db::v1::DrainTenantRequest* request, ::air::db::v1::StatusResponse* response) {
+  (void) context;
+  (void) request;
+  (void) response;
+  return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+}
+
+::grpc::Status GatewayAdmin::Service::SetTenantLimits(::grpc::ServerContext* context, const ::air::db::v1::SetTenantLimitsRequest* request, ::air::db::v1::StatusResponse* response) {
+  (void) context;
+  (void) request;
+  (void) response;
+  return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+}
+
+
 }  // namespace air
 }  // namespace db
 }  // namespace v1

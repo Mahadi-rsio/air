@@ -97,3 +97,19 @@ message TenantChangeEvent {
 message BatchTouchActivityRequest {
   repeated string tenant_ids = 1;
 }
+
+service GatewayAdmin {
+  rpc DrainTenant(DrainTenantRequest) returns (StatusResponse);
+  rpc SetTenantLimits(SetTenantLimitsRequest) returns (StatusResponse);
+}
+
+message DrainTenantRequest {
+  string tenant_id = 1;
+  int32 timeout_ms = 2;
+}
+
+message SetTenantLimitsRequest {
+  string tenant_id = 1;
+  int32 max_client_conns = 2;
+  int32 max_backends = 3;
+}

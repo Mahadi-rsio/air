@@ -20,8 +20,9 @@ type Config struct {
 	HTTPAddr           string
 	GRPCAddr           string
 	GatewayAddr        string
-	GatewayAdminAddr   string
-	GatewayAdminURL    string
+	GatewayAdminAddr     string
+	GatewayAdminURL      string
+	GatewayAdminGRPCAddr string
 	ControlPlaneURL    string
 	InternalToken      string
 	BackendHost        string
@@ -81,6 +82,7 @@ func Load(args []string) (Config, error) {
 	cfg.GatewayAddr = envOr("AIR_GATEWAY_ADDR", cfg.GatewayAddr)
 	cfg.GatewayAdminAddr = envOr("AIR_GATEWAY_ADMIN_ADDR", cfg.GatewayAdminAddr)
 	cfg.GatewayAdminURL = envOr("AIR_GATEWAY_ADMIN_URL", cfg.GatewayAdminURL)
+	cfg.GatewayAdminGRPCAddr = envOr("AIR_GATEWAY_ADMIN_GRPC_ADDR", cfg.GatewayAdminGRPCAddr)
 	cfg.ControlPlaneURL = envOr("AIR_CONTROL_PLANE_URL", cfg.ControlPlaneURL)
 	cfg.InternalToken = envOr("AIR_INTERNAL_TOKEN", cfg.InternalToken)
 	cfg.BackendHost = envOr("AIR_BACKEND_HOST", cfg.BackendHost)
@@ -142,6 +144,7 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&cfg.GatewayAddr, "gateway-addr", cfg.GatewayAddr, "PostgreSQL wire-protocol gateway listen address")
 	fs.StringVar(&cfg.GatewayAdminAddr, "gateway-admin-addr", cfg.GatewayAdminAddr, "Gateway internal admin HTTP listen address (healthz and drain)")
 	fs.StringVar(&cfg.GatewayAdminURL, "gateway-admin-url", cfg.GatewayAdminURL, "Optional Gateway admin HTTP base URL used by air-server for cooperative pool draining")
+	fs.StringVar(&cfg.GatewayAdminGRPCAddr, "gateway-admin-grpc-addr", cfg.GatewayAdminGRPCAddr, "Optional Gateway admin gRPC address used by air-server for cooperative pool draining")
 	fs.StringVar(&cfg.ControlPlaneURL, "control-plane-url", cfg.ControlPlaneURL, "Control Plane HTTP base URL used by air-gateway")
 	fs.StringVar(&cfg.InternalToken, "internal-token", cfg.InternalToken, "Shared secret token for internal air-gateway <-> air-server HTTP APIs")
 	fs.StringVar(&cfg.BackendHost, "backend-host", cfg.BackendHost, "Backend PostgreSQL host returned/used for remote gateway routing (defaults to 127.0.0.1)")

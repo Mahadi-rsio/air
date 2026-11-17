@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,9 +73,13 @@ func (p *Pageserver) Start(ctx context.Context) error {
 	return p.unixSrv.Start(ctx)
 }
 
-// Close shuts down the Unix socket server.
+// Close shuts down the Unix socket server and WAL redo worker pool.
 func (p *Pageserver) Close() error {
-	return p.unixSrv.Close()
+	err := p.unixSrv.Close()
+	if c, ok := p.redoer.(io.Closer); ok {
+		_ = c.Close()
+	}
+	return err
 }
 
 // EnsureTenant returns an existing Timeline for tenantID or creates one at epoch.
@@ -164,13 +169,23 @@ func (p *Pageserver) PutPageBatch(ctx context.Context, tenantID string, spcOID, 
 	return tl.PutPageBatch(ctx, spcOID, dbOID, relNumber, forkNum, startBlock, nblocks, lsn, pages)
 }
 
-// BootstrapTenantFromPGData imports an existing PGDATA base/ and global/ directory into an Image layer at initLSN.
+// BootstrapTenantFromPGData imports an existing PGDATA base/ and global/ directory into an Image layer at initLSN
+// using bounded-memory streaming file traversal and V2 encoding.
 func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID string, epoch int64, pgDataDir string, initLSN uint64) (*LayerMeta, error) {
 	if initLSN == 0 {
 		initLSN = 1
 	}
 	tl := p.EnsureTenant(tenantID, epoch)
-	var recs []LayerRecord
+
+	type pgDataFile struct {
+		path    string
+		spcOID  uint32
+		dbOID   uint32
+		relNum  uint32
+		forkNum uint8
+		segNum  uint32
+	}
+	var files []pgDataFile
 
 	// Import global/ (tablespace 1664, db 0) and base/<dbOid>/ (tablespace 1663).
 	dirs := []struct {
@@ -212,53 +227,14 @@ func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID str
 			if !ok {
 				return nil
 			}
-			f, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-
-			const segBlocks = 131072
-			var blkIdx uint32
-			buf := make([]byte, PageSize)
-			for {
-				n, rerr := io.ReadFull(f, buf)
-				if n == PageSize {
-					absBlk := segNum*segBlocks + blkIdx
-					key := RelBlockKey(d.spcOID, dbOID, relNum, forkNum, absBlk)
-					page := make([]byte, PageSize)
-					copy(page, buf)
-					recs = append(recs, LayerRecord{
-						Key: key,
-						Delta: WALDelta{
-							LSN:       initLSN,
-							Flags:     EntryFlagPageImage,
-							PageImage: page,
-						},
-					})
-					blkIdx++
-				}
-				if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
-					break
-				}
-				if rerr != nil {
-					return rerr
-				}
-			}
-			if segNum == 0 {
-				sizeKey := RelSizeKey(d.spcOID, dbOID, relNum, forkNum)
-				tl.mu.Lock()
-				tl.relSizes[sizeKey] = blkIdx
-				tl.mu.Unlock()
-				recs = append(recs, LayerRecord{
-					Key: sizeKey,
-					Delta: WALDelta{
-						LSN:     initLSN,
-						Flags:   EntryFlagRelSize,
-						RelSize: blkIdx,
-					},
-				})
-			}
+			files = append(files, pgDataFile{
+				path:    path,
+				spcOID:  d.spcOID,
+				dbOID:   dbOID,
+				relNum:  relNum,
+				forkNum: forkNum,
+				segNum:  segNum,
+			})
 			return nil
 		})
 		if err != nil {
@@ -266,9 +242,27 @@ func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID str
 		}
 	}
 
-	if len(recs) == 0 {
+	if len(files) == 0 {
 		return nil, nil
 	}
+
+	// Sort in exact RelBlockKey order: (SpcOID, DbOID, RelNumber, ForkNum, segNum).
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].spcOID != files[j].spcOID {
+			return files[i].spcOID < files[j].spcOID
+		}
+		if files[i].dbOID != files[j].dbOID {
+			return files[i].dbOID < files[j].dbOID
+		}
+		if files[i].relNum != files[j].relNum {
+			return files[i].relNum < files[j].relNum
+		}
+		if files[i].forkNum != files[j].forkNum {
+			return files[i].forkNum < files[j].forkNum
+		}
+		return files[i].segNum < files[j].segNum
+	})
+
 	fileName := fmt.Sprintf("img_bootstrap_%016x.layer", initLSN)
 	logicalKey := fmt.Sprintf("tenants/%s/timeline_%d/layers/%s", tenantID, epoch, fileName)
 	meta := LayerMeta{
@@ -281,13 +275,93 @@ func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID str
 		StartLSN: initLSN,
 		EndLSN:   initLSN,
 	}
-	written, err := p.store.WriteLayer(ctx, meta, recs)
+
+	var wroteAny bool
+	relSizes := make(map[Key]uint32)
+	var sizeOrder []Key
+	written, err := p.store.writeLayerFromStream(ctx, meta, func(sw *v2StreamWriter) error {
+		const segBlocks = 131072
+		buf := make([]byte, PageSize)
+
+		for _, rf := range files {
+			f, err := os.Open(rf.path)
+			if err != nil {
+				return err
+			}
+			var blkIdx uint32
+			for {
+				n, rerr := io.ReadFull(f, buf)
+				if n == PageSize {
+					absBlk := rf.segNum*segBlocks + blkIdx
+					key := RelBlockKey(rf.spcOID, rf.dbOID, rf.relNum, rf.forkNum, absBlk)
+					page := make([]byte, PageSize)
+					copy(page, buf)
+					if err := sw.Add(LayerRecord{
+						Key: key,
+						Delta: WALDelta{
+							LSN:       initLSN,
+							Flags:     EntryFlagPageImage,
+							PageImage: page,
+						},
+					}); err != nil {
+						_ = f.Close()
+						return err
+					}
+					wroteAny = true
+					blkIdx++
+				}
+				if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
+					break
+				}
+				if rerr != nil {
+					_ = f.Close()
+					return rerr
+				}
+			}
+			_ = f.Close()
+
+			sizeKey := RelSizeKey(rf.spcOID, rf.dbOID, rf.relNum, rf.forkNum)
+			totalBlocks := rf.segNum*segBlocks + blkIdx
+			if _, seen := relSizes[sizeKey]; !seen {
+				sizeOrder = append(sizeOrder, sizeKey)
+				relSizes[sizeKey] = totalBlocks
+			} else if totalBlocks > relSizes[sizeKey] {
+				relSizes[sizeKey] = totalBlocks
+			}
+			if blkIdx > 0 {
+				wroteAny = true
+			}
+		}
+
+		// KeyKindRelSize (2) > KeyKindRelBlock (1), and files were already sorted by (SpcOID, DbOID, RelNumber, ForkNum).
+		for _, sizeKey := range sizeOrder {
+			if err := sw.Add(LayerRecord{
+				Key: sizeKey,
+				Delta: WALDelta{
+					LSN:     initLSN,
+					Flags:   EntryFlagRelSize,
+					RelSize: relSizes[sizeKey],
+				},
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
+	}
+	if !wroteAny {
+		return nil, nil
 	}
 	if err := tl.PublishNewLayer(ctx, written); err != nil {
 		return nil, err
 	}
+	tl.mu.Lock()
+	for sizeKey, nb := range relSizes {
+		tl.relSizes[sizeKey] = nb
+	}
+	tl.mu.Unlock()
 	return &written, nil
 }
 

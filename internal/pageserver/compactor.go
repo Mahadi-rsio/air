@@ -1,29 +1,32 @@
 package pageserver
 
 import (
+	"container/heap"
 	"context"
 	"fmt"
-	"sort"
+	"os"
+	"path/filepath"
 )
 
 const (
 	DefaultL0CompactionThreshold = 4
+	compactV1BatchEntries        = 64
 )
 
-// CompactIfNeeded compacts L0 delta layers into an L1 layer when >= threshold L0s exist,
-// and optionally materializes a base Image layer at the latest LSN.
+// CompactIfNeeded compacts L0 delta layers into an L1 (or Image) layer using a bounded-memory
+// streaming K-way merge and streaming V2 output encoding.
 func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materializeImage bool) (*LayerMeta, error) {
+	t.compactMu.Lock()
+	defer t.compactMu.Unlock()
+
 	if threshold <= 0 {
 		threshold = DefaultL0CompactionThreshold
 	}
 	t.mu.RLock()
 	var l0s []LayerMeta
-	var keep []LayerMeta
 	for _, lm := range t.layers {
 		if lm.Kind == LayerKindL0 {
 			l0s = append(l0s, lm)
-		} else {
-			keep = append(keep, lm)
 		}
 	}
 	t.mu.RUnlock()
@@ -32,8 +35,8 @@ func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materiali
 		return nil, nil
 	}
 
-	var merged []LayerRecord
 	var minLSN, maxLSN uint64
+	iters := make([]*layerRecordIterator, 0, len(l0s))
 	for _, lm := range l0s {
 		if minLSN == 0 || lm.StartLSN < minLSN {
 			minLSN = lm.StartLSN
@@ -41,19 +44,17 @@ func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materiali
 		if lm.EndLSN > maxLSN {
 			maxLSN = lm.EndLSN
 		}
-		recs, err := t.readAllRecords(ctx, lm)
+		it, err := newLayerRecordIterator(ctx, t.store, lm)
 		if err != nil {
 			return nil, err
 		}
-		merged = append(merged, recs...)
+		iters = append(iters, it)
 	}
 
-	sort.Slice(merged, func(i, j int) bool {
-		if c := merged[i].Key.Compare(merged[j].Key); c != 0 {
-			return c < 0
-		}
-		return merged[i].Delta.LSN < merged[j].Delta.LSN
-	})
+	merger, err := newKWayLayerMerger(ctx, iters)
+	if err != nil {
+		return nil, err
+	}
 
 	t.mu.Lock()
 	t.layerSeq++
@@ -64,31 +65,81 @@ func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materiali
 
 	kind := LayerKindL1
 	prefix := "l1"
-	outRecs := merged
+	var atLSN uint64
 	if materializeImage {
 		kind = LayerKindImage
 		prefix = "img"
-		atLSN := maxLSN
+		atLSN = maxLSN
 		if atLSN > minLSN {
 			atLSN = maxLSN - 1
 		}
-		outRecs = t.materializeLatest(ctx, merged, atLSN)
 	}
 
 	fileName := fmt.Sprintf("%s_%06d_%016x_%016x.layer", prefix, seq, minLSN, maxLSN)
 	logicalKey := fmt.Sprintf("tenants/%s/timeline_%d/layers/%s", tenantID, epoch, fileName)
 	meta := LayerMeta{
-		TenantID: tenantID,
-		Epoch:    epoch,
-		Kind:     kind,
-		Seq:      seq,
-		FileName: fileName,
-		R2Key:    logicalKey,
-		AADKey:   logicalKey,
-		StartLSN: minLSN,
-		EndLSN:   maxLSN,
+		TenantID:  tenantID,
+		Epoch:     epoch,
+		Kind:      kind,
+		Seq:       seq,
+		FileName:  fileName,
+		R2Key:     logicalKey,
+		AADKey:    logicalKey,
+		StartLSN:  minLSN,
+		EndLSN:    maxLSN,
+		Encrypted: t.store != nil && t.store.kms != nil,
 	}
-	written, err := t.store.WriteLayer(ctx, meta, outRecs)
+
+	var kms = t.store.kms
+	written, err := t.store.writeLayerFromStream(ctx, meta, func(sw *v2StreamWriter) error {
+		if !materializeImage {
+			for {
+				rec, ok, err := merger.Next(ctx)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return nil
+				}
+				if err := sw.Add(rec); err != nil {
+					return err
+				}
+			}
+		}
+
+		var group []LayerRecord
+		flushGroup := func() error {
+			if len(group) == 0 {
+				return nil
+			}
+			outRecs := t.materializeKeyGroup(ctx, group, atLSN)
+			for _, r := range outRecs {
+				if err := sw.Add(r); err != nil {
+					return err
+				}
+			}
+			group = group[:0]
+			return nil
+		}
+
+		for {
+			rec, ok, err := merger.Next(ctx)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				break
+			}
+			if len(group) > 0 && group[0].Key.Compare(rec.Key) != 0 {
+				if err := flushGroup(); err != nil {
+					return err
+				}
+			}
+			group = append(group, rec)
+		}
+		return flushGroup()
+	})
+	_ = kms
 	if err != nil {
 		return nil, err
 	}
@@ -124,82 +175,325 @@ func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materiali
 	return &written, nil
 }
 
-func (t *Timeline) readAllRecords(ctx context.Context, meta LayerMeta) ([]LayerRecord, error) {
-	footerRaw, err := t.store.ReadRange(ctx, meta, meta.FileSize-int64(LayerFooterSize), int64(LayerFooterSize))
-	if err != nil {
-		return nil, err
-	}
-	footer, err := DecodeLayerFooter(footerRaw)
-	if err != nil {
-		return nil, err
-	}
-	if footer.EntryCount == 0 {
-		return nil, nil
-	}
-	idxRaw, err := t.store.ReadRange(ctx, meta, int64(footer.IndexOffset), int64(footer.IndexLen))
-	if err != nil {
-		return nil, err
-	}
-	entries, err := DecodeLayerIndex(idxRaw, meta, footer.EntryCount, t.store.kms)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]LayerRecord, 0, len(entries))
-	for i, e := range entries {
-		raw, err := t.store.ReadRange(ctx, meta, int64(e.Offset), int64(e.Length))
-		if err != nil {
-			return nil, err
+// writeLayerFromStream streams records produced by feed(sw) directly into a V2 layer file
+// with bounded memory, incremental SHA-256, optional CAU upload, and optional DiskCache population.
+func (s *LayerStore) writeLayerFromStream(ctx context.Context, meta LayerMeta, feed func(sw *v2StreamWriter) error) (LayerMeta, error) {
+	meta.Encrypted = s.kms != nil
+	if meta.Encrypted && meta.AADKey == "" {
+		if meta.R2Key != "" {
+			meta.AADKey = meta.R2Key
+		} else {
+			meta.AADKey = fmt.Sprintf("tenants/%s/timeline_%d/layers/%s", meta.TenantID, meta.Epoch, meta.FileName)
 		}
-		if meta.Encrypted {
-			raw, err = t.store.kms.DecryptObject(meta.TenantID, meta.Epoch, fmt.Sprintf("%s#e%d", meta.aadKey(), i), raw)
+	}
+
+	var localPath string
+	var tmpPath string
+	var cleanupTemp bool
+	var outFile *os.File
+	var err error
+
+	if s.localDir != "" {
+		localPath = filepath.Join(s.localDir, meta.TenantID, meta.FileName)
+		if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+			return meta, err
+		}
+		tmpPath = localPath + ".tmp"
+		outFile, err = os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			return meta, err
+		}
+	} else {
+		outFile, err = os.CreateTemp("", "air-stream-layer-*.layer")
+		if err != nil {
+			return meta, err
+		}
+		localPath = outFile.Name()
+		cleanupTemp = true
+	}
+
+	cleanupOnErr := func() {
+		if outFile != nil {
+			_ = outFile.Close()
+		}
+		if tmpPath != "" {
+			_ = os.Remove(tmpPath)
+		} else if localPath != "" {
+			_ = os.Remove(localPath)
+		}
+	}
+	if cleanupTemp {
+		defer os.Remove(localPath)
+	}
+
+	sw := newV2StreamWriter(outFile, meta.TenantID, meta.Epoch, meta.aadKey(), meta.Kind, meta.EndLSN, s.kms, v2EncodeOptions{})
+	if err := feed(sw); err != nil {
+		cleanupOnErr()
+		return meta, err
+	}
+	res, err := sw.Finish()
+	if err != nil {
+		cleanupOnErr()
+		return meta, err
+	}
+	if err := outFile.Close(); err != nil {
+		cleanupOnErr()
+		return meta, err
+	}
+	outFile = nil
+
+	meta.FileSize = res.FileSize
+	meta.SHA256 = res.SHA256Hex
+	meta.StartKey = res.StartKey
+	meta.EndKey = res.EndKey
+
+	uploadPath := localPath
+	if tmpPath != "" {
+		uploadPath = tmpPath
+	}
+	if s.s3c != nil && s.bucket != "" {
+		meta, err = s.uploadLayerFilePrehashed(ctx, meta, uploadPath, meta.SHA256, meta.FileSize)
+		if err != nil {
+			if tmpPath != "" {
+				_ = os.Remove(tmpPath)
+			}
+			return meta, err
+		}
+	} else if cauKey, kErr := ContentAddressedLayerKey(meta.TenantID, meta.SHA256); kErr == nil {
+		meta.R2Key = cauKey
+	}
+
+	if tmpPath != "" {
+		if err := os.Rename(tmpPath, localPath); err != nil {
+			_ = os.Remove(tmpPath)
+			return meta, err
+		}
+	}
+
+	if s.cache != nil && s.localDir == "" {
+		if raw, rErr := os.ReadFile(localPath); rErr == nil {
+			_ = s.cache.Put(meta.R2Key, raw)
+		}
+	}
+	return meta, nil
+}
+
+func (t *Timeline) materializeKeyGroup(ctx context.Context, group []LayerRecord, atLSN uint64) []LayerRecord {
+	if len(group) == 0 {
+		return nil
+	}
+	k := group[0].Key
+	if k.Kind == KeyKindRelSize {
+		last := group[len(group)-1]
+		last.Delta.LSN = atLSN
+		return []LayerRecord{last}
+	}
+	if k.Kind == KeyKindRelBlock {
+		deltas := make([]WALDelta, len(group))
+		for idx, r := range group {
+			deltas[idx] = r.Delta
+		}
+		if page, err := t.redoer.Redo(ctx, k, nil, deltas); err == nil && len(page) == PageSize {
+			return []LayerRecord{{
+				Key: k,
+				Delta: WALDelta{
+					LSN:       atLSN,
+					Flags:     EntryFlagPageImage,
+					PageImage: page,
+				},
+			}}
+		}
+		// Keep raw deltas if base page is in an older layer.
+		return group
+	}
+	return group
+}
+
+// layerRecordIterator streams sorted records from a single V1 or V2 layer with bounded memory.
+type layerRecordIterator struct {
+	store   *LayerStore
+	meta    LayerMeta
+	idxData *layerIndexData
+	pos     int
+	buf     []LayerRecord
+	bufIdx  int
+
+	// V2 state
+	walLoaded bool
+	walTable  [][]byte
+}
+
+func newLayerRecordIterator(ctx context.Context, store *LayerStore, meta LayerMeta) (*layerRecordIterator, error) {
+	if store == nil {
+		return nil, fmt.Errorf("pageserver: nil LayerStore in iterator")
+	}
+	idxData, err := store.loadLayerIndex(ctx, meta)
+	if err != nil {
+		return nil, err
+	}
+	return &layerRecordIterator{
+		store:   store,
+		meta:    meta,
+		idxData: idxData,
+	}, nil
+}
+
+func (it *layerRecordIterator) Next(ctx context.Context) (LayerRecord, bool, error) {
+	for it.bufIdx >= len(it.buf) {
+		if it.pos >= len(it.idxData.entries) {
+			return LayerRecord{}, false, nil
+		}
+		if err := it.fillNextBatch(ctx); err != nil {
+			return LayerRecord{}, false, err
+		}
+	}
+	rec := it.buf[it.bufIdx]
+	it.bufIdx++
+	return rec, true, nil
+}
+
+func (it *layerRecordIterator) fillNextBatch(ctx context.Context) error {
+	it.buf = it.buf[:0]
+	it.bufIdx = 0
+
+	if it.idxData.version == LayerVersionV2 {
+		// Read one V2 chunk at a time (bounded to ~64 KiB).
+		firstEntry := it.idxData.entries[it.pos]
+		cIdx := uint32(firstEntry.Offset)
+		if int(cIdx) >= len(it.idxData.chunks) {
+			return fmt.Errorf("pageserver: v2 chunk %d out of bounds", cIdx)
+		}
+		cm := it.idxData.chunks[cIdx]
+		cipherBuf, err := it.store.ReadRange(ctx, it.meta, int64(cm.Offset), int64(cm.CipherLen))
+		if err != nil {
+			return err
+		}
+		chunkRaw, err := decodeV2ChunkRaw(cipherBuf, it.meta, int(cIdx), cm, it.store.kms)
+		if err != nil {
+			return err
+		}
+
+		for it.pos < len(it.idxData.entries) && uint32(it.idxData.entries[it.pos].Offset) == cIdx {
+			e := it.idxData.entries[it.pos]
+			delta, walIDPlusOne, err := extractV2RecordFromChunk(chunkRaw, e.Length, e.LSN, uint64(e.Flags))
 			if err != nil {
-				return nil, err
+				return err
+			}
+			if walIDPlusOne > 0 {
+				if !it.walLoaded {
+					wt, wErr := it.store.loadV2WALTable(ctx, it.meta, it.idxData)
+					if wErr != nil {
+						return wErr
+					}
+					it.walTable = wt
+					it.walLoaded = true
+				}
+				wIdx := int(walIDPlusOne - 1)
+				if wIdx >= len(it.walTable) {
+					return fmt.Errorf("pageserver: v2 WAL index %d out of bounds", wIdx)
+				}
+				delta.WALRecord = append([]byte(nil), it.walTable[wIdx]...)
+			}
+			it.buf = append(it.buf, LayerRecord{Key: e.Key, Delta: delta})
+			it.pos++
+		}
+		return nil
+	}
+
+	// V1 bounded batch read.
+	startIdx := it.pos
+	endIdx := startIdx + 1
+	spanStart := int64(it.idxData.entries[startIdx].Offset)
+	spanEnd := spanStart + int64(it.idxData.entries[startIdx].Length)
+	for endIdx < len(it.idxData.entries) && endIdx-startIdx < compactV1BatchEntries {
+		e := it.idxData.entries[endIdx]
+		nextStart := int64(e.Offset)
+		nextEnd := nextStart + int64(e.Length)
+		if nextStart < spanStart || nextEnd-spanStart > maxCoalescedSpan || nextStart-spanEnd > coalesceGapBytes {
+			break
+		}
+		if nextEnd > spanEnd {
+			spanEnd = nextEnd
+		}
+		endIdx++
+	}
+
+	spanBuf, err := it.store.ReadRange(ctx, it.meta, spanStart, spanEnd-spanStart)
+	if err != nil {
+		return err
+	}
+	for i := startIdx; i < endIdx; i++ {
+		e := it.idxData.entries[i]
+		relOff := int64(e.Offset) - spanStart
+		raw := spanBuf[relOff : relOff+int64(e.Length)]
+		if it.meta.Encrypted {
+			raw, err = it.store.kms.DecryptObject(it.meta.TenantID, it.meta.Epoch, fmt.Sprintf("%s#e%d", it.meta.aadKey(), i), raw)
+			if err != nil {
+				return err
 			}
 		}
 		d, err := decodeDeltaPayload(raw, e.LSN, e.Flags)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		out = append(out, LayerRecord{Key: e.Key, Delta: d})
+		it.buf = append(it.buf, LayerRecord{Key: e.Key, Delta: d})
 	}
-	return out, nil
+	it.pos = endIdx
+	return nil
 }
 
-func (t *Timeline) materializeLatest(ctx context.Context, sorted []LayerRecord, atLSN uint64) []LayerRecord {
-	var out []LayerRecord
-	for i := 0; i < len(sorted); {
-		k := sorted[i].Key
-		j := i + 1
-		for j < len(sorted) && sorted[j].Key.Compare(k) == 0 {
-			j++
-		}
-		group := sorted[i:j]
-		if k.Kind == KeyKindRelSize {
-			last := group[len(group)-1]
-			last.Delta.LSN = atLSN
-			out = append(out, last)
-		} else if k.Kind == KeyKindRelBlock {
-			deltas := make([]WALDelta, len(group))
-			for idx, r := range group {
-				deltas[idx] = r.Delta
-			}
-			if page, err := t.redoer.Redo(ctx, k, nil, deltas); err == nil && len(page) == PageSize {
-				out = append(out, LayerRecord{
-					Key: k,
-					Delta: WALDelta{
-						LSN:       atLSN,
-						Flags:     EntryFlagPageImage,
-						PageImage: page,
-					},
-				})
-			} else {
-				// Keep raw deltas if base page is in an older layer.
-				out = append(out, group...)
-			}
-		} else {
-			out = append(out, group...)
-		}
-		i = j
+type mergeHeapItem struct {
+	rec     LayerRecord
+	iterIdx int
+}
+
+type mergeHeap []mergeHeapItem
+
+func (h mergeHeap) Len() int { return len(h) }
+func (h mergeHeap) Less(i, j int) bool {
+	if c := h[i].rec.Key.Compare(h[j].rec.Key); c != 0 {
+		return c < 0
 	}
-	return out
+	if h[i].rec.Delta.LSN != h[j].rec.Delta.LSN {
+		return h[i].rec.Delta.LSN < h[j].rec.Delta.LSN
+	}
+	return h[i].iterIdx < h[j].iterIdx
+}
+func (h mergeHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *mergeHeap) Push(x any)         { *h = append(*h, x.(mergeHeapItem)) }
+func (h *mergeHeap) Pop() any           { old := *h; n := len(old); x := old[n-1]; *h = old[:n-1]; return x }
+
+type kwayLayerMerger struct {
+	iters []*layerRecordIterator
+	h     mergeHeap
+}
+
+func newKWayLayerMerger(ctx context.Context, iters []*layerRecordIterator) (*kwayLayerMerger, error) {
+	m := &kwayLayerMerger{iters: iters}
+	for idx, it := range iters {
+		rec, ok, err := it.Next(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			m.h = append(m.h, mergeHeapItem{rec: rec, iterIdx: idx})
+		}
+	}
+	heap.Init(&m.h)
+	return m, nil
+}
+
+func (m *kwayLayerMerger) Next(ctx context.Context) (LayerRecord, bool, error) {
+	if len(m.h) == 0 {
+		return LayerRecord{}, false, nil
+	}
+	top := heap.Pop(&m.h).(mergeHeapItem)
+	nextRec, ok, err := m.iters[top.iterIdx].Next(ctx)
+	if err != nil {
+		return LayerRecord{}, false, err
+	}
+	if ok {
+		heap.Push(&m.h, mergeHeapItem{rec: nextRec, iterIdx: top.iterIdx})
+	}
+	return top.rec, true, nil
 }

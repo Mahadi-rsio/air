@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
@@ -308,4 +309,41 @@ func (s *grpcServer) UnlockDatabase(ctx context.Context, req *pb.TenantRequest) 
 		return nil, mapGRPCError(err)
 	}
 	return &pb.StatusResponse{Status: "SUSPENDED", TenantId: req.GetTenantId()}, nil
+}
+
+// NewGRPCPoolDrainFn returns a cooperative pool drain callback backed by a
+// persistent gRPC client connection to air-gateway's GatewayAdmin service.
+func NewGRPCPoolDrainFn(gatewayAdminGRPCAddr, internalToken string) (func(tenantID string, timeout time.Duration) error, func() error, error) {
+	addr := strings.TrimSpace(gatewayAdminGRPCAddr)
+	if addr == "" {
+		return nil, nil, fmt.Errorf("gateway admin gRPC address is empty")
+	}
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, nil, fmt.Errorf("dial gateway admin gRPC %s: %w", addr, err)
+	}
+	client := pb.NewGatewayAdminClient(conn)
+
+	drainFn := func(tenantID string, timeout time.Duration) error {
+		if timeout <= 0 {
+			timeout = 3 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout+2*time.Second)
+		defer cancel()
+		if internalToken != "" {
+			ctx = metadata.AppendToOutgoingContext(ctx, "x-internal-token", internalToken)
+		}
+		_, err := client.DrainTenant(ctx, &pb.DrainTenantRequest{
+			TenantId:  tenantID,
+			TimeoutMs: int32(timeout.Milliseconds()),
+		})
+		if err != nil {
+			if st, ok := status.FromError(err); ok && st.Code() == codes.FailedPrecondition {
+				return fmt.Errorf("%w: %s", cell.ErrDrainVetoed, st.Message())
+			}
+			return fmt.Errorf("gateway gRPC drain failed: %w", err)
+		}
+		return nil
+	}
+	return drainFn, conn.Close, nil
 }

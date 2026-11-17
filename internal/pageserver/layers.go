@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mahadi-rsio/air/internal/crypto"
@@ -315,7 +316,7 @@ func DecodeLayerFooter(b []byte) (LayerFooter, error) {
 	}
 	magic := binary.LittleEndian.Uint32(b[0:4])
 	ver := binary.LittleEndian.Uint16(b[4:6])
-	if magic != LayerMagic || ver != LayerVersion {
+	if magic != LayerMagic || (ver != LayerVersion && ver != LayerVersionV2) {
 		return LayerFooter{}, fmt.Errorf("pageserver: bad layer footer magic=0x%x ver=%d", magic, ver)
 	}
 	return LayerFooter{
@@ -365,6 +366,12 @@ type layerDownload struct {
 	err  error
 }
 
+type indexLoad struct {
+	done chan struct{}
+	data *layerIndexData
+	err  error
+}
+
 // LayerStore persists and range-reads immutable layer files across local disk and R2.
 type LayerStore struct {
 	localDir           string
@@ -372,12 +379,18 @@ type LayerStore struct {
 	bucket             string
 	kms                *crypto.EnvelopeKMS
 	cache              *DiskCache
-	multipartThreshold int64
-	multipartPartSize  int64
-	idxMu              sync.RWMutex
-	indexCache         map[string][]LayerIndexEntry
+	multipartThreshold   int64
+	multipartPartSize    int64
+	multipartConcurrency int
+	layerFormatVersion   uint16
+	idxCache           *boundedIndexCache
+	idxFlightMu        sync.Mutex
+	idxFlight          map[string]*indexLoad
 	dlMu               sync.Mutex
 	dlFlight           map[string]*layerDownload
+	seqMu              sync.Mutex
+	lastReadEnd        map[string]int64
+	prefetchSem        chan struct{}
 	metricsMu          sync.Mutex
 	lastMetrics        UploadMetrics
 }
@@ -390,10 +403,41 @@ func NewLayerStore(localDir string, s3c *s3.Client, bucket string, kms *crypto.E
 		bucket:             bucket,
 		kms:                kms,
 		cache:              cache,
-		multipartThreshold: DefaultMultipartThreshold,
-		multipartPartSize:  DefaultMultipartPartSize,
-		indexCache:         make(map[string][]LayerIndexEntry),
+		multipartThreshold:   DefaultMultipartThreshold,
+		multipartPartSize:    DefaultMultipartPartSize,
+		multipartConcurrency: 4,
+		layerFormatVersion:   LayerVersionV2,
+		idxCache:           newBoundedIndexCache(defaultIndexCacheMaxBytes),
+		idxFlight:          make(map[string]*indexLoad),
 		dlFlight:           make(map[string]*layerDownload),
+		lastReadEnd:        make(map[string]int64),
+		prefetchSem:        make(chan struct{}, 4),
+	}
+}
+
+// SetLayerFormatVersion configures the layer format version used for new writes (1 or 2).
+func (s *LayerStore) SetLayerFormatVersion(ver uint16) {
+	if ver == LayerVersion || ver == LayerVersionV2 {
+		s.layerFormatVersion = ver
+	}
+}
+
+func (s *LayerStore) layerVersion() uint16 {
+	if s.layerFormatVersion == LayerVersion {
+		return LayerVersion
+	}
+	return LayerVersionV2
+}
+
+// SetIndexCacheMaxBytes configures the byte budget of the in-memory layer index LRU cache.
+func (s *LayerStore) SetIndexCacheMaxBytes(maxBytes int64) {
+	s.idxCache = newBoundedIndexCache(maxBytes)
+}
+
+// ClearIndexCache drops all cached layer indexes and retained Bloom filters (primarily for benchmarks/tests).
+func (s *LayerStore) ClearIndexCache() {
+	if s.idxCache != nil {
+		s.idxCache.clear()
 	}
 }
 
@@ -404,6 +448,13 @@ func (s *LayerStore) SetMultipartConfig(threshold, partSize int64) {
 	}
 	if partSize > 0 {
 		s.multipartPartSize = partSize
+	}
+}
+
+// SetMultipartConcurrency configures the bounded worker concurrency for multipart uploads.
+func (s *LayerStore) SetMultipartConcurrency(n int) {
+	if n > 0 {
+		s.multipartConcurrency = n
 	}
 }
 
@@ -432,67 +483,147 @@ func (s *LayerStore) WriteLayer(ctx context.Context, meta LayerMeta, recs []Laye
 		}
 	}
 
-	data, err := EncodeLayerBytes(meta.TenantID, meta.Epoch, meta.aadKey(), meta.Kind, meta.EndLSN, recs, s.kms)
-	if err != nil {
-		return meta, err
-	}
-	meta.FileSize = int64(len(data))
-	if len(recs) > 0 {
-		meta.StartKey = recs[0].Key
-		meta.EndKey = recs[len(recs)-1].Key
-	}
-
 	var localPath string
 	var cleanupTemp bool
-	if s.localDir != "" {
-		localPath = filepath.Join(s.localDir, meta.TenantID, meta.FileName)
-		if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
-			return meta, err
-		}
-		tmp := localPath + ".tmp"
-		if err := os.WriteFile(tmp, data, 0o600); err != nil {
-			return meta, err
-		}
-		if err := os.Rename(tmp, localPath); err != nil {
-			_ = os.Remove(tmp)
-			return meta, err
-		}
-	} else if s.s3c != nil && s.bucket != "" {
-		tmpFile, err := os.CreateTemp("", "air-layer-*.layer")
+	var memData []byte
+
+	if s.layerVersion() == LayerVersion {
+		data, err := EncodeLayerBytes(meta.TenantID, meta.Epoch, meta.aadKey(), meta.Kind, meta.EndLSN, recs, s.kms)
 		if err != nil {
 			return meta, err
 		}
-		localPath = tmpFile.Name()
-		cleanupTemp = true
-		if _, err := tmpFile.Write(data); err != nil {
-			_ = tmpFile.Close()
-			_ = os.Remove(localPath)
-			return meta, err
+		memData = data
+		meta.FileSize = int64(len(data))
+		if len(recs) > 0 {
+			meta.StartKey = recs[0].Key
+			meta.EndKey = recs[len(recs)-1].Key
 		}
-		if err := tmpFile.Close(); err != nil {
-			_ = os.Remove(localPath)
-			return meta, err
+
+		if s.localDir != "" {
+			localPath = filepath.Join(s.localDir, meta.TenantID, meta.FileName)
+			if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+				return meta, err
+			}
+			tmp := localPath + ".tmp"
+			if err := os.WriteFile(tmp, data, 0o600); err != nil {
+				return meta, err
+			}
+			if err := os.Rename(tmp, localPath); err != nil {
+				_ = os.Remove(tmp)
+				return meta, err
+			}
+		} else if s.s3c != nil && s.bucket != "" {
+			tmpFile, err := os.CreateTemp("", "air-layer-*.layer")
+			if err != nil {
+				return meta, err
+			}
+			localPath = tmpFile.Name()
+			cleanupTemp = true
+			if _, err := tmpFile.Write(data); err != nil {
+				_ = tmpFile.Close()
+				_ = os.Remove(localPath)
+				return meta, err
+			}
+			if err := tmpFile.Close(); err != nil {
+				_ = os.Remove(localPath)
+				return meta, err
+			}
+		}
+	} else {
+		// Layer Format V2: bounded-memory streaming encode directly to disk + incremental SHA-256.
+		var outFile *os.File
+		var tmpPath string
+		var err error
+		if s.localDir != "" {
+			localPath = filepath.Join(s.localDir, meta.TenantID, meta.FileName)
+			if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+				return meta, err
+			}
+			tmpPath = localPath + ".tmp"
+			outFile, err = os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+			if err != nil {
+				return meta, err
+			}
+		} else if s.s3c != nil && s.bucket != "" {
+			outFile, err = os.CreateTemp("", "air-layer-*.layer")
+			if err != nil {
+				return meta, err
+			}
+			localPath = outFile.Name()
+			cleanupTemp = true
+		}
+
+		if outFile != nil {
+			res, encErr := EncodeLayerV2ToWriter(outFile, meta.TenantID, meta.Epoch, meta.aadKey(), meta.Kind, meta.EndLSN, recs, s.kms, v2EncodeOptions{})
+			closeErr := outFile.Close()
+			if encErr != nil {
+				if tmpPath != "" {
+					_ = os.Remove(tmpPath)
+				} else {
+					_ = os.Remove(localPath)
+				}
+				return meta, encErr
+			}
+			if closeErr != nil {
+				if tmpPath != "" {
+					_ = os.Remove(tmpPath)
+				} else {
+					_ = os.Remove(localPath)
+				}
+				return meta, closeErr
+			}
+			if tmpPath != "" {
+				if err := os.Rename(tmpPath, localPath); err != nil {
+					_ = os.Remove(tmpPath)
+					return meta, err
+				}
+			}
+			meta.FileSize = res.FileSize
+			meta.SHA256 = res.SHA256Hex
+			meta.StartKey = res.StartKey
+			meta.EndKey = res.EndKey
+		} else {
+			var buf bytes.Buffer
+			res, err := EncodeLayerV2ToWriter(&buf, meta.TenantID, meta.Epoch, meta.aadKey(), meta.Kind, meta.EndLSN, recs, s.kms, v2EncodeOptions{})
+			if err != nil {
+				return meta, err
+			}
+			memData = buf.Bytes()
+			meta.FileSize = res.FileSize
+			meta.SHA256 = res.SHA256Hex
+			meta.StartKey = res.StartKey
+			meta.EndKey = res.EndKey
 		}
 	}
+
 	if cleanupTemp {
 		defer os.Remove(localPath)
 	}
 
 	if s.s3c != nil && s.bucket != "" {
-		meta, err = s.UploadLayerFile(ctx, meta, localPath)
+		var err error
+		meta, err = s.uploadLayerFilePrehashed(ctx, meta, localPath, meta.SHA256, meta.FileSize)
 		if err != nil {
 			return meta, err
 		}
 	} else {
-		sum := sha256.Sum256(data)
-		meta.SHA256 = hex.EncodeToString(sum[:])
+		if meta.SHA256 == "" {
+			sum := sha256.Sum256(memData)
+			meta.SHA256 = hex.EncodeToString(sum[:])
+		}
 		if cauKey, kErr := ContentAddressedLayerKey(meta.TenantID, meta.SHA256); kErr == nil {
 			meta.R2Key = cauKey
 		}
 	}
 
 	if s.cache != nil {
-		_ = s.cache.Put(meta.R2Key, data)
+		if memData != nil {
+			_ = s.cache.Put(meta.R2Key, memData)
+		} else if localPath != "" && s.localDir == "" {
+			if raw, rErr := os.ReadFile(localPath); rErr == nil {
+				_ = s.cache.Put(meta.R2Key, raw)
+			}
+		}
 	}
 	return meta, nil
 }
@@ -500,6 +631,10 @@ func (s *LayerStore) WriteLayer(ctx context.Context, meta LayerMeta, recs []Laye
 // UploadLayerFile performs an idempotent, integrity-verified Content-Addressed Upload (CAU)
 // of a finalized immutable local layer file to R2 without loading the file into memory.
 func (s *LayerStore) UploadLayerFile(ctx context.Context, meta LayerMeta, localPath string) (LayerMeta, error) {
+	return s.uploadLayerFilePrehashed(ctx, meta, localPath, "", 0)
+}
+
+func (s *LayerStore) uploadLayerFilePrehashed(ctx context.Context, meta LayerMeta, localPath, precomputedSHA256 string, precomputedSize int64) (LayerMeta, error) {
 	totalStart := time.Now()
 	var metrics UploadMetrics
 
@@ -527,11 +662,15 @@ func (s *LayerStore) UploadLayerFile(ctx context.Context, meta LayerMeta, localP
 	}
 
 	hashStart := time.Now()
-	sha256Hex, size, err := StreamSHA256(f)
-	metrics.HashDuration = time.Since(hashStart)
-	if err != nil {
-		return meta, err
+	sha256Hex := precomputedSHA256
+	size := precomputedSize
+	if sha256Hex == "" || size != info.Size() {
+		sha256Hex, size, err = StreamSHA256(f)
+		if err != nil {
+			return meta, err
+		}
 	}
+	metrics.HashDuration = time.Since(hashStart)
 	sha256B64, err := sha256HexToBase64(sha256Hex)
 	if err != nil {
 		return meta, err
@@ -572,7 +711,7 @@ func (s *LayerStore) UploadLayerFile(ctx context.Context, meta LayerMeta, localP
 
 	// Step 6: Upload the layer (single-part or multipart) with conditional creation when supported.
 	uploadStart := time.Now()
-	raced, err := s.uploadContentAddressed(ctx, f, cauKey, size, sha256Hex, sha256B64, &metrics)
+	raced, putVerified, err := s.uploadContentAddressed(ctx, f, cauKey, size, sha256Hex, sha256B64, &metrics)
 	metrics.UploadDuration = time.Since(uploadStart)
 	if err != nil {
 		return meta, err
@@ -581,15 +720,17 @@ func (s *LayerStore) UploadLayerFile(ctx context.Context, meta LayerMeta, localP
 		metrics.Deduplicated = true
 	}
 
-	// Step 7: Verify the uploaded (or raced) remote object before returning durable reference.
-	verifyStart := time.Now()
-	verified, err := s.verifyRemoteObject(ctx, cauKey, size, sha256Hex, sha256B64, &metrics)
-	metrics.VerifyDuration = time.Since(verifyStart)
-	if err != nil {
-		return meta, err
-	}
-	if !verified {
-		return meta, fmt.Errorf("%w: %s", ErrRemoteObjectMissing, cauKey)
+	// Step 7: Verify the uploaded (or raced) remote object unless PutObject already echoed matching SHA-256.
+	if !putVerified || raced {
+		verifyStart := time.Now()
+		verified, err := s.verifyRemoteObject(ctx, cauKey, size, sha256Hex, sha256B64, &metrics)
+		metrics.VerifyDuration = time.Since(verifyStart)
+		if err != nil {
+			return meta, err
+		}
+		if !verified {
+			return meta, fmt.Errorf("%w: %s", ErrRemoteObjectMissing, cauKey)
+		}
 	}
 
 	metrics.TotalDuration = time.Since(totalStart)
@@ -659,35 +800,71 @@ func (s *LayerStore) verifyRemoteObject(ctx context.Context, key string, expecte
 	return true, nil
 }
 
-func (s *LayerStore) uploadContentAddressed(ctx context.Context, f *os.File, key string, size int64, sha256Hex, sha256B64 string, metrics *UploadMetrics) (raced bool, err error) {
+func retryCAUOp(ctx context.Context, maxAttempts int, fn func() error) error {
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isPreconditionS3Err(err) {
+			return err
+		}
+		lastErr = err
+		if attempt+1 < maxAttempts {
+			t := time.NewTimer(5 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return ctx.Err()
+			case <-t.C:
+			}
+		}
+	}
+	return lastErr
+}
+
+func (s *LayerStore) uploadContentAddressed(ctx context.Context, f *os.File, key string, size int64, sha256Hex, sha256B64 string, metrics *UploadMetrics) (raced bool, putVerified bool, err error) {
 	objMeta := map[string]string{
 		metaKeySHA256: sha256Hex,
 		metaKeySize:   strconv.FormatInt(size, 10),
 	}
 
 	if size <= s.multipartThreshold {
-		metrics.PutRequests++
-		_, err := s.s3c.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:            aws.String(s.bucket),
-			Key:               aws.String(key),
-			Body:              io.NewSectionReader(f, 0, size),
-			ContentLength:     aws.Int64(size),
-			ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
-			ChecksumSHA256:    aws.String(sha256B64),
-			Metadata:          objMeta,
-			IfNoneMatch:       aws.String("*"),
+		var putOut *s3.PutObjectOutput
+		err := retryCAUOp(ctx, 3, func() error {
+			metrics.PutRequests++
+			var pErr error
+			putOut, pErr = s.s3c.PutObject(ctx, &s3.PutObjectInput{
+				Bucket:            aws.String(s.bucket),
+				Key:               aws.String(key),
+				Body:              io.NewSectionReader(f, 0, size),
+				ContentLength:     aws.Int64(size),
+				ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
+				ChecksumSHA256:    aws.String(sha256B64),
+				Metadata:          objMeta,
+				IfNoneMatch:       aws.String("*"),
+			})
+			return pErr
 		})
 		if err != nil {
 			if isPreconditionS3Err(err) {
-				return true, nil
+				return true, false, nil
 			}
-			return false, err
+			return false, false, err
 		}
 		metrics.BytesTransferred += size
-		return false, nil
+		verified := putOut != nil && putOut.ChecksumSHA256 != nil && *putOut.ChecksumSHA256 == sha256B64
+		return false, verified, nil
 	}
 
-	// Multipart upload for large layers using streaming io.NewSectionReader per part.
+	// Multipart upload for large layers using bounded concurrent streaming io.NewSectionReader per part.
 	createOut, err := s.s3c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket:            aws.String(s.bucket),
 		Key:               aws.String(key),
@@ -695,7 +872,7 @@ func (s *LayerStore) uploadContentAddressed(ctx context.Context, f *os.File, key
 		Metadata:          objMeta,
 	})
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	uploadID := aws.ToString(createOut.UploadId)
 	abortUpload := func() {
@@ -715,33 +892,99 @@ func (s *LayerStore) uploadContentAddressed(ctx context.Context, f *os.File, key
 	if partSize <= 0 {
 		partSize = DefaultMultipartPartSize
 	}
-	var completedParts []types.CompletedPart
+	type partSpec struct {
+		partNum int32
+		off     int64
+		length  int64
+	}
+	var specs []partSpec
 	var partNum int32 = 1
 	for off := int64(0); off < size; off += partSize {
 		n := partSize
 		if off+n > size {
 			n = size - off
 		}
-		metrics.PutRequests++
-		metrics.MultipartParts++
-		partOut, partErr := s.s3c.UploadPart(ctx, &s3.UploadPartInput{
-			Bucket:        aws.String(s.bucket),
-			Key:           aws.String(key),
-			UploadId:      aws.String(uploadID),
-			PartNumber:    aws.Int32(partNum),
-			Body:          io.NewSectionReader(f, off, n),
-			ContentLength: aws.Int64(n),
-		})
-		if partErr != nil {
-			abortUpload()
-			return false, partErr
-		}
-		metrics.BytesTransferred += n
-		completedParts = append(completedParts, types.CompletedPart{
-			ETag:       partOut.ETag,
-			PartNumber: aws.Int32(partNum),
-		})
+		specs = append(specs, partSpec{partNum: partNum, off: off, length: n})
 		partNum++
+	}
+
+	concurrency := s.multipartConcurrency
+	if concurrency <= 0 {
+		concurrency = 4
+	}
+	if concurrency > len(specs) {
+		concurrency = len(specs)
+	}
+
+	completedParts := make([]types.CompletedPart, len(specs))
+	partCtx, cancelParts := context.WithCancel(ctx)
+	defer cancelParts()
+
+	jobs := make(chan int, len(specs))
+	for idx := range specs {
+		jobs <- idx
+	}
+	close(jobs)
+
+	var (
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+		putReqs  atomic.Int64
+		partCnt  atomic.Int64
+		bytesTx  atomic.Int64
+	)
+
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				if partCtx.Err() != nil {
+					return
+				}
+				sp := specs[idx]
+				var partOut *s3.UploadPartOutput
+				pErr := retryCAUOp(partCtx, 3, func() error {
+					putReqs.Add(1)
+					partCnt.Add(1)
+					var uErr error
+					partOut, uErr = s.s3c.UploadPart(partCtx, &s3.UploadPartInput{
+						Bucket:        aws.String(s.bucket),
+						Key:           aws.String(key),
+						UploadId:      aws.String(uploadID),
+						PartNumber:    aws.Int32(sp.partNum),
+						Body:          io.NewSectionReader(f, sp.off, sp.length),
+						ContentLength: aws.Int64(sp.length),
+					})
+					return uErr
+				})
+				if pErr != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = pErr
+						cancelParts()
+					}
+					errMu.Unlock()
+					return
+				}
+				bytesTx.Add(sp.length)
+				completedParts[idx] = types.CompletedPart{
+					ETag:       partOut.ETag,
+					PartNumber: aws.Int32(sp.partNum),
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	metrics.PutRequests += int(putReqs.Load())
+	metrics.MultipartParts += int(partCnt.Load())
+	metrics.BytesTransferred += bytesTx.Load()
+
+	if firstErr != nil {
+		abortUpload()
+		return false, false, firstErr
 	}
 
 	_, compErr := s.s3c.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
@@ -756,11 +999,11 @@ func (s *LayerStore) uploadContentAddressed(ctx context.Context, f *os.File, key
 	if compErr != nil {
 		abortUpload()
 		if isPreconditionS3Err(compErr) {
-			return true, nil
+			return true, false, nil
 		}
-		return false, compErr
+		return false, false, compErr
 	}
-	return false, nil
+	return false, false, nil
 }
 
 func isNotFoundS3Err(err error) bool {
@@ -927,7 +1170,62 @@ func (s *LayerStore) ensureChunkCached(ctx context.Context, meta LayerMeta, chun
 	return chunkKey, err
 }
 
-// ReadRange fetches [offset, offset+length) from disk cache, localDir, or chunked R2 cache.
+const (
+	tailReadWindowBytes int64 = 64 * 1024
+	coalesceGapBytes    int64 = 64 * 1024
+	maxCoalescedSpan    int64 = 4 * 1024 * 1024
+	adaptiveSmallLayer  int64 = 256 * 1024
+	adaptiveChunkThresh int64 = 64 * 1024
+)
+
+func (s *LayerStore) shouldUseChunkCache(meta LayerMeta, offset, length int64) (useChunk bool, sequential bool) {
+	if s.cache == nil || meta.FileSize <= 0 || layerCacheChunkSize > s.cache.maxBytes {
+		return false, false
+	}
+	s.seqMu.Lock()
+	if s.lastReadEnd == nil {
+		s.lastReadEnd = make(map[string]int64)
+	}
+	prevEnd, seen := s.lastReadEnd[meta.R2Key]
+	if seen && offset >= prevEnd && offset-prevEnd <= coalesceGapBytes {
+		sequential = true
+	}
+	if len(s.lastReadEnd) > 1024 {
+		s.lastReadEnd = make(map[string]int64)
+	}
+	s.lastReadEnd[meta.R2Key] = offset + length
+	s.seqMu.Unlock()
+
+	if meta.FileSize <= adaptiveSmallLayer || length >= adaptiveChunkThresh || sequential {
+		return true, sequential
+	}
+	return false, false
+}
+
+func (s *LayerStore) triggerAsyncPrefetch(meta LayerMeta, nextChunk int64) {
+	if s.cache == nil || s.s3c == nil || s.bucket == "" || meta.FileSize <= 0 {
+		return
+	}
+	if nextChunk*layerCacheChunkSize >= meta.FileSize {
+		return
+	}
+	chunkKey := fmt.Sprintf("%s@c%d", meta.R2Key, nextChunk)
+	if _, ok := s.cache.GetRange(chunkKey, 0, 1); ok {
+		return
+	}
+	select {
+	case s.prefetchSem <- struct{}{}:
+		go func() {
+			defer func() { <-s.prefetchSem }()
+			pctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, _ = s.ensureChunkCached(pctx, meta, nextChunk)
+		}()
+	default:
+	}
+}
+
+// ReadRange fetches [offset, offset+length) from disk cache, localDir, or adaptive chunked R2 cache.
 func (s *LayerStore) ReadRange(ctx context.Context, meta LayerMeta, offset, length int64) ([]byte, error) {
 	if length <= 0 {
 		return nil, nil
@@ -951,7 +1249,8 @@ func (s *LayerStore) ReadRange(ctx context.Context, meta LayerMeta, offset, leng
 	if s.s3c == nil || s.bucket == "" {
 		return nil, fmt.Errorf("pageserver: layer %s not found locally and R2 not configured", meta.R2Key)
 	}
-	if s.cache != nil && meta.FileSize > 0 && layerCacheChunkSize <= s.cache.maxBytes {
+	useChunk, sequential := s.shouldUseChunkCache(meta, offset, length)
+	if useChunk {
 		end := offset + length
 		if end > meta.FileSize {
 			end = meta.FileSize
@@ -961,6 +1260,9 @@ func (s *LayerStore) ReadRange(ctx context.Context, meta LayerMeta, offset, leng
 		if firstChunk == lastChunk {
 			chunkKey, err := s.ensureChunkCached(ctx, meta, firstChunk)
 			if err == nil {
+				if sequential {
+					s.triggerAsyncPrefetch(meta, firstChunk+1)
+				}
 				if b, ok := s.cache.GetRange(chunkKey, offset-firstChunk*layerCacheChunkSize, end-offset); ok {
 					return b, nil
 				}
@@ -992,6 +1294,9 @@ func (s *LayerStore) ReadRange(ctx context.Context, meta LayerMeta, offset, leng
 				out = append(out, b...)
 			}
 			if okAll {
+				if sequential {
+					s.triggerAsyncPrefetch(meta, lastChunk+1)
+				}
 				return out, nil
 			}
 		}
@@ -999,77 +1304,225 @@ func (s *LayerStore) ReadRange(ctx context.Context, meta LayerMeta, offset, leng
 	return s.readRangeLocalOrR2Direct(ctx, meta, offset, length)
 }
 
-// LookupKeyInLayer reads only the footer, index (cached in memory per layer), and matching entry ranges for key <= lsn.
-func (s *LayerStore) LookupKeyInLayer(ctx context.Context, meta LayerMeta, key Key, lsn uint64) ([]WALDelta, error) {
+func (s *LayerStore) loadLayerIndex(ctx context.Context, meta LayerMeta) (*layerIndexData, error) {
 	if meta.FileSize < int64(LayerFooterSize) {
 		return nil, errors.New("pageserver: layer file smaller than footer")
 	}
-	s.idxMu.RLock()
-	entries, cached := s.indexCache[meta.R2Key]
-	s.idxMu.RUnlock()
+	if s.idxCache == nil {
+		s.idxCache = newBoundedIndexCache(defaultIndexCacheMaxBytes)
+	}
+	if data, ok := s.idxCache.get(meta.R2Key); ok {
+		return data, nil
+	}
 
-	if !cached {
-		footerRaw, err := s.readRangeLocalOrR2Direct(ctx, meta, meta.FileSize-int64(LayerFooterSize), int64(LayerFooterSize))
-		if err != nil {
-			return nil, err
+	s.idxFlightMu.Lock()
+	if s.idxFlight == nil {
+		s.idxFlight = make(map[string]*indexLoad)
+	}
+	if f, ok := s.idxFlight[meta.R2Key]; ok {
+		s.idxFlightMu.Unlock()
+		select {
+		case <-f.done:
+			return f.data, f.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-		footer, err := DecodeLayerFooter(footerRaw)
-		if err != nil {
-			return nil, err
-		}
-		if footer.EntryCount == 0 {
-			s.idxMu.Lock()
-			if s.indexCache == nil {
-				s.indexCache = make(map[string][]LayerIndexEntry)
+	}
+	f := &indexLoad{done: make(chan struct{})}
+	s.idxFlight[meta.R2Key] = f
+	s.idxFlightMu.Unlock()
+
+	var loaded *layerIndexData
+	var loadErr error
+
+	// Read tail window (up to 64 KiB) in a single range request to fetch footer + index together when possible.
+	tailLen := tailReadWindowBytes
+	if meta.FileSize < tailLen {
+		tailLen = meta.FileSize
+	}
+	tailStart := meta.FileSize - tailLen
+	tailRaw, err := s.readRangeLocalOrR2Direct(ctx, meta, tailStart, tailLen)
+	if err != nil {
+		loadErr = err
+	} else {
+		footerRaw := tailRaw[len(tailRaw)-LayerFooterSize:]
+		footer, fErr := DecodeLayerFooter(footerRaw)
+		if fErr != nil {
+			loadErr = fErr
+		} else if footer.EntryCount == 0 {
+			loaded = s.idxCache.putVersioned(meta.R2Key, footer.Version, []LayerIndexEntry{}, nil, v2WALTableMeta{})
+		} else {
+			idxStart := int64(footer.IndexOffset)
+			idxLen := int64(footer.IndexLen)
+			var idxRaw []byte
+			if idxStart >= tailStart && idxStart+idxLen <= meta.FileSize-int64(LayerFooterSize) {
+				rel := idxStart - tailStart
+				idxRaw = tailRaw[rel : rel+idxLen]
+			} else if idxStart < tailStart && idxStart+idxLen > tailStart {
+				prefixLen := tailStart - idxStart
+				prefixRaw, pErr := s.readRangeLocalOrR2Direct(ctx, meta, idxStart, prefixLen)
+				if pErr != nil {
+					loadErr = pErr
+				} else {
+					overlap := idxLen - prefixLen
+					idxRaw = make([]byte, idxLen)
+					copy(idxRaw, prefixRaw)
+					copy(idxRaw[prefixLen:], tailRaw[:overlap])
+				}
+			} else {
+				idxRaw, loadErr = s.readRangeLocalOrR2Direct(ctx, meta, idxStart, idxLen)
 			}
-			s.indexCache[meta.R2Key] = []LayerIndexEntry{}
-			s.idxMu.Unlock()
-			return nil, nil
+			if loadErr == nil {
+				if footer.Version == LayerVersionV2 {
+					v2, dErr := decodeLayerV2Index(idxRaw, meta, footer.EntryCount, s.kms)
+					if dErr != nil {
+						loadErr = dErr
+					} else {
+						loaded = s.idxCache.putVersioned(meta.R2Key, LayerVersionV2, v2.entries, v2.chunks, v2.walTable)
+					}
+				} else {
+					entries, dErr := DecodeLayerIndex(idxRaw, meta, footer.EntryCount, s.kms)
+					if dErr != nil {
+						loadErr = dErr
+					} else {
+						loaded = s.idxCache.putVersioned(meta.R2Key, LayerVersion, entries, nil, v2WALTableMeta{})
+					}
+				}
+			}
 		}
-		idxRaw, err := s.readRangeLocalOrR2Direct(ctx, meta, int64(footer.IndexOffset), int64(footer.IndexLen))
-		if err != nil {
-			return nil, err
-		}
-		entries, err = DecodeLayerIndex(idxRaw, meta, footer.EntryCount, s.kms)
-		if err != nil {
-			return nil, err
-		}
-		s.idxMu.Lock()
-		if s.indexCache == nil {
-			s.indexCache = make(map[string][]LayerIndexEntry)
-		}
-		s.indexCache[meta.R2Key] = entries
-		s.idxMu.Unlock()
-	}
-	if len(entries) == 0 {
-		return nil, nil
 	}
 
-	// Binary search for first index >= key.
-	start := sort.Search(len(entries), func(i int) bool {
-		return entries[i].Key.Compare(key) >= 0
-	})
-	var out []WALDelta
-	for i := start; i < len(entries) && entries[i].Key.Compare(key) == 0; i++ {
-		e := entries[i]
-		if lsn != 0 && e.LSN > lsn {
-			break
+	s.idxFlightMu.Lock()
+	f.data = loaded
+	f.err = loadErr
+	close(f.done)
+	delete(s.idxFlight, meta.R2Key)
+	s.idxFlightMu.Unlock()
+
+	return loaded, loadErr
+}
+
+// LookupKeyInLayer reads only the footer, index (cached in bounded LRU), and matching entry ranges for key <= lsn.
+func (s *LayerStore) LookupKeyInLayer(ctx context.Context, meta LayerMeta, key Key, lsn uint64) ([]WALDelta, error) {
+	res, err := s.LookupKeysInLayer(ctx, meta, []Key{key}, lsn)
+	if err != nil {
+		return nil, err
+	}
+	return res[0], nil
+}
+
+// LookupKeysInLayer resolves a batch of keys against a single layer using Bloom pruning,
+// sparse-index search, and coalesced range reads.
+func (s *LayerStore) LookupKeysInLayer(ctx context.Context, meta LayerMeta, keys []Key, lsn uint64) ([][]WALDelta, error) {
+	out := make([][]WALDelta, len(keys))
+	if len(keys) == 0 {
+		return out, nil
+	}
+	if meta.FileSize < int64(LayerFooterSize) {
+		return nil, errors.New("pageserver: layer file smaller than footer")
+	}
+
+	// Fast Bloom check before loading index if Bloom is retained from an earlier read.
+	if s.idxCache != nil {
+		if bloom, ok := s.idxCache.getBloom(meta.R2Key); ok {
+			anyHit := false
+			for _, k := range keys {
+				if bloom.mayContain(k) {
+					anyHit = true
+					break
+				}
+			}
+			if !anyHit {
+				return out, nil
+			}
 		}
-		raw, err := s.ReadRange(ctx, meta, int64(e.Offset), int64(e.Length))
+	}
+
+	idxData, err := s.loadLayerIndex(ctx, meta)
+	if err != nil {
+		return nil, err
+	}
+	if len(idxData.entries) == 0 {
+		return out, nil
+	}
+	if idxData.version == LayerVersionV2 {
+		return s.lookupKeysInLayerV2(ctx, meta, idxData, keys, lsn)
+	}
+
+	type matchedEntry struct {
+		keySlot  int
+		entryIdx int
+		entry    LayerIndexEntry
+	}
+	var matches []matchedEntry
+	for ki, k := range keys {
+		if idxData.bloom != nil && !idxData.bloom.mayContain(k) {
+			continue
+		}
+		start := findKeyStart(idxData.entries, idxData.sparse, k)
+		for i := start; i < len(idxData.entries) && idxData.entries[i].Key.Compare(k) == 0; i++ {
+			e := idxData.entries[i]
+			if lsn != 0 && e.LSN > lsn {
+				break
+			}
+			matches = append(matches, matchedEntry{
+				keySlot:  ki,
+				entryIdx: i,
+				entry:    e,
+			})
+		}
+	}
+	if len(matches) == 0 {
+		return out, nil
+	}
+
+	// Sort matches by file offset to coalesce adjacent payload range reads.
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].entry.Offset != matches[j].entry.Offset {
+			return matches[i].entry.Offset < matches[j].entry.Offset
+		}
+		return matches[i].entryIdx < matches[j].entryIdx
+	})
+
+	i := 0
+	for i < len(matches) {
+		spanStart := int64(matches[i].entry.Offset)
+		spanEnd := spanStart + int64(matches[i].entry.Length)
+		j := i + 1
+		for j < len(matches) {
+			nextStart := int64(matches[j].entry.Offset)
+			nextEnd := nextStart + int64(matches[j].entry.Length)
+			if nextStart-spanEnd > coalesceGapBytes || nextEnd-spanStart > maxCoalescedSpan {
+				break
+			}
+			if nextEnd > spanEnd {
+				spanEnd = nextEnd
+			}
+			j++
+		}
+
+		spanBuf, err := s.ReadRange(ctx, meta, spanStart, spanEnd-spanStart)
 		if err != nil {
 			return nil, err
 		}
-		if meta.Encrypted {
-			raw, err = s.kms.DecryptObject(meta.TenantID, meta.Epoch, fmt.Sprintf("%s#e%d", meta.aadKey(), i), raw)
+
+		for k := i; k < j; k++ {
+			m := matches[k]
+			relOff := int64(m.entry.Offset) - spanStart
+			raw := spanBuf[relOff : relOff+int64(m.entry.Length)]
+			if meta.Encrypted {
+				raw, err = s.kms.DecryptObject(meta.TenantID, meta.Epoch, fmt.Sprintf("%s#e%d", meta.aadKey(), m.entryIdx), raw)
+				if err != nil {
+					return nil, err
+				}
+			}
+			delta, err := decodeDeltaPayload(raw, m.entry.LSN, m.entry.Flags)
 			if err != nil {
 				return nil, err
 			}
+			out[m.keySlot] = append(out[m.keySlot], delta)
 		}
-		delta, err := decodeDeltaPayload(raw, e.LSN, e.Flags)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, delta)
+		i = j
 	}
 	return out, nil
 }
@@ -1161,27 +1614,8 @@ func (s *LayerStore) PublishLayerManifest(ctx context.Context, tenantID string, 
 		return err
 	}
 
-	if s.localDir != "" {
-		localManifest := filepath.Join(s.localDir, tenantID, fmt.Sprintf("timeline_%d_layer_manifest.json", epoch))
-		if err := os.MkdirAll(filepath.Dir(localManifest), 0o755); err != nil {
-			return err
-		}
-		tmp := localManifest + ".tmp"
-		if err := os.WriteFile(tmp, body, 0o600); err != nil {
-			return err
-		}
-		if err := os.Rename(tmp, localManifest); err != nil {
-			_ = os.Remove(tmp)
-			return err
-		}
-	}
-
-	if s.s3c == nil || s.bucket == "" {
-		return nil
-	}
-
-	key := LayerManifestR2Key(tenantID, epoch)
-	for attempt := 0; attempt < 3; attempt++ {
+	if s.s3c != nil && s.bucket != "" {
+		key := LayerManifestR2Key(tenantID, epoch)
 		var expectedETag string
 		headOut, headErr := s.s3c.HeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(s.bucket),
@@ -1207,14 +1641,28 @@ func (s *LayerStore) PublishLayerManifest(ctx context.Context, tenantID string, 
 			putIn.IfMatch = aws.String(expectedETag)
 		}
 		if _, err := s.s3c.PutObject(ctx, putIn); err != nil {
-			if isPreconditionS3Err(err) && attempt < 2 {
-				continue
+			if isPreconditionS3Err(err) {
+				return fmt.Errorf("%w: key=%s", ErrManifestCASConflict, key)
 			}
 			return err
 		}
-		return nil
 	}
-	return fmt.Errorf("pageserver: manifest publish CAS conflict for %s", key)
+
+	if s.localDir != "" {
+		localManifest := filepath.Join(s.localDir, tenantID, fmt.Sprintf("timeline_%d_layer_manifest.json", epoch))
+		if err := os.MkdirAll(filepath.Dir(localManifest), 0o755); err != nil {
+			return err
+		}
+		tmp := localManifest + ".tmp"
+		if err := os.WriteFile(tmp, body, 0o600); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, localManifest); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
+	}
+	return nil
 }
 
 // LoadLayerManifest loads the published TimelineLayerManifest from R2 (or local disk if R2 is not configured).

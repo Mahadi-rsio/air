@@ -2120,6 +2120,370 @@ class AirDBControl final {
   typedef WithStreamedUnaryMethod_GetTenantRoute<WithStreamedUnaryMethod_WakeTenant<WithStreamedUnaryMethod_TouchActivity<WithStreamedUnaryMethod_BatchTouchActivity<WithSplitStreamingMethod_WatchTenantChanges<WithStreamedUnaryMethod_CreateDatabase<WithStreamedUnaryMethod_ListDatabases<WithStreamedUnaryMethod_GetDatabase<WithStreamedUnaryMethod_DeleteDatabase<WithStreamedUnaryMethod_SuspendDatabase<WithStreamedUnaryMethod_StartDatabase<WithStreamedUnaryMethod_LockDatabase<WithStreamedUnaryMethod_UnlockDatabase<Service > > > > > > > > > > > > > StreamedService;
 };
 
+class GatewayAdmin final {
+ public:
+  static constexpr char const* service_full_name() {
+    return "air.db.v1.GatewayAdmin";
+  }
+  class StubInterface {
+   public:
+    virtual ~StubInterface() {}
+    virtual ::grpc::Status DrainTenant(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest& request, ::air::db::v1::StatusResponse* response) = 0;
+    std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::StatusResponse>> AsyncDrainTenant(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::StatusResponse>>(AsyncDrainTenantRaw(context, request, cq));
+    }
+    std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::StatusResponse>> PrepareAsyncDrainTenant(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::StatusResponse>>(PrepareAsyncDrainTenantRaw(context, request, cq));
+    }
+    virtual ::grpc::Status SetTenantLimits(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest& request, ::air::db::v1::StatusResponse* response) = 0;
+    std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::StatusResponse>> AsyncSetTenantLimits(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::StatusResponse>>(AsyncSetTenantLimitsRaw(context, request, cq));
+    }
+    std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::StatusResponse>> PrepareAsyncSetTenantLimits(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::StatusResponse>>(PrepareAsyncSetTenantLimitsRaw(context, request, cq));
+    }
+    class async_interface {
+     public:
+      virtual ~async_interface() {}
+      virtual void DrainTenant(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest* request, ::air::db::v1::StatusResponse* response, std::function<void(::grpc::Status)>) = 0;
+      virtual void DrainTenant(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest* request, ::air::db::v1::StatusResponse* response, ::grpc::ClientUnaryReactor* reactor) = 0;
+      virtual void SetTenantLimits(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest* request, ::air::db::v1::StatusResponse* response, std::function<void(::grpc::Status)>) = 0;
+      virtual void SetTenantLimits(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest* request, ::air::db::v1::StatusResponse* response, ::grpc::ClientUnaryReactor* reactor) = 0;
+    };
+    typedef class async_interface experimental_async_interface;
+    virtual class async_interface* async() { return nullptr; }
+    class async_interface* experimental_async() { return async(); }
+   private:
+    virtual ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::StatusResponse>* AsyncDrainTenantRaw(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest& request, ::grpc::CompletionQueue* cq) = 0;
+    virtual ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::StatusResponse>* PrepareAsyncDrainTenantRaw(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest& request, ::grpc::CompletionQueue* cq) = 0;
+    virtual ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::StatusResponse>* AsyncSetTenantLimitsRaw(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest& request, ::grpc::CompletionQueue* cq) = 0;
+    virtual ::grpc::ClientAsyncResponseReaderInterface< ::air::db::v1::StatusResponse>* PrepareAsyncSetTenantLimitsRaw(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest& request, ::grpc::CompletionQueue* cq) = 0;
+  };
+  class Stub final : public StubInterface {
+   public:
+    Stub(const std::shared_ptr< ::grpc::ChannelInterface>& channel, const ::grpc::StubOptions& options = ::grpc::StubOptions());
+    ::grpc::Status DrainTenant(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest& request, ::air::db::v1::StatusResponse* response) override;
+    std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::air::db::v1::StatusResponse>> AsyncDrainTenant(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::air::db::v1::StatusResponse>>(AsyncDrainTenantRaw(context, request, cq));
+    }
+    std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::air::db::v1::StatusResponse>> PrepareAsyncDrainTenant(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::air::db::v1::StatusResponse>>(PrepareAsyncDrainTenantRaw(context, request, cq));
+    }
+    ::grpc::Status SetTenantLimits(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest& request, ::air::db::v1::StatusResponse* response) override;
+    std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::air::db::v1::StatusResponse>> AsyncSetTenantLimits(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::air::db::v1::StatusResponse>>(AsyncSetTenantLimitsRaw(context, request, cq));
+    }
+    std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::air::db::v1::StatusResponse>> PrepareAsyncSetTenantLimits(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::air::db::v1::StatusResponse>>(PrepareAsyncSetTenantLimitsRaw(context, request, cq));
+    }
+    class async final :
+      public StubInterface::async_interface {
+     public:
+      void DrainTenant(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest* request, ::air::db::v1::StatusResponse* response, std::function<void(::grpc::Status)>) override;
+      void DrainTenant(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest* request, ::air::db::v1::StatusResponse* response, ::grpc::ClientUnaryReactor* reactor) override;
+      void SetTenantLimits(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest* request, ::air::db::v1::StatusResponse* response, std::function<void(::grpc::Status)>) override;
+      void SetTenantLimits(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest* request, ::air::db::v1::StatusResponse* response, ::grpc::ClientUnaryReactor* reactor) override;
+     private:
+      friend class Stub;
+      explicit async(Stub* stub): stub_(stub) { }
+      Stub* stub() { return stub_; }
+      Stub* stub_;
+    };
+    class async* async() override { return &async_stub_; }
+
+   private:
+    std::shared_ptr< ::grpc::ChannelInterface> channel_;
+    class async async_stub_{this};
+    ::grpc::ClientAsyncResponseReader< ::air::db::v1::StatusResponse>* AsyncDrainTenantRaw(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest& request, ::grpc::CompletionQueue* cq) override;
+    ::grpc::ClientAsyncResponseReader< ::air::db::v1::StatusResponse>* PrepareAsyncDrainTenantRaw(::grpc::ClientContext* context, const ::air::db::v1::DrainTenantRequest& request, ::grpc::CompletionQueue* cq) override;
+    ::grpc::ClientAsyncResponseReader< ::air::db::v1::StatusResponse>* AsyncSetTenantLimitsRaw(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest& request, ::grpc::CompletionQueue* cq) override;
+    ::grpc::ClientAsyncResponseReader< ::air::db::v1::StatusResponse>* PrepareAsyncSetTenantLimitsRaw(::grpc::ClientContext* context, const ::air::db::v1::SetTenantLimitsRequest& request, ::grpc::CompletionQueue* cq) override;
+    const ::grpc::internal::RpcMethod rpcmethod_DrainTenant_;
+    const ::grpc::internal::RpcMethod rpcmethod_SetTenantLimits_;
+  };
+  static std::unique_ptr<Stub> NewStub(const std::shared_ptr< ::grpc::ChannelInterface>& channel, const ::grpc::StubOptions& options = ::grpc::StubOptions());
+
+  class Service : public ::grpc::Service {
+   public:
+    Service();
+    virtual ~Service();
+    virtual ::grpc::Status DrainTenant(::grpc::ServerContext* context, const ::air::db::v1::DrainTenantRequest* request, ::air::db::v1::StatusResponse* response);
+    virtual ::grpc::Status SetTenantLimits(::grpc::ServerContext* context, const ::air::db::v1::SetTenantLimitsRequest* request, ::air::db::v1::StatusResponse* response);
+  };
+  template <class BaseClass>
+  class WithAsyncMethod_DrainTenant : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithAsyncMethod_DrainTenant() {
+      ::grpc::Service::MarkMethodAsync(0);
+    }
+    ~WithAsyncMethod_DrainTenant() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status DrainTenant(::grpc::ServerContext* /*context*/, const ::air::db::v1::DrainTenantRequest* /*request*/, ::air::db::v1::StatusResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    void RequestDrainTenant(::grpc::ServerContext* context, ::air::db::v1::DrainTenantRequest* request, ::grpc::ServerAsyncResponseWriter< ::air::db::v1::StatusResponse>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
+      ::grpc::Service::RequestAsyncUnary(0, context, request, response, new_call_cq, notification_cq, tag);
+    }
+  };
+  template <class BaseClass>
+  class WithAsyncMethod_SetTenantLimits : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithAsyncMethod_SetTenantLimits() {
+      ::grpc::Service::MarkMethodAsync(1);
+    }
+    ~WithAsyncMethod_SetTenantLimits() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status SetTenantLimits(::grpc::ServerContext* /*context*/, const ::air::db::v1::SetTenantLimitsRequest* /*request*/, ::air::db::v1::StatusResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    void RequestSetTenantLimits(::grpc::ServerContext* context, ::air::db::v1::SetTenantLimitsRequest* request, ::grpc::ServerAsyncResponseWriter< ::air::db::v1::StatusResponse>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
+      ::grpc::Service::RequestAsyncUnary(1, context, request, response, new_call_cq, notification_cq, tag);
+    }
+  };
+  typedef WithAsyncMethod_DrainTenant<WithAsyncMethod_SetTenantLimits<Service > > AsyncService;
+  template <class BaseClass>
+  class WithCallbackMethod_DrainTenant : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithCallbackMethod_DrainTenant() {
+      ::grpc::Service::MarkMethodCallback(0,
+          new ::grpc::internal::CallbackUnaryHandler< ::air::db::v1::DrainTenantRequest, ::air::db::v1::StatusResponse>(
+            [this](
+                   ::grpc::CallbackServerContext* context, const ::air::db::v1::DrainTenantRequest* request, ::air::db::v1::StatusResponse* response) { return this->DrainTenant(context, request, response); }));}
+    void SetMessageAllocatorFor_DrainTenant(
+        ::grpc::MessageAllocator< ::air::db::v1::DrainTenantRequest, ::air::db::v1::StatusResponse>* allocator) {
+      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(0);
+      static_cast<::grpc::internal::CallbackUnaryHandler< ::air::db::v1::DrainTenantRequest, ::air::db::v1::StatusResponse>*>(handler)
+              ->SetMessageAllocator(allocator);
+    }
+    ~WithCallbackMethod_DrainTenant() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status DrainTenant(::grpc::ServerContext* /*context*/, const ::air::db::v1::DrainTenantRequest* /*request*/, ::air::db::v1::StatusResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    virtual ::grpc::ServerUnaryReactor* DrainTenant(
+      ::grpc::CallbackServerContext* /*context*/, const ::air::db::v1::DrainTenantRequest* /*request*/, ::air::db::v1::StatusResponse* /*response*/)  { return nullptr; }
+  };
+  template <class BaseClass>
+  class WithCallbackMethod_SetTenantLimits : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithCallbackMethod_SetTenantLimits() {
+      ::grpc::Service::MarkMethodCallback(1,
+          new ::grpc::internal::CallbackUnaryHandler< ::air::db::v1::SetTenantLimitsRequest, ::air::db::v1::StatusResponse>(
+            [this](
+                   ::grpc::CallbackServerContext* context, const ::air::db::v1::SetTenantLimitsRequest* request, ::air::db::v1::StatusResponse* response) { return this->SetTenantLimits(context, request, response); }));}
+    void SetMessageAllocatorFor_SetTenantLimits(
+        ::grpc::MessageAllocator< ::air::db::v1::SetTenantLimitsRequest, ::air::db::v1::StatusResponse>* allocator) {
+      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(1);
+      static_cast<::grpc::internal::CallbackUnaryHandler< ::air::db::v1::SetTenantLimitsRequest, ::air::db::v1::StatusResponse>*>(handler)
+              ->SetMessageAllocator(allocator);
+    }
+    ~WithCallbackMethod_SetTenantLimits() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status SetTenantLimits(::grpc::ServerContext* /*context*/, const ::air::db::v1::SetTenantLimitsRequest* /*request*/, ::air::db::v1::StatusResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    virtual ::grpc::ServerUnaryReactor* SetTenantLimits(
+      ::grpc::CallbackServerContext* /*context*/, const ::air::db::v1::SetTenantLimitsRequest* /*request*/, ::air::db::v1::StatusResponse* /*response*/)  { return nullptr; }
+  };
+  typedef WithCallbackMethod_DrainTenant<WithCallbackMethod_SetTenantLimits<Service > > CallbackService;
+  typedef CallbackService ExperimentalCallbackService;
+  template <class BaseClass>
+  class WithGenericMethod_DrainTenant : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithGenericMethod_DrainTenant() {
+      ::grpc::Service::MarkMethodGeneric(0);
+    }
+    ~WithGenericMethod_DrainTenant() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status DrainTenant(::grpc::ServerContext* /*context*/, const ::air::db::v1::DrainTenantRequest* /*request*/, ::air::db::v1::StatusResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+  };
+  template <class BaseClass>
+  class WithGenericMethod_SetTenantLimits : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithGenericMethod_SetTenantLimits() {
+      ::grpc::Service::MarkMethodGeneric(1);
+    }
+    ~WithGenericMethod_SetTenantLimits() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status SetTenantLimits(::grpc::ServerContext* /*context*/, const ::air::db::v1::SetTenantLimitsRequest* /*request*/, ::air::db::v1::StatusResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+  };
+  template <class BaseClass>
+  class WithRawMethod_DrainTenant : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithRawMethod_DrainTenant() {
+      ::grpc::Service::MarkMethodRaw(0);
+    }
+    ~WithRawMethod_DrainTenant() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status DrainTenant(::grpc::ServerContext* /*context*/, const ::air::db::v1::DrainTenantRequest* /*request*/, ::air::db::v1::StatusResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    void RequestDrainTenant(::grpc::ServerContext* context, ::grpc::ByteBuffer* request, ::grpc::ServerAsyncResponseWriter< ::grpc::ByteBuffer>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
+      ::grpc::Service::RequestAsyncUnary(0, context, request, response, new_call_cq, notification_cq, tag);
+    }
+  };
+  template <class BaseClass>
+  class WithRawMethod_SetTenantLimits : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithRawMethod_SetTenantLimits() {
+      ::grpc::Service::MarkMethodRaw(1);
+    }
+    ~WithRawMethod_SetTenantLimits() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status SetTenantLimits(::grpc::ServerContext* /*context*/, const ::air::db::v1::SetTenantLimitsRequest* /*request*/, ::air::db::v1::StatusResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    void RequestSetTenantLimits(::grpc::ServerContext* context, ::grpc::ByteBuffer* request, ::grpc::ServerAsyncResponseWriter< ::grpc::ByteBuffer>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
+      ::grpc::Service::RequestAsyncUnary(1, context, request, response, new_call_cq, notification_cq, tag);
+    }
+  };
+  template <class BaseClass>
+  class WithRawCallbackMethod_DrainTenant : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithRawCallbackMethod_DrainTenant() {
+      ::grpc::Service::MarkMethodRawCallback(0,
+          new ::grpc::internal::CallbackUnaryHandler< ::grpc::ByteBuffer, ::grpc::ByteBuffer>(
+            [this](
+                   ::grpc::CallbackServerContext* context, const ::grpc::ByteBuffer* request, ::grpc::ByteBuffer* response) { return this->DrainTenant(context, request, response); }));
+    }
+    ~WithRawCallbackMethod_DrainTenant() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status DrainTenant(::grpc::ServerContext* /*context*/, const ::air::db::v1::DrainTenantRequest* /*request*/, ::air::db::v1::StatusResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    virtual ::grpc::ServerUnaryReactor* DrainTenant(
+      ::grpc::CallbackServerContext* /*context*/, const ::grpc::ByteBuffer* /*request*/, ::grpc::ByteBuffer* /*response*/)  { return nullptr; }
+  };
+  template <class BaseClass>
+  class WithRawCallbackMethod_SetTenantLimits : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithRawCallbackMethod_SetTenantLimits() {
+      ::grpc::Service::MarkMethodRawCallback(1,
+          new ::grpc::internal::CallbackUnaryHandler< ::grpc::ByteBuffer, ::grpc::ByteBuffer>(
+            [this](
+                   ::grpc::CallbackServerContext* context, const ::grpc::ByteBuffer* request, ::grpc::ByteBuffer* response) { return this->SetTenantLimits(context, request, response); }));
+    }
+    ~WithRawCallbackMethod_SetTenantLimits() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status SetTenantLimits(::grpc::ServerContext* /*context*/, const ::air::db::v1::SetTenantLimitsRequest* /*request*/, ::air::db::v1::StatusResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    virtual ::grpc::ServerUnaryReactor* SetTenantLimits(
+      ::grpc::CallbackServerContext* /*context*/, const ::grpc::ByteBuffer* /*request*/, ::grpc::ByteBuffer* /*response*/)  { return nullptr; }
+  };
+  template <class BaseClass>
+  class WithStreamedUnaryMethod_DrainTenant : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithStreamedUnaryMethod_DrainTenant() {
+      ::grpc::Service::MarkMethodStreamed(0,
+        new ::grpc::internal::StreamedUnaryHandler<
+          ::air::db::v1::DrainTenantRequest, ::air::db::v1::StatusResponse>(
+            [this](::grpc::ServerContext* context,
+                   ::grpc::ServerUnaryStreamer<
+                     ::air::db::v1::DrainTenantRequest, ::air::db::v1::StatusResponse>* streamer) {
+                       return this->StreamedDrainTenant(context,
+                         streamer);
+                  }));
+    }
+    ~WithStreamedUnaryMethod_DrainTenant() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable regular version of this method
+    ::grpc::Status DrainTenant(::grpc::ServerContext* /*context*/, const ::air::db::v1::DrainTenantRequest* /*request*/, ::air::db::v1::StatusResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    // replace default version of method with streamed unary
+    virtual ::grpc::Status StreamedDrainTenant(::grpc::ServerContext* context, ::grpc::ServerUnaryStreamer< ::air::db::v1::DrainTenantRequest,::air::db::v1::StatusResponse>* server_unary_streamer) = 0;
+  };
+  template <class BaseClass>
+  class WithStreamedUnaryMethod_SetTenantLimits : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithStreamedUnaryMethod_SetTenantLimits() {
+      ::grpc::Service::MarkMethodStreamed(1,
+        new ::grpc::internal::StreamedUnaryHandler<
+          ::air::db::v1::SetTenantLimitsRequest, ::air::db::v1::StatusResponse>(
+            [this](::grpc::ServerContext* context,
+                   ::grpc::ServerUnaryStreamer<
+                     ::air::db::v1::SetTenantLimitsRequest, ::air::db::v1::StatusResponse>* streamer) {
+                       return this->StreamedSetTenantLimits(context,
+                         streamer);
+                  }));
+    }
+    ~WithStreamedUnaryMethod_SetTenantLimits() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable regular version of this method
+    ::grpc::Status SetTenantLimits(::grpc::ServerContext* /*context*/, const ::air::db::v1::SetTenantLimitsRequest* /*request*/, ::air::db::v1::StatusResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    // replace default version of method with streamed unary
+    virtual ::grpc::Status StreamedSetTenantLimits(::grpc::ServerContext* context, ::grpc::ServerUnaryStreamer< ::air::db::v1::SetTenantLimitsRequest,::air::db::v1::StatusResponse>* server_unary_streamer) = 0;
+  };
+  typedef WithStreamedUnaryMethod_DrainTenant<WithStreamedUnaryMethod_SetTenantLimits<Service > > StreamedUnaryService;
+  typedef Service SplitStreamedService;
+  typedef WithStreamedUnaryMethod_DrainTenant<WithStreamedUnaryMethod_SetTenantLimits<Service > > StreamedService;
+};
+
 }  // namespace v1
 }  // namespace db
 }  // namespace air

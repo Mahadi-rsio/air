@@ -32,6 +32,7 @@ var (
 	ErrLayerSizeMismatch     = errors.New("pageserver: remote layer size mismatch")
 	ErrLayerChecksumMismatch = errors.New("pageserver: remote layer sha256 checksum mismatch")
 	ErrRemoteObjectMissing   = errors.New("pageserver: remote layer object missing after upload")
+	ErrManifestCASConflict   = errors.New("pageserver: manifest publish CAS conflict")
 )
 
 // UploadMetrics captures timing and request counts for a single CAU upload operation.

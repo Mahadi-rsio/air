@@ -1,3 +1,4 @@
+#include "admin_grpc.hpp"
 #include "config.hpp"
 #include "discovery.hpp"
 #include "metrics.hpp"
@@ -334,6 +335,64 @@ int main() {
 
         disc.stop();
         server->Shutdown();
+    }
+
+    // 8. AdminGRPCServer (DrainTenant + SetTenantLimits + x-internal-token auth)
+    {
+        auto require = [](bool cond, const char* msg) {
+            if (!cond) {
+                std::cerr << "FAIL: " << msg << std::endl;
+                std::abort();
+            }
+        };
+        PoolManager pools(8);
+        pools.upsert_discovered(TenantRoute{"t_admin", "127.0.0.1", "", 15432, "pw", "ACTIVE"});
+        MetricsRegistry metrics(100, 10, 5);
+        AdminGRPCServer admin_grpc("127.0.0.1:0", "adm-tok", pools, metrics);
+        int port = 0;
+        require(admin_grpc.start(&port) && port > 0, "AdminGRPCServer started");
+
+        auto ch = grpc::CreateChannel("127.0.0.1:" + std::to_string(port), grpc::InsecureChannelCredentials());
+        auto stub = ::air::db::v1::GatewayAdmin::NewStub(ch);
+
+        // Unauthorized call fails with PERMISSION_DENIED
+        {
+            grpc::ClientContext ctx;
+            ::air::db::v1::DrainTenantRequest req;
+            req.set_tenant_id("t_admin");
+            req.set_timeout_ms(500);
+            ::air::db::v1::StatusResponse resp;
+            auto st = stub->DrainTenant(&ctx, req, &resp);
+            require(st.error_code() == grpc::StatusCode::PERMISSION_DENIED, "missing token denied");
+        }
+
+        // Authorized DrainTenant succeeds
+        {
+            grpc::ClientContext ctx;
+            ctx.AddMetadata("x-internal-token", "adm-tok");
+            ::air::db::v1::DrainTenantRequest req;
+            req.set_tenant_id("t_admin");
+            req.set_timeout_ms(500);
+            ::air::db::v1::StatusResponse resp;
+            auto st = stub->DrainTenant(&ctx, req, &resp);
+            require(st.ok() && resp.status() == "drained" && resp.tenant_id() == "t_admin", "DrainTenant ok");
+        }
+
+        // Authorized SetTenantLimits updates metrics
+        {
+            grpc::ClientContext ctx;
+            ctx.AddMetadata("x-internal-token", "adm-tok");
+            ::air::db::v1::SetTenantLimitsRequest req;
+            req.set_tenant_id("t_admin");
+            req.set_max_client_conns(42);
+            req.set_max_backends(6);
+            ::air::db::v1::StatusResponse resp;
+            auto st = stub->SetTenantLimits(&ctx, req, &resp);
+            require(st.ok() && resp.status() == "updated", "SetTenantLimits ok");
+            require(metrics.get_tenant_client_limit("t_admin") == 42, "tenant client limit updated");
+        }
+
+        admin_grpc.stop();
     }
 
     std::cout << "All C++ air-gateway tests passed!" << std::endl;

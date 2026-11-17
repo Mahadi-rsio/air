@@ -1,3 +1,4 @@
+#include "admin_grpc.hpp"
 #include "admin_http.hpp"
 #include "config.hpp"
 #include "discovery.hpp"
@@ -237,9 +238,19 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    air::gw::AdminGRPCServer admin_grpc_srv(
+        cfg.admin_grpc_addr, cfg.internal_token, pools, metrics);
+    if (!cfg.admin_grpc_addr.empty() && !admin_grpc_srv.start()) {
+        std::cerr << "[air-gateway] failed to bind admin gRPC on " << cfg.admin_grpc_addr << std::endl;
+        admin_srv.stop();
+        discovery.stop();
+        return 1;
+    }
+
     g_listen_fd = air::gw::listen_tcp_addr(cfg.gateway_addr);
     if (g_listen_fd < 0) {
         std::cerr << "[air-gateway] failed to listen on " << cfg.gateway_addr << std::endl;
+        admin_grpc_srv.stop();
         admin_srv.stop();
         discovery.stop();
         return 1;
@@ -247,6 +258,7 @@ int main(int argc, char** argv) {
 
     std::cout << "[air-gateway] C++ PG Gateway listening on " << cfg.gateway_addr
               << " (admin=" << cfg.admin_addr
+              << ", admin_grpc=" << (cfg.admin_grpc_addr.empty() ? "disabled" : cfg.admin_grpc_addr)
               << ", db_grpc=" << cfg.grpc_addr
               << ", pool_mode=" << (cfg.pool_mode ? "true" : "false")
               << ", max_client_conns=" << cfg.max_client_conns
@@ -274,6 +286,7 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[air-gateway] shutting down..." << std::endl;
+    admin_grpc_srv.stop();
     admin_srv.stop();
     discovery.stop();
     pools.close_all();

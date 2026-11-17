@@ -92,6 +92,14 @@ extern const ::google::protobuf::internal::ClassDataFull DatabaseInfo_class_data
 #else
 extern const DatabaseInfoGlobalsTypeInternal DatabaseInfo_globals_;
 #endif  // PROTOBUF_MESSAGE_GLOBALS
+class DrainTenantRequest;
+struct DrainTenantRequestGlobalsTypeInternal;
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+extern DrainTenantRequestGlobalsTypeInternal DrainTenantRequest_globals_;
+extern const ::google::protobuf::internal::ClassDataFull DrainTenantRequest_class_data_;
+#else
+extern const DrainTenantRequestGlobalsTypeInternal DrainTenantRequest_globals_;
+#endif  // PROTOBUF_MESSAGE_GLOBALS
 class Empty;
 struct EmptyGlobalsTypeInternal;
 #ifndef PROTOBUF_MESSAGE_GLOBALS
@@ -115,6 +123,14 @@ extern ListDatabasesResponseGlobalsTypeInternal ListDatabasesResponse_globals_;
 extern const ::google::protobuf::internal::ClassDataFull ListDatabasesResponse_class_data_;
 #else
 extern const ListDatabasesResponseGlobalsTypeInternal ListDatabasesResponse_globals_;
+#endif  // PROTOBUF_MESSAGE_GLOBALS
+class SetTenantLimitsRequest;
+struct SetTenantLimitsRequestGlobalsTypeInternal;
+#ifndef PROTOBUF_MESSAGE_GLOBALS
+extern SetTenantLimitsRequestGlobalsTypeInternal SetTenantLimitsRequest_globals_;
+extern const ::google::protobuf::internal::ClassDataFull SetTenantLimitsRequest_class_data_;
+#else
+extern const SetTenantLimitsRequestGlobalsTypeInternal SetTenantLimitsRequest_globals_;
 #endif  // PROTOBUF_MESSAGE_GLOBALS
 class StatusResponse;
 struct StatusResponseGlobalsTypeInternal;
@@ -1136,6 +1152,236 @@ class  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED StatusResponse final : public ::goo
 };
 // -------------------------------------------------------------------
 
+class  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED SetTenantLimitsRequest final : public ::google::protobuf::Message
+/* @@protoc_insertion_point(class_definition:air.db.v1.SetTenantLimitsRequest) */ {
+ public:
+  inline SetTenantLimitsRequest() : SetTenantLimitsRequest(nullptr) {}
+  ~SetTenantLimitsRequest() PROTOBUF_FINAL;
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  void operator delete(SetTenantLimitsRequest* PROTOBUF_NONNULL msg, ::std::destroying_delete_t) {
+    SharedDtor(*msg);
+    ::google::protobuf::internal::SizedDelete(msg, sizeof(SetTenantLimitsRequest));
+  }
+#endif
+
+  template <typename = void>
+  explicit constexpr SetTenantLimitsRequest(::google::protobuf::internal::ConstantInitialized,
+                           const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL
+                               class_data);
+
+  inline SetTenantLimitsRequest(const SetTenantLimitsRequest& from) : SetTenantLimitsRequest(nullptr, from) {}
+  inline SetTenantLimitsRequest(SetTenantLimitsRequest&& from) noexcept : SetTenantLimitsRequest(nullptr, ::std::move(from)) {}
+  inline SetTenantLimitsRequest& operator=(const SetTenantLimitsRequest& from) {
+    CopyFrom(from);
+    return *this;
+  }
+  inline SetTenantLimitsRequest& operator=(SetTenantLimitsRequest&& from) noexcept {
+    if (this == &from) return *this;
+    if (::google::protobuf::internal::CanMoveWithInternalSwap(GetArena(), from.GetArena())) {
+      InternalSwap(&from);
+    } else {
+      CopyFrom(from);
+    }
+    return *this;
+  }
+
+  [[nodiscard]] inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance);
+  }
+  [[nodiscard]] inline ::google::protobuf::UnknownFieldSet* PROTOBUF_NONNULL
+  mutable_unknown_fields() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.mutable_unknown_fields<::google::protobuf::UnknownFieldSet>();
+  }
+
+  [[nodiscard]] static const ::google::protobuf::Descriptor* PROTOBUF_NONNULL descriptor() {
+    return GetDescriptor();
+  }
+  [[nodiscard]] static const ::google::protobuf::Descriptor* PROTOBUF_NONNULL
+  GetDescriptor() {
+    return default_instance().GetMetadata().descriptor;
+  }
+  [[nodiscard]] static const ::google::protobuf::Reflection* PROTOBUF_NONNULL GetReflection() {
+    return default_instance().GetMetadata().reflection;
+  }
+  [[nodiscard]] static const SetTenantLimitsRequest& default_instance() {
+    return *::google::protobuf::internal::MessageGlobalsBase::ToDefaultInstance<SetTenantLimitsRequest>(&SetTenantLimitsRequest_globals_);
+  }
+  static constexpr int kIndexInFileMessages = 13;
+  friend void swap(SetTenantLimitsRequest& a, SetTenantLimitsRequest& b) { a.Swap(&b); }
+  inline void Swap(SetTenantLimitsRequest* PROTOBUF_NONNULL other) {
+    if (other == this) return;
+    if (::google::protobuf::internal::CanUseInternalSwap(GetArena(), other->GetArena())) {
+      InternalSwap(other);
+    } else {
+      ::google::protobuf::internal::GenericSwap(this, other);
+    }
+  }
+  void UnsafeArenaSwap(SetTenantLimitsRequest* PROTOBUF_NONNULL other) {
+    if (other == this) return;
+    ABSL_DCHECK(GetArena() == other->GetArena());
+    InternalSwap(other);
+  }
+
+  // implements Message ----------------------------------------------
+
+  [[nodiscard]] SetTenantLimitsRequest* PROTOBUF_NONNULL
+  New(::google::protobuf::Arena* PROTOBUF_NULLABLE arena = nullptr) const {
+    return ::google::protobuf::Message::DefaultConstruct<SetTenantLimitsRequest>(arena);
+  }
+  using ::google::protobuf::Message::CopyFrom;
+  void CopyFrom(const SetTenantLimitsRequest& from);
+  using ::google::protobuf::Message::MergeFrom;
+  void MergeFrom(const SetTenantLimitsRequest& from) { SetTenantLimitsRequest::MergeImpl(*this, from); }
+
+  private:
+  static void MergeImpl(::google::protobuf::MessageLite& to_msg,
+                        const ::google::protobuf::MessageLite& from_msg);
+
+  public:
+  [[nodiscard]] bool IsInitialized() const {
+    return true;
+  }
+  ABSL_ATTRIBUTE_REINITIALIZES void Clear() PROTOBUF_FINAL;
+  #if defined(PROTOBUF_CUSTOM_VTABLE)
+  private:
+  [[nodiscard]] static ::size_t ByteSizeLong(const ::google::protobuf::MessageLite& msg);
+  [[nodiscard]] static ::uint8_t* PROTOBUF_NONNULL _InternalSerialize(
+      const ::google::protobuf::MessageLite& msg, ::uint8_t* PROTOBUF_NONNULL target,
+      ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream);
+
+  public:
+  [[nodiscard]] ::size_t ByteSizeLong() const { return ByteSizeLong(*this); }
+  [[nodiscard]] ::uint8_t* PROTOBUF_NONNULL _InternalSerialize(
+      ::uint8_t* PROTOBUF_NONNULL target,
+      ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) const {
+    return _InternalSerialize(*this, target, stream);
+  }
+  #else   // PROTOBUF_CUSTOM_VTABLE
+  [[nodiscard]] ::size_t ByteSizeLong() const final;
+  [[nodiscard]] ::uint8_t* PROTOBUF_NONNULL _InternalSerialize(
+      ::uint8_t* PROTOBUF_NONNULL target,
+      ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) const final;
+  #endif  // PROTOBUF_CUSTOM_VTABLE
+  [[nodiscard]] int GetCachedSize() const {
+    return _impl_._cached_size_.Get();
+  }
+
+  private:
+  void SharedCtor(::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+  static void SharedDtor(MessageLite& self);
+  void InternalSwap(SetTenantLimitsRequest* PROTOBUF_NONNULL other);
+ private:
+  template <typename T>
+  friend ::absl::string_view(::google::protobuf::internal::GetAnyMessageName)();
+  static ::absl::string_view FullMessageName() { return "air.db.v1.SetTenantLimitsRequest"; }
+
+  explicit SetTenantLimitsRequest(::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+  SetTenantLimitsRequest(::google::protobuf::Arena* PROTOBUF_NULLABLE arena, const SetTenantLimitsRequest& from);
+  SetTenantLimitsRequest(
+      ::google::protobuf::Arena* PROTOBUF_NULLABLE arena, SetTenantLimitsRequest&& from) noexcept
+      : SetTenantLimitsRequest(arena) {
+    *this = ::std::move(from);
+  }
+  const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL GetClassData() const PROTOBUF_FINAL;
+  static void* PROTOBUF_NONNULL PlacementNew_(
+      const void* PROTOBUF_NONNULL, void* PROTOBUF_NONNULL mem,
+      ::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+  static constexpr auto InternalNewImpl_();
+
+ public:
+  static constexpr auto InternalGenerateClassData_(
+      const MessageLite& prototype,
+      const ::google::protobuf::internal::TcParseTableBase* PROTOBUF_NULLABLE tc_table = nullptr);
+
+  [[nodiscard]] ::google::protobuf::Metadata GetMetadata() const;
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+  enum : int {
+    kTenantIdFieldNumber = 1,
+    kMaxClientConnsFieldNumber = 2,
+    kMaxBackendsFieldNumber = 3,
+  };
+  // string tenant_id = 1;
+  void clear_tenant_id() ;
+  [[nodiscard]] const ::std::string& tenant_id() const;
+  template <typename Arg_ = const ::std::string&, typename... Args_>
+  void set_tenant_id(Arg_&& arg, Args_... args);
+  ::std::string* PROTOBUF_NONNULL mutable_tenant_id();
+  [[nodiscard]] ::std::string* PROTOBUF_NULLABLE release_tenant_id();
+  void set_allocated_tenant_id(::std::string* PROTOBUF_NULLABLE value);
+
+  private:
+  const ::std::string& _internal_tenant_id() const;
+  PROTOBUF_ALWAYS_INLINE void _internal_set_tenant_id(const ::std::string& value);
+  ::std::string* PROTOBUF_NONNULL _internal_mutable_tenant_id();
+
+  public:
+  // int32 max_client_conns = 2;
+  void clear_max_client_conns() ;
+  [[nodiscard]] ::int32_t max_client_conns() const;
+  void set_max_client_conns(::int32_t value);
+
+  private:
+  ::int32_t _internal_max_client_conns() const;
+  void _internal_set_max_client_conns(::int32_t value);
+
+  public:
+  // int32 max_backends = 3;
+  void clear_max_backends() ;
+  [[nodiscard]] ::int32_t max_backends() const;
+  void set_max_backends(::int32_t value);
+
+  private:
+  ::int32_t _internal_max_backends() const;
+  void _internal_set_max_backends(::int32_t value);
+
+  public:
+  // @@protoc_insertion_point(class_scope:air.db.v1.SetTenantLimitsRequest)
+ private:
+  class _Internal;
+  using ParseTableT_ =
+      ::google::protobuf::internal::TcParseTable<2, 3,
+                          0, 50,
+                          2>;
+  static constexpr ParseTableT_ InternalGenerateParseTable_(
+      const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL class_data);
+  friend class ::google::protobuf::internal::TcParser;
+  #ifndef PROTOBUF_MESSAGE_GLOBALS
+  static const ParseTableT_ _table_;
+  #endif
+
+  friend class ::google::protobuf::MessageLite;
+  friend class ::google::protobuf::Arena;
+  friend ::google::protobuf::internal::PrivateAccess;
+  template <typename T>
+  friend class ::google::protobuf::Arena::InternalHelper;
+  using InternalArenaConstructable_ = void;
+  using DestructorSkippable_ = void;
+  struct Impl_ {
+    inline explicit constexpr Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                                    ::google::protobuf::internal::ConstantInitialized) noexcept;
+    inline explicit Impl_(
+        ::google::protobuf::internal::InternalVisibility visibility,
+        ::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+    inline explicit Impl_(
+        ::google::protobuf::internal::InternalVisibility visibility,
+        ::google::protobuf::Arena* PROTOBUF_NULLABLE arena, const Impl_& from,
+        const SetTenantLimitsRequest& from_msg);
+    ::google::protobuf::internal::HasBits<1> _has_bits_;
+    ::google::protobuf::internal::CachedSize _cached_size_;
+    ::google::protobuf::internal::ArenaStringPtr tenant_id_;
+    ::int32_t max_client_conns_;
+    ::int32_t max_backends_;
+    PROTOBUF_TSAN_DECLARE_MEMBER
+  };
+  union { Impl_ _impl_; };
+  friend struct ::TableStruct_airdb_2eproto;
+};
+// -------------------------------------------------------------------
+
 class  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED ListDatabasesRequest final : public ::google::protobuf::Message
 /* @@protoc_insertion_point(class_definition:air.db.v1.ListDatabasesRequest) */ {
  public:
@@ -1476,6 +1722,224 @@ class  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED Empty final : public ::google::prot
   friend class ::google::protobuf::Arena::InternalHelper;
   using InternalArenaConstructable_ = void;
   using DestructorSkippable_ = void;
+  friend struct ::TableStruct_airdb_2eproto;
+};
+// -------------------------------------------------------------------
+
+class  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED DrainTenantRequest final : public ::google::protobuf::Message
+/* @@protoc_insertion_point(class_definition:air.db.v1.DrainTenantRequest) */ {
+ public:
+  inline DrainTenantRequest() : DrainTenantRequest(nullptr) {}
+  ~DrainTenantRequest() PROTOBUF_FINAL;
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  void operator delete(DrainTenantRequest* PROTOBUF_NONNULL msg, ::std::destroying_delete_t) {
+    SharedDtor(*msg);
+    ::google::protobuf::internal::SizedDelete(msg, sizeof(DrainTenantRequest));
+  }
+#endif
+
+  template <typename = void>
+  explicit constexpr DrainTenantRequest(::google::protobuf::internal::ConstantInitialized,
+                           const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL
+                               class_data);
+
+  inline DrainTenantRequest(const DrainTenantRequest& from) : DrainTenantRequest(nullptr, from) {}
+  inline DrainTenantRequest(DrainTenantRequest&& from) noexcept : DrainTenantRequest(nullptr, ::std::move(from)) {}
+  inline DrainTenantRequest& operator=(const DrainTenantRequest& from) {
+    CopyFrom(from);
+    return *this;
+  }
+  inline DrainTenantRequest& operator=(DrainTenantRequest&& from) noexcept {
+    if (this == &from) return *this;
+    if (::google::protobuf::internal::CanMoveWithInternalSwap(GetArena(), from.GetArena())) {
+      InternalSwap(&from);
+    } else {
+      CopyFrom(from);
+    }
+    return *this;
+  }
+
+  [[nodiscard]] inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance);
+  }
+  [[nodiscard]] inline ::google::protobuf::UnknownFieldSet* PROTOBUF_NONNULL
+  mutable_unknown_fields() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.mutable_unknown_fields<::google::protobuf::UnknownFieldSet>();
+  }
+
+  [[nodiscard]] static const ::google::protobuf::Descriptor* PROTOBUF_NONNULL descriptor() {
+    return GetDescriptor();
+  }
+  [[nodiscard]] static const ::google::protobuf::Descriptor* PROTOBUF_NONNULL
+  GetDescriptor() {
+    return default_instance().GetMetadata().descriptor;
+  }
+  [[nodiscard]] static const ::google::protobuf::Reflection* PROTOBUF_NONNULL GetReflection() {
+    return default_instance().GetMetadata().reflection;
+  }
+  [[nodiscard]] static const DrainTenantRequest& default_instance() {
+    return *::google::protobuf::internal::MessageGlobalsBase::ToDefaultInstance<DrainTenantRequest>(&DrainTenantRequest_globals_);
+  }
+  static constexpr int kIndexInFileMessages = 12;
+  friend void swap(DrainTenantRequest& a, DrainTenantRequest& b) { a.Swap(&b); }
+  inline void Swap(DrainTenantRequest* PROTOBUF_NONNULL other) {
+    if (other == this) return;
+    if (::google::protobuf::internal::CanUseInternalSwap(GetArena(), other->GetArena())) {
+      InternalSwap(other);
+    } else {
+      ::google::protobuf::internal::GenericSwap(this, other);
+    }
+  }
+  void UnsafeArenaSwap(DrainTenantRequest* PROTOBUF_NONNULL other) {
+    if (other == this) return;
+    ABSL_DCHECK(GetArena() == other->GetArena());
+    InternalSwap(other);
+  }
+
+  // implements Message ----------------------------------------------
+
+  [[nodiscard]] DrainTenantRequest* PROTOBUF_NONNULL
+  New(::google::protobuf::Arena* PROTOBUF_NULLABLE arena = nullptr) const {
+    return ::google::protobuf::Message::DefaultConstruct<DrainTenantRequest>(arena);
+  }
+  using ::google::protobuf::Message::CopyFrom;
+  void CopyFrom(const DrainTenantRequest& from);
+  using ::google::protobuf::Message::MergeFrom;
+  void MergeFrom(const DrainTenantRequest& from) { DrainTenantRequest::MergeImpl(*this, from); }
+
+  private:
+  static void MergeImpl(::google::protobuf::MessageLite& to_msg,
+                        const ::google::protobuf::MessageLite& from_msg);
+
+  public:
+  [[nodiscard]] bool IsInitialized() const {
+    return true;
+  }
+  ABSL_ATTRIBUTE_REINITIALIZES void Clear() PROTOBUF_FINAL;
+  #if defined(PROTOBUF_CUSTOM_VTABLE)
+  private:
+  [[nodiscard]] static ::size_t ByteSizeLong(const ::google::protobuf::MessageLite& msg);
+  [[nodiscard]] static ::uint8_t* PROTOBUF_NONNULL _InternalSerialize(
+      const ::google::protobuf::MessageLite& msg, ::uint8_t* PROTOBUF_NONNULL target,
+      ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream);
+
+  public:
+  [[nodiscard]] ::size_t ByteSizeLong() const { return ByteSizeLong(*this); }
+  [[nodiscard]] ::uint8_t* PROTOBUF_NONNULL _InternalSerialize(
+      ::uint8_t* PROTOBUF_NONNULL target,
+      ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) const {
+    return _InternalSerialize(*this, target, stream);
+  }
+  #else   // PROTOBUF_CUSTOM_VTABLE
+  [[nodiscard]] ::size_t ByteSizeLong() const final;
+  [[nodiscard]] ::uint8_t* PROTOBUF_NONNULL _InternalSerialize(
+      ::uint8_t* PROTOBUF_NONNULL target,
+      ::google::protobuf::io::EpsCopyOutputStream* PROTOBUF_NONNULL stream) const final;
+  #endif  // PROTOBUF_CUSTOM_VTABLE
+  [[nodiscard]] int GetCachedSize() const {
+    return _impl_._cached_size_.Get();
+  }
+
+  private:
+  void SharedCtor(::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+  static void SharedDtor(MessageLite& self);
+  void InternalSwap(DrainTenantRequest* PROTOBUF_NONNULL other);
+ private:
+  template <typename T>
+  friend ::absl::string_view(::google::protobuf::internal::GetAnyMessageName)();
+  static ::absl::string_view FullMessageName() { return "air.db.v1.DrainTenantRequest"; }
+
+  explicit DrainTenantRequest(::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+  DrainTenantRequest(::google::protobuf::Arena* PROTOBUF_NULLABLE arena, const DrainTenantRequest& from);
+  DrainTenantRequest(
+      ::google::protobuf::Arena* PROTOBUF_NULLABLE arena, DrainTenantRequest&& from) noexcept
+      : DrainTenantRequest(arena) {
+    *this = ::std::move(from);
+  }
+  const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL GetClassData() const PROTOBUF_FINAL;
+  static void* PROTOBUF_NONNULL PlacementNew_(
+      const void* PROTOBUF_NONNULL, void* PROTOBUF_NONNULL mem,
+      ::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+  static constexpr auto InternalNewImpl_();
+
+ public:
+  static constexpr auto InternalGenerateClassData_(
+      const MessageLite& prototype,
+      const ::google::protobuf::internal::TcParseTableBase* PROTOBUF_NULLABLE tc_table = nullptr);
+
+  [[nodiscard]] ::google::protobuf::Metadata GetMetadata() const;
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+  enum : int {
+    kTenantIdFieldNumber = 1,
+    kTimeoutMsFieldNumber = 2,
+  };
+  // string tenant_id = 1;
+  void clear_tenant_id() ;
+  [[nodiscard]] const ::std::string& tenant_id() const;
+  template <typename Arg_ = const ::std::string&, typename... Args_>
+  void set_tenant_id(Arg_&& arg, Args_... args);
+  ::std::string* PROTOBUF_NONNULL mutable_tenant_id();
+  [[nodiscard]] ::std::string* PROTOBUF_NULLABLE release_tenant_id();
+  void set_allocated_tenant_id(::std::string* PROTOBUF_NULLABLE value);
+
+  private:
+  const ::std::string& _internal_tenant_id() const;
+  PROTOBUF_ALWAYS_INLINE void _internal_set_tenant_id(const ::std::string& value);
+  ::std::string* PROTOBUF_NONNULL _internal_mutable_tenant_id();
+
+  public:
+  // int32 timeout_ms = 2;
+  void clear_timeout_ms() ;
+  [[nodiscard]] ::int32_t timeout_ms() const;
+  void set_timeout_ms(::int32_t value);
+
+  private:
+  ::int32_t _internal_timeout_ms() const;
+  void _internal_set_timeout_ms(::int32_t value);
+
+  public:
+  // @@protoc_insertion_point(class_scope:air.db.v1.DrainTenantRequest)
+ private:
+  class _Internal;
+  using ParseTableT_ =
+      ::google::protobuf::internal::TcParseTable<1, 2,
+                          0, 46,
+                          2>;
+  static constexpr ParseTableT_ InternalGenerateParseTable_(
+      const ::google::protobuf::internal::ClassData* PROTOBUF_NONNULL class_data);
+  friend class ::google::protobuf::internal::TcParser;
+  #ifndef PROTOBUF_MESSAGE_GLOBALS
+  static const ParseTableT_ _table_;
+  #endif
+
+  friend class ::google::protobuf::MessageLite;
+  friend class ::google::protobuf::Arena;
+  friend ::google::protobuf::internal::PrivateAccess;
+  template <typename T>
+  friend class ::google::protobuf::Arena::InternalHelper;
+  using InternalArenaConstructable_ = void;
+  using DestructorSkippable_ = void;
+  struct Impl_ {
+    inline explicit constexpr Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                                    ::google::protobuf::internal::ConstantInitialized) noexcept;
+    inline explicit Impl_(
+        ::google::protobuf::internal::InternalVisibility visibility,
+        ::google::protobuf::Arena* PROTOBUF_NULLABLE arena);
+    inline explicit Impl_(
+        ::google::protobuf::internal::InternalVisibility visibility,
+        ::google::protobuf::Arena* PROTOBUF_NULLABLE arena, const Impl_& from,
+        const DrainTenantRequest& from_msg);
+    ::google::protobuf::internal::HasBits<1> _has_bits_;
+    ::google::protobuf::internal::CachedSize _cached_size_;
+    ::google::protobuf::internal::ArenaStringPtr tenant_id_;
+    ::int32_t timeout_ms_;
+    PROTOBUF_TSAN_DECLARE_MEMBER
+  };
+  union { Impl_ _impl_; };
   friend struct ::TableStruct_airdb_2eproto;
 };
 // -------------------------------------------------------------------
@@ -4931,6 +5395,214 @@ inline ::google::protobuf::RepeatedPtrField<::std::string>* PROTOBUF_NONNULL
 BatchTouchActivityRequest::_internal_mutable_tenant_ids() {
   ::google::protobuf::internal::TSanRead(&_impl_);
   return &_impl_.tenant_ids_;
+}
+
+// -------------------------------------------------------------------
+
+// DrainTenantRequest
+
+// string tenant_id = 1;
+inline void DrainTenantRequest::clear_tenant_id() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.tenant_id_.ClearToEmpty();
+  ClearHasBit(_impl_._has_bits_[0], 0x00000001U);
+}
+inline const ::std::string& DrainTenantRequest::tenant_id() const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_get:air.db.v1.DrainTenantRequest.tenant_id)
+  return _internal_tenant_id();
+}
+template <typename Arg_, typename... Args_>
+PROTOBUF_ALWAYS_INLINE void DrainTenantRequest::set_tenant_id(Arg_&& arg, Args_... args) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  SetHasBit(_impl_._has_bits_[0], 0x00000001U);
+  _impl_.tenant_id_.Set(static_cast<Arg_&&>(arg), args..., GetArena());
+  // @@protoc_insertion_point(field_set:air.db.v1.DrainTenantRequest.tenant_id)
+}
+inline ::std::string* PROTOBUF_NONNULL DrainTenantRequest::mutable_tenant_id()
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  SetHasBit(_impl_._has_bits_[0], 0x00000001U);
+  ::std::string* _s = _internal_mutable_tenant_id();
+  // @@protoc_insertion_point(field_mutable:air.db.v1.DrainTenantRequest.tenant_id)
+  return _s;
+}
+inline const ::std::string& DrainTenantRequest::_internal_tenant_id() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.tenant_id_.Get();
+}
+inline void DrainTenantRequest::_internal_set_tenant_id(const ::std::string& value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.tenant_id_.Set(value, GetArena());
+}
+inline ::std::string* PROTOBUF_NONNULL DrainTenantRequest::_internal_mutable_tenant_id() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  return _impl_.tenant_id_.Mutable( GetArena());
+}
+inline ::std::string* PROTOBUF_NULLABLE DrainTenantRequest::release_tenant_id() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  // @@protoc_insertion_point(field_release:air.db.v1.DrainTenantRequest.tenant_id)
+  if (!CheckHasBit(_impl_._has_bits_[0], 0x00000001U)) {
+    return nullptr;
+  }
+  ClearHasBit(_impl_._has_bits_[0], 0x00000001U);
+  auto* released = _impl_.tenant_id_.Release();
+  if (::google::protobuf::internal::DebugHardenForceCopyDefaultString()) {
+    _impl_.tenant_id_.Set("", GetArena());
+  }
+  return released;
+}
+inline void DrainTenantRequest::set_allocated_tenant_id(::std::string* PROTOBUF_NULLABLE value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  if (value != nullptr) {
+    SetHasBit(_impl_._has_bits_[0], 0x00000001U);
+  } else {
+    ClearHasBit(_impl_._has_bits_[0], 0x00000001U);
+  }
+  _impl_.tenant_id_.SetAllocated(value, GetArena());
+  if (::google::protobuf::internal::DebugHardenForceCopyDefaultString() && _impl_.tenant_id_.IsDefault()) {
+    _impl_.tenant_id_.Set("", GetArena());
+  }
+  // @@protoc_insertion_point(field_set_allocated:air.db.v1.DrainTenantRequest.tenant_id)
+}
+
+// int32 timeout_ms = 2;
+inline void DrainTenantRequest::clear_timeout_ms() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.timeout_ms_ = 0;
+  ClearHasBit(_impl_._has_bits_[0], 0x00000002U);
+}
+inline ::int32_t DrainTenantRequest::timeout_ms() const {
+  // @@protoc_insertion_point(field_get:air.db.v1.DrainTenantRequest.timeout_ms)
+  return _internal_timeout_ms();
+}
+inline void DrainTenantRequest::set_timeout_ms(::int32_t value) {
+  _internal_set_timeout_ms(value);
+  SetHasBit(_impl_._has_bits_[0], 0x00000002U);
+  // @@protoc_insertion_point(field_set:air.db.v1.DrainTenantRequest.timeout_ms)
+}
+inline ::int32_t DrainTenantRequest::_internal_timeout_ms() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.timeout_ms_;
+}
+inline void DrainTenantRequest::_internal_set_timeout_ms(::int32_t value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.timeout_ms_ = value;
+}
+
+// -------------------------------------------------------------------
+
+// SetTenantLimitsRequest
+
+// string tenant_id = 1;
+inline void SetTenantLimitsRequest::clear_tenant_id() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.tenant_id_.ClearToEmpty();
+  ClearHasBit(_impl_._has_bits_[0], 0x00000001U);
+}
+inline const ::std::string& SetTenantLimitsRequest::tenant_id() const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_get:air.db.v1.SetTenantLimitsRequest.tenant_id)
+  return _internal_tenant_id();
+}
+template <typename Arg_, typename... Args_>
+PROTOBUF_ALWAYS_INLINE void SetTenantLimitsRequest::set_tenant_id(Arg_&& arg, Args_... args) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  SetHasBit(_impl_._has_bits_[0], 0x00000001U);
+  _impl_.tenant_id_.Set(static_cast<Arg_&&>(arg), args..., GetArena());
+  // @@protoc_insertion_point(field_set:air.db.v1.SetTenantLimitsRequest.tenant_id)
+}
+inline ::std::string* PROTOBUF_NONNULL SetTenantLimitsRequest::mutable_tenant_id()
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  SetHasBit(_impl_._has_bits_[0], 0x00000001U);
+  ::std::string* _s = _internal_mutable_tenant_id();
+  // @@protoc_insertion_point(field_mutable:air.db.v1.SetTenantLimitsRequest.tenant_id)
+  return _s;
+}
+inline const ::std::string& SetTenantLimitsRequest::_internal_tenant_id() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.tenant_id_.Get();
+}
+inline void SetTenantLimitsRequest::_internal_set_tenant_id(const ::std::string& value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.tenant_id_.Set(value, GetArena());
+}
+inline ::std::string* PROTOBUF_NONNULL SetTenantLimitsRequest::_internal_mutable_tenant_id() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  return _impl_.tenant_id_.Mutable( GetArena());
+}
+inline ::std::string* PROTOBUF_NULLABLE SetTenantLimitsRequest::release_tenant_id() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  // @@protoc_insertion_point(field_release:air.db.v1.SetTenantLimitsRequest.tenant_id)
+  if (!CheckHasBit(_impl_._has_bits_[0], 0x00000001U)) {
+    return nullptr;
+  }
+  ClearHasBit(_impl_._has_bits_[0], 0x00000001U);
+  auto* released = _impl_.tenant_id_.Release();
+  if (::google::protobuf::internal::DebugHardenForceCopyDefaultString()) {
+    _impl_.tenant_id_.Set("", GetArena());
+  }
+  return released;
+}
+inline void SetTenantLimitsRequest::set_allocated_tenant_id(::std::string* PROTOBUF_NULLABLE value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  if (value != nullptr) {
+    SetHasBit(_impl_._has_bits_[0], 0x00000001U);
+  } else {
+    ClearHasBit(_impl_._has_bits_[0], 0x00000001U);
+  }
+  _impl_.tenant_id_.SetAllocated(value, GetArena());
+  if (::google::protobuf::internal::DebugHardenForceCopyDefaultString() && _impl_.tenant_id_.IsDefault()) {
+    _impl_.tenant_id_.Set("", GetArena());
+  }
+  // @@protoc_insertion_point(field_set_allocated:air.db.v1.SetTenantLimitsRequest.tenant_id)
+}
+
+// int32 max_client_conns = 2;
+inline void SetTenantLimitsRequest::clear_max_client_conns() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.max_client_conns_ = 0;
+  ClearHasBit(_impl_._has_bits_[0], 0x00000002U);
+}
+inline ::int32_t SetTenantLimitsRequest::max_client_conns() const {
+  // @@protoc_insertion_point(field_get:air.db.v1.SetTenantLimitsRequest.max_client_conns)
+  return _internal_max_client_conns();
+}
+inline void SetTenantLimitsRequest::set_max_client_conns(::int32_t value) {
+  _internal_set_max_client_conns(value);
+  SetHasBit(_impl_._has_bits_[0], 0x00000002U);
+  // @@protoc_insertion_point(field_set:air.db.v1.SetTenantLimitsRequest.max_client_conns)
+}
+inline ::int32_t SetTenantLimitsRequest::_internal_max_client_conns() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.max_client_conns_;
+}
+inline void SetTenantLimitsRequest::_internal_set_max_client_conns(::int32_t value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.max_client_conns_ = value;
+}
+
+// int32 max_backends = 3;
+inline void SetTenantLimitsRequest::clear_max_backends() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.max_backends_ = 0;
+  ClearHasBit(_impl_._has_bits_[0], 0x00000004U);
+}
+inline ::int32_t SetTenantLimitsRequest::max_backends() const {
+  // @@protoc_insertion_point(field_get:air.db.v1.SetTenantLimitsRequest.max_backends)
+  return _internal_max_backends();
+}
+inline void SetTenantLimitsRequest::set_max_backends(::int32_t value) {
+  _internal_set_max_backends(value);
+  SetHasBit(_impl_._has_bits_[0], 0x00000004U);
+  // @@protoc_insertion_point(field_set:air.db.v1.SetTenantLimitsRequest.max_backends)
+}
+inline ::int32_t SetTenantLimitsRequest::_internal_max_backends() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.max_backends_;
+}
+inline void SetTenantLimitsRequest::_internal_set_max_backends(::int32_t value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.max_backends_ = value;
 }
 
 #ifdef __GNUC__

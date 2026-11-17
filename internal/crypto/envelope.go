@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -33,6 +34,7 @@ type EnvelopeKMS struct {
 	mu          sync.RWMutex
 	kek         []byte
 	wrappedDEKs map[string][]byte
+	aeadCache   map[string]cipher.AEAD
 }
 
 // NewEnvelopeKMS creates an in-memory KMS with a fresh 256-bit KEK (primarily for tests).
@@ -44,6 +46,7 @@ func NewEnvelopeKMS() (*EnvelopeKMS, error) {
 	return &EnvelopeKMS{
 		kek:         kek,
 		wrappedDEKs: make(map[string][]byte),
+		aeadCache:   make(map[string]cipher.AEAD),
 	}, nil
 }
 
@@ -54,7 +57,7 @@ func LoadOrCreateEnvelopeKMS(keyPath string) (*EnvelopeKMS, error) {
 		if decErr != nil || len(kek) != 32 {
 			return nil, fmt.Errorf("invalid master key at %s", keyPath)
 		}
-		return &EnvelopeKMS{kek: kek, wrappedDEKs: make(map[string][]byte)}, nil
+		return &EnvelopeKMS{kek: kek, wrappedDEKs: make(map[string][]byte), aeadCache: make(map[string]cipher.AEAD)}, nil
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
@@ -74,7 +77,7 @@ func LoadOrCreateEnvelopeKMS(keyPath string) (*EnvelopeKMS, error) {
 		_ = os.Remove(tmp)
 		return nil, err
 	}
-	return &EnvelopeKMS{kek: kek, wrappedDEKs: make(map[string][]byte)}, nil
+	return &EnvelopeKMS{kek: kek, wrappedDEKs: make(map[string][]byte), aeadCache: make(map[string]cipher.AEAD)}, nil
 }
 
 // EnsureTenantDEK generates and wraps a 256-bit DEK for tenantID if not already loaded.
@@ -115,6 +118,9 @@ func (k *EnvelopeKMS) LoadWrappedDEK(tenantID, wrappedB64 string) error {
 	}
 	k.mu.Lock()
 	k.wrappedDEKs[tenantID] = raw
+	if k.aeadCache != nil {
+		delete(k.aeadCache, tenantID)
+	}
 	k.mu.Unlock()
 	return nil
 }
@@ -141,43 +147,115 @@ func (k *EnvelopeKMS) ImportWrappedDEKBundle(b WrappedDEKBundle) error {
 func (k *EnvelopeKMS) UnwrapDEK(tenantID string) ([]byte, error) {
 	k.mu.RLock()
 	wrapped, ok := k.wrappedDEKs[tenantID]
-	k.mu.RUnlock()
 	if !ok || len(wrapped) == 0 {
+		k.mu.RUnlock()
 		return nil, ErrDEKMissing
 	}
-	return aeadOpen(k.kek, wrapped, []byte("wrap:"+tenantID))
+	wrappedCopy := append([]byte(nil), wrapped...)
+	k.mu.RUnlock()
+	defer zeroBytes(wrappedCopy)
+	return aeadOpen(k.kek, wrappedCopy, []byte("wrap:"+tenantID))
 }
 
-// ShredDEK zeroes and removes the tenant's wrapped DEK from memory.
+// ShredDEK zeroes and removes the tenant's wrapped DEK and cached AEAD from memory.
+// Security semantics: ShredDEK is a linearizable erasure boundary under k.mu. Any
+// EncryptObject, DecryptObject, or UnwrapDEK call that acquires k.mu after ShredDEK
+// returns ErrDEKMissing. An in-flight Seal/Open that already acquired its cipher.AEAD
+// handle before ShredDEK completes that single operation and cannot be reused.
 func (k *EnvelopeKMS) ShredDEK(tenantID string) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if w, ok := k.wrappedDEKs[tenantID]; ok {
-		for i := range w {
-			w[i] = 0
-		}
+		zeroBytes(w)
 		delete(k.wrappedDEKs, tenantID)
+	}
+	if k.aeadCache != nil {
+		delete(k.aeadCache, tenantID)
+	}
+}
+
+func (k *EnvelopeKMS) tenantAEAD(tenantID string) (cipher.AEAD, error) {
+	for {
+		k.mu.RLock()
+		if k.aeadCache != nil {
+			if gcm, ok := k.aeadCache[tenantID]; ok {
+				k.mu.RUnlock()
+				return gcm, nil
+			}
+		}
+		wrapped, ok := k.wrappedDEKs[tenantID]
+		if !ok || len(wrapped) == 0 {
+			k.mu.RUnlock()
+			return nil, ErrDEKMissing
+		}
+		wrappedCopy := append([]byte(nil), wrapped...)
+		k.mu.RUnlock()
+
+		dek, err := aeadOpen(k.kek, wrappedCopy, []byte("wrap:"+tenantID))
+		if err != nil {
+			zeroBytes(wrappedCopy)
+			return nil, err
+		}
+
+		block, err := aes.NewCipher(dek)
+		zeroBytes(dek)
+		if err != nil {
+			zeroBytes(wrappedCopy)
+			return nil, err
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			zeroBytes(wrappedCopy)
+			return nil, err
+		}
+
+		k.mu.Lock()
+		cur, ok := k.wrappedDEKs[tenantID]
+		if !ok || len(cur) == 0 {
+			k.mu.Unlock()
+			zeroBytes(wrappedCopy)
+			return nil, ErrDEKMissing
+		}
+		if !bytes.Equal(cur, wrappedCopy) {
+			// DEK was rotated concurrently while unwrapping; retry with the current DEK.
+			k.mu.Unlock()
+			zeroBytes(wrappedCopy)
+			continue
+		}
+		zeroBytes(wrappedCopy)
+		if k.aeadCache == nil {
+			k.aeadCache = make(map[string]cipher.AEAD)
+		}
+		k.aeadCache[tenantID] = gcm
+		k.mu.Unlock()
+		return gcm, nil
 	}
 }
 
 // EncryptObject encrypts plaintext with the tenant's DEK bound to tenantID|epoch|objectKey AAD.
 func (k *EnvelopeKMS) EncryptObject(tenantID string, epoch int64, objectKey string, plaintext []byte) ([]byte, error) {
-	dek, err := k.UnwrapDEK(tenantID)
+	gcm, err := k.tenantAEAD(tenantID)
 	if err != nil {
 		return nil, err
 	}
-	defer zeroBytes(dek)
-	return aeadSeal(dek, plaintext, []byte(fmt.Sprintf("%s|%d|%s", tenantID, epoch, objectKey)))
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	return gcm.Seal(nonce, nonce, plaintext, []byte(fmt.Sprintf("%s|%d|%s", tenantID, epoch, objectKey))), nil
 }
 
 // DecryptObject decrypts ciphertext with the tenant's DEK and verifies tenantID|epoch|objectKey AAD.
 func (k *EnvelopeKMS) DecryptObject(tenantID string, epoch int64, objectKey string, ciphertext []byte) ([]byte, error) {
-	dek, err := k.UnwrapDEK(tenantID)
+	gcm, err := k.tenantAEAD(tenantID)
 	if err != nil {
 		return nil, err
 	}
-	defer zeroBytes(dek)
-	pt, err := aeadOpen(dek, ciphertext, []byte(fmt.Sprintf("%s|%d|%s", tenantID, epoch, objectKey)))
+	ns := gcm.NonceSize()
+	if len(ciphertext) < ns {
+		return nil, ErrAADMismatch
+	}
+	pt, err := gcm.Open(nil, ciphertext[:ns], ciphertext[ns:], []byte(fmt.Sprintf("%s|%d|%s", tenantID, epoch, objectKey)))
 	if err != nil {
 		return nil, ErrAADMismatch
 	}

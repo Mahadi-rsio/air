@@ -1,13 +1,27 @@
 package pageserver
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"os/exec"
+	"runtime"
 	"sync"
+	"time"
+)
+
+const (
+	defaultRedoWorkers        = 4
+	maxRedoWorkers            = 16
+	defaultRedoQueueSize      = 64
+	defaultRedoRequestTimeout = 10 * time.Second
+)
+
+var (
+	ErrWALRedoClosed = errors.New("pageserver: walredo worker pool closed")
 )
 
 // WALRedoer reconstructs an 8192-byte page from an optional base page and ordered WAL deltas.
@@ -15,26 +29,117 @@ type WALRedoer interface {
 	Redo(ctx context.Context, key Key, basePage []byte, deltas []WALDelta) ([]byte, error)
 }
 
-// DefaultWALRedoer applies FPIs directly in Go and optionally delegates non-FPI delta chains
-// to an external stateless PG17 walredo worker binary if configured.
+// WALRedoRequest describes a single page reconstruction request for batch WAL redo.
+type WALRedoRequest struct {
+	Key      Key
+	BasePage []byte
+	Deltas   []WALDelta
+}
+
+// BatchWALRedoer is an optional extension of WALRedoer that executes multiple page redos concurrently.
+type BatchWALRedoer interface {
+	WALRedoer
+	RedoBatch(ctx context.Context, reqs []WALRedoRequest) ([][]byte, []error)
+}
+
+// WALRedoPoolConfig configures the bounded persistent WAL-redo worker pool.
+type WALRedoPoolConfig struct {
+	WorkerBin      string
+	Workers        int
+	QueueSize      int
+	RequestTimeout time.Duration
+	Env            []string
+}
+
+type redoJob struct {
+	ctx      context.Context
+	key      Key
+	basePage []byte
+	records  [][]byte
+	resCh    chan redoResult
+}
+
+type redoResult struct {
+	page []byte
+	err  error
+}
+
+// DefaultWALRedoer applies FPIs directly in Go and delegates non-FPI delta chains
+// to a bounded pool of persistent external PG17 walredo worker processes.
 type DefaultWALRedoer struct {
-	workerBin string
-	mu        sync.Mutex
+	cfg      WALRedoPoolConfig
+	initOnce sync.Once
+	reqCh    chan *redoJob
+	closedCh chan struct{}
+	closeMu  sync.Mutex
+	closed   bool
+	wg       sync.WaitGroup
 }
 
-// NewDefaultWALRedoer creates a WALRedoer. If workerBin is empty, only FPI/will-init records are applied.
+// NewDefaultWALRedoer creates a WALRedoer with default bounded worker pool settings.
+// If workerBin is empty, only FPI/will-init records are applied.
 func NewDefaultWALRedoer(workerBin string) *DefaultWALRedoer {
-	return &DefaultWALRedoer{workerBin: workerBin}
+	return NewWALRedoPool(WALRedoPoolConfig{
+		WorkerBin: workerBin,
+	})
 }
 
-// Redo applies deltas onto basePage in LSN order and returns the materialized 8192-byte page.
-func (r *DefaultWALRedoer) Redo(ctx context.Context, key Key, basePage []byte, deltas []WALDelta) ([]byte, error) {
-	var cur []byte
+// NewWALRedoPool creates a WALRedoer backed by a bounded persistent worker pool.
+func NewWALRedoPool(cfg WALRedoPoolConfig) *DefaultWALRedoer {
+	if cfg.Workers <= 0 {
+		cfg.Workers = runtime.NumCPU()
+		if cfg.Workers > defaultRedoWorkers {
+			cfg.Workers = defaultRedoWorkers
+		}
+		if cfg.Workers < 1 {
+			cfg.Workers = 1
+		}
+	}
+	if cfg.Workers > maxRedoWorkers {
+		cfg.Workers = maxRedoWorkers
+	}
+	if cfg.QueueSize <= 0 {
+		cfg.QueueSize = defaultRedoQueueSize
+	}
+	if cfg.RequestTimeout <= 0 {
+		cfg.RequestTimeout = defaultRedoRequestTimeout
+	}
+	return &DefaultWALRedoer{
+		cfg:      cfg,
+		closedCh: make(chan struct{}),
+	}
+}
+
+func (r *DefaultWALRedoer) ensureStarted() {
+	r.initOnce.Do(func() {
+		r.reqCh = make(chan *redoJob, r.cfg.QueueSize)
+		for i := 0; i < r.cfg.Workers; i++ {
+			r.wg.Add(1)
+			go r.workerLoop()
+		}
+	})
+}
+
+// Close shuts down the persistent worker pool and terminates all child processes.
+func (r *DefaultWALRedoer) Close() error {
+	r.closeMu.Lock()
+	if r.closed {
+		r.closeMu.Unlock()
+		return nil
+	}
+	r.closed = true
+	close(r.closedCh)
+	r.closeMu.Unlock()
+	r.wg.Wait()
+	return nil
+}
+
+// prepareRedo resolves FPI/will-init records in Go and returns either a completed page
+// or the pending non-FPI WAL records that require the external worker.
+func prepareRedo(key Key, basePage []byte, deltas []WALDelta) (cur []byte, pendingWAL [][]byte, done bool, err error) {
 	if len(basePage) == PageSize {
 		cur = append([]byte(nil), basePage...)
 	}
-
-	var pendingWAL [][]byte
 	for _, d := range deltas {
 		if (d.Flags&EntryFlagPageImage) != 0 && len(d.PageImage) == PageSize {
 			cur = append([]byte(nil), d.PageImage...)
@@ -48,68 +153,299 @@ func (r *DefaultWALRedoer) Redo(ctx context.Context, key Key, basePage []byte, d
 			pendingWAL = append(pendingWAL, d.WALRecord)
 		}
 	}
-
 	if len(pendingWAL) == 0 {
 		if len(cur) == PageSize {
-			return cur, nil
+			return cur, nil, true, nil
 		}
-		return nil, ErrNotFound
+		return nil, nil, true, ErrNotFound
 	}
+	return cur, pendingWAL, false, nil
+}
 
-	if r.workerBin == "" {
+// Redo applies deltas onto basePage in LSN order and returns the materialized 8192-byte page.
+func (r *DefaultWALRedoer) Redo(ctx context.Context, key Key, basePage []byte, deltas []WALDelta) ([]byte, error) {
+	cur, pendingWAL, done, err := prepareRedo(key, basePage, deltas)
+	if done {
+		return cur, err
+	}
+	if r.cfg.WorkerBin == "" {
 		if len(cur) == PageSize {
 			return cur, nil
 		}
 		return nil, fmt.Errorf("pageserver: %d non-FPI WAL records for %s require walredo worker", len(pendingWAL), key)
 	}
-
-	return r.invokeWorker(ctx, key, cur, pendingWAL)
+	return r.submitJob(ctx, key, cur, pendingWAL)
 }
 
-func (r *DefaultWALRedoer) invokeWorker(ctx context.Context, key Key, basePage []byte, records [][]byte) ([]byte, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+// RedoBatch executes multiple WAL redo requests concurrently across the bounded worker pool.
+func (r *DefaultWALRedoer) RedoBatch(ctx context.Context, reqs []WALRedoRequest) ([][]byte, []error) {
+	pages := make([][]byte, len(reqs))
+	errs := make([]error, len(reqs))
+	if len(reqs) == 0 {
+		return pages, errs
+	}
 
-	cmd := exec.CommandContext(ctx, r.workerBin)
-	stdin, err := cmd.StdinPipe()
+	type inflight struct {
+		idx   int
+		resCh chan redoResult
+	}
+	var pending []inflight
+
+	for i, req := range reqs {
+		cur, pendingWAL, done, err := prepareRedo(req.Key, req.BasePage, req.Deltas)
+		if done {
+			pages[i] = cur
+			errs[i] = err
+			continue
+		}
+		if r.cfg.WorkerBin == "" {
+			if len(cur) == PageSize {
+				pages[i] = cur
+			} else {
+				errs[i] = fmt.Errorf("pageserver: %d non-FPI WAL records for %s require walredo worker", len(pendingWAL), req.Key)
+			}
+			continue
+		}
+
+		resCh, subErr := r.enqueueJob(ctx, req.Key, cur, pendingWAL)
+		if subErr != nil {
+			errs[i] = subErr
+			continue
+		}
+		pending = append(pending, inflight{idx: i, resCh: resCh})
+	}
+
+	for _, p := range pending {
+		select {
+		case res := <-p.resCh:
+			pages[p.idx] = res.page
+			errs[p.idx] = res.err
+		case <-ctx.Done():
+			errs[p.idx] = ctx.Err()
+		case <-r.closedCh:
+			errs[p.idx] = ErrWALRedoClosed
+		}
+	}
+	return pages, errs
+}
+
+func (r *DefaultWALRedoer) submitJob(ctx context.Context, key Key, basePage []byte, records [][]byte) ([]byte, error) {
+	resCh, err := r.enqueueJob(ctx, key, basePage, records)
 	if err != nil {
 		return nil, err
+	}
+	select {
+	case res := <-resCh:
+		return res.page, res.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-r.closedCh:
+		return nil, ErrWALRedoClosed
+	}
+}
+
+func (r *DefaultWALRedoer) enqueueJob(ctx context.Context, key Key, basePage []byte, records [][]byte) (chan redoResult, error) {
+	r.closeMu.Lock()
+	if r.closed {
+		r.closeMu.Unlock()
+		return nil, ErrWALRedoClosed
+	}
+	r.ensureStarted()
+	r.closeMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	job := &redoJob{
+		ctx:      ctx,
+		key:      key,
+		basePage: basePage,
+		records:  records,
+		resCh:    make(chan redoResult, 1),
+	}
+	select {
+	case r.reqCh <- job:
+		return job.resCh, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-r.closedCh:
+		return nil, ErrWALRedoClosed
+	}
+}
+
+type persistentWorker struct {
+	bin    string
+	env    []string
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	bw     *bufio.Writer
+	stdout io.ReadCloser
+}
+
+func (w *persistentWorker) start() error {
+	cmd := exec.Command(w.bin)
+	if len(w.env) > 0 {
+		cmd.Env = append(cmd.Environ(), w.env...)
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, err
+		_ = stdin.Close()
+		return err
 	}
 	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		return err
+	}
+	w.cmd = cmd
+	w.stdin = stdin
+	w.bw = bufio.NewWriterSize(stdin, 16*1024)
+	w.stdout = stdout
+	return nil
+}
+
+func (w *persistentWorker) kill() {
+	if w.stdin != nil {
+		_ = w.stdin.Close()
+		w.stdin = nil
+	}
+	if w.stdout != nil {
+		_ = w.stdout.Close()
+		w.stdout = nil
+	}
+	if w.cmd != nil {
+		if w.cmd.Process != nil {
+			_ = w.cmd.Process.Kill()
+		}
+		_ = w.cmd.Wait()
+		w.cmd = nil
+	}
+	w.bw = nil
+}
+
+func (w *persistentWorker) execJob(job *redoJob, defaultTimeout time.Duration) ([]byte, error) {
+	if err := job.ctx.Err(); err != nil {
 		return nil, err
 	}
+	if w.cmd == nil {
+		if err := w.start(); err != nil {
+			return nil, err
+		}
+	}
 
+	// Enforce cancellation / timeout by killing the worker if the request aborts mid-flight.
+	var procMu sync.Mutex
+	var waited bool
+	proc := w.cmd.Process
+	killProc := func() {
+		procMu.Lock()
+		if !waited && proc != nil {
+			_ = proc.Kill()
+		}
+		procMu.Unlock()
+	}
+
+	doneCh := make(chan struct{})
+	var stopTimer *time.Timer
+	if _, hasDeadline := job.ctx.Deadline(); !hasDeadline && defaultTimeout > 0 {
+		stopTimer = time.AfterFunc(defaultTimeout, killProc)
+	}
+	var cancelWg sync.WaitGroup
+	cancelWg.Add(1)
+	go func() {
+		defer cancelWg.Done()
+		select {
+		case <-job.ctx.Done():
+			killProc()
+		case <-doneCh:
+		}
+	}()
+
+	err := writeRedoFrame(w.bw, job.key, job.basePage, job.records)
+	if err == nil {
+		err = w.bw.Flush()
+	}
+	var out []byte
+	if err == nil {
+		out = make([]byte, PageSize)
+		_, err = io.ReadFull(w.stdout, out)
+	}
+
+	close(doneCh)
+	cancelWg.Wait()
+	if stopTimer != nil {
+		stopTimer.Stop()
+	}
+
+	if err != nil {
+		procMu.Lock()
+		waited = true
+		procMu.Unlock()
+		w.kill()
+		if ctxErr := job.ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, errors.Join(errors.New("pageserver: walredo worker failed"), err)
+	}
+	return out, nil
+}
+
+func writeRedoFrame(w io.Writer, key Key, basePage []byte, records [][]byte) error {
 	// Frame: [24B key][1B hasBase][8192B basePage if hasBase][4B count]([4B len][record])...
 	var keyBuf [24]byte
 	key.Encode(keyBuf[:])
-	_, _ = stdin.Write(keyBuf[:])
+	if _, err := w.Write(keyBuf[:]); err != nil {
+		return err
+	}
 	if len(basePage) == PageSize {
-		_, _ = stdin.Write([]byte{1})
-		_, _ = stdin.Write(basePage)
+		if _, err := w.Write([]byte{1}); err != nil {
+			return err
+		}
+		if _, err := w.Write(basePage); err != nil {
+			return err
+		}
 	} else {
-		_, _ = stdin.Write([]byte{0})
+		if _, err := w.Write([]byte{0}); err != nil {
+			return err
+		}
 	}
 	var cnt [4]byte
 	binary.LittleEndian.PutUint32(cnt[:], uint32(len(records)))
-	_, _ = stdin.Write(cnt[:])
+	if _, err := w.Write(cnt[:]); err != nil {
+		return err
+	}
 	for _, rec := range records {
 		binary.LittleEndian.PutUint32(cnt[:], uint32(len(rec)))
-		_, _ = stdin.Write(cnt[:])
-		_, _ = stdin.Write(rec)
+		if _, err := w.Write(cnt[:]); err != nil {
+			return err
+		}
+		if _, err := w.Write(rec); err != nil {
+			return err
+		}
 	}
-	_ = stdin.Close()
+	return nil
+}
 
-	out := make([]byte, PageSize)
-	if _, err := io.ReadFull(stdout, out); err != nil {
-		_ = cmd.Wait()
-		return nil, errors.Join(errors.New("pageserver: walredo worker failed"), err)
+func (r *DefaultWALRedoer) workerLoop() {
+	defer r.wg.Done()
+	w := &persistentWorker{
+		bin: r.cfg.WorkerBin,
+		env: r.cfg.Env,
 	}
-	if err := cmd.Wait(); err != nil {
-		return nil, err
+	defer w.kill()
+
+	for {
+		select {
+		case <-r.closedCh:
+			return
+		case job := <-r.reqCh:
+			page, err := w.execJob(job, r.cfg.RequestTimeout)
+			job.resCh <- redoResult{page: page, err: err}
+		}
 	}
-	return out, nil
 }
