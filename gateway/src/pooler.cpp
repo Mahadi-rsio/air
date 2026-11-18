@@ -660,7 +660,8 @@ void TenantPool::serve_client(Stream& client,
     // Transition from auth timeout to configured idle/query timeout.
     client.set_timeouts(client_idle_timeout_ms, 30000);
 
-    ClientSessionState st{client, startup_user, client_id, gw_pid, gw_secret, metrics, cancel_reg};
+    ClientSessionState st{client, startup_user, client_id, gw_pid, gw_secret, metrics, cancel_reg,
+                          {}, {}, nullptr, 'I', false, false, false};
     auto cleanup = [&]() {
         if (st.session_pinned) pinned_clients_.fetch_sub(1);
         if (st.in_tx_counted) active_tx_count_.fetch_sub(1);

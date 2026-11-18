@@ -6,11 +6,13 @@
 #include "pg_wire.hpp"
 #include "pooler.hpp"
 
+#include <arpa/inet.h>
 #include <cassert>
 #include <chrono>
 #include <grpcpp/server.h>
 #include <grpcpp/server_builder.h>
 #include <iostream>
+#include <netinet/in.h>
 #include <regex>
 #include <sys/socket.h>
 #include <thread>
