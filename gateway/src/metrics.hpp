@@ -197,6 +197,12 @@ public:
         if (active_global_conns_ > 0) --active_global_conns_;
     }
 
+    void record_auth_failure() { auth_failures_.fetch_add(1, std::memory_order_relaxed); }
+    void record_protocol_error() { protocol_errors_.fetch_add(1, std::memory_order_relaxed); }
+    void record_rpc_error() { rpc_errors_.fetch_add(1, std::memory_order_relaxed); }
+    void record_timeout() { timeouts_.fetch_add(1, std::memory_order_relaxed); }
+    void record_pool_exhausted() { pool_exhausted_.fetch_add(1, std::memory_order_relaxed); }
+
     bool try_acquire_tenant_user(const std::string& tenant_id,
                                  const std::string& user,
                                  std::string& err_out) {
@@ -311,7 +317,12 @@ public:
             << ",\"max_user_client_conns\":" << max_user_conns_ << "}"
             << ",\"global\":{\"active_connections\":" << active_global_conns_
             << ",\"total_connections\":" << total_global_conns_
-            << ",\"rejected_connections\":" << rejected_global_conns_ << ",";
+            << ",\"rejected_connections\":" << rejected_global_conns_
+            << ",\"auth_failures\":" << auth_failures_.load(std::memory_order_relaxed)
+            << ",\"protocol_errors\":" << protocol_errors_.load(std::memory_order_relaxed)
+            << ",\"rpc_errors\":" << rpc_errors_.load(std::memory_order_relaxed)
+            << ",\"timeouts\":" << timeouts_.load(std::memory_order_relaxed)
+            << ",\"pool_exhausted\":" << pool_exhausted_.load(std::memory_order_relaxed) << ",";
         global_queries_.append_json_fields(out);
         out << "},\"tenants\":[";
 
@@ -418,6 +429,22 @@ public:
                 << "\"} " << ps.active_backends << "\n";
         }
 
+        out << "# HELP air_gateway_auth_failures_total Total authentication failures\n"
+            << "# TYPE air_gateway_auth_failures_total counter\n"
+            << "air_gateway_auth_failures_total " << auth_failures_.load(std::memory_order_relaxed) << "\n"
+            << "# HELP air_gateway_protocol_errors_total Total PostgreSQL wire protocol errors\n"
+            << "# TYPE air_gateway_protocol_errors_total counter\n"
+            << "air_gateway_protocol_errors_total " << protocol_errors_.load(std::memory_order_relaxed) << "\n"
+            << "# HELP air_gateway_rpc_errors_total Total Control Plane RPC failures\n"
+            << "# TYPE air_gateway_rpc_errors_total counter\n"
+            << "air_gateway_rpc_errors_total " << rpc_errors_.load(std::memory_order_relaxed) << "\n"
+            << "# HELP air_gateway_timeouts_total Total gateway timeouts\n"
+            << "# TYPE air_gateway_timeouts_total counter\n"
+            << "air_gateway_timeouts_total " << timeouts_.load(std::memory_order_relaxed) << "\n"
+            << "# HELP air_gateway_pool_exhausted_total Total backend pool saturation events\n"
+            << "# TYPE air_gateway_pool_exhausted_total counter\n"
+            << "air_gateway_pool_exhausted_total " << pool_exhausted_.load(std::memory_order_relaxed) << "\n";
+
         return out.str();
     }
 
@@ -433,6 +460,12 @@ private:
     int max_tenant_conns_;
     int max_user_conns_;
     std::chrono::steady_clock::time_point started_at_;
+
+    std::atomic<uint64_t> auth_failures_{0};
+    std::atomic<uint64_t> protocol_errors_{0};
+    std::atomic<uint64_t> rpc_errors_{0};
+    std::atomic<uint64_t> timeouts_{0};
+    std::atomic<uint64_t> pool_exhausted_{0};
 
     mutable std::mutex mu_;
     int64_t active_global_conns_ = 0;

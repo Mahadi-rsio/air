@@ -31,6 +31,9 @@ struct PreparedDef {
 struct BackendConn {
     Stream stream;
     uint64_t last_client_id = 0;
+    uint32_t backend_pid = 0;
+    uint32_t backend_secret = 0;
+    std::chrono::steady_clock::time_point last_used = std::chrono::steady_clock::now();
     std::unordered_set<std::string> prepared_stmts;
 
     void close() { stream.close(); }
@@ -40,6 +43,12 @@ namespace sqlparse {
 
 inline const std::regex& re_set_stmt() {
     static const std::regex r(R"(^\s*SET\s+(?:SESSION\s+)?([a-zA-Z0-9_.]+)\s*(?:=|TO)\s*(.+?)\s*;?\s*$)",
+                              std::regex::icase);
+    return r;
+}
+
+inline const std::regex& re_reset_stmt() {
+    static const std::regex r(R"(^\s*RESET\s+([a-zA-Z0-9_.]+|ALL)\s*;?\s*$)",
                               std::regex::icase);
     return r;
 }
@@ -157,13 +166,40 @@ public:
     using WakeFn = std::function<bool(TenantRoute& route_out, std::string& err_out)>;
 
     TenantPool(std::string tenant_id, std::string host, std::string sock_dir,
-               int port, std::string app_password, int max_backends)
+               int port, std::string app_password, int max_backends,
+               int idle_timeout_sec = 300)
         : tenant_id_(std::move(tenant_id)),
           max_backends_(max_backends > 0 ? max_backends : 16),
+          idle_timeout_sec_(idle_timeout_sec > 0 ? idle_timeout_sec : 300),
           host_(std::move(host)),
           sock_dir_(std::move(sock_dir)),
           port_(port),
           app_password_(std::move(app_password)) {}
+
+    void set_idle_timeout_sec(int sec) {
+        if (sec > 0) idle_timeout_sec_.store(sec, std::memory_order_relaxed);
+    }
+
+    size_t evict_expired_idle() {
+        auto now = std::chrono::steady_clock::now();
+        int timeout_s = idle_timeout_sec_.load(std::memory_order_relaxed);
+        std::vector<std::unique_ptr<BackendConn>> to_close;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            for (auto it = idle_pool_.begin(); it != idle_pool_.end();) {
+                if (!*it || std::chrono::duration_cast<std::chrono::seconds>(now - (*it)->last_used).count() >= timeout_s) {
+                    to_close.push_back(std::move(*it));
+                    it = idle_pool_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (auto& b : to_close) {
+            if (b) b->close();
+        }
+        return to_close.size();
+    }
 
     ~TenantPool() { close_all_idle(); }
 
@@ -247,29 +283,54 @@ public:
     void serve_client(Stream& client, const std::string& startup_user,
                       const std::string& expected_pass,
                       const std::function<void()>& touch_activity,
-                      MetricsRegistry* metrics = nullptr) {
+                      MetricsRegistry* metrics = nullptr,
+                      CancelRegistry* cancel_reg = nullptr,
+                      int client_idle_timeout_ms = 0) {
         uint64_t client_id = client_seq_.fetch_add(1) + 1;
 
-        if (!expected_pass.empty()) {
-            if (!client.write_all(build_auth_cleartext())) return;
+        if (expected_pass.empty()) {
+            if (metrics) metrics->record_auth_failure();
+            std::cerr << "[air-gateway] auth rejected: missing credentials for tenant=" << tenant_id_ << std::endl;
+            client.write_all(build_error_response("FATAL", "28000", "tenant credentials unavailable"));
+            return;
+        }
+
+        if (!client.write_all(build_auth_cleartext())) return;
+        {
             char mtype = 0;
             std::vector<uint8_t> mbody;
-            if (!read_pg_packet(client, mtype, mbody) || mtype != 'p') return;
+            if (!read_pg_packet(client, mtype, mbody) || mtype != 'p') {
+                if (metrics) metrics->record_auth_failure();
+                client.write_all(build_error_response("FATAL", "28P01", "password authentication failed"));
+                return;
+            }
             size_t off = 0;
             std::string got_pass = sqlparse::read_cstr(mbody, off);
-            if (got_pass != expected_pass) {
+            if (!constant_time_equals(got_pass, expected_pass)) {
+                if (metrics) metrics->record_auth_failure();
+                std::cerr << "[air-gateway] auth failed for tenant=" << tenant_id_
+                          << " user=" << startup_user << std::endl;
                 client.write_all(build_error_response(
                     "FATAL", "28P01", "password authentication failed for user \"" + startup_user + "\""));
                 return;
             }
         }
 
+        uint32_t gw_pid = static_cast<uint32_t>(10000 + (client_id % 50000));
+        uint32_t gw_secret = 0;
+        if (RAND_bytes(reinterpret_cast<uint8_t*>(&gw_secret), sizeof(gw_secret)) != 1 || gw_secret == 0) {
+            gw_secret = static_cast<uint32_t>(0x9e3779b9u ^ (client_id * 2654435761u));
+        }
+
         if (!client.write_all(build_auth_ok())) return;
         if (!client.write_all(build_param_status("server_version", "17.12"))) return;
         if (!client.write_all(build_param_status("client_encoding", "UTF8"))) return;
         if (!client.write_all(build_param_status("DateStyle", "ISO, MDY"))) return;
-        if (!client.write_all(build_backend_key_data(static_cast<uint32_t>(10000 + (client_id % 50000)), 9999))) return;
+        if (!client.write_all(build_backend_key_data(gw_pid, gw_secret))) return;
         if (!client.write_all(build_ready_for_query('I'))) return;
+
+        // Transition from auth timeout to configured idle/query timeout.
+        client.set_timeouts(client_idle_timeout_ms, 30000);
 
         std::unordered_map<std::string, std::string> session_vars;
         std::unordered_map<std::string, PreparedDef> client_stmts;
@@ -277,13 +338,24 @@ public:
         char tx_status = 'I';
         bool in_tx_counted = false;
         bool session_pinned = false;
+        bool backend_in_flight = false;
+
+        auto unregister_cancel = [&]() {
+            if (cancel_reg) cancel_reg->unregister_target(gw_pid, gw_secret);
+        };
+
+        auto release_current = [&](bool dirty) {
+            unregister_cancel();
+            backend_in_flight = false;
+            if (current_backend) {
+                release_backend(std::move(current_backend), dirty);
+            }
+        };
 
         auto cleanup = [&]() {
             if (session_pinned) pinned_clients_.fetch_sub(1);
             if (in_tx_counted) active_tx_count_.fetch_sub(1);
-            if (current_backend) {
-                release_backend(std::move(current_backend), tx_status != 'I' || session_pinned);
-            }
+            release_current(tx_status != 'I' || session_pinned || backend_in_flight);
         };
 
         auto ensure_session_and_stmts = [&](BackendConn* b) -> bool {
@@ -320,15 +392,21 @@ public:
                     std::chrono::steady_clock::now() - wait_start)
                     .count());
             if (!current_backend) {
+                if (metrics) metrics->record_pool_exhausted();
                 client.write_all(build_error_response("ERROR", "53300", acq_err));
                 client.write_all(build_ready_for_query(tx_status));
                 return false;
             }
             if (!ensure_session_and_stmts(current_backend.get())) {
-                release_backend(std::move(current_backend), true);
+                release_current(true);
                 client.write_all(build_error_response("ERROR", "08006", "failed to prepare pooled backend session state"));
                 client.write_all(build_ready_for_query(tx_status));
                 return false;
+            }
+            if (cancel_reg && current_backend->backend_pid != 0) {
+                std::lock_guard<std::mutex> lk(mu_);
+                cancel_reg->register_target(gw_pid, gw_secret, CancelTarget{
+                    host_, sock_dir_, port_, current_backend->backend_pid, current_backend->backend_secret});
             }
             return true;
         };
@@ -349,7 +427,10 @@ public:
                                   rstats.data_row_bytes, had_err, count);
         };
 
+        static constexpr size_t kMaxExtBatchMsgs = 4096;
+        static constexpr size_t kMaxExtBatchBytes = 32 * 1024 * 1024;
         std::vector<std::pair<char, std::vector<uint8_t>>> ext_batch;
+        size_t ext_batch_bytes = 0;
 
         while (true) {
             char mtype = 0;
@@ -387,22 +468,58 @@ public:
                         record_metrics(q_start, pool_wait_us, bytes_in, {}, true, 1);
                         continue;
                     }
+                    backend_in_flight = true;
                     if (!current_backend->stream.write_all(build_pg_message('Q', mbody))) {
-                        release_backend(std::move(current_backend), true);
+                        release_current(true);
                         cleanup();
                         return;
                     }
                     bool had_err = false;
                     RelayStats rstats;
                     if (!relay_until_ready(current_backend.get(), client, tx_status, had_err, &rstats)) {
-                        release_backend(std::move(current_backend), true);
+                        release_current(true);
                         cleanup();
                         return;
                     }
+                    backend_in_flight = false;
                     record_metrics(q_start, pool_wait_us, bytes_in, rstats, had_err, 1);
                     if (!had_err) session_vars[key] = val;
                     if (tx_status == 'I' && !session_pinned) {
-                        release_backend(std::move(current_backend), false);
+                        release_current(false);
+                    }
+                    continue;
+                }
+
+                if (std::regex_match(trimmed, sm, sqlparse::re_reset_stmt())) {
+                    std::string key = sm[1].str();
+                    if (!ensure_backend(pool_wait_us)) {
+                        record_metrics(q_start, pool_wait_us, bytes_in, {}, true, 1);
+                        continue;
+                    }
+                    backend_in_flight = true;
+                    if (!current_backend->stream.write_all(build_pg_message('Q', mbody))) {
+                        release_current(true);
+                        cleanup();
+                        return;
+                    }
+                    bool had_err = false;
+                    RelayStats rstats;
+                    if (!relay_until_ready(current_backend.get(), client, tx_status, had_err, &rstats)) {
+                        release_current(true);
+                        cleanup();
+                        return;
+                    }
+                    backend_in_flight = false;
+                    record_metrics(q_start, pool_wait_us, bytes_in, rstats, had_err, 1);
+                    if (!had_err) {
+                        if (iequals(key, "ALL")) {
+                            session_vars.clear();
+                        } else {
+                            session_vars.erase(key);
+                        }
+                    }
+                    if (tx_status == 'I' && !session_pinned) {
+                        release_current(false);
                     }
                     continue;
                 }
@@ -417,19 +534,21 @@ public:
                         record_metrics(q_start, pool_wait_us, bytes_in, {}, true, 1);
                         continue;
                     }
+                    backend_in_flight = true;
                     std::string rewritten = "PREPARE " + global_name + type_list + " AS " + inner_q;
                     if (!current_backend->stream.write_all(build_simple_query(rewritten))) {
-                        release_backend(std::move(current_backend), true);
+                        release_current(true);
                         cleanup();
                         return;
                     }
                     bool had_err = false;
                     RelayStats rstats;
                     if (!relay_until_ready(current_backend.get(), client, tx_status, had_err, &rstats)) {
-                        release_backend(std::move(current_backend), true);
+                        release_current(true);
                         cleanup();
                         return;
                     }
+                    backend_in_flight = false;
                     record_metrics(q_start, pool_wait_us, bytes_in, rstats, had_err, 1);
                     if (!had_err) {
                         PreparedDef def;
@@ -442,27 +561,56 @@ public:
                         current_backend->prepared_stmts.insert(global_name);
                     }
                     if (tx_status == 'I' && !session_pinned) {
-                        release_backend(std::move(current_backend), false);
+                        release_current(false);
                     }
                     continue;
                 }
 
                 if (std::regex_match(trimmed, sm, sqlparse::re_dealloc_stmt())) {
                     std::string cname = sm[1].str();
-                    if (iequals(cname, "ALL")) {
-                        client_stmts.clear();
-                    } else {
-                        client_stmts.erase(cname);
+                    if (!ensure_backend(pool_wait_us)) {
+                        record_metrics(q_start, pool_wait_us, bytes_in, {}, true, 1);
+                        continue;
                     }
-                    auto cmsg = build_pg_message('C', std::vector<uint8_t>{'D','E','A','L','L','O','C','A','T','E',0});
-                    auto zmsg = build_ready_for_query(tx_status);
-                    if (!client.write_all(cmsg) || !client.write_all(zmsg)) {
+                    std::string dealloc_sql;
+                    std::string erased_global;
+                    bool dealloc_all = iequals(cname, "ALL");
+                    if (dealloc_all) {
+                        dealloc_sql = "DEALLOCATE ALL";
+                    } else if (auto it = client_stmts.find(cname); it != client_stmts.end()) {
+                        erased_global = it->second.global_name;
+                        dealloc_sql = "DEALLOCATE " + erased_global;
+                    } else {
+                        // Forward unknown name to backend so PostgreSQL returns SQLSTATE 26000 and updates tx state.
+                        dealloc_sql = "DEALLOCATE " + cname;
+                    }
+                    backend_in_flight = true;
+                    if (!current_backend->stream.write_all(build_simple_query(dealloc_sql))) {
+                        release_current(true);
                         cleanup();
                         return;
                     }
+                    bool had_err = false;
                     RelayStats rstats;
-                    rstats.bytes_out = cmsg.size() + zmsg.size();
-                    record_metrics(q_start, 0, bytes_in, rstats, false, 1);
+                    if (!relay_until_ready(current_backend.get(), client, tx_status, had_err, &rstats)) {
+                        release_current(true);
+                        cleanup();
+                        return;
+                    }
+                    backend_in_flight = false;
+                    record_metrics(q_start, pool_wait_us, bytes_in, rstats, had_err, 1);
+                    if (!had_err) {
+                        if (dealloc_all) {
+                            client_stmts.clear();
+                            current_backend->prepared_stmts.clear();
+                        } else if (!erased_global.empty()) {
+                            client_stmts.erase(cname);
+                            current_backend->prepared_stmts.erase(erased_global);
+                        }
+                    }
+                    if (tx_status == 'I' && !session_pinned) {
+                        release_current(false);
+                    }
                     continue;
                 }
 
@@ -481,18 +629,20 @@ public:
                     record_metrics(q_start, pool_wait_us, bytes_in, {}, true, 1);
                     continue;
                 }
+                backend_in_flight = true;
                 if (!current_backend->stream.write_all(build_pg_message('Q', out_body))) {
-                    release_backend(std::move(current_backend), true);
+                    release_current(true);
                     cleanup();
                     return;
                 }
                 bool had_err = false;
                 RelayStats rstats;
                 if (!relay_until_ready(current_backend.get(), client, tx_status, had_err, &rstats)) {
-                    release_backend(std::move(current_backend), true);
+                    release_current(true);
                     cleanup();
                     return;
                 }
+                backend_in_flight = false;
                 record_metrics(q_start, pool_wait_us, bytes_in, rstats, had_err, 1);
                 if (tx_status != 'I' && !in_tx_counted) {
                     in_tx_counted = true;
@@ -502,13 +652,23 @@ public:
                     active_tx_count_.fetch_sub(1);
                 }
                 if (tx_status == 'I' && !session_pinned) {
-                    release_backend(std::move(current_backend), false);
+                    release_current(false);
                 }
                 continue;
             }
 
             // Extended query protocol messages: buffer until Sync ('S') or Flush ('H').
             if (mtype == 'P' || mtype == 'B' || mtype == 'D' || mtype == 'E' || mtype == 'C') {
+                if (ext_batch.size() >= kMaxExtBatchMsgs ||
+                    ext_batch_bytes + 5 + mbody.size() > kMaxExtBatchBytes) {
+                    ext_batch.clear();
+                    ext_batch_bytes = 0;
+                    if (metrics) metrics->record_protocol_error();
+                    client.write_all(build_error_response("FATAL", "54000", "extended query pipeline buffer limit exceeded"));
+                    cleanup();
+                    return;
+                }
+                ext_batch_bytes += 5 + mbody.size();
                 ext_batch.emplace_back(mtype, std::move(mbody));
                 continue;
             }
@@ -527,9 +687,20 @@ public:
                 uint64_t pool_wait_us = 0;
                 if (!ensure_backend(pool_wait_us)) {
                     ext_batch.clear();
+                    ext_batch_bytes = 0;
                     record_metrics(q_start, pool_wait_us, bytes_in, {}, true, exec_count);
                     continue;
                 }
+
+                struct UndoParse {
+                    std::string cname;
+                    std::string gname;
+                    bool had_prev = false;
+                    PreparedDef prev;
+                };
+                std::vector<UndoParse> undo_parses;
+
+                backend_in_flight = true;
                 for (auto& [bt, bb] : ext_batch) {
                     if (bt == 'P') {
                         std::string cname, query;
@@ -537,10 +708,63 @@ public:
                         std::string gname = "_air_s_" + std::to_string(client_id) + "_" +
                                             std::to_string(stmt_seq_.fetch_add(1) + 1);
                         auto rewritten = sqlparse::rewrite_parse_body(bb, gname, cname, query, oids);
+                        std::smatch psm;
+                        std::string trimmed_q = trim_ascii(query);
+                        auto rebuild_parse_body = [&]() {
+                            std::vector<uint8_t> rbody;
+                            append_cstr(rbody, gname);
+                            append_cstr(rbody, query);
+                            append_be16(rbody, static_cast<uint16_t>(oids.size()));
+                            for (uint32_t oid : oids) append_be32(rbody, oid);
+                            rewritten = std::move(rbody);
+                        };
+                        if (std::regex_match(trimmed_q, psm, sqlparse::re_prepare_stmt())) {
+                            std::string sql_cname = psm[1].str();
+                            std::string sql_tlist = psm[2].str();
+                            std::string sql_inner = psm[3].str();
+                            std::string sql_gname = "_air_s_" + std::to_string(client_id) + "_" +
+                                                    std::to_string(stmt_seq_.fetch_add(1) + 1);
+                            query = "PREPARE " + sql_gname + sql_tlist + " AS " + sql_inner;
+                            rebuild_parse_body();
+                            PreparedDef sdef;
+                            sdef.client_name = sql_cname;
+                            sdef.global_name = sql_gname;
+                            sdef.type_list = sql_tlist;
+                            sdef.query = sql_inner;
+                            sdef.is_sql_prep = true;
+                            client_stmts[sql_cname] = std::move(sdef);
+                            current_backend->prepared_stmts.insert(sql_gname);
+                        } else if (std::regex_match(trimmed_q, psm, sqlparse::re_execute_stmt())) {
+                            auto it = client_stmts.find(psm[2].str());
+                            if (it != client_stmts.end()) {
+                                query = psm[1].str() + it->second.global_name + psm[3].str();
+                                rebuild_parse_body();
+                            }
+                        } else if (std::regex_match(trimmed_q, psm, sqlparse::re_dealloc_stmt())) {
+                            std::string sql_cname = psm[1].str();
+                            if (iequals(sql_cname, "ALL")) {
+                                client_stmts.clear();
+                                current_backend->prepared_stmts.clear();
+                            } else if (auto it = client_stmts.find(sql_cname); it != client_stmts.end()) {
+                                query = "DEALLOCATE " + it->second.global_name;
+                                rebuild_parse_body();
+                                current_backend->prepared_stmts.erase(it->second.global_name);
+                                client_stmts.erase(it);
+                            }
+                        }
                         if (sqlparse::is_session_pinning_sql(query) && !session_pinned) {
                             session_pinned = true;
                             pinned_clients_.fetch_add(1);
                         }
+                        UndoParse u;
+                        u.cname = cname;
+                        u.gname = gname;
+                        if (auto prev_it = client_stmts.find(cname); prev_it != client_stmts.end()) {
+                            u.had_prev = true;
+                            u.prev = prev_it->second;
+                        }
+                        undo_parses.push_back(std::move(u));
+
                         PreparedDef def;
                         def.client_name = cname;
                         def.global_name = gname;
@@ -557,24 +781,43 @@ public:
                     } else if (bt == 'C') {
                         std::string erased;
                         bb = sqlparse::rewrite_named_op_body(bb, client_stmts, true, erased);
-                        if (!erased.empty()) client_stmts.erase(erased);
+                        if (!erased.empty()) {
+                            if (auto it = client_stmts.find(erased); it != client_stmts.end()) {
+                                current_backend->prepared_stmts.erase(it->second.global_name);
+                                client_stmts.erase(it);
+                            }
+                        }
                     }
                     if (!current_backend->stream.write_all(build_pg_message(bt, bb))) {
-                        release_backend(std::move(current_backend), true);
+                        release_current(true);
                         cleanup();
                         return;
                     }
                 }
-                ext_batch.clear();
+
+                auto rollback_parses = [&]() {
+                    for (auto it = undo_parses.rbegin(); it != undo_parses.rend(); ++it) {
+                        if (current_backend) current_backend->prepared_stmts.erase(it->gname);
+                        if (it->had_prev) {
+                            client_stmts[it->cname] = it->prev;
+                        } else {
+                            client_stmts.erase(it->cname);
+                        }
+                    }
+                };
 
                 if (mtype == 'S') {
+                    ext_batch.clear();
+                    ext_batch_bytes = 0;
                     bool had_err = false;
                     RelayStats rstats;
                     if (!relay_until_ready(current_backend.get(), client, tx_status, had_err, &rstats)) {
-                        release_backend(std::move(current_backend), true);
+                        release_current(true);
                         cleanup();
                         return;
                     }
+                    backend_in_flight = false;
+                    if (had_err) rollback_parses();
                     record_metrics(q_start, pool_wait_us, bytes_in, rstats, had_err, exec_count);
                     if (tx_status != 'I' && !in_tx_counted) {
                         in_tx_counted = true;
@@ -584,17 +827,29 @@ public:
                         active_tx_count_.fetch_sub(1);
                     }
                     if (tx_status == 'I' && !session_pinned) {
-                        release_backend(std::move(current_backend), false);
+                        release_current(false);
                     }
+                } else {
+                    // Flush ('H'): relay responses for pipelined messages sent so far without waiting for ReadyForQuery.
+                    bool had_err = false;
+                    RelayStats rstats;
+                    bool ok = relay_flush_batch(current_backend.get(), client, ext_batch, had_err, &rstats);
+                    ext_batch.clear();
+                    ext_batch_bytes = 0;
+                    if (!ok) {
+                        release_current(true);
+                        cleanup();
+                        return;
+                    }
+                    if (had_err) rollback_parses();
+                    record_metrics(q_start, pool_wait_us, bytes_in, rstats, had_err, exec_count);
                 }
                 continue;
             }
 
-            // CopyData ('d'), CopyDone ('c'), CopyFail ('f'), etc.
-            uint64_t unused_wait = 0;
-            if (!ensure_backend(unused_wait)) continue;
-            if (!current_backend->stream.write_all(build_pg_message(mtype, mbody))) {
-                release_backend(std::move(current_backend), true);
+            if (metrics) metrics->record_protocol_error();
+            if (!client.write_all(build_error_response("ERROR", "08P01", "unsupported frontend message type")) ||
+                !client.write_all(build_ready_for_query(tx_status))) {
                 cleanup();
                 return;
             }
@@ -604,6 +859,7 @@ public:
 private:
     std::string tenant_id_;
     int max_backends_;
+    std::atomic<int> idle_timeout_sec_{300};
 
     std::mutex mu_;
     std::string host_;
@@ -646,6 +902,8 @@ private:
     std::unique_ptr<BackendConn> acquire_backend(uint64_t client_id, std::string& err_out) {
         if (!acquire_slot(err_out)) return nullptr;
 
+        auto now = std::chrono::steady_clock::now();
+        int timeout_s = idle_timeout_sec_.load(std::memory_order_relaxed);
         while (true) {
             std::unique_ptr<BackendConn> b;
             {
@@ -656,6 +914,10 @@ private:
                 }
             }
             if (b) {
+                if (std::chrono::duration_cast<std::chrono::seconds>(now - b->last_used).count() >= timeout_s) {
+                    b->close();
+                    continue;
+                }
                 if (b->last_client_id != client_id) {
                     if (!exec_simple_backend(b.get(), "DISCARD ALL;")) {
                         b->close();
@@ -716,6 +978,7 @@ private:
             release_slot();
             return;
         }
+        b->last_used = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (static_cast<int>(idle_pool_.size()) < max_backends_) {
@@ -777,6 +1040,9 @@ private:
                     err_out = "unsupported backend auth method: " + std::to_string(code);
                     return nullptr;
                 }
+            } else if (t == 'K' && body.size() >= 8) {
+                b->backend_pid = read_be32(body.data());
+                b->backend_secret = read_be32(body.data() + 4);
             } else if (t == 'Z' && !body.empty()) {
                 return b;
             } else if (t == 'E') {
@@ -807,6 +1073,19 @@ private:
         uint64_t data_row_bytes = 0;
     };
 
+    static bool relay_copy_in(BackendConn* b, Stream& client) {
+        while (true) {
+            char ct = 0;
+            std::vector<uint8_t> cbody;
+            if (!read_pg_packet(client, ct, cbody)) return false;
+            if (ct != 'd' && ct != 'c' && ct != 'f') {
+                return false;
+            }
+            if (!b->stream.write_all(build_pg_message(ct, cbody))) return false;
+            if (ct == 'c' || ct == 'f') return true;
+        }
+    }
+
     static bool relay_until_ready(BackendConn* b, Stream& client, char& tx_status,
                                   bool& had_err, RelayStats* stats = nullptr) {
         had_err = false;
@@ -823,17 +1102,71 @@ private:
             }
             if (t == 'E') had_err = true;
             if (!client.write_all(build_pg_message(t, body))) return false;
+            if (t == 'G') {
+                if (!relay_copy_in(b, client)) return false;
+                continue;
+            }
             if (t == 'Z' && !body.empty()) {
                 tx_status = static_cast<char>(body[0]);
                 return true;
             }
         }
     }
+
+    static bool relay_flush_batch(BackendConn* b, Stream& client,
+                                  const std::vector<std::pair<char, std::vector<uint8_t>>>& batch,
+                                  bool& had_err, RelayStats* stats = nullptr) {
+        had_err = false;
+        auto forward_pkt = [&](char& t, std::vector<uint8_t>& body) -> bool {
+            while (true) {
+                if (!read_pg_packet(b->stream, t, body)) return false;
+                if (stats) {
+                    stats->bytes_out += 5 + body.size();
+                    if (t == 'D') {
+                        ++stats->rows_returned;
+                        stats->data_row_bytes += body.size();
+                    }
+                }
+                if (t == 'E') had_err = true;
+                if (!client.write_all(build_pg_message(t, body))) return false;
+                // Async notices/param status/notifications can arrive before command completion.
+                if (t == 'N' || t == 'S' || t == 'A') continue;
+                return true;
+            }
+        };
+
+        for (const auto& [bt, _] : batch) {
+            if (bt == 'H') break;
+            if (had_err) break; // PG skips remaining pipelined messages until Sync ('S') after an ErrorResponse.
+            char t = 0;
+            std::vector<uint8_t> body;
+            if (bt == 'P' || bt == 'B' || bt == 'C') {
+                if (!forward_pkt(t, body)) return false;
+            } else if (bt == 'D') {
+                if (!forward_pkt(t, body)) return false;
+                if (t == 't') { // ParameterDescription is followed by RowDescription ('T') or NoData ('n')
+                    if (!forward_pkt(t, body)) return false;
+                }
+            } else if (bt == 'E') {
+                while (true) {
+                    if (!forward_pkt(t, body)) return false;
+                    if (t == 'G') {
+                        if (!relay_copy_in(b, client)) return false;
+                        continue;
+                    }
+                    if (t == 'C' || t == 'I' || t == 's' || t == 'E') break;
+                }
+            }
+        }
+        return true;
+    }
 };
 
 class PoolManager {
 public:
-    explicit PoolManager(int max_backends) : max_backends_(max_backends) {}
+    explicit PoolManager(int max_backends, int idle_timeout_sec = 300)
+        : max_backends_(max_backends),
+          idle_timeout_sec_(idle_timeout_sec > 0 ? idle_timeout_sec : 300) {}
 
     std::shared_ptr<TenantPool> get_or_create(const TenantRoute& route, TenantPool::WakeFn wake_fn) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -843,10 +1176,25 @@ public:
             return it->second;
         }
         auto p = std::make_shared<TenantPool>(
-            route.tenant_id, route.host, route.sock_dir, route.port, route.app_password, max_backends_);
+            route.tenant_id, route.host, route.sock_dir, route.port, route.app_password,
+            max_backends_, idle_timeout_sec_);
         p->set_wake_fn(std::move(wake_fn));
         pools_[route.tenant_id] = p;
         return p;
+    }
+
+    size_t evict_expired_idle() {
+        std::vector<std::shared_ptr<TenantPool>> list;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            list.reserve(pools_.size());
+            for (const auto& [_, p] : pools_) {
+                if (p) list.push_back(p);
+            }
+        }
+        size_t evicted = 0;
+        for (const auto& p : list) evicted += p->evict_expired_idle();
+        return evicted;
     }
 
     void upsert_discovered(const TenantRoute& route) {
@@ -921,6 +1269,7 @@ public:
 
 private:
     int max_backends_;
+    int idle_timeout_sec_;
     mutable std::mutex mu_;
     std::unordered_map<std::string, std::shared_ptr<TenantPool>> pools_;
 };

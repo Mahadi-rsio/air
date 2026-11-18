@@ -7,6 +7,9 @@
 
 #include <arpa/inet.h>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <netdb.h>
 #include <sstream>
 #include <string>
@@ -77,6 +80,10 @@ public:
             listen_fd_ = -1;
         }
         if (worker_.joinable()) worker_.join();
+        std::unique_lock<std::mutex> lk(http_mu_);
+        http_cv_.wait_for(lk, std::chrono::seconds(3), [this]() {
+            return active_http_.load(std::memory_order_acquire) == 0;
+        });
     }
 
 private:
@@ -88,6 +95,9 @@ private:
     int listen_fd_ = -1;
     std::atomic<bool> running_{false};
     std::thread worker_;
+    std::atomic<int> active_http_{0};
+    std::mutex http_mu_;
+    std::condition_variable http_cv_;
 
     void accept_loop() {
         while (running_.load()) {
@@ -96,7 +106,19 @@ private:
                 if (!running_.load()) break;
                 continue;
             }
-            std::thread([this, cfd]() { handle_http(cfd); }).detach();
+            if (active_http_.load(std::memory_order_relaxed) >= 64) {
+                send_http(cfd, 503, "Service Unavailable", R"({"error":"admin http busy"})");
+                ::close(cfd);
+                continue;
+            }
+            active_http_.fetch_add(1, std::memory_order_relaxed);
+            std::thread([this, cfd]() {
+                handle_http(cfd);
+                if (active_http_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    std::lock_guard<std::mutex> lk(http_mu_);
+                    http_cv_.notify_all();
+                }
+            }).detach();
         }
     }
 

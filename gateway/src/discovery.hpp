@@ -105,9 +105,18 @@ public:
     using TenantCallback = std::function<void(const TenantRoute&)>;
     using TenantRemovedCallback = std::function<void(const std::string&)>;
 
+    static std::shared_ptr<grpc::Channel> make_channel(const std::string& addr) {
+        grpc::ChannelArguments args;
+        args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 30000);
+        args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 5000);
+        args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+        args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
+        return grpc::CreateCustomChannel(addr, grpc::InsecureChannelCredentials(), args);
+    }
+
     explicit TenantDiscovery(const Config& cfg)
         : cfg_(cfg),
-          channel_(grpc::CreateChannel(cfg_.grpc_addr, grpc::InsecureChannelCredentials())),
+          channel_(make_channel(cfg_.grpc_addr)),
           stub_(air::db::v1::AirDBControl::NewStub(channel_)) {}
 
     ~TenantDiscovery() {
@@ -120,6 +129,8 @@ public:
 
     TenantDiscovery(const TenantDiscovery&) = delete;
     TenantDiscovery& operator=(const TenantDiscovery&) = delete;
+
+    void set_metrics(MetricsRegistry* metrics) { metrics_ = metrics; }
 
     void set_callbacks(TenantCallback on_upsert, TenantRemovedCallback on_remove) {
         std::lock_guard<std::mutex> lk(cb_mu_);
@@ -165,7 +176,9 @@ public:
         return out;
     }
 
-    bool resolve_tenant(const std::string& tenant_id, TenantRoute& route_out, std::string& err_out) {
+    bool resolve_tenant(const std::string& tenant_id, TenantRoute& route_out, std::string& err_out,
+                        grpc::StatusCode* grpc_code_out = nullptr) {
+        if (grpc_code_out) *grpc_code_out = grpc::StatusCode::OK;
         // Fast path: serve ACTIVE cached routes with credentials directly under a shared read lock.
         {
             std::shared_lock<std::shared_mutex> lk(cache_mu_);
@@ -180,10 +193,24 @@ public:
         air::db::v1::TenantRequest req;
         req.set_tenant_id(tenant_id);
         air::db::v1::TenantRouteResponse resp;
-        grpc::ClientContext ctx;
-        prepare_ctx(ctx, 10);
-        grpc::Status st = stub_->GetTenantRoute(&ctx, req, &resp);
+        grpc::Status st;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            grpc::ClientContext ctx;
+            prepare_ctx(ctx, 10);
+            st = stub_->GetTenantRoute(&ctx, req, &resp);
+            if (st.ok() || st.error_code() != grpc::StatusCode::UNAVAILABLE || attempt == 1) {
+                break;
+            }
+            // Trigger immediate reconnect if the channel is sitting in TRANSIENT_FAILURE backoff
+            // (e.g. air-gateway started a few seconds before air-server finished booting).
+            (void)channel_->WaitForConnected(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
+        }
         if (!st.ok()) {
+            if (grpc_code_out) *grpc_code_out = st.error_code();
+            if (metrics_) metrics_->record_rpc_error();
+            if (st.error_code() == grpc::StatusCode::NOT_FOUND) {
+                remove_cache(tenant_id);
+            }
             err_out = st.error_message();
             return false;
         }
@@ -205,6 +232,7 @@ public:
         prepare_ctx(ctx, 35);
         grpc::Status st = stub_->WakeTenant(&ctx, req, &resp);
         if (!st.ok()) {
+            if (metrics_) metrics_->record_rpc_error();
             err_out = st.error_message();
             return false;
         }
@@ -441,6 +469,7 @@ private:
     Config cfg_;
     std::shared_ptr<grpc::Channel> channel_;
     std::shared_ptr<air::db::v1::AirDBControl::Stub> stub_;
+    MetricsRegistry* metrics_ = nullptr;
 
     void prepare_ctx(grpc::ClientContext& ctx, int timeout_sec) const {
         ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(timeout_sec));

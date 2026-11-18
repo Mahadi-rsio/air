@@ -1,4 +1,5 @@
 #include "admin_grpc.hpp"
+#include "admin_http.hpp"
 #include "config.hpp"
 #include "discovery.hpp"
 #include "metrics.hpp"
@@ -11,6 +12,7 @@
 #include <grpcpp/server_builder.h>
 #include <iostream>
 #include <regex>
+#include <sys/socket.h>
 #include <thread>
 
 int main() {
@@ -39,16 +41,36 @@ int main() {
         assert(!cfg.meta_dsn.empty());
     }
 
-    // 2. Tenant ID & SNI extraction
+    // 2. Tenant ID, SNI extraction, constant-time auth & CancelRequest
     {
         assert(validate_tenant_id("tenant_123-abc"));
         assert(!validate_tenant_id(""));
         assert(!validate_tenant_id("bad;drop"));
         assert(parse_sni_tenant("t_demo.air.local") == "t_demo");
+        assert(parse_sni_tenant("localhost") == "");
+        assert(parse_sni_tenant("127.0.0.1") == "");
         std::unordered_map<std::string, std::string> params{{"database", "postgres"}, {"user", "app_user"}};
         assert(extract_tenant("t_demo.air.local", params) == "t_demo");
         params["database"] = "t_explicit";
         assert(extract_tenant("t_demo.air.local", params) == "t_explicit");
+
+        assert(constant_time_equals("secret123", "secret123"));
+        assert(!constant_time_equals("secret123", "secret124"));
+        assert(!constant_time_equals("secret123", "secret12"));
+
+        auto creq = build_cancel_request(1234, 5678);
+        assert(creq.size() == 16);
+        assert(read_be32(creq.data()) == 16);
+        assert(read_be32(creq.data() + 4) == kCancelRequestCode);
+        assert(read_be32(creq.data() + 8) == 1234);
+        assert(read_be32(creq.data() + 12) == 5678);
+
+        CancelRegistry creg;
+        creg.register_target(100, 200, CancelTarget{"127.0.0.1", "", 15432, 9001, 42});
+        CancelTarget ct;
+        assert(creg.lookup(100, 200, ct) && ct.backend_pid == 9001 && ct.backend_secret == 42);
+        creg.unregister_target(100, 200);
+        assert(!creg.lookup(100, 200, ct));
     }
 
     // 3. Extended query statement rewriting
@@ -68,6 +90,7 @@ int main() {
 
         size_t off = 0;
         assert(sqlparse::read_cstr(rewritten, off) == "_air_s_1_1");
+        (void)off;
 
         std::unordered_map<std::string, PreparedDef> stmts;
         stmts["stmt1"] = PreparedDef{"stmt1", "_air_s_1_1", "", query, oids, false};
@@ -110,6 +133,13 @@ int main() {
         assert(sqlparse::is_session_pinning_sql("CREATE TEMP TABLE t (x int);"));
         assert(sqlparse::is_session_pinning_sql("SELECT pg_advisory_lock(42);"));
         assert(!sqlparse::is_session_pinning_sql("SELECT 1;"));
+
+        std::string s4 = "RESET work_mem;";
+        assert(std::regex_match(s4, sm, sqlparse::re_reset_stmt()));
+        assert(sm[1].str() == "work_mem");
+        std::string s5 = "RESET ALL;";
+        assert(std::regex_match(s5, sm, sqlparse::re_reset_stmt()));
+        assert(sm[1].str() == "ALL");
     }
 
     // 5. PoolManager drain & TLSContext self-signed cert
@@ -393,6 +423,171 @@ int main() {
         }
 
         admin_grpc.stop();
+    }
+
+    // 9. Protocol regression tests: fail-closed auth, unknown msg rejection, Flush ('H'), COPY FROM STDIN, and isolation
+    {
+        auto require = [](bool cond, const char* msg) {
+            if (!cond) {
+                std::cerr << "FAIL: " << msg << std::endl;
+                std::abort();
+            }
+        };
+
+        // 9a. Fail-closed when expected_pass is empty
+        {
+            int sv[2];
+            require(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair 9a");
+            TenantPool pool("t_auth", "127.0.0.1", "", 1, "", 4);
+            MetricsRegistry reg(10, 5, 5);
+            Stream srv(sv[0]);
+            Stream cli(sv[1]);
+            std::thread t([&]() {
+                pool.serve_client(srv, "app_user", "", nullptr, &reg);
+            });
+            char mtype = 0;
+            std::vector<uint8_t> mbody;
+            require(read_pg_packet(cli, mtype, mbody) && mtype == 'E', "empty password rejected with ErrorResponse");
+            cli.close();
+            t.join();
+            require(reg.to_json({}).find("\"auth_failures\":1") != std::string::npos, "auth_failures incremented");
+        }
+
+        // 9b. Wrong password rejected
+        {
+            int sv[2];
+            require(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair 9b");
+            TenantPool pool("t_auth", "127.0.0.1", "", 1, "correct_pw", 4);
+            MetricsRegistry reg(10, 5, 5);
+            Stream srv(sv[0]);
+            Stream cli(sv[1]);
+            std::thread t([&]() {
+                pool.serve_client(srv, "app_user", "correct_pw", nullptr, &reg);
+            });
+            char mtype = 0;
+            std::vector<uint8_t> mbody;
+            require(read_pg_packet(cli, mtype, mbody) && mtype == 'R' && read_be32(mbody.data()) == 3, "cleartext auth requested");
+            require(cli.write_all(build_password_message("wrong_pw")), "send wrong password");
+            require(read_pg_packet(cli, mtype, mbody) && mtype == 'E', "wrong password rejected with ErrorResponse");
+            cli.close();
+            t.join();
+            require(reg.to_json({}).find("\"auth_failures\":1") != std::string::npos, "wrong password incremented auth_failures");
+        }
+
+        // 9c. Full mock PG backend protocol test: Flush ('H'), COPY FROM STDIN, and unsupported message rejection
+        {
+            int lfd = listen_tcp_addr("127.0.0.1:0");
+            require(lfd >= 0, "listen mock pg backend");
+            struct sockaddr_in sin{};
+            socklen_t slen = sizeof(sin);
+            require(::getsockname(lfd, reinterpret_cast<sockaddr*>(&sin), &slen) == 0, "getsockname");
+            int pg_port = ntohs(sin.sin_port);
+
+            std::atomic<bool> backend_ok{true};
+            std::thread pg_backend([&]() {
+                int bfd = ::accept(lfd, nullptr, nullptr);
+                if (bfd < 0) { backend_ok = false; return; }
+                Stream bs(bfd);
+                // Read startup
+                uint8_t hdr[8];
+                if (!bs.read_exact(hdr, 8)) { backend_ok = false; return; }
+                uint32_t mlen = read_be32(hdr);
+                std::vector<uint8_t> sbody(mlen - 8);
+                if (!bs.read_exact(sbody.data(), sbody.size())) { backend_ok = false; return; }
+                // Send AuthOk + BackendKeyData + ReadyForQuery
+                bs.write_all(build_auth_ok());
+                bs.write_all(build_backend_key_data(4321, 8765));
+                bs.write_all(build_ready_for_query('I'));
+
+                // 1) Expect Parse + Describe + Flush
+                char t = 0;
+                std::vector<uint8_t> b;
+                if (!read_pg_packet(bs, t, b) || t != 'P') { backend_ok = false; return; }
+                if (!read_pg_packet(bs, t, b) || t != 'D') { backend_ok = false; return; }
+                if (!read_pg_packet(bs, t, b) || t != 'H') { backend_ok = false; return; }
+                // Respond to Flush immediately without ReadyForQuery
+                bs.write_all(build_pg_message('1', {})); // ParseComplete
+                bs.write_all(build_pg_message('t', {0, 0})); // ParameterDescription (0 params)
+                bs.write_all(build_pg_message('n', {})); // NoData
+
+                // 2) Expect Sync ('S')
+                if (!read_pg_packet(bs, t, b) || t != 'S') { backend_ok = false; return; }
+                bs.write_all(build_ready_for_query('I'));
+
+                // 2b) Pooler liveness ping Q("") on re-acquire for same client_id
+                if (!read_pg_packet(bs, t, b) || t != 'Q') { backend_ok = false; return; }
+                bs.write_all(build_pg_message('I', {}));
+                bs.write_all(build_ready_for_query('I'));
+
+                // 3) Expect SimpleQuery COPY FROM STDIN
+                if (!read_pg_packet(bs, t, b) || t != 'Q') { backend_ok = false; return; }
+                bs.write_all(build_pg_message('G', {0, 0, 1, 0, 0})); // CopyInResponse
+                if (!read_pg_packet(bs, t, b) || t != 'd') { backend_ok = false; return; }
+                if (!read_pg_packet(bs, t, b) || t != 'c') { backend_ok = false; return; }
+                std::vector<uint8_t> cc{'C','O','P','Y',' ','1',0};
+                bs.write_all(build_pg_message('C', cc));
+                bs.write_all(build_ready_for_query('I'));
+                ::close(lfd);
+            });
+
+            int sv[2];
+            require(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair 9c");
+            TenantPool pool("t_proto", "127.0.0.1", "", pg_port, "pw123", 4);
+            MetricsRegistry reg(10, 5, 5);
+            CancelRegistry creg;
+            Stream srv(sv[0]);
+            Stream cli(sv[1]);
+
+            std::thread gw([&]() {
+                pool.serve_client(srv, "app_user", "pw123", nullptr, &reg, &creg, 0);
+            });
+
+            char t = 0;
+            std::vector<uint8_t> b;
+            require(read_pg_packet(cli, t, b) && t == 'R', "auth req");
+            require(cli.write_all(build_password_message("pw123")), "send password");
+            // Drain startup messages until ReadyForQuery
+            while (read_pg_packet(cli, t, b)) {
+                if (t == 'Z') break;
+            }
+            require(t == 'Z', "client ReadyForQuery");
+
+            // Unsupported message type ('?') returns ERROR 08P01 + ReadyForQuery
+            require(cli.write_all(build_pg_message('?', {1, 2})), "send unsupported msg");
+            require(read_pg_packet(cli, t, b) && t == 'E', "unsupported msg returns ErrorResponse");
+            require(read_pg_packet(cli, t, b) && t == 'Z', "unsupported msg returns ReadyForQuery");
+
+            // Parse + Describe + Flush ('H') must NOT deadlock
+            require(cli.write_all(build_parse_message("s1", "SELECT 1", {})), "send Parse");
+            std::vector<uint8_t> desc_body{'S'};
+            append_cstr(desc_body, "s1");
+            require(cli.write_all(build_pg_message('D', desc_body)), "send Describe");
+            require(cli.write_all(build_pg_message('H', {})), "send Flush");
+
+            require(read_pg_packet(cli, t, b) && t == '1', "Flush relayed ParseComplete");
+            require(read_pg_packet(cli, t, b) && t == 't', "Flush relayed ParameterDescription");
+            require(read_pg_packet(cli, t, b) && t == 'n', "Flush relayed NoData");
+
+            // Sync
+            require(cli.write_all(build_sync_message()), "send Sync");
+            require(read_pg_packet(cli, t, b) && t == 'Z', "Sync relayed ReadyForQuery");
+
+            // COPY FROM STDIN
+            require(cli.write_all(build_simple_query("COPY t FROM STDIN")), "send COPY");
+            require(read_pg_packet(cli, t, b) && t == 'G', "relayed CopyInResponse");
+            std::vector<uint8_t> row_data{'4','2','\n'};
+            require(cli.write_all(build_pg_message('d', row_data)), "send CopyData");
+            require(cli.write_all(build_pg_message('c', {})), "send CopyDone");
+            require(read_pg_packet(cli, t, b) && t == 'C', "relayed COPY CommandComplete");
+            require(read_pg_packet(cli, t, b) && t == 'Z', "relayed COPY ReadyForQuery");
+
+            require(cli.write_all(build_pg_message('X', {})), "send Terminate");
+            cli.close();
+            gw.join();
+            pg_backend.join();
+            require(backend_ok.load(), "mock pg backend protocol sequence ok");
+            require(reg.to_json({}).find("\"protocol_errors\":1") != std::string::npos, "protocol_errors recorded");
+        }
     }
 
     std::cout << "All C++ air-gateway tests passed!" << std::endl;

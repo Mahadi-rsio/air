@@ -5,8 +5,10 @@
 #include <cstdint>
 #include <cstring>
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <openssl/bio.h>
 #include <openssl/bn.h>
+#include <openssl/crypto.h>
 #include <openssl/ec.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -17,6 +19,7 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
+#include <mutex>
 #include <string>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -28,7 +31,10 @@
 namespace air::gw {
 
 constexpr uint32_t kMaxStartupMessageBytes = 8192;
+constexpr uint32_t kMaxPGPacketBytes = 32 * 1024 * 1024;
+constexpr uint32_t kCancelRequestCode = 80877102;
 constexpr uint32_t kSSLRequestCode = 80877103;
+constexpr uint32_t kGSSENCRequestCode = 80877104;
 constexpr uint32_t kPGProtocolVersion3 = 196608; // 3.0
 
 inline uint32_t read_be32(const uint8_t* p) {
@@ -364,6 +370,16 @@ inline std::vector<uint8_t> build_parse_message(const std::string& name,
     return build_pg_message('P', body);
 }
 
+inline std::vector<uint8_t> build_cancel_request(uint32_t pid, uint32_t secret) {
+    std::vector<uint8_t> out;
+    out.reserve(16);
+    append_be32(out, 16);
+    append_be32(out, kCancelRequestCode);
+    append_be32(out, pid);
+    append_be32(out, secret);
+    return out;
+}
+
 inline std::vector<uint8_t> build_startup_message(
     const std::unordered_map<std::string, std::string>& params) {
     std::vector<uint8_t> kv;
@@ -384,7 +400,7 @@ inline bool read_pg_packet(Stream& s, char& type_out, std::vector<uint8_t>& body
     if (!s.read_exact(hdr, 5)) return false;
     type_out = static_cast<char>(hdr[0]);
     uint32_t len = read_be32(hdr + 1);
-    if (len < 4 || len > 64 * 1024 * 1024) return false;
+    if (len < 4 || len > kMaxPGPacketBytes) return false;
     size_t body_len = len - 4;
     body_out.resize(body_len);
     if (body_len > 0 && !s.read_exact(body_out.data(), body_len)) {
@@ -432,6 +448,12 @@ inline bool iequals(const std::string& a, const std::string& b) {
     return true;
 }
 
+inline bool constant_time_equals(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    if (a.empty()) return true;
+    return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
+}
+
 inline bool validate_tenant_id(const std::string& id) {
     if (id.empty() || id.size() > 63) return false;
     for (unsigned char ch : id) {
@@ -445,9 +467,11 @@ inline bool validate_tenant_id(const std::string& id) {
 inline std::string parse_sni_tenant(const std::string& sni_host) {
     std::string trimmed = trim_ascii(sni_host);
     if (trimmed.empty()) return "";
+    // Single-label hosts (e.g. "localhost") or IPv4 literals are not tenant SNI subdomains.
+    struct in_addr ipv4{};
+    if (::inet_pton(AF_INET, trimmed.c_str(), &ipv4) == 1) return "";
     auto dot = trimmed.find('.');
-    if (dot == std::string::npos) return trimmed;
-    if (dot == 0) return "";
+    if (dot == std::string::npos || dot == 0) return "";
     return trimmed.substr(0, dot);
 }
 
@@ -461,6 +485,12 @@ inline std::string extract_tenant(const std::string& sni_host,
         }
     }
     return parse_sni_tenant(sni_host);
+}
+
+inline void set_tcp_nodelay(int fd) {
+    if (fd < 0) return;
+    int one = 1;
+    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
 
 inline int dial_backend_socket(const std::string& host, const std::string& sock_dir, int port) {
@@ -501,6 +531,7 @@ inline int dial_backend_socket(const std::string& host, const std::string& sock_
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         if (::connect(fd, p->ai_addr, p->ai_addrlen) == 0) {
+            set_tcp_nodelay(fd);
             break;
         }
         ::close(fd);
@@ -640,5 +671,42 @@ inline bool scram_sha256_client_auth(Stream& s, const std::string& user, const s
     }
     return true;
 }
+
+struct CancelTarget {
+    std::string host;
+    std::string sock_dir;
+    int port = 0;
+    uint32_t backend_pid = 0;
+    uint32_t backend_secret = 0;
+};
+
+class CancelRegistry {
+public:
+    void register_target(uint32_t gw_pid, uint32_t gw_secret, CancelTarget target) {
+        std::lock_guard<std::mutex> lk(mu_);
+        targets_[make_key(gw_pid, gw_secret)] = std::move(target);
+    }
+
+    void unregister_target(uint32_t gw_pid, uint32_t gw_secret) {
+        std::lock_guard<std::mutex> lk(mu_);
+        targets_.erase(make_key(gw_pid, gw_secret));
+    }
+
+    bool lookup(uint32_t gw_pid, uint32_t gw_secret, CancelTarget& out) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = targets_.find(make_key(gw_pid, gw_secret));
+        if (it == targets_.end()) return false;
+        out = it->second;
+        return true;
+    }
+
+private:
+    static uint64_t make_key(uint32_t pid, uint32_t secret) {
+        return (static_cast<uint64_t>(pid) << 32) | static_cast<uint64_t>(secret);
+    }
+
+    mutable std::mutex mu_;
+    std::unordered_map<uint64_t, CancelTarget> targets_;
+};
 
 } // namespace air::gw

@@ -20,6 +20,9 @@ struct Config {
     std::string tls_key_path;
     bool pool_mode = true;
     int pool_max_backends = 16;
+    int pool_idle_timeout_sec = 300;
+    int auth_timeout_ms = 5000;
+    int client_idle_timeout_ms = 0;
     int max_client_conns = 1024;
     int max_tenant_client_conns = 128;
     int max_user_client_conns = 0;
@@ -67,6 +70,14 @@ struct Config {
         c.tls_key_path = env_or("AIR_TLS_KEY", "");
         c.pool_mode = env_bool("AIR_POOL_MODE", c.pool_mode);
         c.pool_max_backends = env_int("AIR_POOL_MAX_BACKENDS", c.pool_max_backends);
+        c.pool_idle_timeout_sec = env_int("AIR_POOL_IDLE_TIMEOUT_SEC", c.pool_idle_timeout_sec);
+        c.auth_timeout_ms = env_int("AIR_AUTH_TIMEOUT_MS", c.auth_timeout_ms);
+        if (const char* v = std::getenv("AIR_CLIENT_IDLE_TIMEOUT_MS"); v != nullptr && v[0] != '\0') {
+            try {
+                int parsed = std::stoi(v);
+                if (parsed >= 0) c.client_idle_timeout_ms = parsed;
+            } catch (...) {}
+        }
         c.max_client_conns = env_int("AIR_MAX_CLIENT_CONNS", c.max_client_conns);
         c.max_tenant_client_conns = env_int("AIR_MAX_TENANT_CLIENT_CONNS", c.max_tenant_client_conns);
         c.max_user_client_conns = env_int("AIR_MAX_USER_CLIENT_CONNS", c.max_user_client_conns);
@@ -92,6 +103,12 @@ struct Config {
             else if (arg == "--no-pool-mode") c.pool_mode = false;
             else if (arg == "--pool-max-backends" && i + 1 < argc) {
                 try { c.pool_max_backends = std::stoi(argv[++i]); } catch (...) {}
+            } else if (arg == "--pool-idle-timeout-sec" && i + 1 < argc) {
+                try { c.pool_idle_timeout_sec = std::stoi(argv[++i]); } catch (...) {}
+            } else if (arg == "--auth-timeout-ms" && i + 1 < argc) {
+                try { c.auth_timeout_ms = std::stoi(argv[++i]); } catch (...) {}
+            } else if (arg == "--client-idle-timeout-ms" && i + 1 < argc) {
+                try { c.client_idle_timeout_ms = std::stoi(argv[++i]); } catch (...) {}
             } else if (arg == "--max-client-conns" && i + 1 < argc) {
                 try { c.max_client_conns = std::stoi(argv[++i]); } catch (...) {}
             } else if (arg == "--max-tenant-client-conns" && i + 1 < argc) {

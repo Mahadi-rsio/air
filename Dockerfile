@@ -50,7 +50,8 @@ RUN git clone --depth 1 https://github.com/supabase/supautils.git /tmp/supautils
     && rm -rf /tmp/supautils
 
 COPY extensions/air_smgr /tmp/air_smgr
-RUN make -C /tmp/air_smgr PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config \
+RUN make -C /tmp/air_smgr PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config clean \
+    && make -C /tmp/air_smgr PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config \
     && make -C /tmp/air_smgr PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config install \
     && rm -rf /tmp/air_smgr
 
