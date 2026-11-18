@@ -199,10 +199,14 @@ func TestPhaseH_CooperativeScaleToZero_DrainVetoesAndWakeStorm(t *testing.T) {
 		t.Fatalf("INSERT: %v", err)
 	}
 
-	// 1. Drain veto when an active client session is connected
+	// 1. Drain veto when an active client session has an open transaction
+	if _, err := c1.Exec(ctx, "BEGIN"); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
 	if err := cp.SuspendTenant(ctx, "t_scale_zero", 500*time.Millisecond, nil); !errors.Is(err, cell.ErrDrainVetoed) {
 		t.Fatalf("expected ErrDrainVetoed with active client connection, got: %v", err)
 	}
+	_, _ = c1.Exec(ctx, "ROLLBACK")
 	_ = c1.Close(ctx)
 
 	// 2. Drain veto on open 2PC prepared transaction

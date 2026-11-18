@@ -7,8 +7,11 @@
 #include "pooler.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <iostream>
+#include <mutex>
 #include <poll.h>
 #include <thread>
 #include <vector>
@@ -28,21 +31,12 @@ void signal_handler(int) {
 }
 
 void proxy_bidirectional(air::gw::Stream& client, air::gw::Stream& backend) {
-    uint8_t buf[32768];
-    auto pump_one = [&](air::gw::Stream& src, air::gw::Stream& dst) {
+    auto pump_one = [](air::gw::Stream& src, air::gw::Stream& dst) {
+        uint8_t buf[32768];
         while (true) {
-            ssize_t n = 0;
-            if (src.is_tls()) {
-                // Handled via simple blocking read when TLS is active
-                uint8_t b;
-                if (!src.read_exact(&b, 1)) return;
-                if (!dst.write_all(&b, 1)) return;
-            } else {
-                n = ::recv(src.fd(), buf, sizeof(buf), 0);
-                if (n < 0 && errno == EINTR) continue;
-                if (n <= 0) return;
-                if (!dst.write_all(buf, static_cast<size_t>(n))) return;
-            }
+            ssize_t n = src.read_some(buf, sizeof(buf));
+            if (n <= 0) return;
+            if (!dst.write_all(buf, static_cast<size_t>(n))) return;
         }
     };
     if (client.is_tls()) {
@@ -54,6 +48,7 @@ void proxy_bidirectional(air::gw::Stream& client, air::gw::Stream& backend) {
         return;
     }
 
+    uint8_t buf[32768];
     struct pollfd pfds[2];
     pfds[0] = {client.fd(), POLLIN, 0};
     pfds[1] = {backend.fd(), POLLIN, 0};
@@ -266,6 +261,10 @@ int main(int argc, char** argv) {
               << ", max_user_client_conns=" << cfg.max_user_client_conns
               << ", require_tls=" << (cfg.require_tls ? "true" : "false") << ")" << std::endl;
 
+    std::atomic<int> active_clients{0};
+    std::mutex clients_mu;
+    std::condition_variable clients_cv;
+
     while (g_running.load()) {
         int cfd = ::accept(g_listen_fd, nullptr, nullptr);
         if (cfd < 0) {
@@ -280,8 +279,14 @@ int main(int argc, char** argv) {
                 "FATAL", "53300", "sorry, too many clients already (gateway global connection limit reached)"));
             continue;
         }
-        std::thread([cfd, &cfg, &tls_ctx, &discovery, &pools, &metrics]() {
+        active_clients.fetch_add(1, std::memory_order_relaxed);
+        std::thread([cfd, &cfg, &tls_ctx, &discovery, &pools, &metrics,
+                     &active_clients, &clients_mu, &clients_cv]() {
             handle_client(cfd, cfg, tls_ctx, discovery, pools, metrics);
+            if (active_clients.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                std::lock_guard<std::mutex> lk(clients_mu);
+                clients_cv.notify_all();
+            }
         }).detach();
     }
 
@@ -290,5 +295,11 @@ int main(int argc, char** argv) {
     admin_srv.stop();
     discovery.stop();
     pools.close_all();
+    {
+        std::unique_lock<std::mutex> lk(clients_mu);
+        clients_cv.wait_for(lk, std::chrono::seconds(5), [&active_clients]() {
+            return active_clients.load(std::memory_order_acquire) == 0;
+        });
+    }
     return 0;
 }

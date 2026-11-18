@@ -4,50 +4,29 @@ This document tracks known operational and packaging issues in the AIR repositor
 
 ---
 
-## 1. Deferred Issue: `air-gateway` Container Runtime Shared Library Dependency (`libgrpc++.so.1.83`)
+## 1. ~~Deferred Issue~~ Resolved (Phase 14): `air-gateway` Container Runtime Shared Library Dependency (`libgrpc++.so.1.83`)
 
-- **Status**: Intentionally Deferred in Phase 13.1 (Scheduled for Gateway Packaging Phase)
+- **Status**: **Resolved in Phase 14** (see [Phase 14 Gateway & Integration Audit](file:///workspaces/air/docs/phase14-gateway-audit.md))
 - **Severity**: High (Container Deployment / Fly.io Runtime)
 - **Affected Components**:
   - `air-gateway` C++20 binary inside the multi-stage container image built by [Dockerfile](file:///workspaces/air/Dockerfile)
-  - Container startup script [scripts/air-entrypoint.sh](file:///workspaces/air/scripts/air-entrypoint.sh)
-  - Public PostgreSQL wire protocol listener (`:5432`) and Gateway Admin/Metrics HTTP server (`:8081`) in container deployments
+  - [gateway/Makefile](file:///workspaces/air/gateway/Makefile)
+  - Container startup script [scripts/air-entrypoint.sh](file:///workspaces/air/scripts/air-entrypoint.sh) (already updated to supervise both `air-server` and `air-gateway` via `wait -n`)
 
-### 1.1 Exact Symptom and Error Message
+### 1.1 Exact Symptom and Root Causes Found in Phase 14
 
-When starting the production container image, `air-gateway` immediately exits at dynamic link time with:
+Previously, container builds/runtimes suffered from three packaging/linking issues:
+1. **Unconditional conda RPATH in [gateway/Makefile](file:///workspaces/air/gateway/Makefile)**: `RPATH_FLAGS := -Wl,-rpath,/opt/conda/lib` linked local builds against `/opt/conda/lib/libgrpc++.so.1.83` and `/opt/conda/lib/libssl.so.3` (requiring `OPENSSL_3.3.0`), causing binaries built on conda-equipped hosts to fail on standard Debian/Ubuntu systems or inside containers.
+2. **Missing gRPC/Protobuf dev packages & stale pre-generated `pb` headers in [Dockerfile](file:///workspaces/air/Dockerfile) `cpp-builder`**: Stage 1b (`cpp-builder`) lacked `libgrpc++-dev`, `libprotobuf-dev`, `protobuf-compiler`, and `protobuf-compiler-grpc`, and `gateway/src/pb/airdb.pb.h` had been pre-generated against conda's newer protobuf (`google/protobuf/runtime_version.h`).
+3. **Missing gRPC/Protobuf runtime shared libraries in [Dockerfile](file:///workspaces/air/Dockerfile) Stage 3**: The final `debian:bookworm-slim` runtime stage lacked `libgrpc++1.51` and `libprotobuf32` and had no `ldd` verification.
 
-```text
-/usr/local/bin/air-gateway: error while loading shared libraries: libgrpc++.so.1.83: cannot open shared object file: No such file or directory
-```
+### 1.2 Resolution Applied in Phase 14
 
-Because [scripts/air-entrypoint.sh](file:///workspaces/air/scripts/air-entrypoint.sh#L56-L70) launches `air-gateway` as an unmonitored background job (`air-gateway ... &`) before `exec air-server`, the container stays running (`air-server` serves `/healthz` on `:8080` and gRPC on `:9090`), while ports `:5432` and `:8081` remain closed.
-
-### 1.2 Root Cause
-
-1. **Missing Runtime Shared Libraries in Final Image Stage**:
-   - In [Dockerfile](file:///workspaces/air/Dockerfile#L6-L24), Stage 1 (`builder`) installs `libgrpc++-dev`, `libprotobuf-dev`, and `protobuf-compiler-grpc` and compiles [gateway/Makefile](file:///workspaces/air/gateway/Makefile) dynamically against `libgrpc++`, `libgrpc`, `libprotobuf`, `libabsl_*`, `libpq`, `libssl`, and `libcrypto`.
-   - In [Dockerfile](file:///workspaces/air/Dockerfile#L79-L106), Stage 2 (`FROM debian:bookworm-slim`) copies `/usr/local/bin/air-gateway` from `builder` (`COPY --from=builder /src/gateway/air-gateway /usr/local/bin/air-gateway`), but only installs `ca-certificates`, `curl`, `gnupg`, `iproute2`, `jq`, `libpq5`, `procps`, `zstd`, and `postgresql-17`. The C++ gRPC and Protobuf shared libraries (`libgrpc++.so*`, `libgrpc.so*`, `libprotobuf.so*`, `libabsl_*.so*`, `libre2.so*`, `libc-ares.so*`, `libupb.so*`) are not installed in the runtime image.
-2. **Silent Background Exit in Entrypoint**:
-   - [scripts/air-entrypoint.sh](file:///workspaces/air/scripts/air-entrypoint.sh) starts `air-gateway` in the background without `wait -n` or readiness verification on `:5432` / `:8081`.
-
-### 1.3 Why Deferred in Phase 13.1
-
-Per Phase 13.1 Scope Restrictions:
-- Phase 13.1 is dedicated to Go codebase modularity, concurrency safety, developer documentation, and end-to-end verification of Phase 13 Backup, WAL Archival, Checksum Verification, PITR, and Restore workflows.
-- Modifying `gateway/*`, [Dockerfile](file:///workspaces/air/Dockerfile), or [scripts/air-entrypoint.sh](file:///workspaces/air/scripts/air-entrypoint.sh) was explicitly prohibited in Phase 13.1 to isolate Go control-plane/storage changes from container packaging changes.
-- Note: Building and running `air-gateway` directly in the development workspace (`make -C gateway all test`) works when the development host has `libgrpc++-dev` installed.
-
-### 1.4 Recommended Fix for the Future Gateway Packaging Phase
-
-1. **Runtime Library Packaging in [Dockerfile](file:///workspaces/air/Dockerfile)**:
-   - Install matching Debian Bookworm runtime packages (`libgrpc++1.51`, `libgrpc29`, `libprotobuf32`, `libc-ares2`, `libre2-9`) in the runtime stage, **or** copy all non-glibc shared libraries resolved by `ldd /src/gateway/air-gateway` from the `builder` stage and run `ldconfig`.
-   - Add a build-time verification step in the final stage of [Dockerfile](file:///workspaces/air/Dockerfile):
-     ```dockerfile
-     RUN ldd /usr/local/bin/air-gateway | (! grep -q "not found") && /usr/local/bin/air-gateway --help >/dev/null
-     ```
-2. **Fail-Fast Supervision in [scripts/air-entrypoint.sh](file:///workspaces/air/scripts/air-entrypoint.sh)**:
-   - Supervise both `air-server` and `air-gateway` using `wait -n` (with `trap` forwarding `SIGTERM`/`SIGINT` to both PIDs) so the container exits immediately if either process crashes.
+1. **[gateway/Makefile](file:///workspaces/air/gateway/Makefile)**: Guarded `RPATH_FLAGS` with `ifneq ($(wildcard /opt/conda/lib),)` so `-Wl,-rpath,/opt/conda/lib` is only added when `/opt/conda/lib` exists, and added `src/admin_grpc.hpp` to `HEADERS`.
+2. **[Dockerfile](file:///workspaces/air/Dockerfile)**:
+   - Added `libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc` to `cpp-builder` and regenerated `src/pb/*` from `proto/airdb.proto` during the Docker build.
+   - Added `libgrpc++1.51 libprotobuf32` to the final `debian:bookworm-slim` runtime stage and added `RUN ldd /usr/local/bin/air-gateway && (! ldd /usr/local/bin/air-gateway | grep -q "not found")`.
+3. **Verification**: Verified `cpp-builder` (`make all` + `make test`: `All C++ air-gateway tests passed!`) and clean `debian:bookworm-slim` runtime container (`ldd`, `air-gateway` startup on `:5432`/`:8081`, `GET /healthz` -> `{"status":"ok"}`, and clean `SIGTERM` exit code `0`).
 
 ---
 

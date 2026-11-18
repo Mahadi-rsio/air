@@ -8,12 +8,16 @@ endif
 ifeq ($(strip $(PKG_LIBS)),)
 PKG_LIBS := -lpq -lssl -lcrypto -lgrpc++ -lprotobuf
 endif
+ifneq ($(wildcard /opt/conda/lib),)
 RPATH_FLAGS := -Wl,-rpath,/opt/conda/lib
+else
+RPATH_FLAGS :=
+endif
 CXXFLAGS ?= -std=c++20 -O2 -DNDEBUG -Wall -Wextra -pthread $(PKG_CFLAGS)
 LDFLAGS ?= $(PKG_LIBS) $(RPATH_FLAGS) -pthread
 
 PB_SRCS := src/pb/airdb.pb.cc src/pb/airdb.grpc.pb.cc
-HEADERS := src/config.hpp src/pg_wire.hpp src/discovery.hpp src/pooler.hpp src/admin_http.hpp src/metrics.hpp
+HEADERS := src/config.hpp src/pg_wire.hpp src/discovery.hpp src/pooler.hpp src/admin_http.hpp src/admin_grpc.hpp src/metrics.hpp
 
 all: air-gateway
 

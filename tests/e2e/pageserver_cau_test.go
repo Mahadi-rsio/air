@@ -420,7 +420,7 @@ func TestPageserverCAU_LivePG17_LifecycleAndRestart(t *testing.T) {
 	}
 
 	// Verify manifest and CAU objects exist in R2.
-	manifestKey := pageserver.LayerManifestR2Key(tenantID, resp.FencingEpoch)
+	manifestKey := pageserver.LayerManifestR2KeyGen(tenantID, resp.Generation, resp.FencingEpoch)
 	mockMu.Lock()
 	_, hasManifest := mockObjects[manifestKey]
 	var cauKeys []string
@@ -457,6 +457,7 @@ func TestPageserverCAU_LivePG17_LifecycleAndRestart(t *testing.T) {
 	}
 	defer ps2.Close()
 
+	ps2.SetTenantGeneration(tenantID, resp.Generation)
 	tl2 := ps2.EnsureTenant(tenantID, resp.FencingEpoch)
 	if err := tl2.LoadLayersFromR2(ctx); err != nil {
 		t.Fatalf("LoadLayersFromR2 after restart: %v", err)

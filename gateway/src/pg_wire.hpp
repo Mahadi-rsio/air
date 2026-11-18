@@ -139,6 +139,21 @@ public:
         return true;
     }
 
+    ssize_t read_some(uint8_t* dst, size_t max_len) {
+        if (max_len == 0) return 0;
+        while (true) {
+            ssize_t n = 0;
+            if (ssl_) {
+                n = SSL_read(ssl_, dst, static_cast<int>(max_len));
+                if (n <= 0) return -1;
+                return n;
+            }
+            n = ::recv(fd_, dst, max_len, 0);
+            if (n < 0 && errno == EINTR) continue;
+            return n;
+        }
+    }
+
     bool write_all(const std::vector<uint8_t>& buf) {
         return write_all(buf.data(), buf.size());
     }

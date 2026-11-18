@@ -18,10 +18,13 @@ FROM debian:bookworm-slim AS cpp-builder
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ make pkg-config libpq-dev libcurl4-openssl-dev libssl-dev \
+    libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src/gateway
+COPY proto/airdb.proto /src/proto/airdb.proto
 COPY gateway/ ./
-RUN make all && cp air-gateway /out-air-gateway
+RUN protoc -I/src/proto --cpp_out=src/pb --grpc_out=src/pb --plugin=protoc-gen-grpc=/usr/bin/grpc_cpp_plugin /src/proto/airdb.proto \
+    && make all && cp air-gateway /out-air-gateway
 
 # Stage 2: Build patched PostgreSQL 17.12 (smgr_hook) + supautils + air_smgr
 FROM debian:bookworm-slim AS pg-builder
@@ -57,6 +60,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl gnupg zstd gosu \
     libreadline8 zlib1g libssl3 libxml2 libossp-uuid16 libcurl4 \
+    libgrpc++1.51 libprotobuf32 \
     && install -d /usr/share/postgresql-common/pgdg \
     && curl -fsSL --retry 5 --retry-all-errors https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
     && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
@@ -68,6 +72,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=pg-builder /usr/lib/postgresql/17 /usr/lib/postgresql/17
 COPY --from=go-builder /out/air-server /usr/local/bin/air-server
 COPY --from=cpp-builder /out-air-gateway /usr/local/bin/air-gateway
+RUN ldd /usr/local/bin/air-gateway && (! ldd /usr/local/bin/air-gateway | grep -q "not found")
 COPY scripts/air-entrypoint.sh /usr/local/bin/air-entrypoint.sh
 RUN chmod +x /usr/local/bin/air-entrypoint.sh
 COPY migrations/ /app/migrations/
