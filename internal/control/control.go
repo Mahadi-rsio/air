@@ -31,10 +31,7 @@ import (
 )
 
 const currentSchemaVersion = 2
-
-var (
-	ErrIdempotencyConflict = errors.New("idempotency key conflict: different account or payload")
-	ErrNotFound            = errors.New("database not found")
+type restoreDatabaseReq struct {	TargetLSN   string `json:"target_lsn"`	TargetTime string `json:"target_time,omitempty"`	NewTenantID string `json:"new_tenant_id,omitempty"`	VerifyQuery string `json:"verify_query"`}
 	ErrForbidden           = errors.New("forbidden: database belongs to another account")
 	ErrUnauthorized        = errors.New("unauthorized: missing, invalid, or revoked API key")
 	ErrCorruptedMetadata   = errors.New("corrupted metadata directory: refusing destructive reset")
@@ -1188,9 +1185,8 @@ func (cp *ControlPlane) backupTenantToR2(ctx context.Context, tenantID, bkpType 
 		art, _, err = backup.RunEncryptedBackupStep(ctx, cp.agent, s3c, bucket, tenantID, bkpID, parentID, bkpType, parentManifestPath)
 		if err != nil {
 			return nil, err
-		}
-	}
-
+t	gen := cp.getTenantGeneration(ctx, tenantID)
+		art, _, err = backup.RunEncryptedBackupStepGen(ctx, cp.agent, s3c, bucket, tenantID, gen, bkpID, parentID, bkpType, parentManifestPath)
 	walCount, err := cp.drainWALSpoolAndUpdateManifest(ctx, tenantID, 0, false)
 	if err != nil {
 		return nil, err

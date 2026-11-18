@@ -40,13 +40,15 @@ var (
 )
 
 type WALSegmentArtifact struct {
-	SegmentName string `json:"segment_name"`
-	R2Key       string `json:"r2_key"`
-	Epoch       int64  `json:"epoch"`
-	CipherBytes int    `json:"cipher_bytes"`
-	PlainSHA256 string `json:"plain_sha256,omitempty"`
-	CipherETag  string `json:"cipher_etag,omitempty"`
-	Status      string `json:"status,omitempty"` // PENDING, VERIFIED_IN_R2, LOCAL_DELETED
+	SegmentName  string `json:"segment_name"`
+	TimelineID   string `json:"timeline_id,omitempty"`
+	R2Key        string `json:"r2_key"`
+	Epoch        int64  `json:"epoch"`
+	CipherBytes  int    `json:"cipher_bytes"`
+	CipherSHA256 string `json:"cipher_sha256,omitempty"`
+	PlainSHA256  string `json:"plain_sha256,omitempty"`
+	CipherETag   string `json:"cipher_etag,omitempty"`
+	Status       string `json:"status,omitempty"` // PENDING, VERIFIED_IN_R2, LOCAL_DELETED
 }
 
 type WALUploadManifest struct {
@@ -109,13 +111,6 @@ func saveWALManifestAtomic(path string, m *WALUploadManifest) error {
 // prior to INCR, runs pg_verifybackup, compresses with tar+zstd, encrypts with AES-256-GCM-AAD,
 // uploads to R2 with If-None-Match: "*", and atomically commits the BackupArtifact into
 // TenantFenceManifest via PutManifestCAS (aborting and cleaning up on CAS/epoch conflict).
-func r2TenantPrefix(tenantID, generation string) string {
-	if generation == "" {
-		return fmt.Sprintf("tenants/%s", tenantID)
-	}
-	return fmt.Sprintf("tenants/%s/%s", tenantID, generation)
-}
-
 func RunEncryptedBackupStep(
 	ctx context.Context,
 	agent *cell.Agent,
@@ -173,7 +168,7 @@ func RunEncryptedBackupStepGen(
 		sockDir = filepath.Join(activeBase, "sock")
 	}
 
-	if bkpType == "INCR" {
+	if strings.TrimSpace(bkpType) == "INCR" {
 		sumCount, err := agent.VerifyWALSummaryContinuity(ctx, tenantID)
 		if err != nil || sumCount == 0 || parentManifestPath == "" {
 			bkpType = "FULL"
@@ -195,7 +190,7 @@ func RunEncryptedBackupStepGen(
 		return nil, "", err
 	}
 
-	if bkpType == "INCR" {
+	if strings.TrimSpace(bkpType) == "INCR" {
 		time.Sleep(200 * time.Millisecond)
 	}
 
@@ -226,7 +221,8 @@ func RunEncryptedBackupStepGen(
 		return nil, "", fmt.Errorf("compress backup tar.zst: %w", err)
 	}
 
-	r2Key := fmt.Sprintf("%s/epoch_%06d/%s.tar.zst.enc", r2TenantPrefix(tenantID, generation), rt.FencingEpoch, bkpID)
+	baseObjKey := backup.BackupBaseObjectKey(tenantID, generation, bkpID)
+	r2Key = baseObjKey
 	cipherBytes, err := agent.KMS().EncryptObject(tenantID, rt.FencingEpoch, r2Key, plainBytes)
 	if err != nil {
 		_ = os.RemoveAll(bkpDir)
@@ -283,6 +279,56 @@ func DrainAndEncryptWALSpoolToR2(
 	bucket, tenantID string,
 ) ([]WALSegmentArtifact, error) {
 	return DrainAndEncryptWALSpoolToR2WithFault(ctx, agent, s3c, bucket, tenantID, nil)
+}
+
+// DrainAndEncryptWALSpoolToR2Gen force-switches WAL and drains the spool using generation-isolated keys.
+func DrainAndEncryptWALSpoolToR2Gen(
+	ctx context.Context,
+	agent *cell.Agent,
+	s3c *s3.Client,
+	bucket, tenantID, generation string,
+) ([]WALSegmentArtifact, error) {
+	return DrainAndEncryptWALSpoolToR2GenWithFault(ctx, agent, s3c, bucket, tenantID, generation, nil)
+}
+
+// DrainAndEncryptWALSpoolToR2GenWithFault is the generation-aware fault-injectable variant.
+func DrainAndEncryptWALSpoolToR2GenWithFault(
+	ctx context.Context,
+	agent *cell.Agent,
+	s3c *s3.Client,
+	bucket, tenantID, generation string,
+	faultHook func(stage, segName string) error,
+) ([]WALSegmentArtifact, error) {
+	if s3c == nil || strings.TrimSpace(bucket) == "" {
+		return nil, ErrR2ClientRequired
+	}
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return nil, err
+	}
+	rt, ok := agent.GetTenant(tenantID)
+	if !ok {
+		return nil, fmt.Errorf("tenant %s not active", tenantID)
+	}
+	sockDir := rt.SockDir
+	if sockDir == "" {
+		activeBase, _ := tenant.SafeSubpath(agent.VolDir(), "tenants/active", tenantID)
+		sockDir = filepath.Join(activeBase, "sock")
+	}
+	walSpoolDir := rt.WALSpoolDir
+	if walSpoolDir == "" {
+		var err error
+		walSpoolDir, err = tenant.SafeSubpath(agent.VolDir(), "spool/wal", tenantID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	_, _ = agent.RunPostgresCmd(
+		filepath.Join(agent.PGBin(), "psql"),
+		"-h", sockDir, "-p", strconv.Itoa(rt.Port), "-U", "postgres", "-d", "postgres",
+		"-c", "SELECT pg_switch_wal(); CHECKPOINT;",
+	)
+	time.Sleep(300 * time.Millisecond)
+	return drainWALSpoolDirWithFaultGen(ctx, agent.KMS(), s3c, bucket, tenantID, generation, rt.FencingEpoch, walSpoolDir, faultHook)
 }
 
 // DrainAndEncryptWALSpoolToR2WithFault allows injecting deterministic faults at upload/manifest/delete boundaries.
@@ -453,11 +499,18 @@ func drainWALSpoolDirWithFaultGen(
 		if err != nil {
 			return uploaded, err
 		}
+		cipherSum := sha256.Sum256(cipherBytes)
+		cipherSHA := hex.EncodeToString(cipherSum[:])
 
 		putOut, err := s3c.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String(r2Key),
 			Body:   bytes.NewReader(cipherBytes),
+			Metadata: map[string]string{
+				"air-sha256":        plainSHA,
+				"air-cipher-sha256": cipherSHA,
+				"air-size":          strconv.Itoa(len(cipherBytes)),
+			},
 		})
 		if err != nil {
 			return uploaded, fmt.Errorf("R2 PutObject WAL %s: %w", r2Key, err)
@@ -485,13 +538,15 @@ func drainWALSpoolDirWithFaultGen(
 			etag = *putOut.ETag
 		}
 		art := &WALSegmentArtifact{
-			SegmentName: segName,
-			R2Key:       r2Key,
-			Epoch:       epoch,
-			CipherBytes: len(cipherBytes),
-			PlainSHA256: plainSHA,
-			CipherETag:  etag,
-			Status:      "VERIFIED_IN_R2",
+			SegmentName:  segName,
+			TimelineID:   timelineIDFromSegment(segName),
+			R2Key:        r2Key,
+			Epoch:        epoch,
+			CipherBytes:  len(cipherBytes),
+			CipherSHA256: cipherSHA,
+			PlainSHA256:  plainSHA,
+			CipherETag:   etag,
+			Status:       "VERIFIED_IN_R2",
 		}
 		manifest.Segments[segName] = art
 		if err := saveWALManifestAtomic(manifestPath, manifest); err != nil {
@@ -549,26 +604,135 @@ func CombineAndReplayPITRWithLimits(
 }
 
 // CombineAndReplayPITRWithOptions is like CombineAndReplayPITRWithLimits with an explicit target database name for verification.
-func CombineAndReplayPITRWithOptions(
+// StagePITROptions controls a staging PITR restore.
+type StagePITROptions struct {
+	DBName             string
+	VerifyQuery        string
+	Limits             TarExtractLimits
+	KeepStaging        bool
+	StagingRoot        string
+	RenameDatabaseFrom string
+	RenameDatabaseTo   string
+}
+
+// StagePITRResult describes a completed staging restore.
+type StagePITRResult struct {
+	PGDataDir         string
+	QueryOutput       string
+	StagingHeadroomOK bool
+	AmcheckOK         bool
+	Cleanup           func()
+}
+
+// StagePITRRestore performs a real PostgreSQL PITR into an isolated staging directory.
+// It validates the manifest target range, WAL continuity, and WAL checksums before replay,
+// then verifies the promoted database with amcheck. The caller owns the staging directory
+// when KeepStaging is set and must call Cleanup.
+func StagePITRRestore(
 	ctx context.Context,
 	agent *cell.Agent,
 	s3c *s3.Client,
-	bucket, tenantID, dbName string,
+	bucket string,
+	m *BackupManifest,
 	chain []*fencing.BackupArtifact,
 	walSegments []WALSegmentArtifact,
-	targetLSN string,
-	verifyQuery string,
-	limits TarExtractLimits,
-) (queryOut string, stagingHeadroomOK bool, amcheckOK bool, err error) {
+	target RecoveryTarget,
+	opts StagePITROptions,
+) (*StagePITRResult, error) {
 	if s3c == nil || strings.TrimSpace(bucket) == "" {
-		return "", false, false, ErrR2ClientRequired
+		return nil, ErrR2ClientRequired
+	}
+	if agent == nil {
+		return nil, errors.New("backup: cell agent is required for PITR")
+	}
+	if err := target.Validate(); err != nil {
+		return nil, err
+	}
+	if m != nil {
+		if err := target.ValidateAgainstManifest(m); err != nil {
+			return nil, err
+		}
+	}
+	tenantID := ""
+	if m != nil {
+		tenantID = m.TenantID
+	} else if len(chain) > 0 {
+		// Legacy callers still pass tenantID through the KMS AAD; caller supplies m in Phase 13.
+		return nil, fmt.Errorf("%w: manifest is required for PITR", ErrInvalidBackupManifest)
 	}
 	if err := tenant.ValidateID(tenantID); err != nil {
-		return "", false, false, err
+		return nil, err
 	}
+	if len(chain) == 0 || chain[0].Type != "FULL" {
+		return nil, fmt.Errorf("invalid backup chain: must begin with FULL backup")
+	}
+	for i := 1; i < len(chain); i++ {
+		if chain[i].Type != "INCR" {
+			return nil, fmt.Errorf("invalid backup chain at %s: expected INCR, got %s", chain[i].BackupID, chain[i].Type)
+		}
+		if chain[i].Epoch != chain[0].Epoch {
+			return nil, fmt.Errorf("backup chain epoch mismatch at %s: got=%d expected=%d", chain[i].BackupID, chain[i].Epoch, chain[0].Epoch)
+		}
+		if chain[i].ParentID != chain[i-1].BackupID {
+			return nil, fmt.Errorf("broken backup chain at %s: parent=%s expected=%s", chain[i].BackupID, chain[i].ParentID, chain[i-1].BackupID)
+		}
+	}
+
+	// Validate WAL continuity and checksums before touching the staging area.
+	if len(walSegments) == 0 {
+		return nil, fmt.Errorf("%w: no WAL segments supplied", ErrMissingWALSegment)
+	}
+	sort.Slice(walSegments, func(i, j int) bool {
+		si, _ := WALSegmentStartLSN(walSegments[i].SegmentName)
+		sj, _ := WALSegmentStartLSN(walSegments[j].SegmentName)
+		if si != sj {
+			return si < sj
+		}
+		return walSegments[i].SegmentName < walSegments[j].SegmentName
+	})
+	seenSeg := make(map[string]bool, len(walSegments))
+	walRefs := make([]WALRef, 0, len(walSegments))
+	for _, seg := range walSegments {
+		if !isValidWALFilename(seg.SegmentName) {
+			return nil, fmt.Errorf("%w: %q", ErrInvalidWALName, seg.SegmentName)
+		}
+		if seenSeg[seg.SegmentName] {
+			return nil, fmt.Errorf("%w: duplicate WAL segment %s", ErrWALDiscontinuity, seg.SegmentName)
+		}
+		seenSeg[seg.SegmentName] = true
+		start, err := WALSegmentStartLSN(seg.SegmentName)
+		if err != nil {
+			return nil, err
+		}
+		walRefs = append(walRefs, WALRef{
+			SegmentName:  seg.SegmentName,
+			TimelineID:   seg.TimelineID,
+			R2Key:        seg.R2Key,
+			Size:         int64(seg.CipherBytes),
+			CipherSHA256: seg.CipherSHA256,
+			SHA256:       seg.PlainSHA256,
+			StartLSN:     FormatLSN(start),
+			EndLSN:       FormatLSN(start + WALSegmentSize),
+		})
+	}
+	if m != nil {
+		if err := ValidateWALContinuity(walRefs, m.WALStartLSN, m.WALEndLSN); err != nil {
+			return nil, err
+		}
+	} else {
+		first, _ := WALSegmentStartLSN(walSegments[0].SegmentName)
+		last, _ := WALSegmentStartLSN(walSegments[len(walSegments)-1].SegmentName)
+		if err := ValidateWALContinuity(walRefs, FormatLSN(first), FormatLSN(last+WALSegmentSize)); err != nil {
+			return nil, err
+		}
+	}
+
 	var totalCipherBytes uint64
 	for _, b := range chain {
 		totalCipherBytes += uint64(b.CipherBytes)
+	}
+	for _, w := range walSegments {
+		totalCipherBytes += uint64(w.CipherBytes)
 	}
 	estBytes := totalCipherBytes * 8
 	if estBytes < 40*1024*1024 {
@@ -576,33 +740,25 @@ func CombineAndReplayPITRWithOptions(
 	}
 	_, _, headroomOK, hErr := agent.VerifyCombineStagingHeadroom(estBytes)
 	if hErr != nil || !headroomOK {
-		return "", false, false, fmt.Errorf("insufficient staging disk headroom for pg_combinebackup: %v", hErr)
+		return nil, fmt.Errorf("insufficient staging disk headroom for pg_combinebackup: %v", hErr)
 	}
-	stagingHeadroomOK = true
 
-	bkpBase, err := tenant.SafeSubpath(agent.VolDir(), "backups", tenantID)
-	if err != nil {
-		return "", stagingHeadroomOK, false, err
+	var restoreRoot string
+	if opts.StagingRoot != "" {
+		restoreRoot = opts.StagingRoot
+	} else {
+		bkpBase, err := tenant.SafeSubpath(agent.VolDir(), "backups", tenantID)
+		if err != nil {
+			return nil, err
+		}
+		restoreRoot = filepath.Join(bkpBase, fmt.Sprintf("pitr_restore_%d", time.Now().UnixNano()))
 	}
-	restoreRoot := filepath.Join(bkpBase, fmt.Sprintf("pitr_restore_%d", time.Now().UnixNano()))
 	if err := os.MkdirAll(restoreRoot, 0o700); err != nil {
-		return "", stagingHeadroomOK, false, err
+		return nil, err
 	}
-	defer func() { _ = os.RemoveAll(restoreRoot) }()
-
-	if len(chain) == 0 || chain[0].Type != "FULL" {
-		return "", stagingHeadroomOK, false, fmt.Errorf("invalid backup chain: must begin with FULL backup")
-	}
-	for i := 1; i < len(chain); i++ {
-		if chain[i].Type != "INCR" {
-			return "", stagingHeadroomOK, false, fmt.Errorf("invalid backup chain at %s: expected INCR, got %s", chain[i].BackupID, chain[i].Type)
-		}
-		if chain[i].Epoch != chain[0].Epoch {
-			return "", stagingHeadroomOK, false, fmt.Errorf("backup chain epoch mismatch at %s: got=%d expected=%d", chain[i].BackupID, chain[i].Epoch, chain[0].Epoch)
-		}
-		if chain[i].ParentID != chain[i-1].BackupID {
-			return "", stagingHeadroomOK, false, fmt.Errorf("broken backup chain at %s: parent=%s expected=%s", chain[i].BackupID, chain[i].ParentID, chain[i-1].BackupID)
-		}
+	cleanup := func() { _ = os.RemoveAll(restoreRoot) }
+	if !opts.KeepStaging {
+		defer cleanup()
 	}
 
 	var unpackedDirs []string
@@ -613,23 +769,23 @@ func CombineAndReplayPITRWithOptions(
 			Key:    aws.String(art.R2Key),
 		})
 		if err != nil {
-			return "", stagingHeadroomOK, false, fmt.Errorf("get backup %s: %w", art.R2Key, err)
+			return nil, fmt.Errorf("get backup %s: %w", art.R2Key, err)
 		}
 		cipherBytes, err := io.ReadAll(io.LimitReader(obj.Body, maxObjBytes+1))
 		_ = obj.Body.Close()
 		if err != nil {
-			return "", stagingHeadroomOK, false, err
+			return nil, err
 		}
 		if int64(len(cipherBytes)) > maxObjBytes {
-			return "", stagingHeadroomOK, false, fmt.Errorf("backup object %s exceeds %d MiB limit", art.R2Key, maxRestoreObjMiB)
+			return nil, fmt.Errorf("backup object %s exceeds %d MiB limit", art.R2Key, maxRestoreObjMiB)
 		}
 		plainBytes, err := agent.KMS().DecryptObject(tenantID, art.Epoch, art.R2Key, cipherBytes)
 		if err != nil {
-			return "", stagingHeadroomOK, false, err
+			return nil, fmt.Errorf("decrypt backup %s: %w", art.BackupID, err)
 		}
 		partDir := filepath.Join(restoreRoot, fmt.Sprintf("part_%d", i))
-		if err := ExtractTarZstSafe(bytes.NewReader(plainBytes), partDir, limits); err != nil {
-			return "", stagingHeadroomOK, false, fmt.Errorf("extract part_%d: %w", i, err)
+		if err := ExtractTarZstSafe(bytes.NewReader(plainBytes), partDir, opts.Limits); err != nil {
+			return nil, fmt.Errorf("extract part_%d: %w", i, err)
 		}
 		unpackedDirs = append(unpackedDirs, partDir)
 	}
@@ -637,70 +793,81 @@ func CombineAndReplayPITRWithOptions(
 	combinedDir := filepath.Join(restoreRoot, "combined_pgdata")
 	if len(unpackedDirs) == 1 {
 		if err := os.Rename(unpackedDirs[0], combinedDir); err != nil {
-			return "", stagingHeadroomOK, false, err
+			return nil, err
 		}
 	} else {
 		args := append([]string{filepath.Join(agent.PGBin(), "pg_combinebackup"), "-o", combinedDir}, unpackedDirs...)
 		if out, err := agent.RunPostgresCmd(args[0], args[1:]...); err != nil {
-			return "", stagingHeadroomOK, false, fmt.Errorf("pg_combinebackup failed: %w (%s)", err, out)
+			return nil, fmt.Errorf("pg_combinebackup failed: %w (%s)", err, out)
 		}
 	}
 
 	_ = os.Chmod(combinedDir, 0o700)
 	if out, err := agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "pg_verifybackup"), combinedDir); err != nil {
-		return "", stagingHeadroomOK, false, fmt.Errorf("pg_verifybackup on combined dir failed: %w (%s)", err, out)
+		return nil, fmt.Errorf("pg_verifybackup on combined dir failed: %w (%s)", err, out)
 	}
 
 	walRestoreDir := filepath.Join(restoreRoot, "wal_archive")
 	if err := os.MkdirAll(walRestoreDir, 0o700); err != nil {
-		return "", stagingHeadroomOK, false, err
+		return nil, err
 	}
+	expectedSHA := make(map[string]string, len(walSegments))
 	for _, seg := range walSegments {
-		if !isValidWALFilename(seg.SegmentName) {
-			return "", stagingHeadroomOK, false, fmt.Errorf("%w: %q", ErrInvalidWALName, seg.SegmentName)
-		}
+		expectedSHA[seg.SegmentName] = strings.ToLower(seg.PlainSHA256)
+	}
+
+	for _, seg := range walSegments {
 		obj, err := s3c.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String(seg.R2Key),
 		})
 		if err != nil {
-			return "", stagingHeadroomOK, false, fmt.Errorf("get wal %s: %w", seg.R2Key, err)
+			if isS3NotFound(err) {
+				return nil, fmt.Errorf("%w: %s", ErrMissingWALSegment, seg.SegmentName)
+			}
+			return nil, fmt.Errorf("get wal %s: %w", seg.R2Key, err)
 		}
 		cipherBytes, err := io.ReadAll(io.LimitReader(obj.Body, maxWALObjBytes+1))
 		_ = obj.Body.Close()
 		if err != nil {
-			return "", stagingHeadroomOK, false, err
+			return nil, err
 		}
 		if int64(len(cipherBytes)) > maxWALObjBytes {
-			return "", stagingHeadroomOK, false, fmt.Errorf("wal object %s exceeds %d byte limit", seg.R2Key, maxWALObjBytes)
+			return nil, fmt.Errorf("wal object %s exceeds %d byte limit", seg.R2Key, maxWALObjBytes)
 		}
 		zstBytes, err := agent.KMS().DecryptObject(tenantID, seg.Epoch, seg.R2Key, cipherBytes)
 		if err != nil {
-			return "", stagingHeadroomOK, false, fmt.Errorf("decrypt wal %s: %w", seg.SegmentName, err)
+			return nil, fmt.Errorf("%w: decrypt %s: %v", ErrCorruptWALSegment, seg.SegmentName, err)
 		}
 		rawWAL, err := DecompressBytesZstd(zstBytes, maxWALObjBytes)
 		if err != nil {
-			return "", stagingHeadroomOK, false, fmt.Errorf("decompress wal %s: %w", seg.SegmentName, err)
+			return nil, fmt.Errorf("%w: decompress %s: %v", ErrCorruptWALSegment, seg.SegmentName, err)
+		}
+		if want := expectedSHA[seg.SegmentName]; want != "" {
+			sum := sha256.Sum256(rawWAL)
+			if !strings.EqualFold(hex.EncodeToString(sum[:]), want) {
+				return nil, fmt.Errorf("%w: %s checksum mismatch", ErrCorruptWALSegment, seg.SegmentName)
+			}
 		}
 		rawWalPath := filepath.Join(walRestoreDir, seg.SegmentName)
 		if err := os.WriteFile(rawWalPath, rawWAL, 0o600); err != nil {
-			return "", stagingHeadroomOK, false, err
+			return nil, err
 		}
 	}
 
 	port, err := allocFreePort()
 	if err != nil {
-		return "", stagingHeadroomOK, false, err
+		return nil, err
 	}
 	sockDir := fmt.Sprintf("/tmp/air_pitr_%d", port)
 	if err := os.MkdirAll(sockDir, 0o755); err != nil {
-		return "", stagingHeadroomOK, false, err
+		return nil, err
 	}
 	defer func() { _ = os.RemoveAll(sockDir) }()
 
-	targetCfg := ""
-	if targetLSN != "" {
-		targetCfg = fmt.Sprintf("recovery_target_lsn = '%s'\nrecovery_target_inclusive = off\n", targetLSN)
+	targetCfg, err := target.recoveryConf()
+	if err != nil {
+		return nil, err
 	}
 	pitrConf := fmt.Sprintf(`
 port = %d
@@ -712,49 +879,151 @@ restore_command = 'cp %s/%%f %%p'
 
 	f, err := os.OpenFile(filepath.Join(combinedDir, "postgresql.conf"), os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return "", stagingHeadroomOK, false, err
+		return nil, err
 	}
 	_, _ = f.WriteString(pitrConf)
 	_ = f.Close()
 
 	if err := os.WriteFile(filepath.Join(combinedDir, "recovery.signal"), []byte(""), 0o600); err != nil {
-		return "", stagingHeadroomOK, false, err
+		return nil, err
 	}
 
 	logFile := filepath.Join(restoreRoot, "pitr_restore.log")
-	if out, err := agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "pg_ctl"), "-D", combinedDir, "-l", logFile, "-w", "-t", "25", "start"); err != nil {
+	if out, err := agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "pg_ctl"), "-D", combinedDir, "-l", logFile, "-w", "-t", "30", "start"); err != nil {
 		logBytes, _ := os.ReadFile(logFile)
-		return "", stagingHeadroomOK, false, fmt.Errorf("pitr pg_ctl start failed: %w (%s / log: %s)", err, out, string(logBytes))
+		return nil, fmt.Errorf("pitr pg_ctl start failed: %w (%s / log: %s)", err, out, string(logBytes))
 	}
-	defer func() {
-		_, _ = agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "pg_ctl"), "-D", combinedDir, "-m", "immediate", "-w", "stop")
-	}()
+	stopped := false
+	stop := func() {
+		if !stopped {
+			_, _ = agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "pg_ctl"), "-D", combinedDir, "-m", "fast", "-w", "-t", "20", "stop")
+			stopped = true
+		}
+	}
+	defer stop()
 
-	for i := 0; i < 40; i++ {
+	promoted := false
+	for i := 0; i < 300; i++ {
 		inRec, _ := agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "psql"), "-h", sockDir, "-p", strconv.Itoa(port), "-U", "postgres", "-d", "postgres", "-t", "-A", "-c", "SELECT pg_is_in_recovery();")
 		if strings.TrimSpace(inRec) == "f" {
+			promoted = true
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	if !promoted {
+		logBytes, _ := os.ReadFile(logFile)
+		return nil, fmt.Errorf("pitr recovery did not promote within timeout (log: %s)", string(logBytes))
+	}
 
-	verifyDB := strings.TrimSpace(dbName)
+	verifyDB := strings.TrimSpace(opts.DBName)
 	if verifyDB == "" {
 		verifyDB = "postgres"
 	}
 
 	qOut := ""
-	if strings.TrimSpace(verifyQuery) != "" {
-		qOut, err = agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "psql"), "-h", sockDir, "-p", strconv.Itoa(port), "-U", "postgres", "-d", verifyDB, "-t", "-A", "-c", verifyQuery)
+	if strings.TrimSpace(opts.VerifyQuery) != "" {
+		qOut, err = agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "psql"), "-h", sockDir, "-p", strconv.Itoa(port), "-U", "postgres", "-d", verifyDB, "-t", "-A", "-c", opts.VerifyQuery)
 		if err != nil {
-			return "", stagingHeadroomOK, false, fmt.Errorf("pitr verifyQuery failed: %w (%s)", err, qOut)
+			return nil, fmt.Errorf("pitr verifyQuery failed: %w (%s)", err, qOut)
+		}
+	}
+
+	if opts.RenameDatabaseFrom != "" && opts.RenameDatabaseTo != "" && opts.RenameDatabaseFrom != opts.RenameDatabaseTo {
+		renameSQL := fmt.Sprintf(`ALTER DATABASE %s RENAME TO %s`, quoteIdent(opts.RenameDatabaseFrom), quoteIdent(opts.RenameDatabaseTo))
+		if out, err := agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "psql"), "-h", sockDir, "-p", strconv.Itoa(port), "-U", "postgres", "-d", "postgres", "-c", renameSQL); err != nil {
+			return nil, fmt.Errorf("rename restored database %s -> %s failed: %w (%s)", opts.RenameDatabaseFrom, opts.RenameDatabaseTo, err, out)
 		}
 	}
 
 	_, _ = agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "psql"), "-h", sockDir, "-p", strconv.Itoa(port), "-U", "postgres", "-d", verifyDB, "-c", "CREATE EXTENSION IF NOT EXISTS amcheck;")
 	_, amErr := agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "pg_amcheck"), "-h", sockDir, "-p", strconv.Itoa(port), "-U", "postgres", verifyDB)
 
-	return strings.TrimSpace(qOut), stagingHeadroomOK, amErr == nil, nil
+	stop()
+	_ = os.Remove(filepath.Join(combinedDir, "postmaster.pid"))
+	_ = os.Remove(filepath.Join(combinedDir, "recovery.signal"))
+	_ = os.Remove(filepath.Join(combinedDir, "standby.signal"))
+
+	return &StagePITRResult{
+		PGDataDir:         combinedDir,
+		QueryOutput:       strings.TrimSpace(qOut),
+		StagingHeadroomOK: true,
+		AmcheckOK:         amErr == nil,
+		Cleanup:           cleanup,
+	}, nil
+}
+
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// CombineAndReplayPITRWithOptions is the Phase 11/12 compatibility wrapper. It performs a
+// validation-only PITR (staging is deleted) and returns the observed verification output.
+func CombineAndReplayPITRWithOptions(
+	ctx context.Context,
+	agent *cell.Agent,
+	s3c *s3.Client,
+	bucket, tenantID, dbName string,
+	chain []*fencing.BackupArtifact,
+	walSegments []WALSegmentArtifact,
+	targetLSN string,
+	verifyQuery string,
+	limits TarExtractLimits,
+) (queryOut string, stagingHeadroomOK bool, amcheckOK bool, err error) {
+	target := NewLatestRecoveryTarget()
+	if strings.TrimSpace(targetLSN) != "" {
+		target, err = NewLSNRecoveryTarget(targetLSN)
+		if err != nil {
+			return "", false, false, err
+		}
+	}
+	// Legacy callers do not have a Phase 13 manifest; synthesize the minimum manifest needed
+	// for tenant/generation validation and WAL continuity checking.
+	m, mErr := legacyManifestForPITR(tenantID, chain, walSegments)
+	if mErr != nil {
+		return "", false, false, mErr
+	}
+	if strings.TrimSpace(targetLSN) != "" {
+		// Legacy behavior allowed targets below the new Phase 13 minimum; only range-check WAL.
+		m.ConsistencyLSN = m.WALStartLSN
+	}
+	res, err := StagePITRRestore(ctx, agent, s3c, bucket, m, chain, walSegments, target, StagePITROptions{
+		DBName:      dbName,
+		VerifyQuery: verifyQuery,
+		Limits:      limits,
+	})
+	if err != nil {
+		return "", false, false, err
+	}
+	return res.QueryOutput, res.StagingHeadroomOK, res.AmcheckOK, nil
+}
+
+func legacyManifestForPITR(tenantID string, chain []*fencing.BackupArtifact, walSegments []WALSegmentArtifact) (*BackupManifest, error) {
+	if len(walSegments) == 0 {
+		return nil, fmt.Errorf("%w: no WAL segments", ErrMissingWALSegment)
+	}
+	first, err := WALSegmentStartLSN(walSegments[0].SegmentName)
+	if err != nil {
+		return nil, err
+	}
+	last, err := WALSegmentStartLSN(walSegments[len(walSegments)-1].SegmentName)
+	if err != nil {
+		return nil, err
+	}
+	gen := "legacy"
+	m := &BackupManifest{
+		ManifestVersion: ManifestVersion,
+		BackupID:        "legacy_backup",
+		TenantID:        tenantID,
+		Generation:      gen,
+		TimelineID:      timelineIDFromSegment(walSegments[0].SegmentName),
+		Type:            BackupTypeFull,
+		State:           BackupStateSucceeded,
+		WALStartLSN:     FormatLSN(first),
+		WALEndLSN:       FormatLSN(last + WALSegmentSize),
+		ConsistencyLSN:  FormatLSN(first),
+	}
+	return m, nil
 }
 
 func allocFreePort() (int, error) {
