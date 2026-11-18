@@ -35,10 +35,14 @@ jobs:
 
       - name: Verify Go & C++ Gateway build & unit tests
         run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends libpq-dev libcurl4-openssl-dev libssl-dev
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libpq-dev libcurl4-openssl-dev libssl-dev \
+            libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc
           go build -v ./cmd/air-server
           go test -v -race ./internal/...
-          make -C gateway all test
+          protoc -Iproto --cpp_out=gateway/src/pb --grpc_out=gateway/src/pb \
+            --plugin=protoc-gen-grpc=/usr/bin/grpc_cpp_plugin proto/airdb.proto
+          make -C gateway -j"$(nproc)" all test
 
       - name: Normalize image name to lowercase
         id: image
