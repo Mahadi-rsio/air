@@ -36,6 +36,8 @@ type BackupArtifact struct {
 	StartLSN     string                  `json:"start_lsn"`
 	EndLSN       string                  `json:"end_lsn"`
 	CipherBytes  int                     `json:"cipher_bytes"`
+	PlainSHA256  string                  `json:"plain_sha256,omitempty"`
+	CipherSHA256 string                  `json:"cipher_sha256,omitempty"`
 	CreatedAt    time.Time               `json:"created_at"`
 	Verified     bool                    `json:"verified"`
 	DEKBundle    crypto.WrappedDEKBundle `json:"dek_bundle"`
@@ -81,6 +83,11 @@ func IsNotFoundErr(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "NoSuchKey") || strings.Contains(msg, "404") || strings.Contains(msg, "NotFound")
+}
+
+// IsPreconditionErr reports whether err represents an HTTP 412 Precondition Failed response from S3/R2.
+func IsPreconditionErr(err error) bool {
+	return isPreconditionErr(err)
 }
 
 func isPreconditionErr(err error) bool {

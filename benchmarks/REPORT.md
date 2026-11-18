@@ -293,3 +293,23 @@ Measured on `p12_introspect` (`items` table with `TEXT` TOAST column + `idx_item
 - **After `TRUNCATE TABLE items` + `DROP TABLE aux_tbl`:** `0 B` / `8,192 B` / `24,576 B` / `7,771,827 B`.
 - **Architecture Note:** `pg_database_size()` combines catalog/local PGDATA base metadata with `air_smgr`-managed relation fork sizes tracked in Pageserver; temporary relations created only in local backend temp files outside `air_smgr` remote persistence remain local-only per session.
 
+## 14. Phase 13.1 — Code Quality, Architecture Refactoring & Backup/PITR Verification
+
+Phase 13.1 audited the repository baseline at commit `d54bdc2`, modularized `internal/control/` and `internal/backup/`, fixed build/continuity/checksum/PITR defects, and verified backup, WAL archival, manifest verification, and PITR restore end-to-end against real PostgreSQL 17 clusters.
+
+### 14A. Key Remediations & Refactorings
+
+| Area | Finding | Resolution |
+| :--- | :--- | :--- |
+| **Build & Package Integrity** | `internal/backup/pitr_dag.go` failed to compile (`undefined: backup`, `undefined: r2Key`); `internal/control/control.go` had a corrupted `var (` block and duplicate `RunEncryptedBackupStep` call; `tests/e2e` imported removed `internal/gateway`. | Fixed build errors in `pitr_dag.go`; split 2,445-line `control.go` into [control.go](file:///workspaces/air/internal/control/control.go), [migrations.go](file:///workspaces/air/internal/control/migrations.go), [offload.go](file:///workspaces/air/internal/control/offload.go), [backup_restore.go](file:///workspaces/air/internal/control/backup_restore.go), and [http.go](file:///workspaces/air/internal/control/http.go); cleaned dead `internal/gateway` imports in `tests/e2e`. |
+| **WAL Continuity & LSN Math** | `ValidateWALContinuity` used `segs[last].start` instead of `start + WALSegmentSize`, rejected earlier retained segments, and failed on auxiliary `.history`/`.backup` files. | Added `IsWALSegmentName`, fixed `lastCovered = segs[last].start + WALSegmentSize`, allowed `segs[0].start <= firstSegment`, and filtered auxiliary files in `WALRefsFromArtifacts` and `StagePITRRestore`. |
+| **Checksum Separation** | Plaintext vs. ciphertext SHA-256 digests were conflated under `x-amz-meta-air-sha256`, causing `Store.VerifyObject` (`HeadObject`) to compare ciphertext against plaintext hashes. | Separated `CipherSHA256` (`x-amz-meta-air-cipher-sha256` / `ChecksumSHA256`) for `HeadObject` verification from `PlainSHA256` (`x-amz-meta-air-plain-sha256`) for post-decryption verification. |
+| **Immutable Manifests & Post-Backup WAL PITR** | `PublishCompletedBackupManifest` was missing/unwired; `RestoreDatabaseWithOptions` rejected `target_lsn` in WAL segments archived after the base backup. | Implemented `PublishCompletedBackupManifest` (`If-None-Match: *`) after WAL drain; added `buildRestoreWALArtifacts` to merge base manifest WALs with subsequent archived WAL segments; added `GET /v1/databases/:id/backups` and `POST /v1/databases/:id/backups/:backup_id/verify`. |
+| **Warm Pool Goroutine Cleanup** | `cell.Agent.Close()` did not wait for the background `warmPoolLoop` `initdb` goroutine, causing `TestCgroupV2SetupAndTeardown_TempRoot` `TempDir` cleanup races. | Added `warmPoolWG sync.WaitGroup` to `cell.Agent` and `a.warmPoolWG.Wait()` in `Agent.Close()`. |
+
+### 14B. Verification Results (Go `-race` & Live PG17 E2E)
+
+- **`go build ./cmd/air-server ./internal/...` & `go vet ./...`**: PASS (0 errors, 0 warnings).
+- **`go test -race -count=1 ./internal/...`**: PASS across `internal/backup` (`1.238s`), `internal/cell` (`9.192s`), `internal/config` (`1.042s`), `internal/control` (`288.242s`), `internal/crypto` (`1.105s`), `internal/fencing` (`1.084s`), and `internal/pageserver` (`141.488s`).
+- **`TestPhase13_EndToEnd_BackupManifest_Verification_PITR_And_RestoreToNewTenant`**: PASS (`6.29s`) — verified real PG17 `FULL` backup, immutable `BackupManifest` publication, `GET /v1/databases/:id/backups`, `POST .../verify`, post-backup WAL archival (`type=WAL`), `target_lsn` PITR, and full restore into an isolated `new_tenant_id` (preserving pre-target rows and excluding post-target rows).
+- **`TestPhaseF_LivePG17_Backup_WAL_PITR_And_CASFencing` & `TestPhaseF_ControlPlane_BackupAndRestoreHTTPAPI`**: PASS (`5.42s` and `6.07s`).

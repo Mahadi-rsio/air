@@ -38,6 +38,7 @@ type mockS3Obj struct {
 	data        []byte
 	etag        string
 	contentType string
+	meta        map[string]string
 }
 
 type mockS3Server struct {
@@ -135,10 +136,18 @@ func (m *mockS3Server) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		sum := md5.Sum(body)
 		etag := `"` + hex.EncodeToString(sum[:]) + `"`
+		meta := make(map[string]string)
+		for hk, hv := range r.Header {
+			lower := strings.ToLower(hk)
+			if strings.HasPrefix(lower, "x-amz-meta-") && len(hv) > 0 {
+				meta[strings.TrimPrefix(lower, "x-amz-meta-")] = hv[0]
+			}
+		}
 		m.objects[fullKey] = mockS3Obj{
 			data:        body,
 			etag:        etag,
 			contentType: r.Header.Get("Content-Type"),
+			meta:        meta,
 		}
 		w.Header().Set("ETag", etag)
 		w.WriteHeader(http.StatusOK)
@@ -149,6 +158,9 @@ func (m *mockS3Server) handle(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`<Error><Code>NoSuchKey</Code></Error>`))
 			return
+		}
+		for mk, mv := range obj.meta {
+			w.Header().Set("X-Amz-Meta-"+mk, mv)
 		}
 		w.Header().Set("ETag", obj.etag)
 		if obj.contentType != "" {
@@ -162,6 +174,9 @@ func (m *mockS3Server) handle(w http.ResponseWriter, r *http.Request) {
 		if !exists {
 			w.WriteHeader(http.StatusNotFound)
 			return
+		}
+		for mk, mv := range obj.meta {
+			w.Header().Set("X-Amz-Meta-"+mk, mv)
 		}
 		w.Header().Set("ETag", obj.etag)
 		w.Header().Set("Content-Length", strconv.Itoa(len(obj.data)))
@@ -309,7 +324,7 @@ func TestPhaseF_LivePG17_Backup_WAL_PITR_And_CASFencing(t *testing.T) {
 	if !errors.Is(staleErr, fencing.ErrStaleFencingEpoch) {
 		t.Fatalf("expected ErrStaleFencingEpoch for epoch-1 writer, got: %v", staleErr)
 	}
-	staleKey := fmt.Sprintf("tenants/%s/epoch_%06d/B_stale.tar.zst.enc", tenantID, 1)
+	staleKey := backup.BackupBaseObjectKey(tenantID, "", "B_stale")
 	if mock.hasKey(bucket, staleKey) {
 		t.Fatalf("expected stale backup object %s to be absent/cleaned up", staleKey)
 	}

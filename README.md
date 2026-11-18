@@ -1,14 +1,23 @@
 # AIR — Multi-Tenant PostgreSQL 17 Platform (`v2.0`)
 
-AIR is a production-oriented, multi-tenant PostgreSQL 17 platform featuring a Go database engine/control plane (`air-server`), a standalone **C++20 PG gateway & connection pooler** (`air-gateway`) communicating over **gRPC**, cooperative scale-to-zero, encrypted R2 backups/PITR, and a custom Neon-style Pageserver (`air_smgr`) with Content-Addressed Upload (CAU).
+AIR is a production-oriented, multi-tenant PostgreSQL 17 platform featuring a Go database engine and control plane (`air-server`), a standalone **C++20 PG gateway & connection pooler** (`air-gateway`) communicating over **gRPC**, cooperative scale-to-zero, generation-fenced cold offload, encrypted Cloudflare R2 backups/PITR, and a custom Neon-style Pageserver (`air_smgr`) with Content-Addressed Upload (CAU).
 
-> **Docs & Architecture:** [phase.md](file:///workspaces/air/phase.md) · [todo.md](file:///workspaces/air/todo.md) · [pageserver.md](file:///workspaces/air/pageserver.md) · [smgr.md](file:///workspaces/air/smgr.md)
+> **Architecture & Developer Guides:** [Overview](file:///workspaces/air/docs/architecture/overview.md) · [Codebase Map](file:///workspaces/air/docs/architecture/codebase-map.md) · [Developer Guide](file:///workspaces/air/docs/development/DEVELOPMENT.md) · [Contributing](file:///workspaces/air/CONTRIBUTING.md) · [Known Issues](file:///workspaces/air/docs/known-issues.md)
+>
+> **Subsystem Docs:** [Pageserver](file:///workspaces/air/docs/architecture/pageserver.md) · [Storage](file:///workspaces/air/docs/architecture/storage.md) · [Tenant Lifecycle](file:///workspaces/air/docs/architecture/tenant-lifecycle.md) · [WAL & Recovery](file:///workspaces/air/docs/architecture/wal-and-recovery.md) · [Backup & Restore](file:///workspaces/air/docs/architecture/backup-and-restore.md)
+
+## How AIR Differs from Standard PostgreSQL
+
+- **Per-Tenant Process & Filesystem Isolation**: Each tenant database runs in its own hardened PostgreSQL 17 cluster (`PGDATA` under `tenant.SafeSubpath`) with `supautils.so`, `app_user` non-superuser privileges, Linux `cgroup v2` limits, `flock` single-owner locks, and a per-tenant AES-256-GCM DEK (`EnvelopeKMS`).
+- **Cooperative Scale-to-Zero & Cold Offload**: Idle `ACTIVE` tenants drain cleanly (`SUSPENDED`) and can offload their storage to R2 (`OFFLOADED`), waking transparently on demand with `singleflight` coalescing and monotonic `Epoch` CAS fencing.
+- **Disaggregated Page Storage**: With `--pageserver`, `air_smgr.so` intercepts relation block reads via `smgr_hook` and fetches missing pages at an explicit LSN (`GetPage@LSN`) from the Go Pageserver and R2 CAU layers.
+- **Non-Destructive Encrypted PITR**: Backups (`FULL`, `INCR`, `WAL`) are Zstd-compressed, AES-256-GCM encrypted, verified via immutable `BackupManifest` objects (`If-None-Match: *`), and restored either as a staged verification or into a new isolated tenant (`new_tenant_id`).
 
 ## Repository Structure
 
 ```text
 .
-├── cmd/air-server/          # Air DB server entrypoint (Control Plane HTTP + gRPC server + Cell Agent + Pageserver)
+├── cmd/air-server/          # Air DB server entrypoint (Control Plane HTTP + gRPC + Cell Agent + Pageserver)
 ├── gateway/                 # Standalone C++20 PG Gateway & Pooler (PG wire :5432, Admin API :8081, gRPC client)
 ├── proto/                   # Protobuf / gRPC contract (airdb.proto: AirDBControl)
 ├── internal/
@@ -16,15 +25,16 @@ AIR is a production-oriented, multi-tenant PostgreSQL 17 platform featuring a Go
 │   ├── crypto/              # EnvelopeKMS (persistent 256-bit KEK + wrapped per-tenant DEKs)
 │   ├── tenant/              # Canonical tenant/account ID validation & symlink-safe path containment
 │   ├── cell/                # PG17 lifecycle, warm initdb pool, cgroup v2, supautils hardening, flock ownership
-│   ├── control/             # Durable PG17 metadata, schema_migrations, Bearer API key auth, HTTP & gRPC servers
+│   ├── control/             # Durable PG17 metadata, migrations, offload worker, backup/restore, HTTP & gRPC
 │   ├── pb/                  # Generated Go protobuf & gRPC stubs
-│   ├── pageserver/          # Go Pageserver (WAL receiver/parser, L0/L1/Image layers, CAU R2 upload, GetPage@LSN, walredo)
-│   ├── backup/              # Encrypted full/incremental PG17 backups, WAL spooling, PITR & DAG GC
+│   ├── pageserver/          # Go Pageserver (WAL receiver/parser, L0/L1/Image layers, CAU R2 upload, GetPage@LSN)
+│   ├── backup/              # Shared R2 Store, LSN continuity, encrypted backups, manifest verify, PITR & DAG GC
 │   └── fencing/             # CLOCK_MONOTONIC lease watchdog & R2 ETag CAS fencing manifests
 ├── extensions/air_smgr/     # PostgreSQL 17 custom smgr extension (Local File Cache + Pageserver IPC)
 ├── patches/                 # PG17 smgr_hook source patch (pg17-smgr-hook.patch)
 ├── migrations/              # SQL schema reference (001_initial_schema.sql, 002_api_keys.sql)
-├── tests/e2e/               # Real PostgreSQL 17 end-to-end tests (e2e, phase_f/g/h, pageserver_cau)
+├── docs/                    # Architecture, development, known issues, and Phase 13.1 audit reports
+├── tests/e2e/               # Real PostgreSQL 17 end-to-end tests (including Phase 13 backup/PITR verification)
 ├── Dockerfile               # Multi-stage container build (Go air-server + C++ air-gateway + PG17 + air_smgr)
 └── fly.toml                 # Fly.io deployment configuration
 ```
@@ -104,9 +114,16 @@ All `/v1/*` endpoints require `Authorization: Bearer <token>`:
 - `POST /v1/databases` — Provision an isolated tenant database (`Idempotency-Key` required, body `{"tenant_id": "demo_db"}`)
 - `GET /v1/databases/{id}` — Inspect database metadata (account-scoped)
 - `DELETE /v1/databases/{id}` — Stop PG17, purge storage, shred DEK, and mark `PURGED` (account-scoped)
-- `POST /v1/databases/{id}/backups` — Trigger an encrypted full or incremental backup + WAL drain
-- `POST /v1/databases/{id}/restore` — Execute `CombineAndReplayPITR` to a target LSN or latest WAL
+- `POST /v1/databases/{id}/backups` — Trigger an encrypted full, incremental, or WAL-only backup + WAL drain
+- `GET /v1/databases/{id}/backups` — List recorded backup operations and statuses for a tenant
+- `POST /v1/databases/{id}/backups/{backup_id}/verify` — Verify an immutable `BackupManifest`, WAL continuity, and R2 object/checksum integrity
+- `POST /v1/databases/{id}/restore` — Execute `StagePITRRestore` (validation restore or full restore into `new_tenant_id` with `backup_id`, `target_lsn`, `target_time`, or `latest`)
 - `DELETE /v1/api-keys/{id}` — Revoke an API key belonging to the authenticated account
+
+## Current Limitations & Known Issues
+
+- **Container `air-gateway` Runtime Packaging (Deferred)**: In container builds ([Dockerfile](file:///workspaces/air/Dockerfile)), `air-gateway` currently lacks runtime `libgrpc++.so.1.83` shared libraries in the final image stage (scheduled for a dedicated gateway packaging phase). See [known-issues.md](file:///workspaces/air/docs/known-issues.md) for full details.
+- **Non-Destructive Restore**: `POST /v1/databases/{id}/restore` never overwrites an active tenant in place; pass `new_tenant_id` to materialize a restored tenant alongside the original.
 
 Example with `curl` and `psql`:
 

@@ -98,6 +98,7 @@ type Agent struct {
 	warmPoolMu     sync.Mutex
 	warmPoolSlots  []string
 	warmPoolTarget int
+	warmPoolWG     sync.WaitGroup
 	warmPoolSeq    atomic.Int64
 	warmPoolNotify chan struct{}
 }
@@ -783,6 +784,7 @@ func (a *Agent) GetTenant(tenantID string) (*TenantRuntime, bool) {
 // so a restarted Cell Agent can readopt running tenants.
 func (a *Agent) Close() {
 	a.stopOnce.Do(func() { close(a.stopCh) })
+	a.warmPoolWG.Wait()
 	a.tenantMu.Lock()
 	defer a.tenantMu.Unlock()
 	for tid := range a.lockFDs {
@@ -790,8 +792,8 @@ func (a *Agent) Close() {
 	}
 }
 
-func (a *Agent) VolDir() string          { return a.volDir }
-func (a *Agent) PGBin() string           { return a.pgBin }
+func (a *Agent) VolDir() string           { return a.volDir }
+func (a *Agent) PGBin() string            { return a.pgBin }
 func (a *Agent) KMS() *crypto.EnvelopeKMS { return a.kms }
 
 func (a *Agent) RunPostgresCmd(bin string, args ...string) (string, error) {

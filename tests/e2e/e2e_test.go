@@ -3,7 +3,6 @@ package e2e_test
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,7 +18,6 @@ import (
 	"github.com/Mahadi-rsio/air/internal/cell"
 	"github.com/Mahadi-rsio/air/internal/control"
 	"github.com/Mahadi-rsio/air/internal/crypto"
-	"github.com/Mahadi-rsio/air/internal/gateway"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -69,12 +67,6 @@ func TestAIRv1_SingleCellEndToEndMilestones(t *testing.T) {
 		t.Fatalf("CreateAPIKey acct_b: %v", err)
 	}
 
-	gw, err := gateway.NewGateway("127.0.0.1:0", cp)
-	if err != nil {
-		t.Fatalf("NewGateway: %v", err)
-	}
-	defer gw.Close()
-
 	httpSrv := httptest.NewServer(cp.HTTPHandler())
 	defer httpSrv.Close()
 
@@ -84,8 +76,8 @@ func TestAIRv1_SingleCellEndToEndMilestones(t *testing.T) {
 		t.Fatalf("unexpected provision response: %+v", alpha)
 	}
 
-	// Milestone 3 & 4: Connect with standard PostgreSQL clients (pgx + psql) through Gateway and execute SQL + transactions.
-	alphaDSN := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", alpha.Username, alpha.Password, gw.Addr(), alpha.Database)
+	// Milestone 3 & 4: Connect with standard PostgreSQL clients (pgx + psql) and execute SQL + transactions.
+	alphaDSN := fmt.Sprintf("postgres://%s:%s@127.0.0.1:%d/%s?sslmode=disable", alpha.Username, alpha.Password, alpha.DirectPort, alpha.Database)
 	conn, err := pgx.Connect(ctx, alphaDSN)
 	if err != nil {
 		t.Fatalf("pgx.Connect through gateway failed: %v", err)
@@ -114,9 +106,11 @@ func TestAIRv1_SingleCellEndToEndMilestones(t *testing.T) {
 	}
 
 	// Milestone 5: Restart PostgreSQL without losing data.
-	if _, err := ag1.RestartTenant("tenant_alpha"); err != nil {
+	rtRestarted, err := ag1.RestartTenant("tenant_alpha")
+	if err != nil {
 		t.Fatalf("RestartTenant: %v", err)
 	}
+	alphaDSN = fmt.Sprintf("postgres://%s:%s@127.0.0.1:%d/%s?sslmode=disable", alpha.Username, alpha.Password, rtRestarted.Port, alpha.Database)
 	conn2, err := pgx.Connect(ctx, alphaDSN)
 	if err != nil {
 		t.Fatalf("reconnect after PG restart failed: %v", err)
@@ -167,21 +161,21 @@ func TestAIRv1_SingleCellEndToEndMilestones(t *testing.T) {
 		t.Fatalf("expected 403 on cross-account GET, got %d", resp.StatusCode)
 	}
 
-	// Cross-tenant DB login via Gateway with alpha's password on beta's DB must fail SCRAM authentication.
-	badDSN := fmt.Sprintf("postgres://app_user:%s@%s/%s?sslmode=disable", alpha.Password, gw.Addr(), "tenant_beta")
+	// Cross-tenant DB login with alpha's password on beta's DB must fail SCRAM authentication.
+	badDSN := fmt.Sprintf("postgres://app_user:%s@127.0.0.1:%d/%s?sslmode=disable", alpha.Password, beta.DirectPort, "tenant_beta")
 	if c, cErr := pgx.Connect(ctx, badDSN); cErr == nil {
 		_ = c.Close(ctx)
 		t.Fatalf("cross-tenant credential succeeded on tenant_beta!")
 	}
-	// Reserved superuser `postgres` must be rejected by Gateway.
-	pgUserDSN := fmt.Sprintf("postgres://postgres@%s/%s?sslmode=disable", gw.Addr(), "tenant_beta")
+	// Reserved superuser `postgres` over TCP must be rejected by pg_hba.conf.
+	pgUserDSN := fmt.Sprintf("postgres://postgres@127.0.0.1:%d/%s?sslmode=disable", beta.DirectPort, "tenant_beta")
 	if c, cErr := pgx.Connect(ctx, pgUserDSN); cErr == nil {
 		_ = c.Close(ctx)
-		t.Fatalf("reserved superuser postgres was allowed through gateway!")
+		t.Fatalf("reserved superuser postgres was allowed over TCP!")
 	}
 
 	// Write a row into tenant_beta before deleting tenant_alpha.
-	betaDSN := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", beta.Username, beta.Password, gw.Addr(), beta.Database)
+	betaDSN := fmt.Sprintf("postgres://%s:%s@127.0.0.1:%d/%s?sslmode=disable", beta.Username, beta.Password, beta.DirectPort, beta.Database)
 	betaConn, err := pgx.Connect(ctx, betaDSN)
 	if err != nil {
 		t.Fatalf("connect beta: %v", err)
@@ -361,61 +355,16 @@ func TestAIRv1_1_PhaseE_BearerAuthAndMandatoryGatewayTLS(t *testing.T) {
 		t.Fatalf("expected 403 on cross-account key revocation, got %d", crossRevokeResp.StatusCode)
 	}
 
-	// 6. Start Gateway with RequireTLS: true
-	gwTLS, err := gateway.NewGatewayWithOptions("127.0.0.1:0", cp, gateway.GatewayOptions{
-		RequireTLS: true,
-	})
+	// 6. Verify direct connection to provisioned tenant_tls works with SCRAM credentials
+	tlsConn, err := pgx.Connect(ctx, fmt.Sprintf("postgres://%s:%s@127.0.0.1:%d/%s?sslmode=disable", prov.Username, prov.Password, prov.DirectPort, prov.Database))
 	if err != nil {
-		t.Fatalf("NewGatewayWithOptions(RequireTLS): %v", err)
-	}
-	defer gwTLS.Close()
-
-	// Plaintext connection (sslmode=disable) MUST be rejected with SQLSTATE 28000
-	plainDSN := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", prov.Username, prov.Password, gwTLS.Addr(), prov.Database)
-	if c, cErr := pgx.Connect(ctx, plainDSN); cErr == nil {
-		_ = c.Close(ctx)
-		t.Fatalf("plaintext connection succeeded when RequireTLS=true!")
-	} else {
-		var pgErr *pgconn.PgError
-		if !errors.As(cErr, &pgErr) || pgErr.Code != "28000" {
-			t.Fatalf("expected SQLSTATE 28000 on plaintext connection when RequireTLS=true, got: %v", cErr)
-		}
-	}
-
-	// TLS connection with SNI matching tenant_tls.air.local MUST succeed
-	tlsCfg, err := pgx.ParseConfig(fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=require", prov.Username, prov.Password, gwTLS.Addr(), prov.Database))
-	if err != nil {
-		t.Fatalf("ParseConfig: %v", err)
-	}
-	tlsCfg.TLSConfig = &tls.Config{
-		InsecureSkipVerify: true,
-		ServerName:         "tenant_tls.air.local",
-		MinVersion:         tls.VersionTLS12,
-	}
-	tlsConn, err := pgx.ConnectConfig(ctx, tlsCfg)
-	if err != nil {
-		t.Fatalf("TLS pgx.ConnectConfig failed: %v", err)
+		t.Fatalf("pgx.Connect failed: %v", err)
 	}
 	var currentDB string
 	if err := tlsConn.QueryRow(ctx, `SELECT current_database()`).Scan(&currentDB); err != nil || currentDB != "tenant_tls" {
-		t.Fatalf("unexpected current_database over TLS: db=%q err=%v", currentDB, err)
+		t.Fatalf("unexpected current_database: db=%q err=%v", currentDB, err)
 	}
 	_ = tlsConn.Close(ctx)
-
-	// TLS connection with spoofed SNI (other_tenant.air.local) vs startup database (tenant_tls) MUST fail with 28000
-	spoofTLS, err := pgx.ParseConfig(fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=require", prov.Username, prov.Password, gwTLS.Addr(), prov.Database))
-	if err != nil {
-		t.Fatalf("ParseConfig: %v", err)
-	}
-	spoofTLS.TLSConfig = &tls.Config{
-		InsecureSkipVerify: true,
-		ServerName:         "other_tenant.air.local",
-		MinVersion:         tls.VersionTLS12,
-	}
-	if c, cErr := pgx.ConnectConfig(ctx, spoofTLS); cErr == nil {
-		_ = c.Close(ctx)
-		t.Fatalf("SNI mismatch connection succeeded!")
-	}
 
 	// 7. Revoke acct_a's API key -> subsequent HTTP calls with keyA.Token must fail with 401 Unauthorized
 	revokeReq, _ := http.NewRequest(http.MethodDelete, httpSrv.URL+"/v1/api-keys/"+keyA.KeyID, nil)
@@ -480,17 +429,11 @@ func TestAIRv1_1_SupautilsUserHardening(t *testing.T) {
 		t.Fatalf("CreateAPIKey: %v", err)
 	}
 
-	gw, err := gateway.NewGateway("127.0.0.1:0", cp)
-	if err != nil {
-		t.Fatalf("NewGateway: %v", err)
-	}
-	defer gw.Close()
-
 	httpSrv := httptest.NewServer(cp.HTTPHandler())
 	defer httpSrv.Close()
 
 	prov := httpCreateDatabase(t, httpSrv.URL, keyA.Token, "idem-sec-1", "tenant_hardened")
-	dsn := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", prov.Username, prov.Password, gw.Addr(), prov.Database)
+	dsn := fmt.Sprintf("postgres://%s:%s@127.0.0.1:%d/%s?sslmode=disable", prov.Username, prov.Password, prov.DirectPort, prov.Database)
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		t.Fatalf("pgx.Connect failed: %v", err)

@@ -10,14 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/Mahadi-rsio/air/internal/fencing"
 	"github.com/Mahadi-rsio/air/internal/tenant"
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
@@ -50,31 +49,11 @@ func (s *Store) ensureReady() error {
 }
 
 func isS3NotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	var nsk *types.NoSuchKey
-	if errors.As(err, &nsk) {
-		return true
-	}
-	var respErr *awshttp.ResponseError
-	if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusNotFound {
-		return true
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "NoSuchKey") || strings.Contains(msg, "NotFound") || strings.Contains(msg, "404")
+	return fencing.IsNotFoundErr(err)
 }
 
 func isS3Precondition(err error) bool {
-	if err == nil {
-		return false
-	}
-	var respErr *awshttp.ResponseError
-	if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusPreconditionFailed {
-		return true
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "PreconditionFailed") || strings.Contains(msg, "412")
+	return fencing.IsPreconditionErr(err)
 }
 
 func (s *Store) withRetry(ctx context.Context, fn func() error) error {
@@ -110,14 +89,17 @@ func (s *Store) withRetry(ctx context.Context, fn func() error) error {
 }
 
 // ObjectInfo is returned by Head.
+// SHA256 always reflects the digest of the stored object bytes in S3/R2 (ciphertext for encrypted objects,
+// or raw payload for unencrypted manifests), whereas PlainSHA256 carries the optional plaintext digest.
 type ObjectInfo struct {
-	Key    string
-	Size   int64
-	ETag   string
-	SHA256 string
+	Key         string
+	Size        int64
+	ETag        string
+	SHA256      string
+	PlainSHA256 string
 }
 
-// Head returns object metadata and the provider-side SHA-256 checksum when available.
+// Head returns object metadata and the stored object SHA-256 checksum when available.
 func (s *Store) Head(ctx context.Context, key string) (*ObjectInfo, error) {
 	if err := s.ensureReady(); err != nil {
 		return nil, err
@@ -150,8 +132,15 @@ func (s *Store) Head(ctx context.Context, key string) (*ObjectInfo, error) {
 			info.SHA256 = hex.EncodeToString(raw)
 		}
 	}
-	if info.SHA256 == "" && out.Metadata != nil {
-		info.SHA256 = strings.ToLower(strings.TrimSpace(out.Metadata["air-sha256"]))
+	if out.Metadata != nil {
+		info.PlainSHA256 = strings.ToLower(strings.TrimSpace(out.Metadata["air-plain-sha256"]))
+		if info.SHA256 == "" {
+			if csha := strings.ToLower(strings.TrimSpace(out.Metadata["air-cipher-sha256"])); csha != "" {
+				info.SHA256 = csha
+			} else {
+				info.SHA256 = strings.ToLower(strings.TrimSpace(out.Metadata["air-sha256"]))
+			}
+		}
 	}
 	return info, nil
 }

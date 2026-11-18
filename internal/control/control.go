@@ -21,7 +21,6 @@ import (
 	"github.com/Mahadi-rsio/air/internal/backup"
 	"github.com/Mahadi-rsio/air/internal/cell"
 	"github.com/Mahadi-rsio/air/internal/crypto"
-	"github.com/Mahadi-rsio/air/internal/fencing"
 	"github.com/Mahadi-rsio/air/internal/pageserver"
 	"github.com/Mahadi-rsio/air/internal/tenant"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -30,8 +29,9 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-const currentSchemaVersion = 2
-type restoreDatabaseReq struct {	TargetLSN   string `json:"target_lsn"`	TargetTime string `json:"target_time,omitempty"`	NewTenantID string `json:"new_tenant_id,omitempty"`	VerifyQuery string `json:"verify_query"`}
+var (
+	ErrIdempotencyConflict = errors.New("idempotency conflict: key already used with different parameters")
+	ErrNotFound            = errors.New("database or resource not found")
 	ErrForbidden           = errors.New("forbidden: database belongs to another account")
 	ErrUnauthorized        = errors.New("unauthorized: missing, invalid, or revoked API key")
 	ErrCorruptedMetadata   = errors.New("corrupted metadata directory: refusing destructive reset")
@@ -68,27 +68,6 @@ type DatabaseInfo struct {
 	State            string `json:"state"`
 }
 
-// OffloadStatus describes the durable state of a tenant cold-offload operation.
-type OffloadStatus struct {
-	OpID            string     `json:"op_id"`
-	TenantID        string     `json:"tenant_id"`
-	Generation      string     `json:"generation"`
-	State           string     `json:"state"`
-	StartedAt       *time.Time `json:"started_at,omitempty"`
-	CompletedAt     *time.Time `json:"completed_at,omitempty"`
-	UploadedObjects int        `json:"uploaded_objects"`
-	FailedObjects   int        `json:"failed_objects"`
-	ErrorDetails    string     `json:"error_details,omitempty"`
-	RetryCount      int        `json:"retry_count"`
-}
-
-type coldOffloadJob struct {
-	tenantID   string
-	generation string
-	opID       string
-	seq        int64
-}
-
 // ControlPlaneConfig configures ControlPlane metadata storage (either external HA MetaDSN or local MetaDir).
 type ControlPlaneConfig struct {
 	MetaDir        string
@@ -104,34 +83,40 @@ type ControlPlaneConfig struct {
 }
 
 // ControlPlane manages durable PG17 metadata, schema migrations, provisioning state machine, and tenant routing.
+//
+// Concurrency and Lock Ordering Invariants:
+//  1. provMu protects in-process provisioning state and configuration pointers (s3Client, faultHook).
+//  2. tenantLocks (via lockTenantLifecycle) serializes per-tenant lifecycle transitions (Suspend, Wake, Delete, Restore).
+//     Never hold lockTenantLifecycle across background cold-offload R2 uploads.
+//  3. psMu, walMu, coldMu, offloadMu, and activityMu are leaf locks protecting their respective maps/fields.
 type ControlPlane struct {
-	metaDir          string
-	metaDSN          string
-	externalMeta     bool
-	pgBin            string
-	metaPort         int
-	db               *pgxpool.Pool
-	agent            *cell.Agent
-	kms              *crypto.EnvelopeKMS
-	provMu           sync.Mutex
-	faultHook        func(stage string) error
-	gatewayPort      int
-	s3Client         *s3.Client
-	backupBucket     string
-	r2Primary        bool
-	evictOnSuspend   bool
-	internalToken    string
-	backendHost      string
-	pageserver       *pageserver.Pageserver
-	psMu             sync.RWMutex
-	wakeGroup        singleflight.Group
-	tenantLocksMu    sync.Mutex
-	tenantLocks      map[string]*sync.Mutex
-	activityMu       sync.Mutex
-	lastActivity     map[string]time.Time
-	walMu            sync.Mutex
-	walReceivers     map[string]context.CancelFunc
-	walDone          map[string]chan struct{}
+	metaDir              string
+	metaDSN              string
+	externalMeta         bool
+	pgBin                string
+	metaPort             int
+	db                   *pgxpool.Pool
+	agent                *cell.Agent
+	kms                  *crypto.EnvelopeKMS
+	provMu               sync.Mutex
+	faultHook            func(stage string) error
+	gatewayPort          int
+	s3Client             *s3.Client
+	backupBucket         string
+	r2Primary            bool
+	evictOnSuspend       bool
+	internalToken        string
+	backendHost          string
+	pageserver           *pageserver.Pageserver
+	psMu                 sync.RWMutex
+	wakeGroup            singleflight.Group
+	tenantLocksMu        sync.Mutex
+	tenantLocks          map[string]*sync.Mutex
+	activityMu           sync.Mutex
+	lastActivity         map[string]time.Time
+	walMu                sync.Mutex
+	walReceivers         map[string]context.CancelFunc
+	walDone              map[string]chan struct{}
 	coldMu               sync.Mutex
 	coldQueueStarted     bool
 	coldPending          map[string]bool
@@ -200,7 +185,6 @@ func NewControlPlaneWithConfig(ctx context.Context, cfg ControlPlaneConfig) (*Co
 		} else if err != nil {
 			return nil, err
 		} else {
-			// Ensure port/sockDir in postgresql.conf match current runtime settings cleanly.
 			conf := fmt.Sprintf("listen_addresses = '127.0.0.1'\nport = %d\nunix_socket_directories = '%s'\nmax_connections = 100\nshared_buffers = 32MB\nssl = off\n", cfg.MetaPort, sockDir)
 			if err := os.WriteFile(filepath.Join(pgData, "postgresql.conf"), []byte(conf), 0o600); err != nil {
 				return nil, err
@@ -304,11 +288,7 @@ func (cp *ControlPlane) getPageserver() *pageserver.Pageserver {
 }
 
 func parsePGLSN(s string) (uint64, error) {
-	var hi, lo uint32
-	if _, err := fmt.Sscanf(strings.TrimSpace(s), "%X/%X", &hi, &lo); err != nil {
-		return 0, fmt.Errorf("parse LSN %q: %w", s, err)
-	}
-	return (uint64(hi) << 32) | uint64(lo), nil
+	return backup.ParseLSN(s)
 }
 
 func (cp *ControlPlane) readPGControlLSN(pgDataDir string) uint64 {
@@ -493,160 +473,6 @@ func (cp *ControlPlane) backupStore() (*s3.Client, string) {
 	return cp.s3Client, cp.backupBucket
 }
 
-func (cp *ControlPlane) runMigrations(ctx context.Context) error {
-	if _, err := cp.db.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS schema_migrations (
-			version INT PRIMARY KEY,
-			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-		)
-	`); err != nil {
-		return err
-	}
-	var current int
-	_ = cp.db.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&current)
-	if current < 1 {
-		tx, err := cp.db.Begin(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-		stmts := []string{
-			`CREATE TABLE IF NOT EXISTS clusters (
-				tenant_id TEXT PRIMARY KEY,
-				account_id TEXT NOT NULL,
-				state TEXT NOT NULL,
-				direct_port INT NOT NULL DEFAULT 0,
-				system_identifier TEXT NOT NULL DEFAULT '',
-				fencing_epoch BIGINT NOT NULL DEFAULT 1,
-				app_password_enc TEXT NOT NULL DEFAULT '',
-				wrapped_dek TEXT NOT NULL DEFAULT '',
-				created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-			)`,
-			`CREATE TABLE IF NOT EXISTS idempotency_records (
-				account_id TEXT NOT NULL,
-				idempotency_key TEXT NOT NULL,
-				tenant_id TEXT NOT NULL,
-				payload_hash TEXT NOT NULL,
-				response_json JSONB NOT NULL,
-				created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-				PRIMARY KEY (account_id, idempotency_key)
-			)`,
-			`CREATE TABLE IF NOT EXISTS provisioning_ops (
-				op_id BIGSERIAL PRIMARY KEY,
-				account_id TEXT NOT NULL,
-				tenant_id TEXT NOT NULL,
-				idempotency_key TEXT NOT NULL,
-				state TEXT NOT NULL,
-				last_error TEXT NOT NULL DEFAULT '',
-				created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-			)`,
-			`INSERT INTO schema_migrations(version) VALUES (1) ON CONFLICT DO NOTHING`,
-		}
-		for _, s := range stmts {
-			if _, err := tx.Exec(ctx, s); err != nil {
-				return fmt.Errorf("migration v1 failed: %w", err)
-			}
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-	}
-	if current < 2 {
-		tx, err := cp.db.Begin(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-		stmts := []string{
-			`CREATE TABLE IF NOT EXISTS api_keys (
-				key_id TEXT PRIMARY KEY,
-				key_sha256 TEXT UNIQUE NOT NULL,
-				account_id TEXT NOT NULL,
-				description TEXT NOT NULL DEFAULT '',
-				created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-				revoked_at TIMESTAMPTZ
-			)`,
-			`CREATE INDEX IF NOT EXISTS idx_api_keys_account_id ON api_keys(account_id)`,
-			`INSERT INTO schema_migrations(version) VALUES (2) ON CONFLICT DO NOTHING`,
-		}
-		for _, s := range stmts {
-			if _, err := tx.Exec(ctx, s); err != nil {
-				return fmt.Errorf("migration v2 failed: %w", err)
-			}
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-	}
-	if current < 3 {
-		tx, err := cp.db.Begin(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-		stmts := []string{
-			`CREATE TABLE IF NOT EXISTS tenant_events (
-				version BIGSERIAL PRIMARY KEY,
-				tenant_id TEXT NOT NULL,
-				event_type TEXT NOT NULL,
-				state TEXT NOT NULL,
-				host TEXT NOT NULL DEFAULT '',
-				direct_port INT NOT NULL DEFAULT 0,
-				fencing_epoch BIGINT NOT NULL DEFAULT 1,
-				emitted_at TIMESTAMPTZ NOT NULL DEFAULT now()
-			)`,
-			`CREATE INDEX IF NOT EXISTS idx_tenant_events_tenant_id ON tenant_events(tenant_id, version)`,
-			`INSERT INTO schema_migrations(version) VALUES (3) ON CONFLICT DO NOTHING`,
-		}
-		for _, s := range stmts {
-			if _, err := tx.Exec(ctx, s); err != nil {
-				return fmt.Errorf("migration v3 failed: %w", err)
-			}
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-	}
-	if current < 4 {
-		tx, err := cp.db.Begin(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-		stmts := []string{
-			`ALTER TABLE clusters ADD COLUMN IF NOT EXISTS generation TEXT NOT NULL DEFAULT ''`,
-			`ALTER TABLE clusters ADD COLUMN IF NOT EXISTS lifecycle_seq BIGINT NOT NULL DEFAULT 1`,
-			`CREATE TABLE IF NOT EXISTS offload_ops (
-				op_id TEXT PRIMARY KEY,
-				tenant_id TEXT NOT NULL,
-				generation TEXT NOT NULL DEFAULT '',
-				state TEXT NOT NULL,
-				started_at TIMESTAMPTZ,
-				completed_at TIMESTAMPTZ,
-				uploaded_objects INT NOT NULL DEFAULT 0,
-				failed_objects INT NOT NULL DEFAULT 0,
-				error_details TEXT NOT NULL DEFAULT '',
-				retry_count INT NOT NULL DEFAULT 0,
-				created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-			)`,
-			`CREATE INDEX IF NOT EXISTS idx_offload_ops_tenant ON offload_ops(tenant_id, created_at DESC)`,
-			`INSERT INTO schema_migrations(version) VALUES (4) ON CONFLICT DO NOTHING`,
-		}
-		for _, s := range stmts {
-			if _, err := tx.Exec(ctx, s); err != nil {
-				return fmt.Errorf("migration v4 failed: %w", err)
-			}
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (cp *ControlPlane) reloadDEKs(ctx context.Context) error {
 	if cp.kms == nil {
 		return nil
@@ -666,12 +492,6 @@ func (cp *ControlPlane) reloadDEKs(ctx context.Context) error {
 		}
 	}
 	return rows.Err()
-}
-
-func (cp *ControlPlane) SchemaVersion(ctx context.Context) (int, error) {
-	var v int
-	err := cp.db.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&v)
-	return v, err
 }
 
 func payloadHash(accountID, tenantID string) string {
@@ -712,7 +532,6 @@ func (cp *ControlPlane) ProvisionDatabase(ctx context.Context, accountID, idempo
 		if uErr := json.Unmarshal(storedResp, &out); uErr != nil {
 			return nil, uErr
 		}
-		// Decrypt password for owning account replay.
 		if pw, dErr := cp.decryptTenantPassword(ctx, accountID, tenantID); dErr == nil {
 			out.Password = pw
 		}
@@ -1091,255 +910,6 @@ func (cp *ControlPlane) DeleteDatabase(ctx context.Context, accountID, tenantID 
 	return err
 }
 
-type BackupResponse struct {
-	TenantID            string `json:"tenant_id"`
-	BackupID            string `json:"backup_id"`
-	ParentID            string `json:"parent_id,omitempty"`
-	Type                string `json:"type"`
-	R2Key               string `json:"r2_key"`
-	Epoch               int64  `json:"epoch"`
-	CipherBytes         int    `json:"cipher_bytes"`
-	WALSegmentsArchived int    `json:"wal_segments_archived"`
-}
-
-type RestoreResponse struct {
-	TenantID            string `json:"tenant_id"`
-	TargetLSN           string `json:"target_lsn,omitempty"`
-	RestoredBackups     int    `json:"restored_backups"`
-	WALSegmentsReplayed int    `json:"wal_segments_replayed"`
-	StagingHeadroomOK   bool   `json:"staging_headroom_ok"`
-	AmcheckOK           bool   `json:"amcheck_ok"`
-	VerifyQueryOutput   string `json:"verify_query_output,omitempty"`
-}
-
-// TriggerBackup executes an encrypted FULL or INCR backup + WAL spool drain for an active tenant.
-func (cp *ControlPlane) TriggerBackup(ctx context.Context, accountID, tenantID, backupType string) (*BackupResponse, error) {
-	if err := tenant.ValidateAccountID(accountID); err != nil {
-		return nil, err
-	}
-	if err := tenant.ValidateID(tenantID); err != nil {
-		return nil, err
-	}
-	var owner, state string
-	err := cp.db.QueryRow(ctx, `SELECT account_id, state FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&owner, &state)
-	if errors.Is(err, pgx.ErrNoRows) || state == "PURGED" {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	if owner != accountID {
-		return nil, ErrForbidden
-	}
-	if state != "ACTIVE" {
-		return nil, fmt.Errorf("tenant %s is not ACTIVE (state=%s)", tenantID, state)
-	}
-	if cp.agent == nil {
-		return nil, errors.New("cell agent is not configured")
-	}
-	s3c, bucket := cp.backupStore()
-	if s3c == nil || bucket == "" {
-		return nil, ErrBackupNotConfigured
-	}
-
-	bkpType := strings.ToUpper(strings.TrimSpace(backupType))
-	if bkpType == "" {
-		bkpType = "FULL"
-	}
-	if bkpType != "FULL" && bkpType != "INCR" && bkpType != "WAL" {
-		return nil, fmt.Errorf("unsupported backup type %q (must be FULL, INCR, or WAL)", backupType)
-	}
-	return cp.backupTenantToR2(ctx, tenantID, bkpType)
-}
-
-func (cp *ControlPlane) backupTenantToR2(ctx context.Context, tenantID, bkpType string) (*BackupResponse, error) {
-	s3c, bucket := cp.backupStore()
-	if s3c == nil || bucket == "" {
-		return nil, ErrBackupNotConfigured
-	}
-
-	var art *fencing.BackupArtifact
-	if bkpType != "WAL" {
-		var parentID, parentManifestPath string
-		if bkpType == "INCR" {
-			manifest, _, mErr := fencing.ReadManifestWithETag(ctx, s3c, bucket, tenantID)
-			if mErr == nil && manifest != nil && len(manifest.Backups) > 0 {
-				last := manifest.Backups[len(manifest.Backups)-1]
-				parentID = last.BackupID
-				if bkpBase, sErr := tenant.SafeSubpath(cp.agent.VolDir(), "backups", tenantID); sErr == nil {
-					candidate := filepath.Join(bkpBase, last.BackupID, "backup_manifest")
-					if _, stErr := os.Stat(candidate); stErr == nil {
-						parentManifestPath = candidate
-					}
-				}
-			}
-			if parentID == "" || parentManifestPath == "" {
-				bkpType = "FULL"
-				parentID = ""
-				parentManifestPath = ""
-			}
-		}
-
-		bkpID := fmt.Sprintf("bkp_%d", time.Now().UnixNano())
-		var err error
-		art, _, err = backup.RunEncryptedBackupStep(ctx, cp.agent, s3c, bucket, tenantID, bkpID, parentID, bkpType, parentManifestPath)
-		if err != nil {
-			return nil, err
-t	gen := cp.getTenantGeneration(ctx, tenantID)
-		art, _, err = backup.RunEncryptedBackupStepGen(ctx, cp.agent, s3c, bucket, tenantID, gen, bkpID, parentID, bkpType, parentManifestPath)
-	walCount, err := cp.drainWALSpoolAndUpdateManifest(ctx, tenantID, 0, false)
-	if err != nil {
-		return nil, err
-	}
-
-	resp := &BackupResponse{
-		TenantID:            tenantID,
-		Type:                bkpType,
-		WALSegmentsArchived: walCount,
-	}
-	if art != nil {
-		resp.BackupID = art.BackupID
-		resp.ParentID = art.ParentID
-		resp.Type = art.Type
-		resp.R2Key = art.R2Key
-		resp.Epoch = art.Epoch
-		resp.CipherBytes = art.CipherBytes
-	}
-	return resp, nil
-}
-
-func (cp *ControlPlane) drainWALSpoolAndUpdateManifest(ctx context.Context, tenantID string, epoch int64, stopped bool) (int, error) {
-	return cp.drainWALSpoolAndUpdateManifestGen(ctx, tenantID, cp.getTenantGeneration(ctx, tenantID), epoch, stopped)
-}
-
-func (cp *ControlPlane) drainWALSpoolAndUpdateManifestGen(ctx context.Context, tenantID, generation string, epoch int64, stopped bool) (int, error) {
-	s3c, bucket := cp.backupStore()
-	if s3c == nil || bucket == "" {
-		return 0, nil
-	}
-	var walSegs []backup.WALSegmentArtifact
-	var err error
-	if stopped {
-		walSegs, err = backup.DrainStoppedWALSpoolToR2Gen(ctx, cp.agent, s3c, bucket, tenantID, generation, epoch)
-	} else {
-		walSegs, err = backup.DrainAndEncryptWALSpoolToR2(ctx, cp.agent, s3c, bucket, tenantID)
-	}
-	if err != nil {
-		return 0, err
-	}
-	if len(walSegs) > 0 {
-		manifest, etag, mErr := fencing.ReadManifestWithETagGen(ctx, s3c, bucket, tenantID, generation)
-		if mErr == nil && manifest != nil {
-			seen := make(map[string]bool, len(manifest.WALSegments))
-			for _, k := range manifest.WALSegments {
-				seen[k] = true
-			}
-			for _, w := range walSegs {
-				if !seen[w.R2Key] {
-					manifest.WALSegments = append(manifest.WALSegments, w.R2Key)
-					seen[w.R2Key] = true
-				}
-			}
-			if _, casErr := fencing.PutManifestCAS(ctx, s3c, bucket, manifest, etag); casErr != nil {
-				return 0, casErr
-			}
-		}
-	}
-	return len(walSegs), nil
-}
-
-// RestoreDatabase executes CombineAndReplayPITR for a tenant up to targetLSN (or latest WAL).
-func (cp *ControlPlane) RestoreDatabase(ctx context.Context, accountID, tenantID, targetLSN, verifyQuery string) (*RestoreResponse, error) {
-	if err := tenant.ValidateAccountID(accountID); err != nil {
-		return nil, err
-	}
-	if err := tenant.ValidateID(tenantID); err != nil {
-		return nil, err
-	}
-	var owner, state string
-	err := cp.db.QueryRow(ctx, `SELECT account_id, state FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&owner, &state)
-	if errors.Is(err, pgx.ErrNoRows) || state == "PURGED" {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	if owner != accountID {
-		return nil, ErrForbidden
-	}
-	if cp.agent == nil {
-		return nil, errors.New("cell agent is not configured")
-	}
-	s3c, bucket := cp.backupStore()
-	if s3c == nil || bucket == "" {
-		return nil, ErrBackupNotConfigured
-	}
-
-	manifest, _, err := fencing.ReadManifestWithETag(ctx, s3c, bucket, tenantID)
-	if err != nil {
-		if fencing.IsNotFoundErr(err) {
-			return nil, fmt.Errorf("%w: no backup manifest for tenant %s", ErrNotFound, tenantID)
-		}
-		return nil, err
-	}
-	if len(manifest.Backups) == 0 {
-		return nil, fmt.Errorf("%w: manifest has no backups for tenant %s", ErrNotFound, tenantID)
-	}
-
-	// Build latest FULL -> INCR chain from manifest.Backups
-	lastFullIdx := -1
-	for i := len(manifest.Backups) - 1; i >= 0; i-- {
-		if manifest.Backups[i].Type == "FULL" {
-			lastFullIdx = i
-			break
-		}
-	}
-	if lastFullIdx < 0 {
-		return nil, fmt.Errorf("no FULL backup found in manifest for tenant %s", tenantID)
-	}
-	var chain []*fencing.BackupArtifact
-	first := manifest.Backups[lastFullIdx]
-	chain = append(chain, &first)
-	for i := lastFullIdx + 1; i < len(manifest.Backups); i++ {
-		cand := manifest.Backups[i]
-		if cand.Type == "INCR" && cand.ParentID == chain[len(chain)-1].BackupID {
-			c := cand
-			chain = append(chain, &c)
-		}
-	}
-
-	var walSegs []backup.WALSegmentArtifact
-	for _, r2Key := range manifest.WALSegments {
-		segName := strings.TrimSuffix(filepath.Base(r2Key), ".zst.enc")
-		walSegs = append(walSegs, backup.WALSegmentArtifact{
-			SegmentName: segName,
-			R2Key:       r2Key,
-			Epoch:       chain[0].Epoch,
-		})
-	}
-
-	if strings.TrimSpace(verifyQuery) == "" {
-		verifyQuery = "SELECT 1;"
-	}
-	qOut, headroomOK, amcheckOK, err := backup.CombineAndReplayPITRWithOptions(
-		ctx, cp.agent, s3c, bucket, tenantID, tenantID,
-		chain, walSegs, targetLSN, verifyQuery, backup.TarExtractLimits{},
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	return &RestoreResponse{
-		TenantID:            tenantID,
-		TargetLSN:           targetLSN,
-		RestoredBackups:     len(chain),
-		WALSegmentsReplayed: len(walSegs),
-		StagingHeadroomOK:   headroomOK,
-		AmcheckOK:           amcheckOK,
-		VerifyQueryOutput:   qOut,
-	}, nil
-}
-
 // GetTenantRoute is used by the PostgreSQL Gateway to resolve active tenant backend port.
 func (cp *ControlPlane) GetTenantRoute(ctx context.Context, tenantID string) (state string, directPort int, err error) {
 	if err := tenant.ValidateID(tenantID); err != nil {
@@ -1397,8 +967,6 @@ func (cp *ControlPlane) GetTenantRouteAndCredentials(ctx context.Context, tenant
 	return state, directPort, sockDir, appPassword, nil
 }
 
-// WakeTenant coalesces concurrent wake requests for a SUSPENDED tenant via singleflight,
-// starting the tenant's PostgreSQL 17 instance once and transitioning state back to ACTIVE.
 func (cp *ControlPlane) lockTenantLifecycle(tenantID string) func() {
 	cp.tenantLocksMu.Lock()
 	if cp.tenantLocks == nil {
@@ -1414,6 +982,8 @@ func (cp *ControlPlane) lockTenantLifecycle(tenantID string) func() {
 	return mu.Unlock
 }
 
+// WakeTenant coalesces concurrent wake requests for a SUSPENDED tenant via singleflight,
+// starting the tenant's PostgreSQL 17 instance once and transitioning state back to ACTIVE.
 func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (directPort int, sockDir string, appPassword string, err error) {
 	if err := tenant.ValidateID(tenantID); err != nil {
 		return 0, "", "", err
@@ -1422,7 +992,6 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 		return 0, "", "", errors.New("cell agent not configured")
 	}
 	v, err, _ := cp.wakeGroup.Do(tenantID, func() (any, error) {
-		// Cancel any in-flight cold offload for this tenant immediately so we don't wait on slow R2 I/O.
 		cp.cancelActiveOffload(tenantID)
 		unlock := cp.lockTenantLifecycle(tenantID)
 		defer unlock()
@@ -1439,7 +1008,6 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 		if curState != "SUSPENDED" && curState != "ACTIVE" {
 			return nil, fmt.Errorf("tenant %s cannot wake from state %s", tenantID, curState)
 		}
-		// Advance lifecycle_seq and cancel any pending/running offload ops so a stale offload cannot evict or overwrite.
 		_, _ = cp.db.Exec(ctx, `UPDATE clusters SET lifecycle_seq = lifecycle_seq + 1, updated_at = NOW() WHERE tenant_id = $1`, tenantID)
 		_, _ = cp.db.Exec(ctx,
 			`UPDATE offload_ops SET state = 'cancelled', completed_at = COALESCE(completed_at, now()), error_details = 'cancelled by wake', updated_at = now()
@@ -1717,463 +1285,6 @@ func (cp *ControlPlane) UnlockDatabase(ctx context.Context, tenantID string) err
 		cp.emitTenantEvent(ctx, tenantID, tenantEventUpsert, "SUSPENDED", 0, 1)
 	}
 	return err
-}
-
-func (cp *ControlPlane) shouldEvictLocalOnSuspend() bool {
-	return cp.evictOnSuspend || os.Getenv("AIR_EVICT_ON_SUSPEND") == "true"
-}
-
-func (cp *ControlPlane) cancelActiveOffload(tenantID string) {
-	cp.offloadMu.Lock()
-	cancel, ok := cp.activeOffloadCancels[tenantID]
-	cp.offloadMu.Unlock()
-	if ok && cancel != nil {
-		cancel()
-	}
-}
-
-func (cp *ControlPlane) registerActiveOffloadCancel(tenantID string, cancel context.CancelFunc) {
-	cp.offloadMu.Lock()
-	if cp.activeOffloadCancels == nil {
-		cp.activeOffloadCancels = make(map[string]context.CancelFunc)
-	}
-	if prev, ok := cp.activeOffloadCancels[tenantID]; ok && prev != nil {
-		prev()
-	}
-	cp.activeOffloadCancels[tenantID] = cancel
-	cp.offloadMu.Unlock()
-}
-
-func (cp *ControlPlane) clearActiveOffloadCancel(tenantID string) {
-	cp.offloadMu.Lock()
-	delete(cp.activeOffloadCancels, tenantID)
-	cp.offloadMu.Unlock()
-}
-
-func (cp *ControlPlane) createOffloadOp(ctx context.Context, tenantID, generation, initialState string) string {
-	opID := newOffloadOpID()
-	if cp.db == nil {
-		return opID
-	}
-	var startedAt any
-	if initialState == "running" {
-		startedAt = time.Now().UTC()
-	}
-	_, _ = cp.db.Exec(ctx,
-		`INSERT INTO offload_ops (op_id, tenant_id, generation, state, started_at) VALUES ($1, $2, $3, $4, $5)`,
-		opID, tenantID, generation, initialState, startedAt,
-	)
-	return opID
-}
-
-func (cp *ControlPlane) updateOffloadOpRunning(ctx context.Context, opID string, retryCount int) {
-	if cp.db == nil || opID == "" {
-		return
-	}
-	_, _ = cp.db.Exec(ctx,
-		`UPDATE offload_ops SET state = 'running', started_at = COALESCE(started_at, now()), retry_count = $2, updated_at = now()
-		 WHERE op_id = $1 AND state NOT IN ('succeeded', 'cancelled')`,
-		opID, retryCount,
-	)
-}
-
-func (cp *ControlPlane) finishOffloadOpSucceeded(ctx context.Context, opID string, uploaded, failed int) {
-	if cp.db == nil || opID == "" {
-		return
-	}
-	_, _ = cp.db.Exec(ctx,
-		`UPDATE offload_ops SET state = 'succeeded', completed_at = now(), uploaded_objects = $2, failed_objects = $3, error_details = '', updated_at = now()
-		 WHERE op_id = $1 AND state <> 'cancelled'`,
-		opID, uploaded, failed,
-	)
-}
-
-func (cp *ControlPlane) finishOffloadOpFailed(ctx context.Context, opID string, uploaded, failed, retryCount int, errMsg string) {
-	if cp.db == nil || opID == "" {
-		return
-	}
-	_, _ = cp.db.Exec(ctx,
-		`UPDATE offload_ops SET state = 'failed', completed_at = now(), uploaded_objects = $2, failed_objects = $3, retry_count = $4, error_details = $5, updated_at = now()
-		 WHERE op_id = $1 AND state <> 'cancelled'`,
-		opID, uploaded, failed, retryCount, errMsg,
-	)
-}
-
-func (cp *ControlPlane) finishOffloadOpCancelled(ctx context.Context, opID, reason string) {
-	if cp.db == nil || opID == "" {
-		return
-	}
-	_, _ = cp.db.Exec(ctx,
-		`UPDATE offload_ops SET state = 'cancelled', completed_at = COALESCE(completed_at, now()), error_details = CASE WHEN error_details = '' THEN $2 ELSE error_details END, updated_at = now()
-		 WHERE op_id = $1 AND state IN ('pending', 'running')`,
-		opID, reason,
-	)
-}
-
-// GetLatestOffloadStatus returns the most recent offload operation for tenantID.
-func (cp *ControlPlane) GetLatestOffloadStatus(ctx context.Context, accountID, tenantID string) (*OffloadStatus, error) {
-	if accountID != "" {
-		if err := tenant.ValidateAccountID(accountID); err != nil {
-			return nil, err
-		}
-	}
-	if err := tenant.ValidateID(tenantID); err != nil {
-		return nil, err
-	}
-	if accountID != "" {
-		var owner string
-		err := cp.db.QueryRow(ctx, `SELECT account_id FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&owner)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		if err != nil {
-			return nil, err
-		}
-		if owner != accountID {
-			return nil, ErrForbidden
-		}
-	}
-	var st OffloadStatus
-	err := cp.db.QueryRow(ctx,
-		`SELECT op_id, tenant_id, generation, state, started_at, completed_at, uploaded_objects, failed_objects, error_details, retry_count
-		 FROM offload_ops WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1`,
-		tenantID,
-	).Scan(&st.OpID, &st.TenantID, &st.Generation, &st.State, &st.StartedAt, &st.CompletedAt, &st.UploadedObjects, &st.FailedObjects, &st.ErrorDetails, &st.RetryCount)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &st, nil
-}
-
-// GetOffloadStatus returns a specific offload operation by opID.
-func (cp *ControlPlane) GetOffloadStatus(ctx context.Context, opID string) (*OffloadStatus, error) {
-	var st OffloadStatus
-	err := cp.db.QueryRow(ctx,
-		`SELECT op_id, tenant_id, generation, state, started_at, completed_at, uploaded_objects, failed_objects, error_details, retry_count
-		 FROM offload_ops WHERE op_id = $1`,
-		opID,
-	).Scan(&st.OpID, &st.TenantID, &st.Generation, &st.State, &st.StartedAt, &st.CompletedAt, &st.UploadedObjects, &st.FailedObjects, &st.ErrorDetails, &st.RetryCount)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &st, nil
-}
-
-// StartColdOffloadWorker starts background workers that upload cold data of suspended tenants
-// to R2 and delete local pgdata/WAL cache once durable R2 sync succeeds.
-func (cp *ControlPlane) StartColdOffloadWorker(ctx context.Context, workers int) {
-	if workers <= 0 {
-		workers = 2
-	}
-	cp.coldMu.Lock()
-	if cp.coldQueueStarted {
-		cp.coldMu.Unlock()
-		return
-	}
-	workerCtx, workerCancel := context.WithCancel(ctx)
-	cp.coldQueueStarted = true
-	cp.coldWorkerCancel = workerCancel
-	cp.coldPending = make(map[string]bool)
-	cp.coldQueueCh = make(chan coldOffloadJob, 256)
-	if cp.coldRetryDelay <= 0 {
-		cp.coldRetryDelay = 5 * time.Second
-	}
-	if cp.coldMaxAttempts <= 0 {
-		cp.coldMaxAttempts = 5
-	}
-	cp.coldMu.Unlock()
-
-	for i := 0; i < workers; i++ {
-		cp.coldWorkersWg.Add(1)
-		go func() {
-			defer cp.coldWorkersWg.Done()
-			for {
-				select {
-				case <-workerCtx.Done():
-					return
-				case job := <-cp.coldQueueCh:
-					cp.coldMu.Lock()
-					delete(cp.coldPending, job.tenantID)
-					cp.coldMu.Unlock()
-					cp.runColdOffloadWithRetry(workerCtx, job)
-				}
-			}
-		}()
-	}
-
-	// On startup, recover any interrupted offload_ops and enqueue suspended tenants with local pgdata.
-	if cp.db != nil {
-		// Mark any orphaned pending/running ops whose tenant is no longer SUSPENDED (or generation changed) as cancelled.
-		_, _ = cp.db.Exec(ctx,
-			`UPDATE offload_ops o SET state = 'cancelled', completed_at = COALESCE(completed_at, now()),
-			 error_details = CASE WHEN error_details = '' THEN 'cancelled after server restart' ELSE error_details END,
-			 updated_at = now()
-			 WHERE o.state IN ('pending', 'running')
-			   AND NOT EXISTS (
-			     SELECT 1 FROM clusters c
-			     WHERE c.tenant_id = o.tenant_id AND c.state = 'SUSPENDED' AND COALESCE(c.generation, '') = o.generation
-			   )`,
-		)
-	}
-	if cp.agent != nil && cp.db != nil {
-		rows, err := cp.db.Query(ctx, `SELECT tenant_id, COALESCE(generation, ''), COALESCE(lifecycle_seq, 1) FROM clusters WHERE state = 'SUSPENDED'`)
-		if err == nil {
-			type suspRow struct {
-				tid string
-				gen string
-				seq int64
-			}
-			var suspended []suspRow
-			for rows.Next() {
-				var r suspRow
-				if scanErr := rows.Scan(&r.tid, &r.gen, &r.seq); scanErr == nil {
-					suspended = append(suspended, r)
-				}
-			}
-			rows.Close()
-			for _, r := range suspended {
-				if cp.agent.HasLocalPGData(r.tid) {
-					var existingOp string
-					_ = cp.db.QueryRow(ctx,
-						`SELECT op_id FROM offload_ops WHERE tenant_id = $1 AND generation = $2 AND state IN ('pending', 'running') ORDER BY created_at DESC LIMIT 1`,
-						r.tid, r.gen,
-					).Scan(&existingOp)
-					if existingOp == "" {
-						existingOp = cp.createOffloadOp(ctx, r.tid, r.gen, "pending")
-					}
-					cp.enqueueColdOffloadJob(coldOffloadJob{tenantID: r.tid, generation: r.gen, opID: existingOp, seq: r.seq})
-				}
-			}
-		}
-	}
-}
-
-// EnqueueColdOffload queues a suspended tenant for asynchronous R2 cold upload and local cache eviction.
-func (cp *ControlPlane) EnqueueColdOffload(tenantID string) {
-	if err := tenant.ValidateID(tenantID); err != nil {
-		return
-	}
-	var gen string
-	var seq int64
-	if cp.db != nil {
-		_ = cp.db.QueryRow(context.Background(), `SELECT COALESCE(generation, ''), COALESCE(lifecycle_seq, 1) FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&gen, &seq)
-	}
-	opID := cp.createOffloadOp(context.Background(), tenantID, gen, "pending")
-	cp.enqueueColdOffloadJob(coldOffloadJob{tenantID: tenantID, generation: gen, opID: opID, seq: seq})
-}
-
-func (cp *ControlPlane) enqueueColdOffloadJob(job coldOffloadJob) {
-	if err := tenant.ValidateID(job.tenantID); err != nil {
-		return
-	}
-	cp.coldMu.Lock()
-	if !cp.coldQueueStarted || cp.coldQueueCh == nil {
-		cp.coldMu.Unlock()
-		return
-	}
-	if cp.coldPending[job.tenantID] {
-		cp.coldMu.Unlock()
-		return
-	}
-	cp.coldPending[job.tenantID] = true
-	ch := cp.coldQueueCh
-	cp.coldMu.Unlock()
-
-	select {
-	case ch <- job:
-	default:
-		// Queue full: clear pending flag so a subsequent scan/suspend can re-enqueue.
-		cp.coldMu.Lock()
-		delete(cp.coldPending, job.tenantID)
-		cp.coldMu.Unlock()
-		log.Printf("[cold-offload] queue full, skipping enqueue for %s", job.tenantID)
-	}
-}
-
-func (cp *ControlPlane) runColdOffloadWithRetry(ctx context.Context, job coldOffloadJob) {
-	cp.coldMu.Lock()
-	maxAttempts := cp.coldMaxAttempts
-	delay := cp.coldRetryDelay
-	cp.coldMu.Unlock()
-	if maxAttempts <= 0 {
-		maxAttempts = 5
-	}
-	if delay <= 0 {
-		delay = 5 * time.Second
-	}
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if ctx.Err() != nil {
-			cp.finishOffloadOpCancelled(context.Background(), job.opID, "cancelled by server shutdown")
-			return
-		}
-		cp.updateOffloadOpRunning(ctx, job.opID, attempt-1)
-		jobCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		evicted, uploaded, failed, cancelled, err := cp.processColdOffloadJob(jobCtx, job)
-		cancel()
-		if cancelled {
-			cp.finishOffloadOpCancelled(context.Background(), job.opID, "cancelled by lifecycle transition")
-			return
-		}
-		if err == nil {
-			cp.finishOffloadOpSucceeded(context.Background(), job.opID, uploaded, failed)
-			if evicted {
-				log.Printf("[cold-offload] tenant=%s gen=%s r2_sync=ok evicted=true", job.tenantID, job.generation)
-			}
-			return
-		}
-		log.Printf("[cold-offload] tenant=%s gen=%s attempt=%d/%d failed (keeping local cache): %v", job.tenantID, job.generation, attempt, maxAttempts, err)
-		if attempt == maxAttempts {
-			cp.finishOffloadOpFailed(context.Background(), job.opID, uploaded, failed, attempt-1, err.Error())
-			return
-		}
-		// Exponential backoff capped at 60s.
-		backoff := delay * time.Duration(1<<uint(attempt-1))
-		if backoff > 60*time.Second {
-			backoff = 60 * time.Second
-		}
-		timer := time.NewTimer(backoff)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			cp.finishOffloadOpCancelled(context.Background(), job.opID, "cancelled by server shutdown")
-			return
-		case <-timer.C:
-		}
-	}
-}
-
-func (cp *ControlPlane) processColdOffload(ctx context.Context, tenantID string) (bool, error) {
-	var gen string
-	var seq int64
-	if cp.db != nil {
-		_ = cp.db.QueryRow(ctx, `SELECT COALESCE(generation, ''), COALESCE(lifecycle_seq, 1) FROM clusters WHERE tenant_id = $1`, tenantID).Scan(&gen, &seq)
-	}
-	evicted, _, _, _, err := cp.processColdOffloadJob(ctx, coldOffloadJob{tenantID: tenantID, generation: gen, seq: seq})
-	return evicted, err
-}
-
-func (cp *ControlPlane) processColdOffloadJob(ctx context.Context, job coldOffloadJob) (evicted bool, uploaded int, failed int, cancelled bool, err error) {
-	if cp.agent == nil {
-		return false, 0, 0, false, nil
-	}
-
-	// Phase 1 (brief lock): validate tenant state, generation, and lifecycle_seq; register cancellable context.
-	unlock := cp.lockTenantLifecycle(job.tenantID)
-	var state, curGen string
-	var epoch, curSeq int64
-	qErr := cp.db.QueryRow(ctx,
-		`SELECT state, fencing_epoch, COALESCE(generation, ''), COALESCE(lifecycle_seq, 1) FROM clusters WHERE tenant_id = $1`,
-		job.tenantID,
-	).Scan(&state, &epoch, &curGen, &curSeq)
-	if errors.Is(qErr, pgx.ErrNoRows) || state != "SUSPENDED" || (job.generation != "" && curGen != job.generation) || (job.seq != 0 && curSeq != job.seq) {
-		unlock()
-		return false, 0, 0, true, nil
-	}
-	if qErr != nil {
-		unlock()
-		return false, 0, 0, false, qErr
-	}
-	offloadCtx, cancel := context.WithCancel(ctx)
-	cp.registerActiveOffloadCancel(job.tenantID, cancel)
-	unlock()
-	defer func() {
-		cancel()
-		cp.clearActiveOffloadCancel(job.tenantID)
-	}()
-
-	// Phase 2 (NO lifecycle lock held): perform potentially slow R2 network uploads.
-	ps := cp.getPageserver()
-	if ps != nil {
-		if curGen != "" {
-			ps.SetTenantGeneration(job.tenantID, curGen)
-		}
-		lm, fErr := ps.FlushTenant(offloadCtx, job.tenantID)
-		if fErr != nil {
-			if offloadCtx.Err() != nil && ctx.Err() == nil {
-				return false, uploaded, failed, true, nil
-			}
-			if errors.Is(fErr, pageserver.ErrStaleGeneration) {
-				return false, uploaded, failed, true, nil
-			}
-			return false, uploaded, failed + 1, false, fmt.Errorf("flush pageserver layers: %w", fErr)
-		}
-		if lm != nil {
-			uploaded++
-		}
-		if pgDataDir, pdErr := cp.agent.TenantPGDataDir(job.tenantID); pdErr == nil {
-			if _, stErr := os.Stat(filepath.Join(pgDataDir, "PG_VERSION")); stErr == nil {
-				if _, sErr := ps.SaveMetadataSkeleton(offloadCtx, job.tenantID, epoch, pgDataDir); sErr != nil {
-					if offloadCtx.Err() != nil && ctx.Err() == nil {
-						return false, uploaded, failed, true, nil
-					}
-					return false, uploaded, failed + 1, false, fmt.Errorf("save metadata skeleton: %w", sErr)
-				}
-				uploaded++
-			}
-		}
-	}
-
-	walCnt, wErr := cp.drainWALSpoolAndUpdateManifestGen(offloadCtx, job.tenantID, curGen, epoch, true)
-	if wErr != nil {
-		if offloadCtx.Err() != nil && ctx.Err() == nil {
-			return false, uploaded, failed, true, nil
-		}
-		return false, uploaded, failed + 1, false, fmt.Errorf("drain WAL spool to R2: %w", wErr)
-	}
-	uploaded += walCnt
-
-	if !cp.shouldEvictLocalOnSuspend() {
-		return false, uploaded, failed, false, nil
-	}
-
-	// Phase 3 (brief lock): re-verify generation, lifecycle_seq, and cancellation before evicting local pgdata.
-	unlock2 := cp.lockTenantLifecycle(job.tenantID)
-	defer unlock2()
-
-	if offloadCtx.Err() != nil {
-		return false, uploaded, failed, true, nil
-	}
-	var postState, postGen string
-	var postSeq int64
-	pErr := cp.db.QueryRow(offloadCtx,
-		`SELECT state, COALESCE(generation, ''), COALESCE(lifecycle_seq, 1) FROM clusters WHERE tenant_id = $1`,
-		job.tenantID,
-	).Scan(&postState, &postGen, &postSeq)
-	if errors.Is(pErr, pgx.ErrNoRows) || postState != "SUSPENDED" || postGen != curGen || postSeq != curSeq {
-		return false, uploaded, failed, true, nil
-	}
-	if pErr != nil {
-		return false, uploaded, failed, false, pErr
-	}
-
-	// Safety guard: never evict local pgdata unless durable state is confirmed in R2/pageserver.
-	if ps != nil {
-		if !ps.HasMetadataSkeleton(offloadCtx, job.tenantID) {
-			return false, uploaded, failed + 1, false, fmt.Errorf("refusing to evict %s: metadata skeleton not confirmed", job.tenantID)
-		}
-	} else {
-		s3c, bucket := cp.backupStore()
-		if !cp.r2Primary || s3c == nil || bucket == "" {
-			return false, uploaded, failed, false, nil
-		}
-		if m, _, mErr := fencing.ReadManifestWithETagGen(offloadCtx, s3c, bucket, job.tenantID, curGen); mErr != nil || m == nil || len(m.Backups) == 0 {
-			return false, uploaded, failed, false, nil
-		}
-	}
-
-	if !cp.agent.HasLocalPGData(job.tenantID) {
-		return false, uploaded, failed, false, nil
-	}
-	if eErr := cp.agent.EvictTenantLocalData(job.tenantID); eErr != nil {
-		return false, uploaded, failed, false, fmt.Errorf("evict local pgdata: %w", eErr)
-	}
-	return true, uploaded, failed, false, nil
 }
 
 // SuspendIdleTenants suspends any ACTIVE tenant whose last recorded activity exceeds idleTimeout.

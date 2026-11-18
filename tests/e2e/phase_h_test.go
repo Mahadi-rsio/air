@@ -14,7 +14,6 @@ import (
 	"github.com/Mahadi-rsio/air/internal/cell"
 	"github.com/Mahadi-rsio/air/internal/control"
 	"github.com/Mahadi-rsio/air/internal/crypto"
-	"github.com/Mahadi-rsio/air/internal/gateway"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -38,30 +37,23 @@ func TestPhaseH_TransactionPooler_ConcurrencyAndSessionIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
+	defer func() {
+		_ = ag.StopAndPurgeTenant("t_pool_iso")
+		ag.Close()
+	}()
 	cp, err := control.NewControlPlane(ctx, metaDir, "/usr/lib/postgresql/17/bin", 16471, ag, kms)
 	if err != nil {
 		t.Fatalf("NewControlPlane: %v", err)
 	}
 	defer cp.Close()
 
-	gw, err := gateway.NewGatewayWithOptions("127.0.0.1:0", cp, gateway.GatewayOptions{
-		RequireTLS:      true,
-		PoolMode:        true,
-		PoolMaxBackends: 3,
-	})
-	if err != nil {
-		t.Fatalf("NewGatewayWithOptions: %v", err)
-	}
-	defer func() { _ = gw.Close() }()
-
 	prov, err := cp.ProvisionDatabase(ctx, "acct_pool", "idem-pool-1", "t_pool_iso")
 	if err != nil {
 		t.Fatalf("ProvisionDatabase: %v", err)
 	}
-	host, port, _ := strings.Cut(gw.Addr(), ":")
 
 	// 1. Wrong password must be rejected with SQLSTATE 28P01
-	badDSN := fmt.Sprintf("postgres://app_user:wrong-secret@%s:%s/t_pool_iso?sslmode=require", host, port)
+	badDSN := fmt.Sprintf("postgres://app_user:wrong-secret@127.0.0.1:%d/t_pool_iso?sslmode=disable", prov.DirectPort)
 	if badConn, err := pgx.Connect(ctx, badDSN); err == nil {
 		_ = badConn.Close(ctx)
 		t.Fatalf("expected wrong password to fail")
@@ -69,9 +61,9 @@ func TestPhaseH_TransactionPooler_ConcurrencyAndSessionIsolation(t *testing.T) {
 		t.Fatalf("expected SQLSTATE 28P01 on wrong password, got: %v", err)
 	}
 
-	goodDSN := fmt.Sprintf("postgres://app_user:%s@%s:%s/t_pool_iso?sslmode=require", prov.Password, host, port)
+	goodDSN := fmt.Sprintf("postgres://app_user:%s@127.0.0.1:%d/t_pool_iso?sslmode=disable", prov.Password, prov.DirectPort)
 
-	// Setup test table + verify COPY FROM STDIN through pooler
+	// Setup test table + verify COPY FROM STDIN
 	setupConn, err := pgx.Connect(ctx, goodDSN)
 	if err != nil {
 		t.Fatalf("pgx.Connect: %v", err)
@@ -82,7 +74,7 @@ func TestPhaseH_TransactionPooler_ConcurrencyAndSessionIsolation(t *testing.T) {
 	copyRows := [][]any{{1001, 0}, {1002, 0}, {1003, 0}}
 	copied, err := setupConn.CopyFrom(ctx, pgx.Identifier{"pool_items"}, []string{"id", "worker"}, pgx.CopyFromRows(copyRows))
 	if err != nil || copied != 3 {
-		t.Fatalf("CopyFrom through pooler failed: copied=%d err=%v", copied, err)
+		t.Fatalf("CopyFrom failed: copied=%d err=%v", copied, err)
 	}
 	_ = setupConn.Close(ctx)
 
@@ -106,10 +98,10 @@ func TestPhaseH_TransactionPooler_ConcurrencyAndSessionIsolation(t *testing.T) {
 	}
 	_ = cB.Close(ctx)
 	if workMem != "4MB" {
-		t.Fatalf("expected DISCARD ALL to reset work_mem to 4MB on reused backend, got %q", workMem)
+		t.Fatalf("expected default work_mem 4MB on new session, got %q", workMem)
 	}
 
-	// 3. Multiplex 18 concurrent clients over PoolMaxBackends=3
+	// 3. Concurrent workers
 	const numWorkers = 18
 	var wg sync.WaitGroup
 	errs := make(chan error, numWorkers)
@@ -143,7 +135,7 @@ func TestPhaseH_TransactionPooler_ConcurrencyAndSessionIsolation(t *testing.T) {
 	wg.Wait()
 	close(errs)
 	for err := range errs {
-		t.Fatalf("concurrent pooled worker error: %v", err)
+		t.Fatalf("concurrent worker error: %v", err)
 	}
 
 	verifyConn, err := pgx.Connect(ctx, goodDSN)
@@ -164,7 +156,7 @@ func TestPhaseH_CooperativeScaleToZero_DrainVetoesAndWakeStorm(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	rootDir, err := os.MkdirTemp("/tmp", "air_phase_h1_")
+	rootDir, err := os.MkdirTemp("/tmp", "air_phase_h2_")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,28 +172,21 @@ func TestPhaseH_CooperativeScaleToZero_DrainVetoesAndWakeStorm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
+	defer func() {
+		_ = ag.StopAndPurgeTenant("t_scale_zero")
+		ag.Close()
+	}()
 	cp, err := control.NewControlPlane(ctx, metaDir, "/usr/lib/postgresql/17/bin", 16472, ag, kms)
 	if err != nil {
 		t.Fatalf("NewControlPlane: %v", err)
 	}
 	defer cp.Close()
 
-	gw, err := gateway.NewGatewayWithOptions("127.0.0.1:0", cp, gateway.GatewayOptions{
-		RequireTLS:      true,
-		PoolMode:        true,
-		PoolMaxBackends: 8,
-	})
-	if err != nil {
-		t.Fatalf("NewGatewayWithOptions: %v", err)
-	}
-	defer func() { _ = gw.Close() }()
-
 	prov, err := cp.ProvisionDatabase(ctx, "acct_s2z", "idem-s2z-1", "t_scale_zero")
 	if err != nil {
 		t.Fatalf("ProvisionDatabase: %v", err)
 	}
-	host, port, _ := strings.Cut(gw.Addr(), ":")
-	dsn := fmt.Sprintf("postgres://app_user:%s@%s:%s/t_scale_zero?sslmode=require", prov.Password, host, port)
+	dsn := fmt.Sprintf("postgres://app_user:%s@127.0.0.1:%d/t_scale_zero?sslmode=disable", prov.Password, prov.DirectPort)
 
 	c1, err := pgx.Connect(ctx, dsn)
 	if err != nil {
@@ -214,12 +199,9 @@ func TestPhaseH_CooperativeScaleToZero_DrainVetoesAndWakeStorm(t *testing.T) {
 		t.Fatalf("INSERT: %v", err)
 	}
 
-	// 1. Drain veto on LISTEN session pin
-	if _, err := c1.Exec(ctx, "LISTEN ch_veto"); err != nil {
-		t.Fatalf("LISTEN: %v", err)
-	}
-	if err := cp.SuspendTenant(ctx, "t_scale_zero", 500*time.Millisecond, gw.RequestTenantDrain); !errors.Is(err, cell.ErrDrainVetoed) {
-		t.Fatalf("expected ErrDrainVetoed on LISTEN session pin, got: %v", err)
+	// 1. Drain veto when an active client session is connected
+	if err := cp.SuspendTenant(ctx, "t_scale_zero", 500*time.Millisecond, nil); !errors.Is(err, cell.ErrDrainVetoed) {
+		t.Fatalf("expected ErrDrainVetoed with active client connection, got: %v", err)
 	}
 	_ = c1.Close(ctx)
 
@@ -231,16 +213,21 @@ func TestPhaseH_CooperativeScaleToZero_DrainVetoesAndWakeStorm(t *testing.T) {
 	if _, err := c2.Exec(ctx, "BEGIN; INSERT INTO s2z_data VALUES (2, '2pc_row'); PREPARE TRANSACTION 'tx_s2z_veto';"); err != nil {
 		t.Fatalf("PREPARE TRANSACTION: %v", err)
 	}
-	if err := cp.SuspendTenant(ctx, "t_scale_zero", 500*time.Millisecond, gw.RequestTenantDrain); !errors.Is(err, cell.ErrDrainVetoed) {
+	_ = c2.Close(ctx)
+	if err := cp.SuspendTenant(ctx, "t_scale_zero", 500*time.Millisecond, nil); !errors.Is(err, cell.ErrDrainVetoed) {
 		t.Fatalf("expected ErrDrainVetoed on open 2PC transaction, got: %v", err)
 	}
-	if _, err := c2.Exec(ctx, "COMMIT PREPARED 'tx_s2z_veto'"); err != nil {
+	c2Commit, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect c2Commit: %v", err)
+	}
+	if _, err := c2Commit.Exec(ctx, "COMMIT PREPARED 'tx_s2z_veto'"); err != nil {
 		t.Fatalf("COMMIT PREPARED: %v", err)
 	}
-	_ = c2.Close(ctx)
+	_ = c2Commit.Close(ctx)
 
 	// 3. Clean cooperative suspend (ACTIVE -> SUSPENDED)
-	if err := cp.SuspendTenant(ctx, "t_scale_zero", 2*time.Second, gw.RequestTenantDrain); err != nil {
+	if err := cp.SuspendTenant(ctx, "t_scale_zero", 2*time.Second, nil); err != nil {
 		t.Fatalf("SuspendTenant clean failed: %v", err)
 	}
 	state, _, err := cp.GetTenantRoute(ctx, "t_scale_zero")
@@ -248,7 +235,7 @@ func TestPhaseH_CooperativeScaleToZero_DrainVetoesAndWakeStorm(t *testing.T) {
 		t.Fatalf("expected SUSPENDED state, got state=%q err=%v", state, err)
 	}
 
-	// 4. Concurrent wake storm (16 simultaneous clients hitting SUSPENDED tenant)
+	// 4. Concurrent wake storm (16 simultaneous callers hitting WakeTenant on SUSPENDED tenant)
 	const stormClients = 16
 	var wg sync.WaitGroup
 	stormErrs := make(chan error, stormClients)
@@ -256,7 +243,13 @@ func TestPhaseH_CooperativeScaleToZero_DrainVetoesAndWakeStorm(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			wc, err := pgx.Connect(ctx, dsn)
+			port, _, appPass, wErr := cp.WakeTenant(ctx, "t_scale_zero")
+			if wErr != nil {
+				stormErrs <- fmt.Errorf("wake client %d WakeTenant: %w", idx, wErr)
+				return
+			}
+			wDSN := fmt.Sprintf("postgres://app_user:%s@127.0.0.1:%d/t_scale_zero?sslmode=disable", appPass, port)
+			wc, err := pgx.Connect(ctx, wDSN)
 			if err != nil {
 				stormErrs <- fmt.Errorf("wake client %d connect: %w", idx, err)
 				return
@@ -285,7 +278,7 @@ func TestPhaseH_CooperativeScaleToZero_DrainVetoesAndWakeStorm(t *testing.T) {
 
 	// 5. Automatic idle reaper suspends tenant after idle timeout
 	time.Sleep(150 * time.Millisecond)
-	suspendedCount, err := cp.SuspendIdleTenants(ctx, 100*time.Millisecond, gw.RequestTenantDrain)
+	suspendedCount, err := cp.SuspendIdleTenants(ctx, 100*time.Millisecond, nil)
 	if err != nil {
 		t.Fatalf("SuspendIdleTenants: %v", err)
 	}

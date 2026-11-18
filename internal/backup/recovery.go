@@ -19,7 +19,7 @@ type RecoveryTarget struct {
 	LSN  string `json:"lsn,omitempty"`
 	Time string `json:"time,omitempty"`
 
-	lsnValue uint64
+	lsnValue  uint64
 	timeValue time.Time
 }
 

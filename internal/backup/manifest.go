@@ -291,11 +291,18 @@ func SortWALRefs(refs []WALRef) {
 	})
 }
 
-// WALRefsFromArtifacts converts upload artifacts into manifest WAL refs.
+// WALRefsFromArtifacts converts 24-hex WAL upload artifacts into manifest WAL refs.
+// Auxiliary timeline history (.history) and backup label (.backup) files are skipped.
 func WALRefsFromArtifacts(segs []WALSegmentArtifact) []WALRef {
 	out := make([]WALRef, 0, len(segs))
 	for _, s := range segs {
-		start, _ := WALSegmentStartLSN(s.SegmentName)
+		if !IsWALSegmentName(s.SegmentName) {
+			continue
+		}
+		start, err := WALSegmentStartLSN(s.SegmentName)
+		if err != nil {
+			continue
+		}
 		e := WALRef{
 			SegmentName:  s.SegmentName,
 			TimelineID:   s.TimelineID,

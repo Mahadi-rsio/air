@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -234,6 +235,7 @@ func TestGarbageCollectBackupDAG(t *testing.T) {
 type testR2Obj struct {
 	data []byte
 	etag string
+	meta map[string]string
 }
 
 func newTestS3(t *testing.T) (*httptest.Server, *s3.Client) {
@@ -246,10 +248,30 @@ func newTestS3(t *testing.T) (*httptest.Server, *s3.Client) {
 		defer mu.Unlock()
 		switch r.Method {
 		case http.MethodPut:
+			if r.Header.Get("If-None-Match") == "*" {
+				if _, exists := objs[key]; exists {
+					w.WriteHeader(http.StatusPreconditionFailed)
+					return
+				}
+			}
+			if ifMatch := r.Header.Get("If-Match"); ifMatch != "" {
+				cur, exists := objs[key]
+				if !exists || cur.etag != ifMatch {
+					w.WriteHeader(http.StatusPreconditionFailed)
+					return
+				}
+			}
 			b, _ := io.ReadAll(r.Body)
 			sum := md5.Sum(b)
 			etag := `"` + hex.EncodeToString(sum[:]) + `"`
-			objs[key] = testR2Obj{data: b, etag: etag}
+			meta := make(map[string]string)
+			for hk, hv := range r.Header {
+				lower := strings.ToLower(hk)
+				if strings.HasPrefix(lower, "x-amz-meta-") && len(hv) > 0 {
+					meta[strings.TrimPrefix(lower, "x-amz-meta-")] = hv[0]
+				}
+			}
+			objs[key] = testR2Obj{data: b, etag: etag, meta: meta}
 			w.Header().Set("ETag", etag)
 			w.WriteHeader(http.StatusOK)
 		case http.MethodHead:
@@ -258,18 +280,53 @@ func newTestS3(t *testing.T) (*httptest.Server, *s3.Client) {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
+			for mk, mv := range o.meta {
+				w.Header().Set("X-Amz-Meta-"+mk, mv)
+			}
 			w.Header().Set("ETag", o.etag)
 			w.Header().Set("Content-Length", strconv.Itoa(len(o.data)))
 			w.WriteHeader(http.StatusOK)
 		case http.MethodGet:
+			if r.URL.Query().Get("list-type") == "2" {
+				bucketPrefix := key
+				if bucketPrefix != "" && !strings.HasSuffix(bucketPrefix, "/") {
+					bucketPrefix += "/"
+				}
+				qPrefix := r.URL.Query().Get("prefix")
+				fullPrefix := bucketPrefix + qPrefix
+				var keys []string
+				for k := range objs {
+					if strings.HasPrefix(k, fullPrefix) {
+						keys = append(keys, strings.TrimPrefix(k, bucketPrefix))
+					}
+				}
+				var sb strings.Builder
+				sb.WriteString(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated>`)
+				for _, k := range keys {
+					sb.WriteString("<Contents><Key>")
+					sb.WriteString(k)
+					sb.WriteString("</Key></Contents>")
+				}
+				sb.WriteString("</ListBucketResult>")
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(sb.String()))
+				return
+			}
 			o, ok := objs[key]
 			if !ok {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
+			for mk, mv := range o.meta {
+				w.Header().Set("X-Amz-Meta-"+mk, mv)
+			}
 			w.Header().Set("ETag", o.etag)
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(o.data)
+		case http.MethodDelete:
+			delete(objs, key)
+			w.WriteHeader(http.StatusNoContent)
 		}
 	}))
 	cfg := aws.Config{
@@ -346,5 +403,201 @@ func TestDrainWALSpoolFaultInjectionAndResume(t *testing.T) {
 	}
 	if _, statErr := os.Stat(segPath); !os.IsNotExist(statErr) {
 		t.Fatalf("expected local WAL segment to be deleted after resume, statErr=%v", statErr)
+	}
+}
+
+func TestLSNAndValidateWALContinuity(t *testing.T) {
+	// Single segment covering [0/1000000, 0/2000000]
+	single := []WALRef{
+		{SegmentName: "000000010000000000000001", TimelineID: "00000001"},
+	}
+	if err := ValidateWALContinuity(single, "0/1000000", "0/1500000"); err != nil {
+		t.Fatalf("expected single segment to cover 0/1500000, got: %v", err)
+	}
+	if err := ValidateWALContinuity(single, "0/1000000", "0/2000000"); err != nil {
+		t.Fatalf("expected single segment to cover end boundary 0/2000000, got: %v", err)
+	}
+	if err := ValidateWALContinuity(single, "0/1000000", "0/2000001"); !errors.Is(err, ErrMissingWALSegment) {
+		t.Fatalf("expected ErrMissingWALSegment past 0/2000000, got: %v", err)
+	}
+
+	// Multi-segment with auxiliary .history file and earlier retained segment
+	multi := []WALRef{
+		{SegmentName: "00000001.history"},
+		{SegmentName: "000000010000000000000001", TimelineID: "00000001"},
+		{SegmentName: "000000010000000000000002", TimelineID: "00000001"},
+		{SegmentName: "000000010000000000000003", TimelineID: "00000001"},
+	}
+	if err := ValidateWALContinuity(multi, "0/2000000", "0/3800000"); err != nil {
+		t.Fatalf("expected multi-segment with .history and earlier segment to pass, got: %v", err)
+	}
+
+	// Gap between segment 1 and 3
+	gapped := []WALRef{
+		{SegmentName: "000000010000000000000001", TimelineID: "00000001"},
+		{SegmentName: "000000010000000000000003", TimelineID: "00000001"},
+	}
+	if err := ValidateWALContinuity(gapped, "0/1000000", "0/3500000"); !errors.Is(err, ErrMissingWALSegment) {
+		t.Fatalf("expected ErrMissingWALSegment on gap, got: %v", err)
+	}
+
+	// Duplicate segment
+	dup := []WALRef{
+		{SegmentName: "000000010000000000000001", TimelineID: "00000001"},
+		{SegmentName: "000000010000000000000001", TimelineID: "00000001"},
+	}
+	if err := ValidateWALContinuity(dup, "0/1000000", "0/1800000"); !errors.Is(err, ErrWALDiscontinuity) {
+		t.Fatalf("expected ErrWALDiscontinuity on duplicate segment, got: %v", err)
+	}
+
+	// Mixed timeline IDs
+	mixedTL := []WALRef{
+		{SegmentName: "000000010000000000000001", TimelineID: "00000001"},
+		{SegmentName: "000000020000000000000002", TimelineID: "00000002"},
+	}
+	if err := ValidateWALContinuity(mixedTL, "0/1000000", "0/2800000"); !errors.Is(err, ErrWALDiscontinuity) {
+		t.Fatalf("expected ErrWALDiscontinuity on mixed timelines, got: %v", err)
+	}
+}
+
+func TestManifestPublishVerifyAndChecksumSeparation(t *testing.T) {
+	srv, s3c := newTestS3(t)
+	defer srv.Close()
+
+	ctx := context.Background()
+	kms, err := crypto.NewEnvelopeKMS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID := "t_manifest_ver"
+	gen := "gen_001"
+	if _, err := kms.EnsureTenantDEK(tenantID); err != nil {
+		t.Fatal(err)
+	}
+	dekBundle, err := kms.ExportWrappedDEKBundle(tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Upload a real WAL segment via drainWALSpoolDirWithFaultGen
+	spoolDir := t.TempDir()
+	segName := "000000010000000000000001"
+	if err := os.WriteFile(filepath.Join(spoolDir, segName), bytes.Repeat([]byte("W"), 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	walArts, err := drainWALSpoolDirWithFaultGen(ctx, kms, s3c, "bkt", tenantID, gen, 1, spoolDir, nil)
+	if err != nil || len(walArts) != 1 {
+		t.Fatalf("drainWALSpoolDirWithFaultGen failed: arts=%+v err=%v", walArts, err)
+	}
+	if walArts[0].PlainSHA256 == walArts[0].CipherSHA256 {
+		t.Fatalf("PlainSHA256 and CipherSHA256 must differ")
+	}
+
+	// Upload base object
+	bkpID := "bkp_100"
+	baseKey := BackupBaseObjectKey(tenantID, gen, bkpID)
+	baseCipher := []byte("encrypted-base-archive-payload")
+	baseSum := sha256.Sum256(baseCipher)
+	baseCipherSHA := hex.EncodeToString(baseSum[:])
+	st := NewStore(s3c, "bkt")
+	if _, err := st.PutImmutable(ctx, baseKey, baseCipher, "application/octet-stream"); err != nil {
+		t.Fatalf("PutImmutable base failed: %v", err)
+	}
+
+	art := &fencing.BackupArtifact{
+		BackupID:     bkpID,
+		Type:         BackupTypeFull,
+		R2Key:        baseKey,
+		Epoch:        1,
+		StartLSN:     "0/1000000",
+		EndLSN:       "0/1500000",
+		CipherBytes:  len(baseCipher),
+		CipherSHA256: baseCipherSHA,
+		CreatedAt:    time.Now().UTC(),
+		Verified:     true,
+		DEKBundle:    dekBundle,
+	}
+
+	m, err := PublishCompletedBackupManifest(ctx, s3c, "bkt", tenantID, gen, time.Now().UTC().Add(-time.Second), art, walArts, nil)
+	if err != nil {
+		t.Fatalf("PublishCompletedBackupManifest failed: %v", err)
+	}
+
+	// Idempotent re-publish of identical manifest must succeed
+	if err := st.PublishManifest(ctx, m); err != nil {
+		t.Fatalf("idempotent PublishManifest failed: %v", err)
+	}
+
+	// VerifyBackup with StreamHash=false (uses Head metadata SHA256; must compare CipherSHA256 against CipherSHA256)
+	repFast, err := VerifyBackup(ctx, st, m, VerifyOptions{
+		ExpectedTenantID:   tenantID,
+		ExpectedGeneration: gen,
+		StreamHash:         false,
+	})
+	if err != nil || !repFast.Valid || !repFast.ObjectsOK || !repFast.WALContinuityOK {
+		t.Fatalf("VerifyBackup(StreamHash=false) failed: rep=%+v err=%v", repFast, err)
+	}
+
+	// VerifyBackup with StreamHash=true
+	repStream, err := VerifyBackup(ctx, st, m, VerifyOptions{
+		ExpectedTenantID:   tenantID,
+		ExpectedGeneration: gen,
+		StreamHash:         true,
+	})
+	if err != nil || !repStream.Valid {
+		t.Fatalf("VerifyBackup(StreamHash=true) failed: rep=%+v err=%v", repStream, err)
+	}
+
+	// Generation mismatch must fail verification
+	repWrongGen, _ := VerifyBackup(ctx, st, m, VerifyOptions{
+		ExpectedTenantID:   tenantID,
+		ExpectedGeneration: "gen_other",
+	})
+	if repWrongGen.Valid {
+		t.Fatalf("expected VerifyBackup to fail on generation mismatch")
+	}
+
+	// Corrupt the base object in S3 -> VerifyBackup must fail
+	_ = st.PutBytesOverwrite(ctx, baseKey, []byte("corrupted-bytes-of-same-len!!12"), "application/octet-stream")
+	repCorrupt, _ := VerifyBackup(ctx, st, m, VerifyOptions{
+		ExpectedTenantID:   tenantID,
+		ExpectedGeneration: gen,
+		StreamHash:         true,
+	})
+	if repCorrupt.Valid || repCorrupt.ObjectsOK {
+		t.Fatalf("expected VerifyBackup to detect corrupted base object: %+v", repCorrupt)
+	}
+}
+
+func TestRecoveryTargetValidation(t *testing.T) {
+	if _, err := ParseRecoveryTarget(true, "0/1000000", ""); !errors.Is(err, ErrInvalidRecoveryTarget) {
+		t.Fatalf("expected mutual exclusion error, got: %v", err)
+	}
+	m := &BackupManifest{
+		ConsistencyLSN:  "0/1500000",
+		WALStartLSN:     "0/1000000",
+		WALEndLSN:       "0/3000000",
+		ConsistencyTime: time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC),
+	}
+	tBefore, err := NewLSNRecoveryTarget("0/1200000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tBefore.ValidateAgainstManifest(m); !errors.Is(err, ErrTargetOutOfRange) {
+		t.Fatalf("expected ErrTargetOutOfRange before ConsistencyLSN, got: %v", err)
+	}
+	tAfter, err := NewLSNRecoveryTarget("0/4000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tAfter.ValidateAgainstManifest(m); !errors.Is(err, ErrTargetOutOfRange) {
+		t.Fatalf("expected ErrTargetOutOfRange after WALEndLSN, got: %v", err)
+	}
+	tValid, err := NewLSNRecoveryTarget("0/2000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tValid.ValidateAgainstManifest(m); err != nil {
+		t.Fatalf("expected valid LSN target to pass, got: %v", err)
 	}
 }

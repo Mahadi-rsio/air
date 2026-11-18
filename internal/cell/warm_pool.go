@@ -44,6 +44,7 @@ func (a *Agent) initWarmPool() {
 		return
 	}
 
+	a.warmPoolWG.Add(1)
 	go a.warmPoolLoop(poolDir, initdbBin)
 	select {
 	case a.warmPoolNotify <- struct{}{}:
@@ -52,6 +53,7 @@ func (a *Agent) initWarmPool() {
 }
 
 func (a *Agent) warmPoolLoop(poolDir, initdbBin string) {
+	defer a.warmPoolWG.Done()
 	for {
 		a.warmPoolMu.Lock()
 		need := len(a.warmPoolSlots) < a.warmPoolTarget

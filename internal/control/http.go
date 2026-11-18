@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mahadi-rsio/air/internal/backup"
 	"github.com/Mahadi-rsio/air/internal/cell"
 	"github.com/Mahadi-rsio/air/internal/tenant"
 	"github.com/gin-gonic/gin"
@@ -32,18 +33,29 @@ type triggerBackupReq struct {
 }
 
 type restoreDatabaseReq struct {
-	TargetLSN   string `json:"target_lsn"`
-	VerifyQuery string `json:"verify_query"`
+	BackupID    string `json:"backup_id,omitempty"`
+	TargetLSN   string `json:"target_lsn,omitempty"`
+	TargetTime  string `json:"target_time,omitempty"`
+	NewTenantID string `json:"new_tenant_id,omitempty"`
+	VerifyQuery string `json:"verify_query,omitempty"`
+}
+
+type verifyBackupReq struct {
+	StreamHash  bool `json:"stream_hash,omitempty"`
+	DeepRestore bool `json:"deep_restore,omitempty"`
 }
 
 // HTTPHandler returns an http.Handler backed by Gin exposing the AIR Control Plane REST API:
 //   - GET    /healthz
-//   - POST   /v1/databases            (Header: Authorization: Bearer <token>, Idempotency-Key; Body: {"tenant_id": "..."})
-//   - GET    /v1/databases/:id        (Header: Authorization: Bearer <token>)
-//   - DELETE /v1/databases/:id        (Header: Authorization: Bearer <token>)
-//   - DELETE /v1/api-keys/:id         (Header: Authorization: Bearer <token>)
-//   - POST   /v1/databases/:id/backups (Header: Authorization: Bearer <token>)
-//   - POST   /v1/databases/:id/restore (Header: Authorization: Bearer <token>)
+//   - POST   /v1/databases                          (Header: Authorization: Bearer <token>, Idempotency-Key; Body: {"tenant_id": "..."})
+//   - GET    /v1/databases/:id                      (Header: Authorization: Bearer <token>)
+//   - DELETE /v1/databases/:id                      (Header: Authorization: Bearer <token>)
+//   - DELETE /v1/api-keys/:id                       (Header: Authorization: Bearer <token>)
+//   - POST   /v1/databases/:id/backups              (Header: Authorization: Bearer <token>)
+//   - GET    /v1/databases/:id/backups              (Header: Authorization: Bearer <token>)
+//   - POST   /v1/databases/:id/backups/:bkp/verify  (Header: Authorization: Bearer <token>)
+//   - POST   /v1/databases/:id/restore              (Header: Authorization: Bearer <token>)
+//   - GET    /v1/databases/:id/offload              (Header: Authorization: Bearer <token>)
 func (cp *ControlPlane) HTTPHandler() http.Handler {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -117,12 +129,40 @@ func (cp *ControlPlane) HTTPHandler() http.Handler {
 			c.JSON(http.StatusCreated, resp)
 		})
 
+		v1.GET("/databases/:id/backups", func(c *gin.Context) {
+			manifests, err := cp.ListBackups(c.Request.Context(), c.GetString(accountIDContextKey), c.Param("id"))
+			if err != nil {
+				writeControlError(c, err)
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"backups": manifests})
+		})
+
+		v1.POST("/databases/:id/backups/:backup_id/verify", func(c *gin.Context) {
+			var req verifyBackupReq
+			if !decodeJSONBody(c, &req, true) {
+				return
+			}
+			rep, err := cp.VerifyDatabaseBackup(c.Request.Context(), c.GetString(accountIDContextKey), c.Param("id"), c.Param("backup_id"), req.StreamHash, req.DeepRestore)
+			if err != nil {
+				writeControlError(c, err)
+				return
+			}
+			c.JSON(http.StatusOK, rep)
+		})
+
 		v1.POST("/databases/:id/restore", func(c *gin.Context) {
 			var req restoreDatabaseReq
 			if !decodeJSONBody(c, &req, true) {
 				return
 			}
-			resp, err := cp.RestoreDatabase(c.Request.Context(), c.GetString(accountIDContextKey), c.Param("id"), req.TargetLSN, req.VerifyQuery)
+			resp, err := cp.RestoreDatabaseWithOptions(c.Request.Context(), c.GetString(accountIDContextKey), c.Param("id"), RestoreOptions{
+				BackupID:    req.BackupID,
+				TargetLSN:   req.TargetLSN,
+				TargetTime:  req.TargetTime,
+				NewTenantID: req.NewTenantID,
+				VerifyQuery: req.VerifyQuery,
+			})
 			if err != nil {
 				writeControlError(c, err)
 				return
@@ -444,6 +484,10 @@ func writeControlError(c *gin.Context, err error) {
 		status = http.StatusConflict
 	case errors.Is(err, ErrBackupNotConfigured):
 		status = http.StatusServiceUnavailable
+	case errors.Is(err, backup.ErrTargetOutOfRange), errors.Is(err, backup.ErrInvalidRecoveryTarget):
+		status = http.StatusUnprocessableEntity
+	case errors.Is(err, backup.ErrInvalidBackupManifest), errors.Is(err, backup.ErrObjectChecksum), errors.Is(err, backup.ErrObjectMissing), errors.Is(err, backup.ErrMissingWALSegment), errors.Is(err, backup.ErrWALDiscontinuity):
+		status = http.StatusConflict
 	}
 	c.JSON(status, gin.H{"error": err.Error()})
 }

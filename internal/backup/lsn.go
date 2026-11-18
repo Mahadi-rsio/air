@@ -39,6 +39,11 @@ func FormatLSN(lsn uint64) string {
 	return fmt.Sprintf("%X/%X", uint32(lsn>>32), uint32(lsn))
 }
 
+// IsWALSegmentName reports whether name is a standard 24-hex-character PostgreSQL WAL segment name.
+func IsWALSegmentName(name string) bool {
+	return walSegmentNameRe.MatchString(strings.ToUpper(strings.TrimSpace(name)))
+}
+
 // WALSegmentStartLSN parses a 24-hex WAL segment name and returns its starting LSN.
 func WALSegmentStartLSN(name string) (uint64, error) {
 	m := walSegmentNameRe.FindStringSubmatch(strings.ToUpper(strings.TrimSpace(name)))
@@ -59,8 +64,9 @@ func WALSegmentStartLSN(name string) (uint64, error) {
 	return ((log * 256) + seg) * WALSegmentSize, nil
 }
 
-// ValidateWALContinuity verifies that all WAL refs share one timeline and form an
-// unbroken ascending segment sequence covering [startLSN, endLSN].
+// ValidateWALContinuity verifies that all 24-hex WAL segment refs share one timeline and form an
+// unbroken ascending segment sequence covering [startLSN, endLSN]. Auxiliary timeline history
+// (.history) and backup label (.backup) files are ignored for 16 MiB segment arithmetic.
 func ValidateWALContinuity(refs []WALRef, startLSN, endLSN string) error {
 	if len(refs) == 0 {
 		return fmt.Errorf("%w: no WAL segments", ErrWALDiscontinuity)
@@ -85,7 +91,11 @@ func ValidateWALContinuity(refs []WALRef, startLSN, endLSN string) error {
 	segs := make([]seg, 0, len(refs))
 	timeline := ""
 	for _, r := range refs {
-		m := walSegmentNameRe.FindStringSubmatch(strings.ToUpper(strings.TrimSpace(r.SegmentName)))
+		trimmed := strings.TrimSpace(r.SegmentName)
+		if walHistoryRe.MatchString(trimmed) || walBackupLabelRe.MatchString(trimmed) {
+			continue
+		}
+		m := walSegmentNameRe.FindStringSubmatch(strings.ToUpper(trimmed))
 		if m == nil {
 			return fmt.Errorf("%w: invalid WAL segment name %q", ErrWALDiscontinuity, r.SegmentName)
 		}
@@ -103,31 +113,30 @@ func ValidateWALContinuity(refs []WALRef, startLSN, endLSN string) error {
 		}
 		segs = append(segs, seg{name: r.SegmentName, start: s, tl: m[1]})
 	}
-	sort.Slice(segs, func(i, j int) bool { return segs[i].start < segs[j].start })
+	if len(segs) == 0 {
+		return fmt.Errorf("%w: no 24-hex WAL segments", ErrWALDiscontinuity)
+	}
+	sort.Slice(segs, func(i, j int) bool {
+		if segs[i].start != segs[j].start {
+			return segs[i].start < segs[j].start
+		}
+		return segs[i].name < segs[j].name
+	})
 
 	firstSegment := start - (start % WALSegmentSize)
-	lastCovered := segs[len(segs)-1].start
-	if lastCovered > end {
-		lastCovered = end
+	if segs[0].start > firstSegment {
+		return fmt.Errorf("%w: missing WAL segment covering %s (first retained %s)", ErrMissingWALSegment, FormatLSN(firstSegment), segs[0].name)
 	}
-	for i, s := range segs {
-		if i == 0 {
-			if s.start < firstSegment {
-				return fmt.Errorf("%w: first retained segment %s starts before required %s", ErrWALDiscontinuity, s.name, FormatLSN(firstSegment))
-			}
-			if s.start > firstSegment {
-				return fmt.Errorf("%w: missing WAL segment covering %s (first retained %s)", ErrMissingWALSegment, FormatLSN(firstSegment), s.name)
-			}
-			continue
-		}
+	for i := 1; i < len(segs); i++ {
 		want := segs[i-1].start + WALSegmentSize
-		if s.start != want {
-			if s.start < want {
-				return fmt.Errorf("%w: duplicate/overlapping WAL segment %s", ErrWALDiscontinuity, s.name)
+		if segs[i].start != want {
+			if segs[i].start < want {
+				return fmt.Errorf("%w: duplicate/overlapping WAL segment %s", ErrWALDiscontinuity, segs[i].name)
 			}
-			return fmt.Errorf("%w: missing WAL segment after %s before %s", ErrMissingWALSegment, segs[i-1].name, s.name)
+			return fmt.Errorf("%w: missing WAL segment after %s before %s", ErrMissingWALSegment, segs[i-1].name, segs[i].name)
 		}
 	}
+	lastCovered := segs[len(segs)-1].start + WALSegmentSize
 	if lastCovered < end {
 		return fmt.Errorf("%w: WAL archive ends at %s before required end LSN %s", ErrMissingWALSegment, FormatLSN(lastCovered), endLSN)
 	}
