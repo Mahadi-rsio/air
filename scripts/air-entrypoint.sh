@@ -9,19 +9,4 @@ if [ "$(id -u)" = "0" ]; then
   exec gosu postgres /usr/local/bin/air-entrypoint.sh "$@"
 fi
 
-/usr/local/bin/air-server "$@" &
-SERVER_PID=$!
-
-/usr/local/bin/air-gateway &
-GATEWAY_PID=$!
-
-cleanup() {
-  kill -TERM "$GATEWAY_PID" "$SERVER_PID" 2>/dev/null || true
-}
-trap cleanup TERM INT
-
-wait -n "$SERVER_PID" "$GATEWAY_PID"
-STATUS=$?
-cleanup
-wait "$SERVER_PID" "$GATEWAY_PID" 2>/dev/null || true
-exit "$STATUS"
+exec /usr/local/bin/air-server "$@"
