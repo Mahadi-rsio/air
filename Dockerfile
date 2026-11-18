@@ -24,7 +24,7 @@ WORKDIR /src/gateway
 COPY proto/airdb.proto /src/proto/airdb.proto
 COPY gateway/ ./
 RUN protoc -I/src/proto --cpp_out=src/pb --grpc_out=src/pb --plugin=protoc-gen-grpc=/usr/bin/grpc_cpp_plugin /src/proto/airdb.proto \
-    && make all && cp air-gateway /out-air-gateway
+    && make clean && make -j"$(nproc)" all && cp air-gateway /out-air-gateway
 
 # Stage 2: Build patched PostgreSQL 17.12 (smgr_hook) + supautils + air_smgr
 FROM debian:bookworm-slim AS pg-builder

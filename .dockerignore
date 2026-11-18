@@ -4,3 +4,7 @@
 .env
 tests/
 *.md
+gateway/build/
+gateway/air-gateway
+gateway/gateway_test
+extensions/air_smgr/*.o
