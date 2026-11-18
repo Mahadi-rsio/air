@@ -7,4 +7,5 @@ extensions/air_smgr/*.bc
 air-server
 gateway/air-gateway
 gateway/gateway_test
+gateway/build/
 
