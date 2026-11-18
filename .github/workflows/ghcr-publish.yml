@@ -1,4 +1,4 @@
-name: Build and Push air-server to GHCR
+name: Build and Push AIR & Gateway to GHCR
 
 on:
   push:
@@ -84,3 +84,28 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Extract Gateway Docker metadata (tags & labels)
+        id: gw_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}-gateway
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-
+            type=raw,value=latest
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Build and push Gateway Docker image to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./gateway/Dockerfile
+          push: true
+          tags: ${{ steps.gw_meta.outputs.tags }}
+          labels: ${{ steps.gw_meta.outputs.labels }}
+          cache-from: type=gha,scope=gateway
+          cache-to: type=gha,mode=max,scope=gateway
