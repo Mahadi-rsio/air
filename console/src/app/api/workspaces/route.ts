@@ -4,6 +4,7 @@ import { getDb, schema } from "@/db";
 import {
   authenticateRequest,
   handleApiError,
+  HttpError,
   recordAuditLog,
 } from "@/lib/auth/server";
 import { generateId } from "@/lib/crypto";
@@ -40,6 +41,10 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await authenticateRequest(req);
+    if (ctx.authType === "api_key") {
+      // API keys are bound to a single workspace and must not mint new workspaces.
+      throw new HttpError(403, "API keys cannot create workspaces", "FORBIDDEN");
+    }
     const body = await req.json();
     const parsed = createWorkspaceSchema.safeParse(body);
     if (!parsed.success) {

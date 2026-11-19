@@ -19,6 +19,19 @@ export const auth = betterAuth({
     process.env.BETTER_AUTH_SECRET ||
     "air-console-dev-secret-change-me-in-production-32bytes",
   baseURL: process.env.BETTER_AUTH_URL || "http://localhost:3000",
+  // Trust same-origin requests (Origin host === Host header) so dev ports / Codespaces / Workers
+  // custom domains work without extra config; cross-site origins stay blocked.
+  trustedOrigins: async (request?: Request) => {
+    const origins = process.env.BETTER_AUTH_TRUSTED_ORIGINS?.split(",").map((o) => o.trim()).filter(Boolean) ?? [];
+    const origin = request?.headers.get("origin");
+    const host = request?.headers.get("x-forwarded-host") || request?.headers.get("host");
+    if (origin && host) {
+      try {
+        if (new URL(origin).host === host) origins.push(origin);
+      } catch {}
+    }
+    return origins;
+  },
   emailAndPassword: {
     enabled: true,
     minPasswordLength: 8,
