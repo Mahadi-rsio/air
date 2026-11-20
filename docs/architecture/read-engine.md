@@ -49,3 +49,49 @@ The Phase 2 prototype in [adapter.go](file:///workspaces/air/internal/readadapte
   4. Zero persistent write methods exposed.
 - **Live PG17 Verification ([adapter_test.go](file:///workspaces/air/internal/readadapter/adapter_test.go)):**
   - `TestAdapterIsolationAndSnapshotRules` and `TestLivePG17SharedStorageCompatibilityProof` verify PG17 `PageHeaderData` (`0x2004`), `ItemIdData`, `HeapTupleHeaderData`, MVCC visibility (committed rows visible, rolled-back row excluded), `INT4`/`INT8`/`FLOAT8`/`TEXT` (including compressed/TOASTed varlena), and B-tree metapage (`0x053162`) / leaf pages against live `PostgreSQL 17.12`.
+
+---
+
+## 3. Native PG17 Read-Only Execution & Storage Integration (Phase 3)
+
+- **`extensions/air_ro/` (`air_ro.so`):** Native PG17 C extension compiled via PGXS enforcing strict read-only execution when `air_ro.enabled = on` across `ExecutorStart_hook` (blocks DML, modifying CTEs, `SELECT ... FOR UPDATE/SHARE`), `ProcessUtility_hook` (blocks DDL, `COPY FROM`, `SELECT INTO`, `DO`/`CALL`, `BEGIN READ WRITE`, and attempts to disable `transaction_read_only`), and `object_access_hook` (defense-in-depth catalog write rejection). Exposes `air_ro_status()`.
+- **`extensions/air_smgr/air_smgr.c` (`air_smgr.read_only`):** Rejects persistent `create`, `unlink`, `extend`, `zeroextend`, `writev`, and `truncate` calls when enabled, while routing backend-local ephemeral temp files to `md.c` (`backend != INVALID_PROC_NUMBER`).
+- **`internal/readadapter/pageserver_backend.go`:** Wraps `*pageserver.Pageserver` as a read-only `StorageBackend` with `StaticSnapshotProvider`.
+
+---
+
+## 4. MVCC, `pg_xact` Visibility & Multi-Level Cache (Phases 4–6)
+
+- **MVCC & `pg_xact` / `pg_subtrans` (`internal/readadapter/mvcc.go`):**
+  - `CLOGResolver` decodes 2-bit `pg_xact` CLOG statuses (`32,768` XIDs/page) and `pg_subtrans` parent links (`2,048` XIDs/page) at the pinned `SnapshotInfo.LSN`.
+  - `IsVisibleWithCLOG` evaluates full PG17 `HeapTupleSatisfiesMVCC` visibility (handling unhinted fresh writes, frozen tuples, lock-only `HeapXmaxLockOnly`, active XIPs, and concurrent commits past `snap.LSN`).
+  - `SnapshotCoordinator` provides monotonic `Publish` and causal `AwaitLSN` synchronization.
+- **L1 RAM + L2 Local NVMe + L3 Pageserver Cache (`internal/readadapter/cache.go`):**
+  - `TieredCacheBackend` layers a bounded LRU L1 RAM cache and a bounded, CRC32C-checksummed L2 NVMe disk cache over L3 `Pageserver`, keyed strictly by `(TenantID, Generation, SpcOID, DbOID, RelNumber, ForkNum, BlockNum, LSN)`. Corrupt/truncated L2 files are automatically detected, evicted, and recovered from L3.
+- **Commit Publication & Session Watermarks (`internal/readadapter/publisher.go`):**
+  - `CommitPublisher` handles Write Engine `CommitEvent`s, invalidates modified blocks/relations in L1+L2, processes primary fencing (`OnGenerationFence`), and tracks per-session write watermarks (`RecordSessionWrite` / `AwaitSessionRead`) for read-your-own-write consistency.
+
+---
+
+## 5. C++20 Gateway SQL Routing & Automatic Fallback (Phase 7)
+
+- **`gateway/src/pg/sql_router.{hpp,cpp}`:**
+  - Lexical SQL classifier (`classify_sql_for_routing`) respecting `--` comments, nested `/* ... */` comments, `'...'` literals, `"..."` identifiers, `$$...$$` dollar-quoting, and multi-statement batches.
+  - Routes safe read-only queries (`SELECT`, read CTEs, `EXPLAIN`, `COPY (...) TO`, `BEGIN READ ONLY`, `SHOW`, safe `SET`) to `ReadEngine`; routes DML, DDL, modifying CTEs, `FOR UPDATE/SHARE`, `SELECT INTO`, `COPY ... FROM`, mutating functions (`nextval`, `pg_advisory_lock*`), and mixed batches to `WriteEngine`.
+  - `route_query` automatically falls back to `WriteEngine` on `session_pinned`, `in_transaction && tx_has_writes`, `!read_engine_healthy`, or causal lag (`read_engine_lsn < session_write_lsn`), recording `RoutingMetrics`.
+
+---
+
+## 6. Hardening & Benchmarks (Phases 8–10)
+
+All Go (`go test -race -count=1 ./internal/readadapter/...`, 11 tests including live PG 17.12 `air_ro` tests, concurrent storms, generation fencing, and L2 NVMe crash truncation recovery), `go vet ./...`, and C++20 (`make -C gateway test`) suites pass.
+
+Measured on `linux/amd64` (`AMD EPYC 7763`, `go test -bench=BenchmarkReadEngine -benchmem -benchtime=300ms`):
+
+| Benchmark | Latency (`ns/op`) | Allocations |
+| :--- | ---: | ---: |
+| `BenchmarkReadEngineL1HotPage-2` | `6,431 ns/op` | `8192 B/op`, `1 allocs/op` |
+| `BenchmarkReadEngineL2NVMePage-2` | `17,312 ns/op` | `9912 B/op`, `5 allocs/op` |
+| `BenchmarkReadEngineL3PageserverPage-2` | `2,738 ns/op` | `8440 B/op`, `6 allocs/op` |
+| `BenchmarkReadEngineMVCCWithCLOG-2` | `39.62 ns/op` | `0 B/op`, `0 allocs/op` |
+| `BenchmarkReadEngineCommitPublish-2` | `90.54 ns/op` | `0 B/op`, `0 allocs/op` |
