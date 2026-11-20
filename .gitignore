@@ -4,6 +4,9 @@
 extensions/air_smgr/*.o
 extensions/air_smgr/*.so
 extensions/air_smgr/*.bc
+extensions/air_ro/*.o
+extensions/air_ro/*.so
+extensions/air_ro/*.bc
 air-server
 gateway/air-gateway
 gateway/gateway_test

@@ -20,6 +20,7 @@ PG_MODULE_MAGIC;
 
 /* GUCs */
 static bool air_smgr_enabled = false;
+static bool air_smgr_read_only = false;
 static char *air_pageserver_socket = NULL;
 static char *air_tenant_id = NULL;
 static char *air_lfc_dir = NULL;
@@ -75,8 +76,18 @@ air_close(SMgrRelation reln, ForkNumber forknum)
 }
 
 static void
+air_reject_readonly_write(const char *op)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+			 errmsg("air_smgr is in read-only mode: persistent %s rejected", op)));
+}
+
+static void
 air_create(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 {
+	if (air_smgr_read_only)
+		air_reject_readonly_write("create");
 	/* Relation creation is recorded via WAL; no local base/ file needed. */
 	(void) isRedo;
 	air_relmeta_set_create(reln->smgr_rlocator.locator, forknum);
@@ -114,6 +125,9 @@ air_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
 	char		errbuf[256];
 
+	if (air_smgr_read_only && rlocator.backend == INVALID_PROC_NUMBER)
+		air_reject_readonly_write("unlink");
+
 	air_lfc_invalidate_rel(rlocator.locator, forknum, 0);
 	air_relmeta_unlink(rlocator.locator, forknum);
 	if (!isRedo && air_smgr_enabled && rlocator.backend == INVALID_PROC_NUMBER)
@@ -134,8 +148,13 @@ static void
 air_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   const void *buffer, bool skipFsync)
 {
-	XLogRecPtr	lsn = current_write_lsn();
+	XLogRecPtr	lsn;
 	char		errbuf[256];
+
+	if (air_smgr_read_only)
+		air_reject_readonly_write("extend");
+
+	lsn = current_write_lsn();
 
 	(void) skipFsync;
 	air_lfc_insert(air_lfc_dir,
@@ -167,7 +186,12 @@ air_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 {
 	static PGAlignedBlock zero_block;
 	static bool zero_inited = false;
-	XLogRecPtr	lsn = current_write_lsn();
+	XLogRecPtr	lsn;
+
+	if (air_smgr_read_only)
+		air_reject_readonly_write("zeroextend");
+
+	lsn = current_write_lsn();
 
 	(void) skipFsync;
 
@@ -279,8 +303,13 @@ static void
 air_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   const void **buffers, BlockNumber nblocks, bool skipFsync)
 {
-	XLogRecPtr	lsn = current_write_lsn();
+	XLogRecPtr	lsn;
 	char		errbuf[256];
+
+	if (air_smgr_read_only)
+		air_reject_readonly_write("writev");
+
+	lsn = current_write_lsn();
 
 	(void) skipFsync;
 
@@ -362,6 +391,9 @@ air_nblocks(SMgrRelation reln, ForkNumber forknum)
 static void
 air_truncate(SMgrRelation reln, ForkNumber forknum, BlockNumber old_blocks, BlockNumber nblocks)
 {
+	if (air_smgr_read_only)
+		air_reject_readonly_write("truncate");
+
 	(void) old_blocks;
 	air_lfc_invalidate_rel(reln->smgr_rlocator.locator, forknum, nblocks);
 	air_relmeta_truncate(reln->smgr_rlocator.locator, forknum, nblocks);
@@ -372,6 +404,8 @@ air_immedsync(SMgrRelation reln, ForkNumber forknum)
 {
 	(void) reln;
 	(void) forknum;
+	if (air_smgr_read_only)
+		return;
 	/* Durability is guaranteed by WAL stream to Pageserver. */
 	if (!RecoveryInProgress())
 		XLogFlush(GetXLogInsertRecPtr());
@@ -464,6 +498,15 @@ _PG_init(void)
 							 "Enable AIR Pageserver storage manager for persistent relations.",
 							 NULL,
 							 &air_smgr_enabled,
+							 false,
+							 PGC_POSTMASTER,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("air_smgr.read_only",
+							 "Enforce read-only mode in air_smgr, rejecting persistent writes.",
+							 NULL,
+							 &air_smgr_read_only,
 							 false,
 							 PGC_POSTMASTER,
 							 0,
