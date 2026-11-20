@@ -98,7 +98,7 @@ type RelationMetadata struct {
 	LSN     uint64
 }
 
-// Adapter is the controlled, read-only AIR Storage Adapter for PGlite.
+// Adapter is the controlled, read-only AIR Storage Adapter for the native PG17 read-only engine.
 // It enforces tenant/generation isolation, snapshot pinning, and zero persistent writes.
 type Adapter struct {
 	backend  StorageBackend

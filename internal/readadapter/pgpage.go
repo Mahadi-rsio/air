@@ -25,8 +25,16 @@ const (
 	HeapHasVarwidth   uint16 = 0x0002
 	HeapXminCommitted uint16 = 0x0100
 	HeapXminInvalid   uint16 = 0x0200
+	HeapXminFrozen    uint16 = HeapXminCommitted | HeapXminInvalid
 	HeapXmaxCommitted uint16 = 0x0400
 	HeapXmaxInvalid   uint16 = 0x0800
+	HeapXmaxIsMulti   uint16 = 0x1000
+	HeapXmaxLockOnly  uint16 = 0x0080
+
+	InvalidTransactionID     uint32 = 0
+	BootstrapTransactionID   uint32 = 1
+	FrozenTransactionID      uint32 = 2
+	FirstNormalTransactionID uint32 = 3
 
 	BTPLeaf uint16 = 1 << 0
 	BTPRoot uint16 = 1 << 1
