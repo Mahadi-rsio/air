@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include "discovery.hpp"
 #include "metrics.hpp"
+#include "pg/sql_router.hpp"
 #include "pg_wire.hpp"
 #include "pooler.hpp"
 
@@ -590,6 +591,77 @@ int main() {
             require(backend_ok.load(), "mock pg backend protocol sequence ok");
             require(reg.to_json({}).find("\"protocol_errors\":1") != std::string::npos, "protocol_errors recorded");
         }
+    }
+
+    // 7. SQL Router & Automatic Fallback (Phase 7)
+    {
+        auto require = [](bool cond, const char* msg) {
+            if (!cond) {
+                std::cerr << "FAIL: " << msg << std::endl;
+                std::exit(1);
+            }
+        };
+        // Read-only queries route to ReadEngine (including comments/dollar-quotes containing write words).
+        require(classify_sql_for_routing("SELECT 1").target == RouteTarget::ReadEngine, "SELECT -> ReadEngine");
+        require(classify_sql_for_routing("/* INSERT INTO t */ -- DELETE FROM t\nSELECT 'UPDATE x', $$DELETE y$$ FROM items").target == RouteTarget::ReadEngine,
+                "comments/literals ignored -> ReadEngine");
+        require(classify_sql_for_routing("WITH cte AS (SELECT id FROM items) SELECT * FROM cte").target == RouteTarget::ReadEngine,
+                "read CTE -> ReadEngine");
+        require(classify_sql_for_routing("EXPLAIN ANALYZE SELECT count(*) FROM items").target == RouteTarget::ReadEngine,
+                "EXPLAIN -> ReadEngine");
+        require(classify_sql_for_routing("COPY (SELECT * FROM items) TO STDOUT").target == RouteTarget::ReadEngine,
+                "COPY TO -> ReadEngine");
+
+        // Writes, modifying CTEs, row locks, SELECT INTO, mutating functions, and mixed batches -> WriteEngine.
+        require(classify_sql_for_routing("INSERT INTO items VALUES (1)").target == RouteTarget::WriteEngine, "INSERT -> WriteEngine");
+        require(classify_sql_for_routing("UPDATE items SET val = 'x'").target == RouteTarget::WriteEngine, "UPDATE -> WriteEngine");
+        require(classify_sql_for_routing("DELETE FROM items WHERE id = 1").target == RouteTarget::WriteEngine, "DELETE -> WriteEngine");
+        require(classify_sql_for_routing("CREATE TABLE foo (id int)").target == RouteTarget::WriteEngine, "DDL -> WriteEngine");
+        require(classify_sql_for_routing("WITH d AS (DELETE FROM items RETURNING *) SELECT * FROM d").target == RouteTarget::WriteEngine,
+                "modifying CTE -> WriteEngine");
+        require(classify_sql_for_routing("SELECT * FROM items WHERE id = 1 FOR UPDATE").target == RouteTarget::WriteEngine,
+                "FOR UPDATE -> WriteEngine");
+        require(classify_sql_for_routing("SELECT * INTO new_items FROM items").target == RouteTarget::WriteEngine,
+                "SELECT INTO -> WriteEngine");
+        require(classify_sql_for_routing("SELECT nextval('items_id_seq')").target == RouteTarget::WriteEngine,
+                "nextval -> WriteEngine");
+        require(classify_sql_for_routing("COPY items FROM STDIN").target == RouteTarget::WriteEngine,
+                "COPY FROM -> WriteEngine");
+        require(classify_sql_for_routing("SELECT 1; INSERT INTO items VALUES (2);").target == RouteTarget::WriteEngine,
+                "mixed batch -> WriteEngine");
+
+        // Session context, causal LSN lag, and health fallback.
+        RoutingMetrics rmetrics;
+        SessionRouteContext healthy_ctx{};
+        healthy_ctx.read_engine_healthy = true;
+        healthy_ctx.session_write_lsn = 100;
+        healthy_ctx.read_engine_lsn = 100;
+        require(route_query("SELECT * FROM items", healthy_ctx, &rmetrics).target == RouteTarget::ReadEngine,
+                "healthy caught-up -> ReadEngine");
+
+        SessionRouteContext lag_ctx = healthy_ctx;
+        lag_ctx.read_engine_lsn = 90;
+        auto lag_dec = route_query("SELECT * FROM items", lag_ctx, &rmetrics);
+        require(lag_dec.target == RouteTarget::WriteEngine && lag_dec.reason == RouteReason::CausalLagFallback,
+                "causal lag -> WriteEngine fallback");
+
+        SessionRouteContext down_ctx = healthy_ctx;
+        down_ctx.read_engine_healthy = false;
+        auto down_dec = route_query("SELECT * FROM items", down_ctx, &rmetrics);
+        require(down_dec.target == RouteTarget::WriteEngine && down_dec.reason == RouteReason::ReadEngineUnavailableFallback,
+                "unhealthy -> WriteEngine fallback");
+
+        SessionRouteContext tx_write_ctx = healthy_ctx;
+        tx_write_ctx.in_transaction = true;
+        tx_write_ctx.tx_has_writes = true;
+        require(route_query("SELECT * FROM items", tx_write_ctx, &rmetrics).target == RouteTarget::WriteEngine,
+                "tx_has_writes -> WriteEngine");
+
+        record_read_fallback(&rmetrics);
+        require(rmetrics.read_routed.load() == 1, "read_routed == 1");
+        require(rmetrics.write_routed.load() == 3, "write_routed == 3");
+        require(rmetrics.fallbacks_to_write.load() == 3, "fallbacks_to_write == 3");
+        require(rmetrics.read_errors_retried.load() == 1, "read_errors_retried == 1");
     }
 
     std::cout << "All C++ air-gateway tests passed!" << std::endl;

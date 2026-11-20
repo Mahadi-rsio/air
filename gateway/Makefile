@@ -29,7 +29,8 @@ LIB_SRCS := \
 	src/net/socket.cpp \
 	src/net/tls.cpp \
 	src/pg/protocol.cpp \
-	src/pg/auth.cpp
+	src/pg/auth.cpp \
+	src/pg/sql_router.cpp
 
 PB_SRCS := src/pb/airdb.pb.cc src/pb/airdb.grpc.pb.cc
 
