@@ -195,7 +195,7 @@ export default function SqlEditorPage() {
   });
 
   return (
-    <div className="flex h-[calc(100vh-5.5rem)] gap-3 overflow-hidden">
+    <div className="flex h-[calc(100dvh-6.5rem)] gap-3 overflow-hidden">
       {/* Left Panel: Schema Explorer & Saved Queries */}
       <div className="hidden md:flex w-64 shrink-0 flex-col rounded-lg border border-[var(--border)] bg-[var(--surface)] overflow-hidden">
         <div className="flex items-center justify-between border-b border-[var(--border)] px-3 py-2">
@@ -437,7 +437,7 @@ export default function SqlEditorPage() {
 
           <div className="flex-1 overflow-auto">
             {execError ? (
-              <div className="m-3 rounded-md border border-red-500/30 bg-red-500/10 p-3 font-mono text-xs text-[var(--danger)]">
+              <div className="m-3 rounded-md border border-[var(--danger-border)] bg-[var(--danger-soft)] p-3 font-mono text-xs text-[var(--danger)]">
                 {execError}
               </div>
             ) : bottomView === "history" ? (

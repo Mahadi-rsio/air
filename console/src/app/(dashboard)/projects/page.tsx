@@ -211,42 +211,42 @@ export default function ProjectsPage() {
   });
 
   return (
-    <div className="space-y-4 max-w-7xl mx-auto">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+    <div className="space-y-5 max-w-7xl mx-auto">
+      <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h1 className="text-lg font-semibold tracking-tight">Projects</h1>
-          <p className="text-xs text-[var(--text-secondary)]">
+          <h1 className="text-xl font-semibold tracking-tight">Projects</h1>
+          <p className="mt-1 text-[13px] text-[var(--text-secondary)]">
             Isolated PostgreSQL 17 database clusters in this workspace.
           </p>
         </div>
         <Link href="/projects/new">
           <Button>
-            <Plus className="h-3.5 w-3.5" /> Create Project
+            <Plus className="h-4 w-4" /> Create Project
           </Button>
         </Link>
       </div>
 
       <div className="flex items-center justify-between gap-3">
         <div className="relative w-full max-w-xs">
-          <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-[var(--text-secondary)]" />
+          <Search className="absolute left-3 top-2.5 h-4 w-4 text-[var(--text-muted)]" />
           <Input
             value={globalFilter}
             onChange={(e) => setGlobalFilter(e.target.value)}
-            placeholder="Filter projects..."
-            className="pl-8"
+            placeholder="Filter projects…"
+            className="pl-9"
           />
         </div>
         {Object.keys(rowSelection).length > 0 && (
-          <span className="text-xs text-[var(--text-secondary)]">
+          <span className="text-xs font-medium text-[var(--accent)]">
             {Object.keys(rowSelection).length} selected
           </span>
         )}
       </div>
 
-      <Card>
+      <Card className="overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead className="border-b border-[var(--border)] text-[var(--text-secondary)]">
+          <table className="w-full text-left text-[13px]">
+            <thead className="border-b border-[var(--border)] bg-[var(--surface-subtle)] text-[11px] uppercase tracking-wider text-[var(--text-muted)]">
               {table.getHeaderGroups().map((hg) => (
                 <tr key={hg.id}>
                   {hg.headers.map((header) => (

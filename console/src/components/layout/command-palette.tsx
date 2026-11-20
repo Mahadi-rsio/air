@@ -56,35 +56,35 @@ export function CommandPalette({
         id: "new-project",
         label: "Create new PostgreSQL project",
         group: "Quick Commands",
-        icon: <Plus className="h-3.5 w-3.5 text-[var(--accent)]" />,
+        icon: <Plus className="h-4 w-4 text-[var(--accent)]" />,
         href: "/projects/new",
       },
       {
         id: "go-overview",
         label: "Workspace Overview",
         group: "Navigation",
-        icon: <Activity className="h-3.5 w-3.5" />,
+        icon: <Activity className="h-4 w-4" />,
         href: "/dashboard",
       },
       {
         id: "go-projects",
         label: "All Projects",
         group: "Navigation",
-        icon: <Database className="h-3.5 w-3.5" />,
+        icon: <Database className="h-4 w-4" />,
         href: "/projects",
       },
       {
         id: "go-billing",
         label: "Usage & Billing",
         group: "Navigation",
-        icon: <Activity className="h-3.5 w-3.5" />,
+        icon: <Activity className="h-4 w-4" />,
         href: "/billing",
       },
       {
         id: "go-settings",
         label: "Workspace Settings",
         group: "Navigation",
-        icon: <Settings className="h-3.5 w-3.5" />,
+        icon: <Settings className="h-4 w-4" />,
         href: "/settings",
       },
     ];
@@ -95,28 +95,28 @@ export function CommandPalette({
           id: "sql-editor",
           label: "Open SQL Editor",
           group: "Active Project",
-          icon: <Terminal className="h-3.5 w-3.5 text-[var(--accent)]" />,
+          icon: <Terminal className="h-4 w-4 text-[var(--accent)]" />,
           href: `/projects/${activeProjectId}/sql`,
         },
         {
           id: "tables",
           label: "Open Table Studio",
           group: "Active Project",
-          icon: <Table2 className="h-3.5 w-3.5" />,
+          icon: <Table2 className="h-4 w-4" />,
           href: `/projects/${activeProjectId}/tables`,
         },
         {
           id: "branches",
           label: "Manage Branches",
           group: "Active Project",
-          icon: <GitBranch className="h-3.5 w-3.5" />,
+          icon: <GitBranch className="h-4 w-4" />,
           href: `/projects/${activeProjectId}/branches`,
         },
         {
           id: "connection",
           label: "Open Connection Details",
           group: "Active Project",
-          icon: <Key className="h-3.5 w-3.5" />,
+          icon: <Key className="h-4 w-4" />,
           href: `/projects/${activeProjectId}/connection`,
         }
       );
@@ -127,7 +127,7 @@ export function CommandPalette({
         id: `prj-${p.id}`,
         label: `Switch to project: ${p.name} (${p.tenantId})`,
         group: "Projects",
-        icon: <Database className="h-3.5 w-3.5" />,
+        icon: <Database className="h-4 w-4" />,
         href: `/projects/${p.id}`,
       });
     }
@@ -159,15 +159,16 @@ export function CommandPalette({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center bg-black/60 pt-24 px-4"
+      className="fixed inset-0 z-50 flex items-start justify-center bg-black/65 backdrop-blur-sm pt-[12vh] px-4"
       onClick={() => setOpen(false)}
     >
       <div
-        className="w-full max-w-lg overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)] shadow-2xl"
+        className="w-full max-w-xl overflow-hidden rounded-xl border border-[var(--border-strong)] bg-[var(--surface)]"
+        style={{ boxShadow: "var(--elevated-shadow)" }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center border-b border-[var(--border)] px-3">
-          <Search className="h-4 w-4 text-[var(--text-secondary)]" />
+        <div className="flex items-center border-b border-[var(--border)] px-4">
+          <Search className="h-4 w-4 text-[var(--text-muted)]" />
           <input
             autoFocus
             value={query}
@@ -184,17 +185,17 @@ export function CommandPalette({
                 runItem(filtered[selectedIndex]);
               }
             }}
-            placeholder="Search projects, SQL editor, branches, settings..."
-            className="h-10 w-full bg-transparent px-2.5 text-xs text-[var(--text-primary)] placeholder:text-[var(--text-secondary)] focus:outline-none"
+            placeholder="Search projects, SQL editor, branches, settings…"
+            className="h-12 w-full bg-transparent px-3 text-[13px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none"
           />
-          <kbd className="rounded border border-[var(--border)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]">
+          <kbd className="rounded-md border border-[var(--border)] bg-[var(--surface-elevated)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--text-muted)]">
             ESC
           </kbd>
         </div>
 
-        <div className="max-h-80 overflow-y-auto p-1.5">
+        <div className="max-h-80 overflow-y-auto p-2 space-y-0.5">
           {filtered.length === 0 ? (
-            <div className="py-8 text-center text-xs text-[var(--text-secondary)]">
+            <div className="py-10 text-center text-xs text-[var(--text-secondary)]">
               No matching commands or resources.
             </div>
           ) : (
@@ -203,17 +204,18 @@ export function CommandPalette({
                 key={item.id}
                 type="button"
                 onClick={() => runItem(item)}
-                className={`flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-xs transition-colors ${
+                onMouseEnter={() => setSelectedIndex(idx)}
+                className={`flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-[13px] transition-colors cursor-pointer ${
                   idx === selectedIndex
-                    ? "bg-[var(--surface-elevated)] text-[var(--text-primary)]"
-                    : "text-[var(--text-secondary)] hover:bg-[var(--surface-elevated)]"
+                    ? "bg-[var(--accent-soft)] text-[var(--text-primary)] border border-[var(--accent-border)]"
+                    : "border border-transparent text-[var(--text-secondary)] hover:bg-[var(--surface-elevated)]"
                 }`}
               >
-                <span className="flex items-center gap-2.5">
+                <span className="flex items-center gap-2.5 min-w-0">
                   {item.icon}
-                  <span>{item.label}</span>
+                  <span className="truncate">{item.label}</span>
                 </span>
-                <span className="text-[10px] text-[var(--text-secondary)]">
+                <span className="ml-3 shrink-0 rounded-md bg-[var(--surface-elevated)] px-2 py-0.5 text-[10px] font-medium text-[var(--text-muted)]">
                   {item.group}
                 </span>
               </button>

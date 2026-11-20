@@ -2,7 +2,7 @@ import * as React from "react";
 import { cn } from "@/lib/utils";
 
 interface BadgeProps extends React.HTMLAttributes<HTMLSpanElement> {
-  variant?: "default" | "success" | "warning" | "danger" | "muted";
+  variant?: "default" | "accent" | "success" | "warning" | "danger" | "muted";
 }
 
 export function Badge({
@@ -11,17 +11,24 @@ export function Badge({
   ...props
 }: BadgeProps) {
   const styles: Record<NonNullable<BadgeProps["variant"]>, string> = {
-    default: "bg-[var(--surface-elevated)] text-[var(--text-primary)] border-[var(--border)]",
-    success: "bg-emerald-500/10 text-[var(--accent)] border-emerald-500/30",
-    warning: "bg-amber-500/10 text-[var(--warning)] border-amber-500/30",
-    danger: "bg-red-500/10 text-[var(--danger)] border-red-500/30",
-    muted: "bg-transparent text-[var(--text-secondary)] border-[var(--border)]",
+    default:
+      "bg-[var(--surface-elevated)] text-[var(--text-primary)] border-[var(--border)]",
+    accent:
+      "bg-[var(--accent-soft)] text-[var(--accent)] border-[var(--accent-border)]",
+    success:
+      "bg-[var(--success-soft)] text-[var(--success)] border-[var(--success-border)]",
+    warning:
+      "bg-[var(--warning-soft)] text-[var(--warning)] border-[var(--warning-border)]",
+    danger:
+      "bg-[var(--danger-soft)] text-[var(--danger)] border-[var(--danger-border)]",
+    muted:
+      "bg-transparent text-[var(--text-secondary)] border-[var(--border)]",
   };
 
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium leading-none",
+        "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px] font-medium leading-tight tracking-tight",
         styles[variant],
         className
       )}

@@ -58,7 +58,7 @@ export default function BranchesPage() {
       </div>
 
       {data?.capabilities && !data.capabilities.nativeCopyOnWriteBranching && (
-        <div className="flex items-start gap-2.5 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs text-[var(--warning)]">
+        <div className="flex items-start gap-2.5 rounded-lg border border-[var(--warning-border)] bg-[var(--warning-soft)] p-3.5 text-xs text-[var(--warning)]">
           <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
           <div>
             <p className="font-medium">

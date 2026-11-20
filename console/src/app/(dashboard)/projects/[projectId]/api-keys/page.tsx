@@ -104,7 +104,7 @@ export default function ApiKeysPage() {
       </div>
 
       {newSecret && (
-        <div className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 p-4 space-y-2">
+        <div className="rounded-xl border border-[var(--accent-border)] bg-[var(--accent-soft)] p-4 space-y-2.5">
           <p className="text-xs font-semibold text-[var(--accent)]">
             Copy your new API key now — you will not be able to see it again.
           </p>

@@ -106,7 +106,7 @@ export default function ProjectSettingsPage() {
         </CardContent>
       </Card>
 
-      <Card className="border-red-500/40">
+      <Card className="border-[var(--danger-border)]">
         <CardHeader>
           <CardTitle className="text-[var(--danger)]">Danger Zone</CardTitle>
         </CardHeader>

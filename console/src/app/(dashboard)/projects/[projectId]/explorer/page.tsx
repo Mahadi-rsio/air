@@ -112,14 +112,14 @@ export default function DatabaseExplorerPage() {
       </div>
 
       {error && (
-        <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-[var(--warning)]">
+        <div className="rounded-md border border-[var(--warning-border)] bg-[var(--warning-soft)] p-3 text-xs text-[var(--warning)]">
           {(error as Error).message}
         </div>
       )}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         {/* Tree */}
-        <Card className="h-[calc(100vh-12rem)] flex flex-col">
+        <Card className="h-[32rem] lg:h-[calc(100vh-13rem)] flex flex-col">
           <CardHeader className="py-2.5">
             <div className="relative w-full">
               <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-[var(--text-secondary)]" />
@@ -207,7 +207,7 @@ export default function DatabaseExplorerPage() {
         </Card>
 
         {/* Details Panel */}
-        <Card className="lg:col-span-2 h-[calc(100vh-12rem)] overflow-y-auto">
+        <Card className="lg:col-span-2 h-[32rem] lg:h-[calc(100vh-13rem)] overflow-y-auto">
           <CardHeader>
             <CardTitle className="font-mono">
               {selected

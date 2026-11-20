@@ -67,22 +67,28 @@ export default function OnboardingPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-[var(--bg)] px-4">
-      <div className="w-full max-w-md rounded-lg border border-[var(--border)] bg-[var(--surface)] p-6">
-        <div className="mb-5 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="flex h-7 w-7 items-center justify-center rounded-md bg-[var(--accent)] text-[var(--accent-fg)]">
+    <div className="air-auth-bg flex min-h-screen items-center justify-center px-4 py-12">
+      <div
+        className="w-full max-w-md rounded-xl border border-[var(--border-strong)] bg-[var(--surface)]/95 backdrop-blur-md p-6"
+        style={{ boxShadow: "var(--elevated-shadow)" }}
+      >
+        <div className="mb-6 flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[var(--accent)] text-[var(--accent-fg)]">
+
               <Database className="h-4 w-4" />
             </div>
-            <span className="text-sm font-semibold">AIR Onboarding</span>
+            <span className="text-sm font-semibold tracking-tight">
+              AIR Onboarding
+            </span>
           </div>
-          <span className="text-[11px] font-mono text-[var(--text-secondary)]">
-            Step {step} of 2
+          <span className="rounded-full border border-[var(--accent-border)] bg-[var(--accent-soft)] px-2.5 py-0.5 text-[11px] font-mono font-medium text-[var(--accent)]">
+            Step {step} / 2
           </span>
         </div>
 
         {error && (
-          <div className="mb-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-[var(--danger)]">
+          <div className="mb-4 rounded-lg border border-[var(--danger-border)] bg-[var(--danger-soft)] px-3.5 py-2.5 text-xs text-[var(--danger)]">
             {error}
           </div>
         )}
@@ -90,13 +96,17 @@ export default function OnboardingPage() {
         {step === 1 ? (
           <form onSubmit={handleCreateWorkspace} className="space-y-4">
             <div>
-              <h1 className="text-base font-semibold">Create your workspace</h1>
-              <p className="mt-1 text-xs text-[var(--text-secondary)]">
+              <h1 className="text-lg font-semibold tracking-tight">
+                Create your workspace
+              </h1>
+              <p className="mt-1 text-[13px] text-[var(--text-secondary)]">
                 Workspaces isolate your PostgreSQL projects, API keys, and team members.
               </p>
             </div>
             <div className="space-y-1.5">
-              <label className="text-xs font-medium">Workspace name</label>
+              <label className="text-xs font-medium text-[var(--text-primary)]">
+                Workspace name
+              </label>
               <Input
                 required
                 value={workspaceName}
@@ -104,24 +114,26 @@ export default function OnboardingPage() {
                 placeholder="Acme Engineering"
               />
             </div>
-            <Button type="submit" className="w-full" disabled={loading}>
-              {loading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-              Continue <ArrowRight className="h-3.5 w-3.5" />
+            <Button type="submit" size="lg" className="w-full" disabled={loading}>
+              {loading && <Loader2 className="h-4 w-4 animate-spin" />}
+              Continue <ArrowRight className="h-4 w-4" />
             </Button>
           </form>
         ) : (
           <form onSubmit={handleCreateFirstProject} className="space-y-4">
             <div>
-              <h1 className="text-base font-semibold flex items-center gap-2">
+              <h1 className="text-lg font-semibold tracking-tight flex items-center gap-2">
                 <Layers className="h-4 w-4 text-[var(--accent)]" />
                 Provision your first PostgreSQL 17 project
               </h1>
-              <p className="mt-1 text-xs text-[var(--text-secondary)]">
+              <p className="mt-1 text-[13px] text-[var(--text-secondary)]">
                 Each project provisions an isolated PostgreSQL 17 cluster via AIR Control Plane.
               </p>
             </div>
             <div className="space-y-1.5">
-              <label className="text-xs font-medium">Project name</label>
+              <label className="text-xs font-medium text-[var(--text-primary)]">
+                Project name
+              </label>
               <Input
                 required
                 value={projectName}
@@ -129,7 +141,9 @@ export default function OnboardingPage() {
               />
             </div>
             <div className="space-y-1.5">
-              <label className="text-xs font-medium">Tenant ID (PG database identifier)</label>
+              <label className="text-xs font-medium text-[var(--text-primary)]">
+                Tenant ID (PG database identifier)
+              </label>
               <Input
                 required
                 value={tenantId}
@@ -138,16 +152,17 @@ export default function OnboardingPage() {
               />
             </div>
             <div className="flex items-center gap-2 pt-2">
-              <Button type="submit" className="flex-1" disabled={loading}>
-                {loading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+              <Button type="submit" size="lg" className="flex-1" disabled={loading}>
+                {loading && <Loader2 className="h-4 w-4 animate-spin" />}
                 Provision project
               </Button>
               <Button
                 type="button"
                 variant="outline"
+                size="lg"
                 onClick={() => router.push("/dashboard")}
               >
-                Skip to dashboard
+                Skip
               </Button>
             </div>
           </form>

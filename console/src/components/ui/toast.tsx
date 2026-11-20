@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { CheckCircle2, AlertCircle, X } from "lucide-react";
+import { CheckCircle2, AlertCircle, Info, X } from "lucide-react";
 
 export interface ToastItem {
   id: string;
@@ -34,19 +34,22 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
         {items.map((item) => (
           <div
             key={item.id}
-            className="flex items-start gap-2.5 rounded-lg border border-[var(--border)] bg-[var(--surface-elevated)] px-3.5 py-2.5 shadow-lg"
+            className="flex items-start gap-2.5 rounded-xl border border-[var(--border-strong)] bg-[var(--surface-elevated)]/95 backdrop-blur-md px-4 py-3"
+            style={{ boxShadow: "var(--elevated-shadow)" }}
           >
             {item.variant === "error" ? (
               <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-[var(--danger)]" />
+            ) : item.variant === "info" ? (
+              <Info className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent)]" />
             ) : (
-              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent)]" />
+              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-[var(--success)]" />
             )}
             <div className="flex-1 min-w-0">
-              <p className="text-xs font-medium text-[var(--text-primary)]">
+              <p className="text-[13px] font-medium text-[var(--text-primary)]">
                 {item.title}
               </p>
               {item.description && (
-                <p className="mt-0.5 text-[11px] text-[var(--text-secondary)] break-words">
+                <p className="mt-0.5 text-xs text-[var(--text-secondary)] break-words">
                   {item.description}
                 </p>
               )}
@@ -56,7 +59,8 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
               onClick={() =>
                 setItems((prev) => prev.filter((x) => x.id !== item.id))
               }
-              className="text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+              className="rounded-md p-0.5 text-[var(--text-secondary)] hover:bg-[var(--surface)] hover:text-[var(--text-primary)] cursor-pointer"
+              aria-label="Dismiss notification"
             >
               <X className="h-3.5 w-3.5" />
             </button>

@@ -164,10 +164,13 @@ export default function ProjectOverviewPage() {
   return (
     <div className="space-y-5 max-w-7xl mx-auto">
       {/* Header */}
-      <div className="flex flex-wrap items-start justify-between gap-4 rounded-lg border border-[var(--border)] bg-[var(--surface)] p-4">
-        <div className="space-y-1">
-          <div className="flex items-center gap-2.5">
-            <h1 className="text-lg font-semibold tracking-tight">{data.name}</h1>
+      <div
+        className="flex flex-wrap items-start justify-between gap-4 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5"
+        style={{ boxShadow: "var(--card-shadow)" }}
+      >
+        <div className="space-y-1.5">
+          <div className="flex flex-wrap items-center gap-2.5">
+            <h1 className="text-xl font-semibold tracking-tight">{data.name}</h1>
             <Badge
               variant={
                 data.status === "ACTIVE"
@@ -261,7 +264,7 @@ export default function ProjectOverviewPage() {
       </div>
 
       {metrics?.pgError && (
-        <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 text-xs text-[var(--warning)]">
+        <div className="rounded-md border border-[var(--warning-border)] bg-[var(--warning-soft)] px-3.5 py-2.5 text-xs text-[var(--warning)]">
           PostgreSQL Data Plane unreachable: {metrics.pgError}
         </div>
       )}

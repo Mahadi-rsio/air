@@ -42,7 +42,7 @@ export default function MonitoringPage() {
       </div>
 
       {data?.pgError && (
-        <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-[var(--warning)]">
+        <div className="rounded-md border border-[var(--warning-border)] bg-[var(--warning-soft)] p-3 text-xs text-[var(--warning)]">
           {data.pgError}
         </div>
       )}

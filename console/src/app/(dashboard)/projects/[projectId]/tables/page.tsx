@@ -185,13 +185,13 @@ export default function TablesStudioPage() {
       </div>
 
       {schemaError && (
-        <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-[var(--warning)]">
+        <div className="rounded-md border border-[var(--warning-border)] bg-[var(--warning-soft)] p-3 text-xs text-[var(--warning)]">
           {(schemaError as Error).message}
         </div>
       )}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-4">
-        <Card className="h-[calc(100vh-12rem)] overflow-y-auto">
+        <Card className="h-[32rem] lg:h-[calc(100vh-13rem)] overflow-y-auto">
           <CardHeader>
             <CardTitle>Tables ({schemaData?.length ?? 0})</CardTitle>
           </CardHeader>
@@ -231,7 +231,7 @@ export default function TablesStudioPage() {
           </CardContent>
         </Card>
 
-        <Card className="lg:col-span-3 h-[calc(100vh-12rem)] flex flex-col overflow-hidden">
+        <Card className="lg:col-span-3 h-[32rem] lg:h-[calc(100vh-13rem)] flex flex-col overflow-hidden">
           <CardHeader className="py-2.5">
             <CardTitle className="font-mono">
               {selected ? `${selected.schema}.${selected.table}` : "Select a table"}

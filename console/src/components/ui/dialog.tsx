@@ -29,19 +29,24 @@ export function Dialog({
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-sm p-4"
+      onClick={() => onOpenChange(false)}
+    >
       <div
-        className="w-full max-w-lg rounded-lg border border-[var(--border)] bg-[var(--surface)] shadow-xl"
+        className="w-full max-w-lg rounded-xl border border-[var(--border-strong)] bg-[var(--surface)]"
+        style={{ boxShadow: "var(--elevated-shadow)" }}
         role="dialog"
         aria-modal="true"
+        onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between border-b border-[var(--border)] px-5 py-4">
           <div>
-            <h2 className="text-sm font-semibold text-[var(--text-primary)]">
+            <h2 className="text-sm font-semibold tracking-tight text-[var(--text-primary)]">
               {title}
             </h2>
             {description && (
-              <p className="mt-0.5 text-xs text-[var(--text-secondary)]">
+              <p className="mt-1 text-xs text-[var(--text-secondary)]">
                 {description}
               </p>
             )}
@@ -49,7 +54,8 @@ export function Dialog({
           <button
             type="button"
             onClick={() => onOpenChange(false)}
-            className="rounded p-1 text-[var(--text-secondary)] hover:bg-[var(--surface-elevated)] hover:text-[var(--text-primary)]"
+            className="rounded-lg p-1.5 text-[var(--text-secondary)] transition-colors hover:bg-[var(--surface-elevated)] hover:text-[var(--text-primary)] cursor-pointer"
+            aria-label="Close dialog"
           >
             <X className="h-4 w-4" />
           </button>
