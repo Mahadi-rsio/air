@@ -107,6 +107,7 @@ flowchart TB
 ## 4. Detailed Architecture Guides
 
 - [Pageserver & `air_smgr` Architecture](file:///workspaces/air/docs/architecture/pageserver.md)
+- [Read-Only Engine & Storage Adapter](file:///workspaces/air/docs/architecture/read-engine.md)
 - [Object Storage & R2 Key Layout](file:///workspaces/air/docs/architecture/storage.md)
 - [Tenant Lifecycle, Generations & Offload](file:///workspaces/air/docs/architecture/tenant-lifecycle.md)
 - [WAL Ingestion, Archival & Crash Recovery](file:///workspaces/air/docs/architecture/wal-and-recovery.md)
