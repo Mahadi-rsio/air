@@ -271,6 +271,32 @@ func (c *TieredCacheBackend) InvalidateGeneration(tenantID, generation string) {
 	})
 }
 
+// InvalidateRelation removes all L1 and L2 cached pages for a specific relation fork.
+func (c *TieredCacheBackend) InvalidateRelation(tenantID, generation string, spcOID, dbOID, relNumber uint32, forkNum uint8) {
+	c.invalidateWhere(func(k PageCacheKey) bool {
+		return k.TenantID == tenantID &&
+			(generation == "" || k.Generation == generation) &&
+			k.SpcOID == spcOID &&
+			k.DbOID == dbOID &&
+			k.RelNumber == relNumber &&
+			k.ForkNum == forkNum
+	})
+}
+
+// InvalidateBlock removes all L1 and L2 cached versions of a specific block below beforeLSN (or all if beforeLSN == 0).
+func (c *TieredCacheBackend) InvalidateBlock(tenantID, generation string, spcOID, dbOID, relNumber uint32, forkNum uint8, blockNum uint32, beforeLSN uint64) {
+	c.invalidateWhere(func(k PageCacheKey) bool {
+		return k.TenantID == tenantID &&
+			(generation == "" || k.Generation == generation) &&
+			k.SpcOID == spcOID &&
+			k.DbOID == dbOID &&
+			k.RelNumber == relNumber &&
+			k.ForkNum == forkNum &&
+			k.BlockNum == blockNum &&
+			(beforeLSN == 0 || k.LSN < beforeLSN)
+	})
+}
+
 func (c *TieredCacheBackend) invalidateWhere(pred func(PageCacheKey) bool) {
 	c.l1Mu.Lock()
 	for k, elem := range c.l1Map {
