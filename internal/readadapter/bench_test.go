@@ -205,3 +205,36 @@ func BenchmarkReadEngineCommitPublish(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkReadEngineSQLiteQuery(b *testing.B) {
+	dbPath := filepath.Join(b.TempDir(), "bench.sqlite3")
+	writer, err := OpenSQLiteConn(dbPath, false, 32768)
+	if err != nil {
+		b.Fatalf("OpenSQLiteConn writer: %v", err)
+	}
+	defer writer.Close()
+
+	if err := writer.Exec(`
+		CREATE TABLE items (id INT4 PRIMARY KEY, val TEXT);
+		INSERT INTO items VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+	`); err != nil {
+		b.Fatalf("seed: %v", err)
+	}
+
+	reader, err := OpenSQLiteConn(dbPath, true, 32768)
+	if err != nil {
+		b.Fatalf("OpenSQLiteConn reader: %v", err)
+	}
+	defer reader.Close()
+
+	args := []string{"2"}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		res, err := reader.Query("SELECT val FROM items WHERE id = ?1", args)
+		if err != nil || len(res.Rows) != 1 {
+			b.Fatalf("Query failed: err=%v rows=%d", err, len(res.Rows))
+		}
+	}
+}
+

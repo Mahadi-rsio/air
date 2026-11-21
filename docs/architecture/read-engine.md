@@ -90,22 +90,30 @@ Measured on `linux/amd64` (`AMD EPYC 7763`, `go test -bench=BenchmarkReadEngine 
 
 | Benchmark | Latency (`ns/op`) | Allocations |
 | :--- | ---: | ---: |
-| `BenchmarkReadEngineL1HotPage-2` | `6,431 ns/op` | `8192 B/op`, `1 allocs/op` |
-| `BenchmarkReadEngineL2NVMePage-2` | `17,312 ns/op` | `9912 B/op`, `5 allocs/op` |
-| `BenchmarkReadEngineL3PageserverPage-2` | `2,738 ns/op` | `8440 B/op`, `6 allocs/op` |
-| `BenchmarkReadEngineMVCCWithCLOG-2` | `39.62 ns/op` | `0 B/op`, `0 allocs/op` |
-| `BenchmarkReadEngineCommitPublish-2` | `90.54 ns/op` | `0 B/op`, `0 allocs/op` |
+| `BenchmarkReadEngineL1HotPage-2` | `2,159 ns/op` | `8192 B/op`, `1 allocs/op` |
+| `BenchmarkReadEngineL2NVMePage-2` | `21,452 ns/op` | `9912 B/op`, `5 allocs/op` |
+| `BenchmarkReadEngineL3PageserverPage-2` | `2,522 ns/op` | `8440 B/op`, `6 allocs/op` |
+| `BenchmarkReadEngineMVCCWithCLOG-2` | `41.77 ns/op` | `0 B/op`, `0 allocs/op` |
+| `BenchmarkReadEngineCommitPublish-2` | `89.05 ns/op` | `0 B/op`, `0 allocs/op` |
+| `BenchmarkReadEngineSQLiteQuery-2` | `6,770 ns/op` | `264 B/op`, `15 allocs/op` |
 
 ---
 
-## 7. Standalone Process Separation (`air-read-engine` + `air-gateway`)
+## 7. Standalone Process Separation & Default Shared SQLite Read Engine (`air-read-engine` + `air-gateway`)
 
 AIR separates the **Gateway** (`gateway/air-gateway`), **Read Engine** ([`cmd/air-read-engine`](file:///workspaces/air/cmd/air-read-engine/main.go)), and **Cell/Control Plane** ([`cmd/air-server`](file:///workspaces/air/cmd/air-server/main.go)) into independent processes:
 
 - **`air-gateway` as Single Entry Point (`:5432`)**: Clients connect only to `air-gateway`. Both [`TenantPool::handle_simple_query`](file:///workspaces/air/gateway/src/pooler.cpp) and [`TenantPool::handle_extended_batch`](file:///workspaces/air/gateway/src/pooler.cpp) (`Parse`/`Bind`/`Execute`/`Sync`) classify queries via `route_query`:
   - Read-only Simple and Extended Query batches route to `read_idle_pool_` (`--read-engine-host` / `--read-engine-port` / `--read-engine-sock-dir`) with automatic fallback to the Cell (`WriteEngine`) on error or unavailability.
   - After writes commit on the Cell, the gateway captures `pg_current_wal_lsn()` into `session_write_lsn`. Subsequent reads refresh `pg_last_wal_replay_lsn()` from the Read Engine if needed and fall back to the Cell (`CausalLagFallback`) whenever `read_engine_lsn < session_write_lsn`.
-- **Shared `air-read-engine` (`:8082` HTTP, `:5433` PG)**:
-  - Runs one shared read-only PG17 cluster serving all tenants by database name (`air_ro.enabled = on`, `default_transaction_read_only = on`, `hot_standby = on`, `autovacuum = off`, `shared_buffers = 32MB`).
-  - Initializes via `pg_basebackup -R -X stream -c fast` when `--primary-conninfo` is provided, or `air_smgr.read_only = on` when `--pageserver-socket` is set.
+- **Shared `air-read-engine` (`:8082` HTTP, `:5433` PG wire) — Default SQLite Engine (`--engine=sqlite`)**:
+  - By default (`--engine=sqlite` / `AIR_READ_ENGINE_TYPE=sqlite`), `air-read-engine` runs [`readadapter.SQLiteReadServer`](file:///workspaces/air/internal/readadapter/sqlite_server.go) backed by native `libsqlite3` ([`sqlite_cgo.go`](file:///workspaces/air/internal/readadapter/sqlite_cgo.go)) instead of spawning a PostgreSQL cluster.
+  - Serves all tenants over the PostgreSQL v3 wire protocol on TCP (`:5433`) and Unix domain socket (`.s.PGSQL.5433`), supporting both Simple Query (`Q`) and Extended Query (`Parse`/`Bind`/`Describe`/`Execute`/`Close`/`Flush`/`Sync`) protocols, `PREPARE`/`EXECUTE`/`DEALLOCATE`, `COPY (...) TO STDOUT`, `EXPLAIN`, and LSN/status introspection (`pg_last_wal_replay_lsn()`, `air_ro_status()`, `sqlite_version()`).
+  - Enforces strict 3-layer read-only execution on every client query:
+    1. `SQLITE_OPEN_READONLY` file descriptor flags + `PRAGMA query_only = ON`.
+    2. C-level `sqlite3_set_authorizer` hook (`air_sqlite_ro_authorizer`) permitting only `SQLITE_SELECT`, `SQLITE_READ`, `SQLITE_FUNCTION`, read-only transactions, and safe inspection pragmas while denying all writes (`SQLITE_DENY` -> `SQLSTATE 25006`).
+    3. `sqlite3_stmt_readonly(stmt)` verification and SQL guard against DML, DDL, modifying CTEs, `SELECT INTO`, `FOR UPDATE/SHARE`, and attempts to disable `transaction_read_only`.
+  - Materializes committed PG17 heap tuples from `readadapter.Adapter` (L1 RAM -> L2 NVMe -> L3 Pageserver with MVCC/CLOG visibility) via `MaterializeRelation` or syncs from the primary Cell via `SyncFromPrimary` / `POST /v1/tenants/{id}/sync`, tracking each tenant's synced LSN in `_air_meta` for gateway causal consistency.
+  - The legacy native PG17 `air_ro.so` read engine remains available via `--engine=postgres` (`AIR_READ_ENGINE_TYPE=postgres`).
+
 

@@ -17,9 +17,12 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/Mahadi-rsio/air/internal/readadapter"
 )
 
 type Config struct {
+	Engine           string
 	HTTPAddr         string
 	ListenHost       string
 	PGPort           int
@@ -47,20 +50,45 @@ func envIntOr(key string, fallback int) int {
 	return fallback
 }
 
+func parseMemoryToKB(s string, fallbackKB int) int {
+	s = strings.TrimSpace(strings.ToUpper(s))
+	if strings.HasSuffix(s, "GB") {
+		if n, err := strconv.Atoi(strings.TrimSuffix(s, "GB")); err == nil && n > 0 {
+			return n * 1024 * 1024
+		}
+	}
+	if strings.HasSuffix(s, "MB") {
+		if n, err := strconv.Atoi(strings.TrimSuffix(s, "MB")); err == nil && n > 0 {
+			return n * 1024
+		}
+	}
+	if strings.HasSuffix(s, "KB") {
+		if n, err := strconv.Atoi(strings.TrimSuffix(s, "KB")); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallbackKB
+}
+
 func loadConfig(args []string) Config {
 	fs := flag.NewFlagSet("air-read-engine", flag.ContinueOnError)
 	cfg := Config{}
+	fs.StringVar(&cfg.Engine, "engine", envOr("AIR_READ_ENGINE_TYPE", "sqlite"), "Read engine backend type ('sqlite' default or 'postgres')")
 	fs.StringVar(&cfg.HTTPAddr, "http-addr", envOr("AIR_READ_ENGINE_HTTP_ADDR", "127.0.0.1:8082"), "HTTP admin/health listen address")
-	fs.StringVar(&cfg.ListenHost, "listen-host", envOr("AIR_READ_ENGINE_HOST", "127.0.0.1"), "Shared PostgreSQL listen address")
+	fs.StringVar(&cfg.ListenHost, "listen-host", envOr("AIR_READ_ENGINE_HOST", "127.0.0.1"), "Shared PostgreSQL wire listen address")
 	fs.IntVar(&cfg.PGPort, "pg-port", envIntOr("AIR_READ_ENGINE_PG_PORT", 5433), "Shared PostgreSQL wire port for all tenants")
 	fs.StringVar(&cfg.DataDir, "data-dir", envOr("AIR_READ_ENGINE_DATA_DIR", "/tmp/air-read-engine"), "Read engine data directory")
-	fs.StringVar(&cfg.PGBinDir, "pg-bin-dir", envOr("AIR_PG_BIN_DIR", "/usr/lib/postgresql/17/bin"), "PostgreSQL 17 binary directory")
-	fs.StringVar(&cfg.AirRoSO, "air-ro-so", envOr("AIR_RO_SO_PATH", ""), "Path to air_ro.so extension")
+	fs.StringVar(&cfg.PGBinDir, "pg-bin-dir", envOr("AIR_PG_BIN_DIR", "/usr/lib/postgresql/17/bin"), "PostgreSQL 17 binary directory (used when --engine=postgres)")
+	fs.StringVar(&cfg.AirRoSO, "air-ro-so", envOr("AIR_RO_SO_PATH", ""), "Path to air_ro.so extension (used when --engine=postgres)")
 	fs.StringVar(&cfg.PageserverSocket, "pageserver-socket", envOr("AIR_PAGESERVER_SOCKET", ""), "Optional Pageserver Unix socket path")
-	fs.StringVar(&cfg.SharedBuffers, "shared-buffers", envOr("AIR_READ_ENGINE_SHARED_BUFFERS", "32MB"), "PostgreSQL shared_buffers setting")
-	fs.StringVar(&cfg.PrimaryConnInfo, "primary-conninfo", envOr("AIR_READ_ENGINE_PRIMARY_CONNINFO", ""), "Optional primary_conninfo for hot_standby streaming")
+	fs.StringVar(&cfg.SharedBuffers, "shared-buffers", envOr("AIR_READ_ENGINE_SHARED_BUFFERS", "32MB"), "Read engine page cache / shared_buffers size")
+	fs.StringVar(&cfg.PrimaryConnInfo, "primary-conninfo", envOr("AIR_READ_ENGINE_PRIMARY_CONNINFO", ""), "Optional primary_conninfo for syncing from Write Engine")
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("parse flags: %v", err)
+	}
+	cfg.Engine = strings.ToLower(strings.TrimSpace(cfg.Engine))
+	if cfg.Engine == "" {
+		cfg.Engine = "sqlite"
 	}
 	if cfg.AirRoSO == "" {
 		for _, cand := range []string{
@@ -78,16 +106,37 @@ func loadConfig(args []string) Config {
 }
 
 type SharedReadEngine struct {
-	cfg     Config
-	mu      sync.Mutex
-	pgData  string
-	sockDir string
-	logRoot string
-	state   string
-	tenants map[string]bool
+	cfg      Config
+	mu       sync.Mutex
+	pgData   string
+	sockDir  string
+	logRoot  string
+	state    string
+	tenants  map[string]bool
+	sqliteRe *readadapter.SQLiteReadServer
 }
 
 func NewSharedReadEngine(cfg Config) (*SharedReadEngine, error) {
+	if cfg.Engine == "sqlite" {
+		sq, err := readadapter.NewSQLiteReadServer(readadapter.SQLiteServerConfig{
+			ListenHost:      cfg.ListenHost,
+			PGPort:          cfg.PGPort,
+			DataDir:         cfg.DataDir,
+			PrimaryConnInfo: cfg.PrimaryConnInfo,
+			CacheKB:         parseMemoryToKB(cfg.SharedBuffers, 32768),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &SharedReadEngine{
+			cfg:      cfg,
+			sockDir:  sq.SockDir(),
+			state:    "STOPPED",
+			tenants:  make(map[string]bool),
+			sqliteRe: sq,
+		}, nil
+	}
+
 	root := filepath.Join(cfg.DataDir, "shared")
 	pgData := filepath.Join(root, "pgdata")
 	sockDir := filepath.Join(root, "sock")
@@ -108,6 +157,16 @@ func (re *SharedReadEngine) Start() error {
 	re.mu.Lock()
 	defer re.mu.Unlock()
 	if re.state == "ACTIVE" {
+		return nil
+	}
+
+	if re.sqliteRe != nil {
+		if err := re.sqliteRe.Start(); err != nil {
+			return err
+		}
+		re.cfg.PGPort = re.sqliteRe.Port()
+		re.sockDir = re.sqliteRe.SockDir()
+		re.state = "ACTIVE"
 		return nil
 	}
 
@@ -161,14 +220,27 @@ func (re *SharedReadEngine) Stop() error {
 		return nil
 	}
 	re.state = "STOPPED"
+	if re.sqliteRe != nil {
+		return re.sqliteRe.Stop()
+	}
 	return re.pgCtl("stop")
 }
 
-// EnsureTenantDB creates the tenant database in the shared cluster when not running as a replica.
+// EnsureTenantDB creates or registers the tenant database in the shared read engine.
 func (re *SharedReadEngine) EnsureTenantDB(tenantID string) error {
 	if tenantID == "" {
 		return fmt.Errorf("tenant_id is required")
 	}
+	if re.sqliteRe != nil {
+		if err := re.sqliteRe.EnsureTenantDB(tenantID); err != nil {
+			return err
+		}
+		re.mu.Lock()
+		re.tenants[tenantID] = true
+		re.mu.Unlock()
+		return nil
+	}
+
 	re.mu.Lock()
 	defer re.mu.Unlock()
 	if re.tenants[tenantID] {
@@ -300,36 +372,62 @@ func (re *SharedReadEngine) HTTPHandler() http.Handler {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		re.mu.Lock()
 		state := re.state
+		port := re.cfg.PGPort
+		sockDir := re.sockDir
 		re.mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":    "ok",
-			"service":   "air-read-engine",
-			"mode":      "shared",
-			"state":     state,
-			"host":      re.cfg.ListenHost,
-			"pg_port":   re.cfg.PGPort,
-			"sock_dir":  re.sockDir,
-			"air_ro_so": re.cfg.AirRoSO,
-		})
-	})
-	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
-		re.mu.Lock()
-		tenants := make([]string, 0, len(re.tenants))
-		for id := range re.tenants {
-			tenants = append(tenants, id)
-		}
-		state := re.state
-		re.mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		resp := map[string]any{
+			"status":   "ok",
+			"service":  "air-read-engine",
+			"engine":   re.cfg.Engine,
 			"mode":     "shared",
 			"state":    state,
 			"host":     re.cfg.ListenHost,
-			"pg_port":  re.cfg.PGPort,
-			"sock_dir": re.sockDir,
+			"pg_port":  port,
+			"sock_dir": sockDir,
+		}
+		if re.sqliteRe != nil {
+			allowed, blocked := re.sqliteRe.Stats()
+			resp["sqlite_version"] = readadapter.SQLiteVersion()
+			resp["queries_allowed"] = allowed
+			resp["writes_blocked"] = blocked
+		} else {
+			resp["air_ro_so"] = re.cfg.AirRoSO
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		re.mu.Lock()
+		var tenants []string
+		if re.sqliteRe != nil {
+			tenants = re.sqliteRe.Tenants()
+		} else {
+			tenants = make([]string, 0, len(re.tenants))
+			for id := range re.tenants {
+				tenants = append(tenants, id)
+			}
+		}
+		state := re.state
+		port := re.cfg.PGPort
+		sockDir := re.sockDir
+		re.mu.Unlock()
+		resp := map[string]any{
+			"engine":   re.cfg.Engine,
+			"mode":     "shared",
+			"state":    state,
+			"host":     re.cfg.ListenHost,
+			"pg_port":  port,
+			"sock_dir": sockDir,
 			"tenants":  tenants,
-		})
+		}
+		if re.sqliteRe != nil {
+			allowed, blocked := re.sqliteRe.Stats()
+			resp["sqlite_version"] = readadapter.SQLiteVersion()
+			resp["queries_allowed"] = allowed
+			resp["writes_blocked"] = blocked
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 	mux.HandleFunc("/v1/tenants/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/v1/tenants/")
@@ -348,15 +446,45 @@ func (re *SharedReadEngine) HTTPHandler() http.Handler {
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"tenant_id": tenantID,
+				"engine":    re.cfg.Engine,
 				"host":      re.cfg.ListenHost,
 				"port":      re.cfg.PGPort,
 				"sock_dir":  re.sockDir,
 				"state":     "ACTIVE",
 				"mode":      "shared",
 			})
+		case r.Method == http.MethodPost && action == "sync":
+			if re.sqliteRe == nil {
+				http.Error(w, "sync endpoint is only supported on sqlite read engine", http.StatusBadRequest)
+				return
+			}
+			var req struct {
+				SQL         string `json:"sql"`
+				LSN         string `json:"lsn"`
+				PrimaryConn string `json:"primary_conninfo"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.PrimaryConn != "" {
+				if err := re.sqliteRe.SyncFromPrimary(r.Context(), tenantID, req.PrimaryConn); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+			} else if req.SQL != "" {
+				lsn := readadapter.ParsePGLSN(req.LSN)
+				if err := re.sqliteRe.ExecInternal(tenantID, req.SQL, lsn); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tenant_id": tenantID,
+				"engine":    re.cfg.Engine,
+				"status":    "synced",
+			})
 		case r.Method == http.MethodGet && action == "route":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"tenant_id": tenantID,
+				"engine":    re.cfg.Engine,
 				"host":      re.cfg.ListenHost,
 				"port":      re.cfg.PGPort,
 				"sock_dir":  re.sockDir,
@@ -382,8 +510,13 @@ func main() {
 	if err := re.Start(); err != nil {
 		log.Fatalf("start shared read engine: %v", err)
 	}
-	log.Printf("[air-read-engine] shared read-only PG17 listening on %s:%d (sock=%s, shared_buffers=%s)",
-		cfg.ListenHost, cfg.PGPort, re.sockDir, cfg.SharedBuffers)
+	if re.sqliteRe != nil {
+		log.Printf("[air-read-engine] shared read-only SQLite %s engine listening on %s:%d (sock=%s, cache=%s)",
+			readadapter.SQLiteVersion(), cfg.ListenHost, re.cfg.PGPort, re.sockDir, cfg.SharedBuffers)
+	} else {
+		log.Printf("[air-read-engine] shared read-only PG17 listening on %s:%d (sock=%s, shared_buffers=%s)",
+			cfg.ListenHost, re.cfg.PGPort, re.sockDir, cfg.SharedBuffers)
+	}
 
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {

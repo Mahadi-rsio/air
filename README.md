@@ -19,7 +19,7 @@ AIR is a production-oriented, multi-tenant PostgreSQL 17 platform featuring a Go
 .
 ├── cmd/
 │   ├── air-server/          # Air DB server entrypoint (Control Plane HTTP + gRPC + Cell Agent + Pageserver)
-│   └── air-read-engine/     # Standalone Read Engine entrypoint (read-only PG17 with air_ro + air_smgr.read_only)
+│   └── air-read-engine/     # Standalone Read Engine entrypoint (shared read-only SQLite default, or PG17 air_ro via --engine=postgres)
 ├── gateway/                 # Standalone C++20 PG Gateway & Pooler (PG wire :5432, Admin API :8081, gRPC client)
 ├── proto/                   # Protobuf / gRPC contract (airdb.proto: AirDBControl)
 ├── internal/
@@ -93,8 +93,9 @@ go run ./cmd/air-server \
   -bootstrap-api-key air_live_demo_secret_token_12345 \
   -internal-token air_internal_secret
 
-# 2. Start shared air-read-engine (one read-only PG17 cluster :5433 serving all tenants, HTTP :8082)
+# 2. Start shared air-read-engine (shared read-only SQLite engine :5433 serving all tenants by default, HTTP :8082)
 go run ./cmd/air-read-engine \
+  -engine sqlite \
   -data-dir /tmp/air-read-engine \
   -http-addr 127.0.0.1:8082 \
   -pg-port 5433
