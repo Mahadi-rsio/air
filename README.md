@@ -1,10 +1,10 @@
 # AIR — Multi-Tenant PostgreSQL 17 Platform (`v2.0`)
 
-AIR is a production-oriented, multi-tenant PostgreSQL 17 platform featuring a Go database engine and control plane (`air-server`), a standalone **C++20 PG gateway & connection pooler** (`air-gateway`) communicating over **gRPC**, cooperative scale-to-zero, generation-fenced cold offload, encrypted Cloudflare R2 backups/PITR, and a custom Neon-style Pageserver (`air_smgr`) with Content-Addressed Upload (CAU).
+AIR is a production-oriented, multi-tenant PostgreSQL 17 platform featuring a Go database engine and control plane (`air-server`), a standalone **Go PG gateway & transaction pooler** (`air-gateway`) communicating over **gRPC**, a **default SQLite read engine** (`air-read-engine`) that reads PostgreSQL 17 pages natively from AIR's Pageserver via the Cgo `air_pg` virtual table (zero `/sync` required), cooperative scale-to-zero, generation-fenced cold offload, encrypted Cloudflare R2 backups/PITR, and a custom Neon-style Pageserver (`air_smgr`) with Content-Addressed Upload (CAU).
 
 > **Architecture & Developer Guides:** [Overview](file:///workspaces/air/docs/architecture/overview.md) · [Codebase Map](file:///workspaces/air/docs/architecture/codebase-map.md) · [Developer Guide](file:///workspaces/air/docs/development/DEVELOPMENT.md) · [Contributing](file:///workspaces/air/CONTRIBUTING.md) · [Known Issues](file:///workspaces/air/docs/known-issues.md)
 >
-> **Subsystem Docs:** [Pageserver](file:///workspaces/air/docs/architecture/pageserver.md) · [Storage](file:///workspaces/air/docs/architecture/storage.md) · [Tenant Lifecycle](file:///workspaces/air/docs/architecture/tenant-lifecycle.md) · [WAL & Recovery](file:///workspaces/air/docs/architecture/wal-and-recovery.md) · [Backup & Restore](file:///workspaces/air/docs/architecture/backup-and-restore.md)
+> **Subsystem Docs:** [Pageserver](file:///workspaces/air/docs/architecture/pageserver.md) · [Read Engine](file:///workspaces/air/docs/architecture/read-engine.md) · [Storage](file:///workspaces/air/docs/architecture/storage.md) · [Tenant Lifecycle](file:///workspaces/air/docs/architecture/tenant-lifecycle.md) · [WAL & Recovery](file:///workspaces/air/docs/architecture/wal-and-recovery.md) · [Backup & Restore](file:///workspaces/air/docs/architecture/backup-and-restore.md)
 
 ## How AIR Differs from Standard PostgreSQL
 
@@ -19,8 +19,9 @@ AIR is a production-oriented, multi-tenant PostgreSQL 17 platform featuring a Go
 .
 ├── cmd/
 │   ├── air-server/          # Air DB server entrypoint (Control Plane HTTP + gRPC + Cell Agent + Pageserver)
-│   └── air-read-engine/     # Standalone Read Engine entrypoint (shared read-only SQLite server over PG wire)
-├── gateway/                 # Standalone C++20 PG Gateway & Pooler (PG wire :5432, Admin API :8081, gRPC client)
+│   ├── air-gateway/         # Standalone Go PG Gateway & Transaction Pooler (PG wire :5432, Admin API :8081, gRPC client)
+│   └── air-read-engine/     # Standalone Read Engine entrypoint (shared read-only SQLite + native Pageserver air_pg vtab)
+├── gateway/                 # Gateway Dockerfile for container builds
 ├── proto/                   # Protobuf / gRPC contract (airdb.proto: AirDBControl)
 ├── internal/
 │   ├── config/              # Runtime flags and environment configuration
@@ -28,16 +29,19 @@ AIR is a production-oriented, multi-tenant PostgreSQL 17 platform featuring a Go
 │   ├── tenant/              # Canonical tenant/account ID validation & symlink-safe path containment
 │   ├── cell/                # PG17 lifecycle, warm initdb pool, cgroup v2, supautils hardening, flock ownership
 │   ├── control/             # Durable PG17 metadata, migrations, offload worker, backup/restore, HTTP & gRPC
+│   ├── gateway/             # Go PG Gateway, SQL router (defaults read-engine to :5433), pooler, metrics & admin API
+│   ├── readadapter/         # Native Pageserver socket client, PG17 catalog discovery, MVCC/CLOG, L1/L2 cache & SQLite air_pg vtab
 │   ├── pb/                  # Generated Go protobuf & gRPC stubs
-│   ├── pageserver/          # Go Pageserver (WAL receiver/parser, L0/L1/Image layers, CAU R2 upload, GetPage@LSN)
+│   ├── pageserver/          # Go Pageserver (WAL receiver/parser, pure-Go Heap/XACT redo, L0/L1/Image layers, CAU R2 upload, GetPage@LSN)
 │   ├── backup/              # Shared R2 Store, LSN continuity, encrypted backups, manifest verify, PITR & DAG GC
 │   └── fencing/             # CLOCK_MONOTONIC lease watchdog & R2 ETag CAS fencing manifests
 ├── extensions/air_smgr/     # PostgreSQL 17 custom smgr extension (Local File Cache + Pageserver IPC)
 ├── patches/                 # PG17 smgr_hook source patch (pg17-smgr-hook.patch)
 ├── migrations/              # SQL schema reference (001_initial_schema.sql, 002_api_keys.sql)
-├── docs/                    # Architecture, development, known issues, and Phase 13.1 audit reports
-├── tests/e2e/               # Real PostgreSQL 17 end-to-end tests (including Phase 13 backup/PITR verification)
-├── Dockerfile               # Multi-stage container build (Go air-server + C++ air-gateway + PG17 + air_smgr)
+├── docs/                    # Architecture, development, known issues, and audit reports
+├── tests/e2e/               # Real PostgreSQL 17 end-to-end tests (including native zero-sync SQLite read E2E)
+├── Dockerfile               # Multi-stage container build for air-server (Go + patched PG17 + supautils + air_smgr)
+├── Dockerfile.read-engine   # Multi-stage container build for air-read-engine (Go + Cgo libsqlite3)
 └── fly.toml                 # Fly.io deployment configuration
 ```
 
@@ -54,8 +58,9 @@ AIR is a production-oriented, multi-tenant PostgreSQL 17 platform featuring a Go
    - All `/v1/*` endpoints require `Authorization: Bearer <token>`.
    - Tokens are stored only as SHA-256 digests (`key_sha256 UNIQUE`) bound to `account_id`, with instant revocation via `DELETE /v1/api-keys/{id}`.
    - Supports external HA metadata PostgreSQL via `--meta-dsn` (`AIR_META_DSN`) or an embedded local metadata PG17 instance.
-2. **Standalone C++20 Gateway, Transaction Pooler & Metrics ([gateway/src/](file:///workspaces/air/gateway/src))**:
-   - Auto-discovers newly created tenant databases from internal metadata PG (`clusters`) and communicates with `air-server` over **gRPC** (`--db-grpc-addr` / `AIR_DB_GRPC_ADDR`, default `127.0.0.1:9090`).
+2. **Standalone Go Gateway, Transaction Pooler & Default Read Routing ([internal/gateway/](file:///workspaces/air/internal/gateway))**:
+   - Auto-discovers newly created tenant databases via `air-server` over **gRPC** (`--db-grpc-addr` / `AIR_DB_GRPC_ADDR`, default `127.0.0.1:9090`).
+   - Routes read-only queries by default to `air-read-engine` (`--read-engine-port=5433` default) with automatic fallback to the PG17 primary on causal lag, write transactions, or unavailability.
    - Enforces an 8 KB `StartupMessage` limit, TLS 1.2+ (`SSLRequest = 80877103`), cryptographic `SNI == database` tenant binding, and blocks reserved `postgres` superuser connections (`SQLSTATE 28000`).
    - Enforces global, per-tenant, and per-user client connection limits (`--max-client-conns`, `--max-tenant-client-conns`, `--max-user-client-conns`) plus runtime per-tenant overrides via `POST /internal/v1/tenants/{id}/limits`.
    - Tracks per-user and per-tenant query count, error count, latency (`min`/`avg`/`max`/`p50`/`p95`/`p99`), pool wait time, and data size (`bytes_in`, `bytes_out`, `rows_returned`, `data_row_bytes`) exposed at `GET /internal/v1/metrics` (JSON) and `GET /metrics` (Prometheus).
@@ -80,10 +85,10 @@ Runs the suites in [tests/e2e/](file:///workspaces/air/tests/e2e) against real P
 go test -v -race -count=1 ./...
 ```
 
-### Running `air-server`, `air-read-engine`, and C++ `air-gateway` Locally
+### Running `air-server`, `air-read-engine`, and `air-gateway` Locally (Zero-Sync Native Mode)
 
 ```bash
-# 1. Start air-server (Control Plane HTTP :8080 + Air DB gRPC :9090 + Cell)
+# 1. Start air-server (Control Plane HTTP :8080 + Air DB gRPC :9090 + Cell + Pageserver)
 go run ./cmd/air-server \
   -data-dir /tmp/air-live \
   -http-addr 127.0.0.1:8080 \
@@ -91,29 +96,41 @@ go run ./cmd/air-server \
   -meta-port 15432 \
   -bootstrap-account-id acct_demo \
   -bootstrap-api-key air_live_demo_secret_token_12345 \
-  -internal-token air_internal_secret
+  -internal-token air_internal_secret \
+  -pageserver \
+  -pageserver-socket /tmp/air-live/pageserver.sock
 
-# 2. Start shared air-read-engine (shared read-only SQLite engine :5433 serving all tenants, HTTP :8082)
+# 2. Start shared air-read-engine in native Pageserver mode (PG wire :5433, HTTP :8082, zero /sync!)
 go run ./cmd/air-read-engine \
   -data-dir /tmp/air-read-engine \
+  -cache-dir /tmp/air-read-engine/cache \
   -http-addr 127.0.0.1:8082 \
-  -pg-port 5433
+  -pg-port 5433 \
+  -pageserver-socket /tmp/air-live/pageserver.sock
 
-# 3. Build and start C++ air-gateway (PG Pooler :5432 + Admin API :8081)
-make -C gateway all test
-./gateway/air-gateway \
+# 3. Start Go air-gateway (PG Pooler :5432 + Admin API :8081; defaults to read-engine :5433)
+go run ./cmd/air-gateway \
   --gateway-addr 127.0.0.1:5432 \
   --gateway-admin-addr 127.0.0.1:8081 \
   --db-grpc-addr 127.0.0.1:9090 \
-  --meta-dsn "host=127.0.0.1 port=15432 user=postgres dbname=postgres" \
+  --control-plane-url http://127.0.0.1:8080 \
   --internal-token air_internal_secret \
-  --read-engine-host 127.0.0.1 \
-  --read-engine-port 5433
+  --pool-mode
 ```
+
+### Container Images (GHCR)
+
+Published automatically on `v*` tags and manual workflow dispatches by [.github/workflows/ghcr-publish.yml](file:///workspaces/air/.github/workflows/ghcr-publish.yml):
+
+| Component | GHCR Image | Dockerfile | Default Ports |
+| :--- | :--- | :--- | :--- |
+| **AIR Server** (Control Plane + Cell + Pageserver) | `ghcr.io/mahadi-rsio/air` | [Dockerfile](file:///workspaces/air/Dockerfile) | `8080` (HTTP), `9090` (gRPC) |
+| **AIR Gateway** (Go PG Pooler + Read Router) | `ghcr.io/mahadi-rsio/air-gateway` | [gateway/Dockerfile](file:///workspaces/air/gateway/Dockerfile) | `5432` (PG), `8081` (Admin) |
+| **AIR Read Engine** (Native SQLite `air_pg` VTab) | `ghcr.io/mahadi-rsio/air-read-engine` | [Dockerfile.read-engine](file:///workspaces/air/Dockerfile.read-engine) | `5433` (PG), `8082` (HTTP) |
 
 ### Fly.io Deployment ([fly.toml](file:///workspaces/air/fly.toml))
 
-- Uses `ghcr.io/mahadi-rsio/air:v2.0.12` (published on `v*` tags by [.github/workflows/ghcr-publish.yml](file:///workspaces/air/.github/workflows/ghcr-publish.yml)) with a persistent `air_data` volume mounted at `/var/lib/air`.
+- Uses `ghcr.io/mahadi-rsio/air` (published on `v*` tags by [.github/workflows/ghcr-publish.yml](file:///workspaces/air/.github/workflows/ghcr-publish.yml)) with a persistent `air_data` volume mounted at `/var/lib/air`.
 - Set `AIR_PAGESERVER_ENABLED = "true"` in `[env]` (along with `AIR_R2_*` credentials in Fly secrets) to enable the in-process Pageserver and CAU layer uploads to R2.
 
 ### Control Plane HTTP API
@@ -132,8 +149,8 @@ All `/v1/*` endpoints require `Authorization: Bearer <token>`:
 
 ## Current Limitations & Known Issues
 
-- **Container `air-gateway` Runtime Packaging (Deferred)**: In container builds ([Dockerfile](file:///workspaces/air/Dockerfile)), `air-gateway` currently lacks runtime `libgrpc++.so.1.83` shared libraries in the final image stage (scheduled for a dedicated gateway packaging phase). See [known-issues.md](file:///workspaces/air/docs/known-issues.md) for full details.
 - **Non-Destructive Restore**: `POST /v1/databases/{id}/restore` never overwrites an active tenant in place; pass `new_tenant_id` to materialize a restored tenant alongside the original.
+- See [known-issues.md](file:///workspaces/air/docs/known-issues.md) for full details.
 
 Example with `curl` and `psql`:
 

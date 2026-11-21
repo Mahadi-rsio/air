@@ -99,20 +99,23 @@ Measured on `linux/amd64` (`AMD EPYC 7763`, `go test -bench=BenchmarkReadEngine 
 
 ---
 
-## 7. Standalone Process Separation & Default Shared SQLite Read Engine (`air-read-engine` + `air-gateway`)
+## 7. Standalone Process Separation & Native Pageserver SQLite Default Read Engine (`air-read-engine` + `air-gateway`)
 
-AIR separates the **Gateway** (`gateway/air-gateway`), **Read Engine** ([`cmd/air-read-engine`](file:///workspaces/air/cmd/air-read-engine/main.go)), and **Cell/Control Plane** ([`cmd/air-server`](file:///workspaces/air/cmd/air-server/main.go)) into independent processes:
+AIR separates the **Gateway** ([`cmd/air-gateway`](file:///workspaces/air/cmd/air-gateway/main.go)), **Read Engine** ([`cmd/air-read-engine`](file:///workspaces/air/cmd/air-read-engine/main.go)), and **Cell/Control Plane** ([`cmd/air-server`](file:///workspaces/air/cmd/air-server/main.go)) into independent Go processes with dedicated GHCR container images (`air`, `air-gateway`, `air-read-engine`):
 
-- **`air-gateway` as Single Entry Point (`:5432`)**: Clients connect only to `air-gateway`. Both [`TenantPool::handle_simple_query`](file:///workspaces/air/gateway/src/pooler.cpp) and [`TenantPool::handle_extended_batch`](file:///workspaces/air/gateway/src/pooler.cpp) (`Parse`/`Bind`/`Execute`/`Sync`) classify queries via `route_query`:
-  - Read-only Simple and Extended Query batches route to `read_idle_pool_` (`--read-engine-host` / `--read-engine-port` / `--read-engine-sock-dir`) with automatic fallback to the Cell (`WriteEngine`) on error or unavailability.
-  - After writes commit on the Cell, the gateway captures `pg_current_wal_lsn()` into `session_write_lsn`. Subsequent reads refresh `pg_last_wal_replay_lsn()` from the Read Engine if needed and fall back to the Cell (`CausalLagFallback`) whenever `read_engine_lsn < session_write_lsn`.
-- **Shared `air-read-engine` (`:8082` HTTP, `:5433` PG wire) — Default SQLite Engine (`--engine=sqlite`)**:
-  - By default (`--engine=sqlite` / `AIR_READ_ENGINE_TYPE=sqlite`), `air-read-engine` runs [`readadapter.SQLiteReadServer`](file:///workspaces/air/internal/readadapter/sqlite_server.go) backed by native `libsqlite3` ([`sqlite_cgo.go`](file:///workspaces/air/internal/readadapter/sqlite_cgo.go)) instead of spawning a PostgreSQL cluster.
-  - Serves all tenants over the PostgreSQL v3 wire protocol on TCP (`:5433`) and Unix domain socket (`.s.PGSQL.5433`), supporting both Simple Query (`Q`) and Extended Query (`Parse`/`Bind`/`Describe`/`Execute`/`Close`/`Flush`/`Sync`) protocols, `PREPARE`/`EXECUTE`/`DEALLOCATE`, `COPY (...) TO STDOUT`, `EXPLAIN`, and LSN/status introspection (`pg_last_wal_replay_lsn()`, `air_ro_status()`, `sqlite_version()`).
+- **`air-gateway` as Single Entry Point (`:5432`, default `ReadEnginePort = 5433`)**: Clients connect only to `air-gateway` ([`internal/gateway/config.go`](file:///workspaces/air/internal/gateway/config.go), [`internal/gateway/pooler.go`](file:///workspaces/air/internal/gateway/pooler.go)). Both Simple Query and Extended Query (`Parse`/`Bind`/`Execute`/`Sync`) batches classify SQL via `RouteQuery`:
+  - Read-only queries route by default to `air-read-engine` (`--read-engine-port=5433`) with automatic fallback to the PG17 Cell (`WriteEngine`) on error, write transactions, causal lag, or unavailability.
+  - After writes commit on the Cell, the gateway captures `pg_current_wal_lsn()` into `session_write_lsn`. Subsequent reads refresh `pg_last_wal_replay_lsn()` from the Read Engine and fall back to the Cell (`CausalLagFallback`) whenever `read_engine_lsn < session_write_lsn`.
+- **Shared `air-read-engine` (`:8082` HTTP, `:5433` PG wire) — Native Pageserver SQLite Virtual Table (`air_pg`)**:
+  - Runs [`readadapter.SQLiteReadServer`](file:///workspaces/air/internal/readadapter/sqlite_server.go) backed by native `libsqlite3` ([`sqlite_cgo.go`](file:///workspaces/air/internal/readadapter/sqlite_cgo.go)) and the Cgo read-only SQLite Virtual Table module `air_pg` ([`sqlite_vtab.go`](file:///workspaces/air/internal/readadapter/sqlite_vtab.go)).
+  - **Zero-Sync Native Mode (`-pageserver-socket` / `AIR_PAGESERVER_SOCKET`)**:
+    1. Connects directly to `air-server`'s Pageserver over `pageserver.sock` via [`PageserverSocketBackend`](file:///workspaces/air/internal/readadapter/pageserver_socket_backend.go) (`OpGetPageAtLSN`, `OpGetPageBatch`, `OpGetRelSize`, `OpGetRelExists`, `OpGetSLRUPage`, `OpGetTenantInfo`), layered under `TieredCacheBackend` (L1 RAM + L2 NVMe `-cache-dir`).
+    2. Automatically discovers PostgreSQL 17 schemas and tables by scanning `pg_database` (`1664/0/1262`), `pg_namespace` (`2615`), `pg_class` (`1259`), and `pg_attribute` (`1249`) directly from 8 KiB Pageserver pages ([`pg_catalog.go`](file:///workspaces/air/internal/readadapter/pg_catalog.go)) and refreshes virtual table definitions whenever the tenant's WAL LSN advances.
+    3. Streams 8 KiB PG17 heap pages on demand inside `air_pg`'s `xFilter`/`xNext`/`xColumn` callbacks, evaluating MVCC visibility via `IsVisibleWithCLOG` against `pg_xact` SLRU pages maintained live by Pageserver's WALReceiver (`RmXactID` + pure-Go PG17 Heap/Heap2 WAL redo in [`heap_redo.go`](file:///workspaces/air/internal/pageserver/heap_redo.go)).
+    4. Requires **zero `POST /v1/tenants/{id}/sync` calls** (the legacy `/sync` materialization path remains supported as a fallback when `-pageserver-socket` is omitted).
   - Enforces strict 3-layer read-only execution on every client query:
-    1. `SQLITE_OPEN_READONLY` file descriptor flags + `PRAGMA query_only = ON`.
+    1. Read-only `air_pg` virtual table (`xUpdate = NULL`) + `PRAGMA query_only = ON` (and `SQLITE_OPEN_READONLY` in file-backed mode).
     2. C-level `sqlite3_set_authorizer` hook (`air_sqlite_ro_authorizer`) permitting only `SQLITE_SELECT`, `SQLITE_READ`, `SQLITE_FUNCTION`, read-only transactions, and safe inspection pragmas while denying all writes (`SQLITE_DENY` -> `SQLSTATE 25006`).
     3. `sqlite3_stmt_readonly(stmt)` verification and SQL guard against DML, DDL, modifying CTEs, `SELECT INTO`, `FOR UPDATE/SHARE`, and attempts to disable `transaction_read_only`.
-  - Materializes committed PG17 heap tuples from `readadapter.Adapter` (L1 RAM -> L2 NVMe -> L3 Pageserver with MVCC/CLOG visibility) via `MaterializeRelation` or syncs from the primary Cell via `SyncFromPrimary` / `POST /v1/tenants/{id}/sync`, tracking each tenant's synced LSN in `_air_meta` for gateway causal consistency.
 
 
