@@ -81,6 +81,7 @@ import "C"
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"sync"
 	"unsafe"
@@ -411,14 +412,18 @@ func (c *SQLiteConn) QueryWithContext(ctx context.Context, snap *ReadSnapshot, s
 				case C.SQLITE_BLOB:
 					n := C.sqlite3_column_bytes(stmt, C.int(i))
 					ptr := C.sqlite3_column_blob(stmt, C.int(i))
-					var b []byte
+					b := []byte{}
 					if n > 0 && ptr != nil {
 						b = C.GoBytes(ptr, n)
 					}
 					row[i] = SQLiteValue{
 						Type: ct,
 						Blob: b,
-						Text: string(b),
+						Text: "\\x" + hex.EncodeToString(b),
+					}
+					if res.Columns[i].DeclType == "" {
+						res.Columns[i].PGType = PGOIDBytea
+						res.Columns[i].PGSize = -1
 					}
 				default: // SQLITE_TEXT
 					n := C.sqlite3_column_bytes(stmt, C.int(i))
@@ -451,6 +456,45 @@ func (c *SQLiteConn) QueryWithContext(ctx context.Context, snap *ReadSnapshot, s
 	}
 
 	return res, nil
+}
+
+// DescribeColumns prepares a SQL statement without stepping it and returns its result column metadata.
+func (c *SQLiteConn) DescribeColumns(sql string) ([]SQLiteColumn, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.db == nil {
+		return nil, fmt.Errorf("sqlite connection closed")
+	}
+	csql := C.CString(sql)
+	defer C.free(unsafe.Pointer(csql))
+
+	var stmt *C.sqlite3_stmt
+	rc := C.sqlite3_prepare_v2(c.db, csql, -1, &stmt, nil)
+	if rc != C.SQLITE_OK {
+		return nil, fmt.Errorf("%s", C.GoString(C.sqlite3_errmsg(c.db)))
+	}
+	if stmt == nil {
+		return nil, nil
+	}
+	defer C.sqlite3_finalize(stmt)
+
+	colCount := int(C.sqlite3_column_count(stmt))
+	cols := make([]SQLiteColumn, colCount)
+	for i := 0; i < colCount; i++ {
+		cname := C.GoString(C.sqlite3_column_name(stmt, C.int(i)))
+		var decl string
+		if cdecl := C.sqlite3_column_decltype(stmt, C.int(i)); cdecl != nil {
+			decl = C.GoString(cdecl)
+		}
+		oid, sz := declTypeToPG(decl)
+		cols[i] = SQLiteColumn{
+			Name:     cname,
+			DeclType: decl,
+			PGType:   oid,
+			PGSize:   sz,
+		}
+	}
+	return cols, nil
 }
 
 // SQLiteReadOnlyError is returned when SQLite's authorizer or read-only mode rejects a write operation.

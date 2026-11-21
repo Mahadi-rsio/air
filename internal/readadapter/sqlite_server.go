@@ -84,6 +84,8 @@ type ReadServerMetrics struct {
 	ActiveTenants       int               `json:"active_tenants"`
 	PerTenantQueries    map[string]uint64 `json:"per_tenant_queries"`
 	VTabPagesRead            uint64            `json:"vtab_pages_read"`
+	VTabIndexPagesRead       uint64            `json:"vtab_index_pages_read"`
+	VTabIndexScans           uint64            `json:"vtab_index_scans"`
 	VTabTuplesDecoded        uint64            `json:"vtab_tuples_decoded"`
 	VTabColsDecoded          uint64            `json:"vtab_cols_decoded"`
 	VTabRowsMatched          uint64            `json:"vtab_rows_matched"`
@@ -288,6 +290,7 @@ func (s *SQLiteReadServer) DetailedMetrics() ReadServerMetrics {
 		activeSnaps = s.nativeAdapter.ActiveSnapshotCount()
 	}
 	pagesRead, tuplesDecoded, colsDecoded, rowsMatched := VTabStats()
+	idxPagesRead, idxScans := VTabIndexStats()
 
 	toastFB := s.toastFallbacks.Load()
 	mxFB := s.multixactFallbacks.Load()
@@ -322,6 +325,8 @@ func (s *SQLiteReadServer) DetailedMetrics() ReadServerMetrics {
 		ActiveTenants:            activeTenants,
 		PerTenantQueries:         perTenant,
 		VTabPagesRead:            pagesRead,
+		VTabIndexPagesRead:       idxPagesRead,
+		VTabIndexScans:           idxScans,
 		VTabTuplesDecoded:        tuplesDecoded,
 		VTabColsDecoded:          colsDecoded,
 		VTabRowsMatched:          rowsMatched,
@@ -2073,16 +2078,42 @@ func (sess *sqliteClientSession) describeColumns(ps *sqlitePreparedStmt, args []
 	if err != nil {
 		return nil
 	}
-	dummyArgs := args
-	if len(dummyArgs) < ps.ParamCount {
-		dummyArgs = make([]string, ps.ParamCount)
-		copy(dummyArgs, args)
-	}
-	res, err := sess.srv.executeReaderQuery(context.Background(), ts, ps.SQLiteSQL, dummyArgs)
-	if err != nil || res == nil {
+	cols, err := sess.srv.describeReaderColumns(sess.sessionCtx(), ts, ps.SQLiteSQL)
+	if err != nil {
 		return nil
 	}
-	return res.Columns
+	return cols
+}
+
+func (s *SQLiteReadServer) describeReaderColumns(ctx context.Context, ts *SQLiteTenantStore, sqliteSQL string) ([]SQLiteColumn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ts.NativeMode && s.nativeAdapter != nil {
+		gen := s.nativeAdapter.backend.GetTenantGeneration(ts.TenantID)
+		snap, err := s.nativeAdapter.GetSnapshot(ctx, ts.TenantID, gen)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = s.nativeAdapter.ReleaseSnapshot(snap) }()
+
+		if ts.readerPool != nil {
+			select {
+			case slot := <-ts.readerPool:
+				defer func() { ts.readerPool <- slot }()
+				if rerr := s.refreshNativeCatalogOnSlot(ctx, ts, slot, snap); rerr != nil {
+					return nil, rerr
+				}
+				return slot.conn.DescribeColumns(sqliteSQL)
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		if rerr := s.refreshNativeCatalogWithSnap(ctx, ts, snap); rerr != nil {
+			return nil, rerr
+		}
+	}
+	return ts.Reader.DescribeColumns(sqliteSQL)
 }
 
 func (sess *sqliteClientSession) handleExecute(body []byte) bool {

@@ -17,6 +17,7 @@ typedef struct {
 } air_pg_cursor;
 
 extern int goAirPGConnect(sqlite3 *db, int argc, char **argv, unsigned long long *out_id, char **out_ddl);
+extern void goAirPGBestIndexCost(unsigned long long vtab_id, char *idx_str, double *out_cost, sqlite3_int64 *out_rows);
 extern int goAirPGOpen(unsigned long long vtab_id, unsigned long long *out_cursor_id);
 extern int goAirPGClose(unsigned long long cursor_id);
 extern int goAirPGFilter(unsigned long long cursor_id, char *idx_str, int argc, sqlite3_value **argv);
@@ -60,9 +61,7 @@ static int air_pg_connect(
 }
 
 static int air_pg_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *pIdxInfo) {
-	(void)pVtab;
-	int has_eq = 0;
-	int has_range = 0;
+	air_pg_vtab *v = (air_pg_vtab *)pVtab;
 	int arg_idx = 1;
 
 	sqlite3_str *str = sqlite3_str_new(NULL);
@@ -76,19 +75,14 @@ static int air_pg_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *pIdxInfo) 
 		int needs_arg = 0;
 		switch (op) {
 			case SQLITE_INDEX_CONSTRAINT_EQ:
-				has_eq = 1;
-				needs_arg = 1;
-				break;
 			case SQLITE_INDEX_CONSTRAINT_GT:
 			case SQLITE_INDEX_CONSTRAINT_LE:
 			case SQLITE_INDEX_CONSTRAINT_LT:
 			case SQLITE_INDEX_CONSTRAINT_GE:
-				has_range = 1;
 				needs_arg = 1;
 				break;
 			case SQLITE_INDEX_CONSTRAINT_ISNULL:
 			case SQLITE_INDEX_CONSTRAINT_ISNOTNULL:
-				has_range = 1;
 				needs_arg = 0;
 				break;
 			default:
@@ -108,16 +102,11 @@ static int air_pg_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *pIdxInfo) 
 	pIdxInfo->idxStr = encoded;
 	pIdxInfo->needToFreeIdxStr = 1;
 
-	if (has_eq) {
-		pIdxInfo->estimatedCost = 100.0;
-		pIdxInfo->estimatedRows = 10;
-	} else if (has_range) {
-		pIdxInfo->estimatedCost = 500.0;
-		pIdxInfo->estimatedRows = 100;
-	} else {
-		pIdxInfo->estimatedCost = 10000.0;
-		pIdxInfo->estimatedRows = 10000;
-	}
+	double cost = 10000.0;
+	sqlite3_int64 rows = 10000;
+	goAirPGBestIndexCost(v != NULL ? v->go_id : 0, encoded, &cost, &rows);
+	pIdxInfo->estimatedCost = cost;
+	pIdxInfo->estimatedRows = rows;
 	return SQLITE_OK;
 }
 
@@ -235,6 +224,22 @@ import (
 	"unsafe"
 )
 
+const (
+	sqliteConstraintEQ        = int(C.SQLITE_INDEX_CONSTRAINT_EQ)
+	sqliteConstraintGT        = int(C.SQLITE_INDEX_CONSTRAINT_GT)
+	sqliteConstraintLE        = int(C.SQLITE_INDEX_CONSTRAINT_LE)
+	sqliteConstraintLT        = int(C.SQLITE_INDEX_CONSTRAINT_LT)
+	sqliteConstraintGE        = int(C.SQLITE_INDEX_CONSTRAINT_GE)
+	sqliteConstraintISNULL    = int(C.SQLITE_INDEX_CONSTRAINT_ISNULL)
+	sqliteConstraintISNOTNULL = int(C.SQLITE_INDEX_CONSTRAINT_ISNOTNULL)
+
+	sqliteTypeInteger = int(C.SQLITE_INTEGER)
+	sqliteTypeFloat   = int(C.SQLITE_FLOAT)
+	sqliteTypeText    = int(C.SQLITE_TEXT)
+	sqliteTypeBlob    = int(C.SQLITE_BLOB)
+	sqliteTypeNull    = int(C.SQLITE_NULL)
+)
+
 type pgVTabSpec struct {
 	ID         uint64
 	db         unsafe.Pointer // *C.sqlite3
@@ -243,6 +248,7 @@ type pgVTabSpec struct {
 	Table      DiscoveredTable
 	AllCols    []ColumnType // includes dropped columns for heap offset alignment
 	VisibleIdx []int        // maps SQLite column index -> index in AllCols
+	IndexPlans []btreeIndexPlan
 	Adapter    *Adapter
 	CLOG       *CLOGResolver
 }
@@ -257,23 +263,26 @@ type vtabFilter struct {
 }
 
 type pgVTabCursor struct {
-	spec       *pgVTabSpec
-	ctx        context.Context
-	snap       *ReadSnapshot
-	ownsSnap   bool
-	rel        *RelationHandle
-	nblocks    uint32
-	nextBlock  uint32
-	neededCols []bool
-	filters    []vtabFilter
-	rowStride  int
-	rows       []HeapVal
-	numRows    int
-	rowBuf     []HeapVal
-	lpBuf      []LinePointer
-	pageRowIdx int
-	rowid      int64
-	eof        bool
+	spec          *pgVTabSpec
+	ctx           context.Context
+	snap          *ReadSnapshot
+	ownsSnap      bool
+	rel           *RelationHandle
+	toastRel      *RelationHandle
+	toastFn       TOASTResolverFunc
+	nblocks       uint32
+	nextBlock     uint32
+	indexScanDone bool
+	neededCols    []bool
+	filters       []vtabFilter
+	rowStride     int
+	rows          []HeapVal
+	numRows       int
+	rowBuf        []HeapVal
+	lpBuf         []LinePointer
+	pageRowIdx    int
+	rowid         int64
+	eof           bool
 }
 
 type queryExecContext struct {
@@ -374,6 +383,7 @@ func (c *SQLiteConn) RegisterNativeTable(tenantID, generation string, tbl Discov
 		Table:      tbl,
 		AllCols:    allCols,
 		VisibleIdx: visibleIdx,
+		IndexPlans: buildTableIndexPlans(tbl, allCols, visibleIdx),
 		Adapter:    adapter,
 		CLOG:       clog,
 	}
@@ -434,6 +444,99 @@ func goAirPGConnect(_ *C.sqlite3, argc C.int, argv **C.char, outID *C.ulonglong,
 	return C.SQLITE_OK
 }
 
+//export goAirPGBestIndexCost
+func goAirPGBestIndexCost(vtabID C.ulonglong, idxStr *C.char, outCost *C.double, outRows *C.sqlite3_int64) {
+	*outCost = 10000.0
+	*outRows = 10000
+	if idxStr == nil {
+		return
+	}
+	encoded := C.GoString(idxStr)
+	barIdx := strings.IndexByte(encoded, '|')
+	if barIdx < 0 {
+		return
+	}
+	condPart := encoded[barIdx+1:]
+	if condPart == "" {
+		return
+	}
+
+	vtabMu.RLock()
+	spec := vtabMap[uint64(vtabID)]
+	vtabMu.RUnlock()
+
+	hasEQ := false
+	hasRange := false
+	hasIndexedEQ := false
+	hasUniqueIndexedEQ := false
+	hasIndexedRange := false
+
+	for len(condPart) > 0 {
+		commaIdx := strings.IndexByte(condPart, ',')
+		var token string
+		if commaIdx >= 0 {
+			token = condPart[:commaIdx]
+			condPart = condPart[commaIdx+1:]
+		} else {
+			token = condPart
+			condPart = ""
+		}
+		if token == "" {
+			continue
+		}
+		colonIdx := strings.IndexByte(token, ':')
+		if colonIdx < 0 {
+			continue
+		}
+		vIdx, err1 := strconv.Atoi(token[:colonIdx])
+		op, err2 := strconv.Atoi(token[colonIdx+1:])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		if op == sqliteConstraintEQ || op == sqliteConstraintISNULL {
+			hasEQ = true
+		} else {
+			hasRange = true
+		}
+		if spec != nil && vIdx >= 0 && vIdx < len(spec.VisibleIdx) {
+			allIdx := spec.VisibleIdx[vIdx]
+			for _, plan := range spec.IndexPlans {
+				if len(plan.KeyAllCols) > 0 && plan.KeyAllCols[0] == allIdx {
+					if op == sqliteConstraintEQ || op == sqliteConstraintISNULL {
+						hasIndexedEQ = true
+						if plan.Index.IsUnique && plan.Index.IndNKeyAtts == 1 {
+							hasUniqueIndexedEQ = true
+						}
+					} else if op == sqliteConstraintGT || op == sqliteConstraintGE || op == sqliteConstraintLT || op == sqliteConstraintLE {
+						hasIndexedRange = true
+					}
+				}
+			}
+		}
+	}
+
+	switch {
+	case hasUniqueIndexedEQ:
+		*outCost = 2.0
+		*outRows = 1
+	case hasIndexedEQ:
+		*outCost = 10.0
+		*outRows = 5
+	case hasIndexedRange:
+		*outCost = 40.0
+		*outRows = 50
+	case hasEQ:
+		*outCost = 100.0
+		*outRows = 10
+	case hasRange:
+		*outCost = 500.0
+		*outRows = 100
+	default:
+		*outCost = 10000.0
+		*outRows = 10000
+	}
+}
+
 //export goAirPGOpen
 func goAirPGOpen(vtabID C.ulonglong, outCursorID *C.ulonglong) C.int {
 	vtabMu.RLock()
@@ -447,6 +550,7 @@ func goAirPGOpen(vtabID C.ulonglong, outCursorID *C.ulonglong) C.int {
 		spec: spec,
 		eof:  true,
 	}
+	cur.toastFn = cur.resolveTOASTPointer
 	cursorMu.Lock()
 	cursorMap[cid] = cur
 	cursorMu.Unlock()
@@ -455,18 +559,23 @@ func goAirPGOpen(vtabID C.ulonglong, outCursorID *C.ulonglong) C.int {
 }
 
 func (cur *pgVTabCursor) resetResources() {
+	if cur.toastRel != nil {
+		_ = cur.spec.Adapter.CloseRelation(cur.toastRel)
+		cur.toastRel = nil
+	}
 	if cur.rel != nil {
-		cur.spec.Adapter.CloseRelation(cur.rel)
+		_ = cur.spec.Adapter.CloseRelation(cur.rel)
 		cur.rel = nil
 	}
 	if cur.snap != nil {
 		if cur.ownsSnap {
-			cur.spec.Adapter.ReleaseSnapshot(cur.snap)
+			_ = cur.spec.Adapter.ReleaseSnapshot(cur.snap)
 		}
 		cur.snap = nil
 		cur.ownsSnap = false
 	}
 	cur.ctx = nil
+	cur.indexScanDone = false
 	cur.neededCols = cur.neededCols[:0]
 	cur.filters = cur.filters[:0]
 	cur.rows = cur.rows[:0]
@@ -597,10 +706,18 @@ func (cur *pgVTabCursor) matchesFilters(vals []HeapVal) bool {
 	return true
 }
 
+func (cur *pgVTabCursor) decodeHeapTupleColumns(_ context.Context, tup []byte, thdr HeapTupleHeader, dst []HeapVal) error {
+	return DecodeHeapColumnsWithTOASTInto(tup, thdr, cur.spec.AllCols, cur.neededCols, dst, false, cur.toastFn)
+}
+
 func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 	cur.rows = cur.rows[:0]
 	cur.numRows = 0
 	cur.pageRowIdx = 0
+	if cur.indexScanDone {
+		cur.eof = true
+		return nil
+	}
 	ncols := len(cur.spec.AllCols)
 	cur.rowStride = ncols
 	if cap(cur.rowBuf) < ncols {
@@ -616,6 +733,16 @@ func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 		for _, need := range cur.neededCols {
 			if need {
 				decodedColsPerTuple++
+			}
+		}
+	}
+
+	var filterCols []bool
+	if len(cur.filters) > 0 {
+		filterCols = make([]bool, ncols)
+		for _, f := range cur.filters {
+			if f.allColIdx >= 0 && f.allColIdx < ncols {
+				filterCols[f.allColIdx] = true
 			}
 		}
 	}
@@ -666,12 +793,20 @@ func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 				if !vis {
 					continue
 				}
-				if err := DecodeHeapColumnsInto(tup, thdr, cur.spec.AllCols, cur.neededCols, cur.rowBuf, false); err != nil {
+				if len(filterCols) > 0 {
+					if err := DecodeHeapColumnsWithTOASTInto(tup, thdr, cur.spec.AllCols, filterCols, cur.rowBuf, false, cur.toastFn); err != nil {
+						return err
+					}
+					if !cur.matchesFilters(cur.rowBuf) {
+						continue
+					}
+				}
+				if err := cur.decodeHeapTupleColumns(ctx, tup, thdr, cur.rowBuf); err != nil {
 					return err
 				}
 				vtabTuplesDecoded.Add(1)
 				vtabColsDecoded.Add(decodedColsPerTuple)
-				if !cur.matchesFilters(cur.rowBuf) {
+				if len(filterCols) == 0 && !cur.matchesFilters(cur.rowBuf) {
 					continue
 				}
 				for j := range cur.rowBuf {
@@ -854,6 +989,27 @@ func goAirPGFilter(cursorID C.ulonglong, idxStr *C.char, argc C.int, argv **C.sq
 	}
 	cur.nblocks = meta.NBlocks
 
+	// Try B-tree index scan pushdown if an eligible index exists for the pushed-down filters.
+	if planIdx, _, _ := selectBestBTreeIndex(cur.spec.IndexPlans, cur.filters); planIdx >= 0 {
+		tids, idxErr := scanBTreeIndexForTIDs(ctx, cur.spec.Adapter, cur.snap, cur.spec.IndexPlans[planIdx], cur.filters)
+		if idxErr == nil {
+			cur.indexScanDone = true
+			if err := cur.fetchVisibleTuplesByTIDs(ctx, tids); err != nil {
+				if qctx := getActiveQueryContext(cur.spec.db); qctx != nil && qctx.lastErr == nil {
+					qctx.lastErr = err
+				}
+				cur.resetResources()
+				cur.eof = true
+				return C.SQLITE_ERROR
+			}
+			if !cur.eof {
+				cur.rowid = 1
+			}
+			return C.SQLITE_OK
+		}
+		// If the index relation was missing/corrupt/in-transition (e.g. REINDEX), fall back safely to sequential heap scan!
+	}
+
 	if err := cur.loadNextBatch(ctx); err != nil {
 		if qctx := getActiveQueryContext(cur.spec.db); qctx != nil && qctx.lastErr == nil {
 			qctx.lastErr = err
@@ -912,6 +1068,8 @@ func goAirPGEof(cursorID C.ulonglong) C.int {
 	return 0
 }
 
+var emptyCByte byte
+
 //export goAirPGColumn
 func goAirPGColumn(cursorID C.ulonglong, ctx *C.sqlite3_context, colIdx C.int) C.int {
 	cursorMu.RLock()
@@ -939,13 +1097,13 @@ func goAirPGColumn(cursorID C.ulonglong, ctx *C.sqlite3_context, colIdx C.int) C
 		C.air_result_text_copy(ctx, (*C.char)(unsafe.Pointer(&b)), 1)
 	case ValString:
 		if len(val.Str) == 0 {
-			C.air_result_text_copy(ctx, (*C.char)(unsafe.Pointer(unsafe.StringData(""))), 0)
+			C.air_result_text_copy(ctx, (*C.char)(unsafe.Pointer(&emptyCByte)), 0)
 		} else {
 			C.air_result_text_copy(ctx, (*C.char)(unsafe.Pointer(unsafe.StringData(val.Str))), C.int(len(val.Str)))
 		}
 	case ValBytes:
 		if len(val.Raw) == 0 {
-			C.air_result_blob_copy(ctx, nil, 0)
+			C.air_result_blob_copy(ctx, unsafe.Pointer(&emptyCByte), 0)
 		} else {
 			C.air_result_blob_copy(ctx, unsafe.Pointer(&val.Raw[0]), C.int(len(val.Raw)))
 		}

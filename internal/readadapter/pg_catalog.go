@@ -14,7 +14,10 @@ const (
 	PGDatabaseRelID  uint32 = 1262
 	PGClassRelID     uint32 = 1259
 	PGAttributeRelID uint32 = 1249
+	PGIndexRelID     uint32 = 2610
 	PGNamespaceRelID uint32 = 2615
+
+	PGBtreeAMOID uint32 = 403
 )
 
 // DiscoveredColumn describes one user column of a PostgreSQL table discovered
@@ -28,18 +31,62 @@ type DiscoveredColumn struct {
 	IsDropped  bool
 }
 
+// DiscoveredIndex describes a PostgreSQL B-tree index discovered from pg_class and pg_index.
+type DiscoveredIndex struct {
+	Name        string
+	IndexRelOID uint32
+	TableRelOID uint32
+	SpcOID      uint32
+	DbOID       uint32
+	RelNumber   uint32
+	IndNAtts    int16
+	IndNKeyAtts int16
+	IsUnique    bool
+	IsPrimary   bool
+	KeyAttNums  []int16
+	KeyOptions  []int16
+}
+
 // DiscoveredTable describes a PostgreSQL table discovered from PG17 catalog pages.
 type DiscoveredTable struct {
-	Schema     string
-	Name       string
-	RelOID     uint32
-	SpcOID     uint32
-	DbOID      uint32
-	RelNumber  uint32
-	Columns    []DiscoveredColumn
+	Schema         string
+	Name           string
+	RelOID         uint32
+	SpcOID         uint32
+	DbOID          uint32
+	RelNumber      uint32
+	ToastRelOID    uint32
+	ToastRelNumber uint32
+	ToastIndexRel  uint32
+	Columns        []DiscoveredColumn
+	Indexes        []DiscoveredIndex
 }
 
 var (
+	pgIndexCols = []ColumnType{
+		ColOID,        // 1: indexrelid
+		ColOID,        // 2: indrelid
+		ColInt2,       // 3: indnatts
+		ColInt2,       // 4: indnkeyatts
+		ColBool,       // 5: indisunique
+		ColBool,       // 6: indnullsnotdistinct
+		ColBool,       // 7: indisprimary
+		ColBool,       // 8: indisexclusion
+		ColBool,       // 9: indimmediate
+		ColBool,       // 10: indisclustered
+		ColBool,       // 11: indisvalid
+		ColBool,       // 12: indcheckxmin
+		ColBool,       // 13: indisready
+		ColBool,       // 14: indislive
+		ColBool,       // 15: indisreplident
+		ColInt2Vector, // 16: indkey
+		ColBytea,      // 17: indcollation (oidvector)
+		ColBytea,      // 18: indclass (oidvector)
+		ColInt2Vector, // 19: indoption
+		ColText,       // 20: indexprs (pg_node_tree)
+		ColText,       // 21: indpred (pg_node_tree)
+	}
+
 	pgDatabaseCols = []ColumnType{
 		ColOID,  // 1: oid
 		ColName, // 2: datname
@@ -295,39 +342,76 @@ func DiscoverCatalog(
 		return nil, nil
 	}
 
-	// 3. Scan pg_class (dbSpcOID/dbOID/1259) for ordinary tables (relkind='r') in public.
+	// 3. Scan pg_class (dbSpcOID/dbOID/1259) for ordinary tables (relkind='r'),
+	// B-tree indexes (relkind='i', relam=403), and TOAST tables (relkind='t').
 	classRows, err := scanCatalogRelation(ctx, adapter, clog, snap, dbSpcOID, dbOID, PGClassRelID, pgClassCols)
 	if err != nil {
 		return nil, fmt.Errorf("readadapter: scan pg_class: %w", err)
 	}
+	type classMeta struct {
+		oid       uint32
+		name      string
+		nspOID    uint32
+		relAM     uint32
+		relNode   uint32
+		relSpc    uint32
+		toastOID  uint32
+		hasIndex  bool
+		relKind   byte
+	}
+	classesByOID := make(map[uint32]classMeta, len(classRows))
 	tablesByOID := make(map[uint32]*DiscoveredTable)
 	for _, r := range classRows {
-		nspOID, _ := r[2].(uint32)
-		relkind, _ := r[16].(byte)
-		if nspOID != publicNspOID || relkind != 'r' {
-			continue
-		}
 		relOID, _ := r[0].(uint32)
 		relName, _ := r[1].(string)
+		nspOID, _ := r[2].(uint32)
+		relAM, _ := r[6].(uint32)
 		relFileNode, _ := r[7].(uint32)
 		relSpc, _ := r[8].(uint32)
+		toastOID, _ := r[12].(uint32)
+		hasIndex, _ := r[13].(bool)
+		relkind, _ := r[16].(byte)
 		if relFileNode == 0 {
 			relFileNode = relOID
 		}
 		if relSpc == 0 {
 			relSpc = dbSpcOID
 		}
+		classesByOID[relOID] = classMeta{
+			oid:      relOID,
+			name:     relName,
+			nspOID:   nspOID,
+			relAM:    relAM,
+			relNode:  relFileNode,
+			relSpc:   relSpc,
+			toastOID: toastOID,
+			hasIndex: hasIndex,
+			relKind:  relkind,
+		}
+		if nspOID != publicNspOID || relkind != 'r' {
+			continue
+		}
 		tablesByOID[relOID] = &DiscoveredTable{
-			Schema:    "public",
-			Name:      relName,
-			RelOID:    relOID,
-			SpcOID:    relSpc,
-			DbOID:     dbOID,
-			RelNumber: relFileNode,
+			Schema:      "public",
+			Name:        relName,
+			RelOID:      relOID,
+			SpcOID:      relSpc,
+			DbOID:       dbOID,
+			RelNumber:   relFileNode,
+			ToastRelOID: toastOID,
 		}
 	}
 	if len(tablesByOID) == 0 {
 		return nil, nil
+	}
+
+	// Resolve ToastRelNumber from classesByOID if present.
+	for _, tbl := range tablesByOID {
+		if tbl.ToastRelOID != 0 {
+			if tm, ok := classesByOID[tbl.ToastRelOID]; ok {
+				tbl.ToastRelNumber = tm.relNode
+			}
+		}
 	}
 
 	// 4. Scan pg_attribute (dbSpcOID/dbOID/1249) for user columns (attnum > 0).
@@ -365,10 +449,97 @@ func DiscoverCatalog(
 		})
 	}
 
+	// 5. Scan pg_index (dbSpcOID/dbOID/2610) to discover valid, live, non-partial, non-expression B-tree indexes.
+	if idxRows, err := scanCatalogRelation(ctx, adapter, clog, snap, dbSpcOID, dbOID, PGIndexRelID, pgIndexCols); err == nil {
+		for _, r := range idxRows {
+			if len(r) < 19 {
+				continue
+			}
+			indexRelID, _ := r[0].(uint32)
+			indRelID, _ := r[1].(uint32)
+			indNAtts, _ := r[2].(int16)
+			indNKeyAtts, _ := r[3].(int16)
+			isUnique, _ := r[4].(bool)
+			isPrimary, _ := r[6].(bool)
+			isValid, _ := r[10].(bool)
+			isReady, _ := r[12].(bool)
+			isLive, _ := r[13].(bool)
+			indKey, _ := r[15].([]int16)
+			indOption, _ := r[18].([]int16)
+
+			if !isValid || !isReady || !isLive || indNKeyAtts <= 0 {
+				continue
+			}
+			// Skip expression indexes (indexprs != nil) and partial indexes (indpred != nil).
+			if (len(r) > 19 && r[19] != nil) || (len(r) > 20 && r[20] != nil) {
+				continue
+			}
+			icls, ok := classesByOID[indexRelID]
+			if !ok || icls.relKind != 'i' || icls.relAM != PGBtreeAMOID {
+				continue
+			}
+
+			// Also link TOAST table's B-tree index if indRelID is a table's ToastRelOID.
+			for _, tbl := range tablesByOID {
+				if tbl.ToastRelOID != 0 && tbl.ToastRelOID == indRelID {
+					tbl.ToastIndexRel = icls.relNode
+				}
+			}
+
+			tbl, ok := tablesByOID[indRelID]
+			if !ok {
+				continue
+			}
+			if len(indKey) < int(indNKeyAtts) {
+				continue
+			}
+			keyAtts := make([]int16, int(indNKeyAtts))
+			validCols := true
+			for i := 0; i < int(indNKeyAtts); i++ {
+				if indKey[i] <= 0 {
+					// Expression index column (attnum == 0) -> skip index
+					validCols = false
+					break
+				}
+				keyAtts[i] = indKey[i]
+			}
+			if !validCols {
+				continue
+			}
+			keyOpts := make([]int16, int(indNKeyAtts))
+			for i := 0; i < int(indNKeyAtts) && i < len(indOption); i++ {
+				keyOpts[i] = indOption[i]
+			}
+			tbl.Indexes = append(tbl.Indexes, DiscoveredIndex{
+				Name:        icls.name,
+				IndexRelOID: indexRelID,
+				TableRelOID: indRelID,
+				SpcOID:      icls.relSpc,
+				DbOID:       dbOID,
+				RelNumber:   icls.relNode,
+				IndNAtts:    indNAtts,
+				IndNKeyAtts: indNKeyAtts,
+				IsUnique:    isUnique,
+				IsPrimary:   isPrimary,
+				KeyAttNums:  keyAtts,
+				KeyOptions:  keyOpts,
+			})
+		}
+	}
+
 	out := make([]DiscoveredTable, 0, len(tablesByOID))
 	for _, tbl := range tablesByOID {
 		sort.Slice(tbl.Columns, func(i, j int) bool {
 			return tbl.Columns[i].AttNum < tbl.Columns[j].AttNum
+		})
+		sort.Slice(tbl.Indexes, func(i, j int) bool {
+			if tbl.Indexes[i].IsPrimary != tbl.Indexes[j].IsPrimary {
+				return tbl.Indexes[i].IsPrimary
+			}
+			if tbl.Indexes[i].IsUnique != tbl.Indexes[j].IsUnique {
+				return tbl.Indexes[i].IsUnique
+			}
+			return tbl.Indexes[i].Name < tbl.Indexes[j].Name
 		})
 		if len(tbl.Columns) > 0 {
 			out = append(out, *tbl)

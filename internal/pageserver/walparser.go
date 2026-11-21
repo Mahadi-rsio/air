@@ -503,6 +503,17 @@ func (p *WALStreamParser) Push(chunk []byte) ([]*DecodedWALRecord, error) {
 			continue
 		}
 		if pageLen == XLogPageSize && p.pos+SizeOfXLogRecord > XLogPageSize {
+			// A record header may start in the last bytes of this page and continue on the next
+			// (remaining space is a multiple of 8, so xl_tot_len is always readable when >= 8).
+			remaining := XLogPageSize - p.pos
+			if remaining >= 4 {
+				totLen := int(binary.LittleEndian.Uint32(p.buf[p.pos : p.pos+4]))
+				if totLen > remaining {
+					p.contLSN = p.pageAddr + uint64(p.pos)
+					p.contBuf = append([]byte(nil), p.buf[p.pos:XLogPageSize]...)
+					p.contNeed = totLen - remaining
+				}
+			}
 			p.buf = append([]byte(nil), p.buf[XLogPageSize:]...)
 			p.pos = 0
 			p.inPage = false

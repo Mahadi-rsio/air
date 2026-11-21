@@ -348,10 +348,17 @@ func TestPhase13_PG15_CompatibilityMatrix(t *testing.T) {
 		t.Fatalf("expected 2 rows in mx_tbl, got %d", len(mxRes.Rows))
 	}
 
-	// Verify External TOAST triggers ErrTOASTUnsupported and increments ToastFallbacks metric
+	// Verify External TOAST is reconstructed directly in Phase 14B, and missing/corrupt TOAST triggers ErrTOASTUnsupported fallback
+	toastRes, toastOkErr := rs.executeReaderQuery(ctx, ts, "SELECT id, big FROM toast_tbl", nil)
+	if toastOkErr != nil || len(toastRes.Rows) != 1 || len(toastRes.Rows[0][1].Text) != 4000 {
+		t.Fatalf("expected 4000-byte external TOAST value to reconstruct directly, got err=%v rows=%+v", toastOkErr, toastRes)
+	}
+	var toastRelNode, dbOID uint32
+	_ = conn.QueryRow(ctx, "SELECT pg_relation_filenode(reltoastrelid), (SELECT oid FROM pg_database WHERE datname = current_database()) FROM pg_class WHERE relname = 'toast_tbl'").Scan(&toastRelNode, &dbOID)
+	_ = ps.UnlinkRel(ctx, tenantID, 1663, dbOID, toastRelNode, 0, tl.LastLSN()+8)
 	_, toastErr := rs.executeReaderQuery(ctx, ts, "SELECT id, big FROM toast_tbl", nil)
 	if !errors.Is(toastErr, ErrTOASTUnsupported) {
-		t.Fatalf("expected ErrTOASTUnsupported, got %v", toastErr)
+		t.Fatalf("expected ErrTOASTUnsupported when TOAST chunks are missing, got %v", toastErr)
 	}
 
 	// Verify unsupported type (numeric) triggers ErrUnsupportedType and increments UnsupportedTypeFallbacks

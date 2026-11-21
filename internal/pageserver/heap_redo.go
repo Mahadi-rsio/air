@@ -97,15 +97,57 @@ func pageAddHeapItem(page []byte, offnum uint16, tup []byte) {
 	binary.LittleEndian.PutUint16(page[14:16], uint16(newUpper))
 }
 
-func pageMarkTupleDeleted(page []byte, offnum uint16, xmax uint32) {
+func applyXLHeapInfobits(tup []byte, infobits uint8) {
+	im1 := binary.LittleEndian.Uint16(tup[20:22])
+	im2 := binary.LittleEndian.Uint16(tup[18:20])
+	im1 &^= pgHeapXmaxInvalid | 0x0400 | 0x1000 | 0x0080 | 0x0040 | 0x0010
+	im2 &^= 0x2000
+	if (infobits & 0x01) != 0 { // XLHL_XMAX_IS_MULTI
+		im1 |= 0x1000 // HEAP_XMAX_IS_MULTI
+	}
+	if (infobits & 0x02) != 0 { // XLHL_XMAX_LOCK_ONLY
+		im1 |= 0x0080 // HEAP_XMAX_LOCK_ONLY
+	}
+	if (infobits & 0x04) != 0 { // XLHL_XMAX_EXCL_LOCK
+		im1 |= 0x0040 // HEAP_XMAX_EXCL_LOCK
+	}
+	if (infobits & 0x08) != 0 { // XLHL_XMAX_KEYSHR_LOCK
+		im1 |= 0x0010 // HEAP_XMAX_KEYSHR_LOCK
+	}
+	if (infobits & 0x10) != 0 { // XLHL_KEYS_UPDATED
+		im2 |= 0x2000 // HEAP_KEYS_UPDATED
+	}
+	binary.LittleEndian.PutUint16(tup[20:22], im1)
+	binary.LittleEndian.PutUint16(tup[18:20], im2)
+}
+
+func pageMarkTupleDeleted(page []byte, offnum uint16, xmax uint32, infobits uint8) {
 	tup := pageGetHeapTuple(page, offnum)
 	if tup == nil {
 		return
 	}
 	binary.LittleEndian.PutUint32(tup[4:8], xmax)
-	infomask := binary.LittleEndian.Uint16(tup[20:22])
-	infomask &^= pgHeapXmaxInvalid
-	binary.LittleEndian.PutUint16(tup[20:22], infomask)
+	applyXLHeapInfobits(tup, infobits)
+}
+
+func pageMarkTupleUpdated(page []byte, oldOffnum uint16, oldXmax uint32, infobits uint8, newBlkno uint32, newOffnum uint16, isHOT bool) {
+	tup := pageGetHeapTuple(page, oldOffnum)
+	if tup == nil {
+		return
+	}
+	binary.LittleEndian.PutUint32(tup[4:8], oldXmax)
+	applyXLHeapInfobits(tup, infobits)
+	// Update t_ctid to point to the updated tuple (newBlkno, newOffnum)
+	binary.LittleEndian.PutUint16(tup[12:14], uint16(newBlkno>>16))
+	binary.LittleEndian.PutUint16(tup[14:16], uint16(newBlkno&0xFFFF))
+	binary.LittleEndian.PutUint16(tup[16:18], newOffnum)
+	im2 := binary.LittleEndian.Uint16(tup[18:20])
+	if isHOT {
+		im2 |= 0x4000 // HEAP_HOT_UPDATED
+	} else {
+		im2 &^= 0x4000
+	}
+	binary.LittleEndian.PutUint16(tup[18:20], im2)
 }
 
 func buildTupleFromXLHeader(xmin, xmax uint32, blkno uint32, offnum uint16, infomask2, infomask uint16, hoff uint8, body []byte) []byte {
@@ -173,14 +215,15 @@ func applyHeapWALRecords(key Key, basePage []byte, records [][]byte) []byte {
 				tup := buildTupleFromXLHeader(rec.XID, 0, key.BlockNum, offnum, infomask2, infomask|pgHeapXmaxInvalid, hoff, blk.BlockData[5:])
 				pageAddHeapItem(page, offnum, tup)
 
-			case XLogHeapDelete:
+			case XLogHeapDelete, 0x60: // XLogHeapDelete or XLogHeapLock
 				blk := findWALBlock(rec, 0, key)
 				if blk == nil || len(rec.MainData) < 8 || len(page) != PageSize {
 					continue
 				}
 				xmax := binary.LittleEndian.Uint32(rec.MainData[0:4])
 				offnum := binary.LittleEndian.Uint16(rec.MainData[4:6])
-				pageMarkTupleDeleted(page, offnum, xmax)
+				infobits := rec.MainData[6]
+				pageMarkTupleDeleted(page, offnum, xmax, infobits)
 
 			case XLogHeapUpdate, XLogHeapHotUpdate:
 				if len(rec.MainData) < 14 {
@@ -188,15 +231,25 @@ func applyHeapWALRecords(key Key, basePage []byte, records [][]byte) []byte {
 				}
 				oldXmax := binary.LittleEndian.Uint32(rec.MainData[0:4])
 				oldOffnum := binary.LittleEndian.Uint16(rec.MainData[4:6])
+				oldInfobits := rec.MainData[6]
 				flags := rec.MainData[7]
 				newXmax := binary.LittleEndian.Uint32(rec.MainData[8:12])
 				newOffnum := binary.LittleEndian.Uint16(rec.MainData[12:14])
+				isHOT := op == XLogHeapHotUpdate
+
+				newBlkno := key.BlockNum
+				for _, b := range rec.Blocks {
+					if b.BlockID == 0 {
+						newBlkno = b.BlockNum
+						break
+					}
+				}
 
 				// Block 1 (if present) is old tuple page; if absent, block 0 is both old and new.
 				oldBlk := findWALBlock(rec, 1, key)
 				newBlk := findWALBlock(rec, 0, key)
 				if oldBlk != nil && len(page) == PageSize {
-					pageMarkTupleDeleted(page, oldOffnum, oldXmax)
+					pageMarkTupleUpdated(page, oldOffnum, oldXmax, oldInfobits, newBlkno, newOffnum, isHOT)
 				}
 				if newBlk != nil {
 					var oldUserData []byte
@@ -205,14 +258,14 @@ func applyHeapWALRecords(key Key, basePage []byte, records [][]byte) []byte {
 						initPGHeapPage(page)
 					} else if oldBlk == nil {
 						// Same-page update: snapshot old user data for prefix/suffix reconstruction,
-						// then mark old tuple deleted on this page.
+						// then mark old tuple updated (with t_ctid -> newOffnum and HEAP_HOT_UPDATED) on this page.
 						if oldTup := pageGetHeapTuple(page, oldOffnum); oldTup != nil {
 							oldHoff := int(oldTup[22])
 							if oldHoff >= pgSizeOfHeapTupleHdr && oldHoff <= len(oldTup) {
 								oldUserData = append([]byte(nil), oldTup[oldHoff:]...)
 							}
 						}
-						pageMarkTupleDeleted(page, oldOffnum, oldXmax)
+						pageMarkTupleUpdated(page, oldOffnum, oldXmax, oldInfobits, newBlkno, newOffnum, isHOT)
 					}
 
 					data := newBlk.BlockData
@@ -325,6 +378,8 @@ func applyHeapWALRecords(key Key, basePage []byte, records [][]byte) []byte {
 				pageAddHeapItem(page, offnum, tup)
 				off += datalen
 			}
+		} else if rec.Rmid == RmBtreeID {
+			page = applyBtreeWALRecords(key, page, [][]byte{raw})
 		}
 	}
 	return page
