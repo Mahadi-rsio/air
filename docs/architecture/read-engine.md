@@ -114,6 +114,5 @@ AIR separates the **Gateway** (`gateway/air-gateway`), **Read Engine** ([`cmd/ai
     2. C-level `sqlite3_set_authorizer` hook (`air_sqlite_ro_authorizer`) permitting only `SQLITE_SELECT`, `SQLITE_READ`, `SQLITE_FUNCTION`, read-only transactions, and safe inspection pragmas while denying all writes (`SQLITE_DENY` -> `SQLSTATE 25006`).
     3. `sqlite3_stmt_readonly(stmt)` verification and SQL guard against DML, DDL, modifying CTEs, `SELECT INTO`, `FOR UPDATE/SHARE`, and attempts to disable `transaction_read_only`.
   - Materializes committed PG17 heap tuples from `readadapter.Adapter` (L1 RAM -> L2 NVMe -> L3 Pageserver with MVCC/CLOG visibility) via `MaterializeRelation` or syncs from the primary Cell via `SyncFromPrimary` / `POST /v1/tenants/{id}/sync`, tracking each tenant's synced LSN in `_air_meta` for gateway causal consistency.
-  - The legacy native PG17 `air_ro.so` read engine remains available via `--engine=postgres` (`AIR_READ_ENGINE_TYPE=postgres`).
 
 

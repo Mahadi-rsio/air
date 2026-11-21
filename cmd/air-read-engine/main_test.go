@@ -17,9 +17,6 @@ func TestSharedReadEngine_DefaultSQLiteLifecycle(t *testing.T) {
 		"-data-dir", t.TempDir(),
 		"-pg-port", "0",
 	})
-	if cfg.Engine != "sqlite" {
-		t.Fatalf("expected default engine 'sqlite', got %q", cfg.Engine)
-	}
 
 	re, err := NewSharedReadEngine(cfg)
 	if err != nil {

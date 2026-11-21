@@ -1,4 +1,0 @@
-comment = 'AIR native PostgreSQL 17 read-only execution guard'
-default_version = '1.0'
-module_pathname = '$libdir/air_ro'
-relocatable = false
