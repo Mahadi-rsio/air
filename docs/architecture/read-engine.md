@@ -102,10 +102,10 @@ Measured on `linux/amd64` (`AMD EPYC 7763`, `go test -bench=BenchmarkReadEngine 
 
 AIR separates the **Gateway** (`gateway/air-gateway`), **Read Engine** ([`cmd/air-read-engine`](file:///workspaces/air/cmd/air-read-engine/main.go)), and **Cell/Control Plane** ([`cmd/air-server`](file:///workspaces/air/cmd/air-server/main.go)) into independent processes:
 
-- **`air-gateway` as Single Entry Point (`:5432`)**: Clients connect only to `air-gateway`. `TenantPool::handle_simple_query` classifies each query via `route_query`:
-  - Read-only Simple Queries route to `read_idle_pool_` (`--read-engine-host` / `--read-engine-port` / `--read-engine-sock-dir`) with automatic fallback to the Cell (`WriteEngine`) on error or unavailability.
+- **`air-gateway` as Single Entry Point (`:5432`)**: Clients connect only to `air-gateway`. Both [`TenantPool::handle_simple_query`](file:///workspaces/air/gateway/src/pooler.cpp) and [`TenantPool::handle_extended_batch`](file:///workspaces/air/gateway/src/pooler.cpp) (`Parse`/`Bind`/`Execute`/`Sync`) classify queries via `route_query`:
+  - Read-only Simple and Extended Query batches route to `read_idle_pool_` (`--read-engine-host` / `--read-engine-port` / `--read-engine-sock-dir`) with automatic fallback to the Cell (`WriteEngine`) on error or unavailability.
   - After writes commit on the Cell, the gateway captures `pg_current_wal_lsn()` into `session_write_lsn`. Subsequent reads refresh `pg_last_wal_replay_lsn()` from the Read Engine if needed and fall back to the Cell (`CausalLagFallback`) whenever `read_engine_lsn < session_write_lsn`.
-- **`air-read-engine` (`:8082` HTTP, `:5433`+ PG)**:
-  - Initializes read-only PG17 instances via `pg_basebackup -R -X stream -c fast` when `--primary-conninfo` (or `POST /v1/tenants/{id}/start` body) is provided, or `air_smgr.read_only = on` when `--pageserver-socket` is set.
-  - Runs with `air_ro.enabled = on`, `default_transaction_read_only = on`, `hot_standby = on`, `autovacuum = off`, and `shared_buffers = 32MB` by default.
+- **Shared `air-read-engine` (`:8082` HTTP, `:5433` PG)**:
+  - Runs one shared read-only PG17 cluster serving all tenants by database name (`air_ro.enabled = on`, `default_transaction_read_only = on`, `hot_standby = on`, `autovacuum = off`, `shared_buffers = 32MB`).
+  - Initializes via `pg_basebackup -R -X stream -c fast` when `--primary-conninfo` is provided, or `air_smgr.read_only = on` when `--pageserver-socket` is set.
 

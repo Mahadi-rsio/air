@@ -93,12 +93,11 @@ go run ./cmd/air-server \
   -bootstrap-api-key air_live_demo_secret_token_12345 \
   -internal-token air_internal_secret
 
-# 2. Start air-read-engine (optional standalone read-only PG17 engine :5433, HTTP :8082)
+# 2. Start shared air-read-engine (one read-only PG17 cluster :5433 serving all tenants, HTTP :8082)
 go run ./cmd/air-read-engine \
   -data-dir /tmp/air-read-engine \
   -http-addr 127.0.0.1:8082 \
-  -pg-port 5433 \
-  -tenant-id demo_db
+  -pg-port 5433
 
 # 3. Build and start C++ air-gateway (PG Pooler :5432 + Admin API :8081)
 make -C gateway all test

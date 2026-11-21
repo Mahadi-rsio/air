@@ -84,13 +84,12 @@ go run ./cmd/air-server \
   --internal-token air_internal_secret
 ```
 
-### Run `air-read-engine` Locally (Optional)
+### Run Shared `air-read-engine` Locally (Optional)
 ```bash
 go run ./cmd/air-read-engine \
   -data-dir /tmp/air-read-engine \
   -http-addr 127.0.0.1:8082 \
-  -pg-port 5433 \
-  -tenant-id demo_db
+  -pg-port 5433
 ```
 
 ### Build & Run `air-gateway` (Optional)

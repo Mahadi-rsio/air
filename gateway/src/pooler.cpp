@@ -587,6 +587,248 @@ bool TenantPool::handle_extended_batch(ClientSessionState& st,
     }
     if (exec_count == 0) exec_count = 1;
 
+    int rport = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        rport = read_port_;
+    }
+
+    // Check if this Sync batch is purely read-only and eligible for the Shared Read Engine.
+    bool batch_has_write = false;
+    bool try_read_engine = (rport > 0 && terminator_type == 'S' && !st.session_pinned &&
+                            st.tx_status == 'I' && !st.current_backend);
+    bool saw_routable = false;
+    if (rport > 0) {
+        uint64_t rlsn = read_engine_lsn_.load(std::memory_order_relaxed);
+        if (try_read_engine && st.session_write_lsn > 0 && rlsn < st.session_write_lsn) {
+            std::string lerr;
+            if (auto rb = acquire_read_backend(st.client_id, lerr)) {
+                uint64_t fresh = 0;
+                if (query_lsn_backend(rb.get(),
+                        "SELECT COALESCE(pg_last_wal_replay_lsn(), pg_current_wal_lsn())::text", fresh)) {
+                    rlsn = fresh;
+                    read_engine_lsn_.store(fresh, std::memory_order_relaxed);
+                }
+                read_engine_healthy_.store(true, std::memory_order_relaxed);
+                release_read_backend(std::move(rb), false);
+            } else {
+                read_engine_healthy_.store(false, std::memory_order_relaxed);
+            }
+        }
+        RoutingContext rctx;
+        rctx.session_pinned = st.session_pinned;
+        rctx.in_transaction = (st.tx_status != 'I');
+        rctx.read_engine_healthy = read_engine_healthy_.load(std::memory_order_relaxed);
+        rctx.session_write_lsn = st.session_write_lsn;
+        rctx.read_engine_lsn = rlsn;
+
+        for (const auto& [bt, bb] : ext_batch) {
+            if (bt == 'P') {
+                size_t off = 0;
+                (void)sqlparse::read_cstr(bb, off); // stmt name
+                std::string pq = sqlparse::read_cstr(bb, off);
+                if (sqlparse::is_session_pinning_sql(pq)) {
+                    try_read_engine = false;
+                }
+                if (classify_sql_for_routing(pq).target == RouteTarget::WriteEngine) {
+                    batch_has_write = true;
+                    try_read_engine = false;
+                } else if (try_read_engine) {
+                    saw_routable = true;
+                    if (route_query(pq, rctx, &routing_metrics_).target != RouteTarget::ReadEngine) {
+                        try_read_engine = false;
+                    }
+                }
+            } else if (bt == 'B') {
+                size_t off = 0;
+                (void)sqlparse::read_cstr(bb, off); // portal
+                std::string sname = sqlparse::read_cstr(bb, off);
+                if (auto it = st.client_stmts.find(sname); it != st.client_stmts.end()) {
+                    if (classify_sql_for_routing(it->second.query).target == RouteTarget::WriteEngine) {
+                        batch_has_write = true;
+                        try_read_engine = false;
+                    } else if (try_read_engine) {
+                        saw_routable = true;
+                        if (route_query(it->second.query, rctx, &routing_metrics_).target != RouteTarget::ReadEngine) {
+                            try_read_engine = false;
+                        }
+                    }
+                }
+            }
+        }
+        if (!saw_routable) try_read_engine = false;
+    }
+
+    auto run_batch_on_backend = [&](BackendConn* target_b, bool is_read_backend, uint64_t wait_us) -> int {
+        // Returns: 1 = handled (success or client error), 0 = backend failed before client output (fallback), -1 = fatal IO error
+        struct UndoParse {
+            std::string cname;
+            std::string gname;
+            bool had_prev = false;
+            PreparedDef prev;
+        };
+        std::vector<UndoParse> undo_parses;
+        std::vector<std::pair<char, std::vector<uint8_t>>> prepared_msgs;
+        prepared_msgs.reserve(ext_batch.size());
+
+        for (const auto& [bt, orig_bb] : ext_batch) {
+            std::vector<uint8_t> bb = orig_bb;
+            if (bt == 'P') {
+                std::string cname, query;
+                std::vector<uint32_t> oids;
+                std::string gname = "_air_s_" + std::to_string(st.client_id) + "_" +
+                                    std::to_string(stmt_seq_.fetch_add(1) + 1);
+                auto rewritten = sqlparse::rewrite_parse_body(bb, gname, cname, query, oids);
+                std::smatch psm;
+                std::string trimmed_q = trim_ascii(query);
+
+                if (std::regex_match(trimmed_q, psm, sqlparse::re_prepare_stmt())) {
+                    std::string sql_cname = psm[1].str();
+                    std::string sql_tlist = psm[2].str();
+                    std::string sql_inner = psm[3].str();
+                    std::string sql_gname = "_air_s_" + std::to_string(st.client_id) + "_" +
+                                            std::to_string(stmt_seq_.fetch_add(1) + 1);
+                    query = "PREPARE " + sql_gname + sql_tlist + " AS " + sql_inner;
+                    rewritten = sqlparse::make_parse_body(gname, query, oids);
+                    PreparedDef sdef;
+                    sdef.client_name = sql_cname;
+                    sdef.global_name = sql_gname;
+                    sdef.type_list = sql_tlist;
+                    sdef.query = sql_inner;
+                    sdef.is_sql_prep = true;
+                    st.client_stmts[sql_cname] = std::move(sdef);
+                    target_b->prepared_stmts.insert(sql_gname);
+                } else if (std::regex_match(trimmed_q, psm, sqlparse::re_execute_stmt())) {
+                    if (auto it = st.client_stmts.find(psm[2].str()); it != st.client_stmts.end()) {
+                        query = psm[1].str() + it->second.global_name + psm[3].str();
+                        rewritten = sqlparse::make_parse_body(gname, query, oids);
+                    }
+                } else if (std::regex_match(trimmed_q, psm, sqlparse::re_dealloc_stmt())) {
+                    std::string sql_cname = psm[1].str();
+                    if (iequals(sql_cname, "ALL")) {
+                        st.client_stmts.clear();
+                        target_b->prepared_stmts.clear();
+                    } else if (auto it = st.client_stmts.find(sql_cname); it != st.client_stmts.end()) {
+                        query = "DEALLOCATE " + it->second.global_name;
+                        rewritten = sqlparse::make_parse_body(gname, query, oids);
+                        target_b->prepared_stmts.erase(it->second.global_name);
+                        st.client_stmts.erase(it);
+                    }
+                }
+
+                if (sqlparse::is_session_pinning_sql(query) && !st.session_pinned) {
+                    st.session_pinned = true;
+                    pinned_clients_.fetch_add(1);
+                }
+                UndoParse u;
+                u.cname = cname;
+                u.gname = gname;
+                if (auto prev_it = st.client_stmts.find(cname); prev_it != st.client_stmts.end()) {
+                    u.had_prev = true;
+                    u.prev = prev_it->second;
+                }
+                undo_parses.push_back(std::move(u));
+
+                PreparedDef def;
+                def.client_name = cname;
+                def.global_name = gname;
+                def.query = query;
+                def.param_oids = std::move(oids);
+                st.client_stmts[cname] = std::move(def);
+                target_b->prepared_stmts.insert(gname);
+                bb = std::move(rewritten);
+            } else if (bt == 'B') {
+                bb = sqlparse::rewrite_bind_body(bb, st.client_stmts);
+            } else if (bt == 'D') {
+                std::string unused;
+                bb = sqlparse::rewrite_named_op_body(bb, st.client_stmts, false, unused);
+            } else if (bt == 'C') {
+                std::string erased;
+                bb = sqlparse::rewrite_named_op_body(bb, st.client_stmts, true, erased);
+                if (!erased.empty()) {
+                    if (auto it = st.client_stmts.find(erased); it != st.client_stmts.end()) {
+                        target_b->prepared_stmts.erase(it->second.global_name);
+                        st.client_stmts.erase(it);
+                    }
+                }
+            }
+            if (!target_b->stream.write_all(build_pg_message(bt, bb))) {
+                for (auto it = undo_parses.rbegin(); it != undo_parses.rend(); ++it) {
+                    target_b->prepared_stmts.erase(it->gname);
+                    if (it->had_prev) st.client_stmts[it->cname] = it->prev;
+                    else st.client_stmts.erase(it->cname);
+                }
+                return is_read_backend ? 0 : -1;
+            }
+            prepared_msgs.emplace_back(bt, std::move(bb));
+        }
+
+        auto rollback_parses = [&]() {
+            for (auto it = undo_parses.rbegin(); it != undo_parses.rend(); ++it) {
+                target_b->prepared_stmts.erase(it->gname);
+                if (it->had_prev) st.client_stmts[it->cname] = it->prev;
+                else st.client_stmts.erase(it->cname);
+            }
+        };
+
+        if (terminator_type == 'S') {
+            bool had_err = false;
+            RelayStats rstats;
+            if (!relay_until_ready(target_b, st.client, st.tx_status, had_err, &rstats)) {
+                return -1;
+            }
+            if (had_err) rollback_parses();
+            record_query_metrics(st, q_start, wait_us, bytes_in, rstats, had_err, exec_count);
+            if (!is_read_backend && rport > 0 && !had_err && st.tx_status == 'I' && batch_has_write) {
+                uint64_t wlsn = 0;
+                if (query_lsn_backend(target_b, "SELECT pg_current_wal_lsn()::text", wlsn) &&
+                    wlsn > st.session_write_lsn) {
+                    st.session_write_lsn = wlsn;
+                }
+            }
+            return 1;
+        } else {
+            bool had_err = false;
+            RelayStats rstats;
+            bool ok = relay_flush_batch(target_b, st.client, prepared_msgs, had_err, &rstats);
+            if (!ok) return -1;
+            if (had_err) rollback_parses();
+            record_query_metrics(st, q_start, wait_us, bytes_in, rstats, had_err, exec_count);
+            return 1;
+        }
+    };
+
+    if (try_read_engine) {
+        auto wait_start = std::chrono::steady_clock::now();
+        std::string rerr;
+        if (auto rb = acquire_read_backend(st.client_id, rerr)) {
+            uint64_t rwait_us = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - wait_start)
+                    .count());
+            read_engine_healthy_.store(true, std::memory_order_relaxed);
+            if (ensure_session_and_stmts(rb.get(), st)) {
+                int rc = run_batch_on_backend(rb.get(), true, rwait_us);
+                if (rc == 1) {
+                    ext_batch.clear();
+                    ext_batch_bytes = 0;
+                    release_read_backend(std::move(rb), st.tx_status != 'I');
+                    return true;
+                }
+                if (rc == -1) {
+                    ext_batch.clear();
+                    ext_batch_bytes = 0;
+                    release_read_backend(std::move(rb), true);
+                    return false;
+                }
+            }
+            release_read_backend(std::move(rb), true);
+        } else {
+            read_engine_healthy_.store(false, std::memory_order_relaxed);
+        }
+        record_fallback_to_write(&routing_metrics_);
+    }
+
     uint64_t pool_wait_us = 0;
     if (!ensure_backend(st, pool_wait_us)) {
         ext_batch.clear();
@@ -595,138 +837,20 @@ bool TenantPool::handle_extended_batch(ClientSessionState& st,
         return true;
     }
 
-    struct UndoParse {
-        std::string cname;
-        std::string gname;
-        bool had_prev = false;
-        PreparedDef prev;
-    };
-    std::vector<UndoParse> undo_parses;
-
     st.backend_in_flight = true;
-    for (auto& [bt, bb] : ext_batch) {
-        if (bt == 'P') {
-            std::string cname, query;
-            std::vector<uint32_t> oids;
-            std::string gname = "_air_s_" + std::to_string(st.client_id) + "_" +
-                                std::to_string(stmt_seq_.fetch_add(1) + 1);
-            auto rewritten = sqlparse::rewrite_parse_body(bb, gname, cname, query, oids);
-            std::smatch psm;
-            std::string trimmed_q = trim_ascii(query);
-
-            if (std::regex_match(trimmed_q, psm, sqlparse::re_prepare_stmt())) {
-                std::string sql_cname = psm[1].str();
-                std::string sql_tlist = psm[2].str();
-                std::string sql_inner = psm[3].str();
-                std::string sql_gname = "_air_s_" + std::to_string(st.client_id) + "_" +
-                                        std::to_string(stmt_seq_.fetch_add(1) + 1);
-                query = "PREPARE " + sql_gname + sql_tlist + " AS " + sql_inner;
-                rewritten = sqlparse::make_parse_body(gname, query, oids);
-                PreparedDef sdef;
-                sdef.client_name = sql_cname;
-                sdef.global_name = sql_gname;
-                sdef.type_list = sql_tlist;
-                sdef.query = sql_inner;
-                sdef.is_sql_prep = true;
-                st.client_stmts[sql_cname] = std::move(sdef);
-                st.current_backend->prepared_stmts.insert(sql_gname);
-            } else if (std::regex_match(trimmed_q, psm, sqlparse::re_execute_stmt())) {
-                if (auto it = st.client_stmts.find(psm[2].str()); it != st.client_stmts.end()) {
-                    query = psm[1].str() + it->second.global_name + psm[3].str();
-                    rewritten = sqlparse::make_parse_body(gname, query, oids);
-                }
-            } else if (std::regex_match(trimmed_q, psm, sqlparse::re_dealloc_stmt())) {
-                std::string sql_cname = psm[1].str();
-                if (iequals(sql_cname, "ALL")) {
-                    st.client_stmts.clear();
-                    st.current_backend->prepared_stmts.clear();
-                } else if (auto it = st.client_stmts.find(sql_cname); it != st.client_stmts.end()) {
-                    query = "DEALLOCATE " + it->second.global_name;
-                    rewritten = sqlparse::make_parse_body(gname, query, oids);
-                    st.current_backend->prepared_stmts.erase(it->second.global_name);
-                    st.client_stmts.erase(it);
-                }
-            }
-
-            if (sqlparse::is_session_pinning_sql(query) && !st.session_pinned) {
-                st.session_pinned = true;
-                pinned_clients_.fetch_add(1);
-            }
-            UndoParse u;
-            u.cname = cname;
-            u.gname = gname;
-            if (auto prev_it = st.client_stmts.find(cname); prev_it != st.client_stmts.end()) {
-                u.had_prev = true;
-                u.prev = prev_it->second;
-            }
-            undo_parses.push_back(std::move(u));
-
-            PreparedDef def;
-            def.client_name = cname;
-            def.global_name = gname;
-            def.query = query;
-            def.param_oids = std::move(oids);
-            st.client_stmts[cname] = std::move(def);
-            st.current_backend->prepared_stmts.insert(gname);
-            bb = std::move(rewritten);
-        } else if (bt == 'B') {
-            bb = sqlparse::rewrite_bind_body(bb, st.client_stmts);
-        } else if (bt == 'D') {
-            std::string unused;
-            bb = sqlparse::rewrite_named_op_body(bb, st.client_stmts, false, unused);
-        } else if (bt == 'C') {
-            std::string erased;
-            bb = sqlparse::rewrite_named_op_body(bb, st.client_stmts, true, erased);
-            if (!erased.empty()) {
-                if (auto it = st.client_stmts.find(erased); it != st.client_stmts.end()) {
-                    st.current_backend->prepared_stmts.erase(it->second.global_name);
-                    st.client_stmts.erase(it);
-                }
-            }
-        }
-        if (!st.current_backend->stream.write_all(build_pg_message(bt, bb))) {
-            release_current(st, true);
-            return false;
-        }
+    int rc = run_batch_on_backend(st.current_backend.get(), false, pool_wait_us);
+    ext_batch.clear();
+    ext_batch_bytes = 0;
+    st.backend_in_flight = false;
+    if (rc == -1) {
+        release_current(st, true);
+        return false;
     }
-
-    auto rollback_parses = [&]() {
-        for (auto it = undo_parses.rbegin(); it != undo_parses.rend(); ++it) {
-            if (st.current_backend) st.current_backend->prepared_stmts.erase(it->gname);
-            if (it->had_prev) st.client_stmts[it->cname] = it->prev;
-            else st.client_stmts.erase(it->cname);
-        }
-    };
-
     if (terminator_type == 'S') {
-        ext_batch.clear();
-        ext_batch_bytes = 0;
-        bool had_err = false;
-        RelayStats rstats;
-        if (!relay_until_ready(st.current_backend.get(), st.client, st.tx_status, had_err, &rstats)) {
-            release_current(st, true);
-            return false;
-        }
-        st.backend_in_flight = false;
-        if (had_err) rollback_parses();
-        record_query_metrics(st, q_start, pool_wait_us, bytes_in, rstats, had_err, exec_count);
         update_tx_count(st);
         if (st.tx_status == 'I' && !st.session_pinned) {
             release_current(st, false);
         }
-    } else {
-        // Flush ('H'): relay responses for pipelined messages without waiting for ReadyForQuery.
-        bool had_err = false;
-        RelayStats rstats;
-        bool ok = relay_flush_batch(st.current_backend.get(), st.client, ext_batch, had_err, &rstats);
-        ext_batch.clear();
-        ext_batch_bytes = 0;
-        if (!ok) {
-            release_current(st, true);
-            return false;
-        }
-        if (had_err) rollback_parses();
-        record_query_metrics(st, q_start, pool_wait_us, bytes_in, rstats, had_err, exec_count);
     }
     return true;
 }
