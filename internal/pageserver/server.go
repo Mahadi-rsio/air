@@ -510,7 +510,8 @@ func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID str
 
 		// KeyKindSLRU (4) > KeyKindRelSize (2): seed pg_xact (CLOG) segments so native MVCC
 		// readers have baseline commit statuses for bootstrapped/pre-existing transactions.
-		xactDir := filepath.Join(pgDataDir, "pg_xact")
+		seedSLRU := func(dirName string, kind uint32) error {
+		xactDir := filepath.Join(pgDataDir, dirName)
 		if xactEntries, err := os.ReadDir(xactDir); err == nil {
 			type xactSeg struct {
 				segNo uint32
@@ -540,7 +541,7 @@ func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID str
 					if n == PageSize {
 						page := make([]byte, PageSize)
 						copy(page, buf)
-						slruKey := Key{Kind: KeyKindSLRU, SpcOID: 0, BlockNum: seg.segNo*slruPagesPerSeg + blkIdx}
+						slruKey := Key{Kind: KeyKindSLRU, SpcOID: kind, BlockNum: seg.segNo*slruPagesPerSeg + blkIdx}
 						tl.SeedSLRUPage(slruKey, page)
 						if err := sw.Add(LayerRecord{
 							Key: slruKey,
@@ -565,6 +566,16 @@ func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID str
 					}
 				}
 				_ = f.Close()
+			}
+		}
+			return nil
+		}
+		for _, d := range []struct {
+			dir  string
+			kind uint32
+		}{{"pg_xact", 0}, {"pg_multixact/offsets", SLRUMultiXactOffsetsKind}, {"pg_multixact/members", SLRUMultiXactMembersKind}} {
+			if err := seedSLRU(d.dir, d.kind); err != nil {
+				return err
 			}
 		}
 		return nil

@@ -35,6 +35,9 @@ type Timeline struct {
 	relSizeKnown      map[Key]bool
 	allRelSizesSeeded bool
 	slruPages         map[Key][]byte
+	mxOldestMulti     uint32
+	mxOldestOffset    uint32
+	mxTruncated       bool
 	layerSeq          uint64
 }
 
@@ -317,6 +320,9 @@ func (t *Timeline) EnforceInMemBudget(ctx context.Context) error {
 
 // ApplyWALRecord ingests a decoded PG17 WAL record into the Timeline's InMemoryLayer.
 func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
+	if rec.Rmid == RmMultiXactID {
+		t.warmMultiXactSLRU(rec)
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -422,6 +428,10 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 				}
 			}
 		}
+	}
+
+	if rec.Rmid == RmMultiXactID {
+		t.applyMultiXactWALLocked(rec)
 	}
 
 	// Track SMGR create/truncate relation sizes from MainData.

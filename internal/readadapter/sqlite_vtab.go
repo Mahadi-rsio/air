@@ -793,6 +793,8 @@ func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 				if !vis {
 					continue
 				}
+				vtabTuplesDecoded.Add(1)
+				vtabColsDecoded.Add(decodedColsPerTuple)
 				if len(filterCols) > 0 {
 					if err := DecodeHeapColumnsWithTOASTInto(tup, thdr, cur.spec.AllCols, filterCols, cur.rowBuf, false, cur.toastFn); err != nil {
 						return err
@@ -804,8 +806,6 @@ func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 				if err := cur.decodeHeapTupleColumns(ctx, tup, thdr, cur.rowBuf); err != nil {
 					return err
 				}
-				vtabTuplesDecoded.Add(1)
-				vtabColsDecoded.Add(decodedColsPerTuple)
 				if len(filterCols) == 0 && !cur.matchesFilters(cur.rowBuf) {
 					continue
 				}

@@ -305,22 +305,34 @@ func IsVisibleWithCLOG(ctx context.Context, h HeapTupleHeader, snap *ReadSnapsho
 		return true, nil
 	}
 
+	xmax := h.Xmax
 	if (h.Infomask & HeapXmaxIsMulti) != 0 {
-		// MultiXact with potential updater/deleter: cannot resolve without pg_multixact SLRU,
-		// so fail explicitly to trigger safe primary-read fallback.
-		return false, fmt.Errorf("%w: xmax=%d infomask=0x%04x", ErrMultiXactUnsupported, h.Xmax, h.Infomask)
+		// MultiXact xmax that is not flagged lock-only: resolve members from pg_multixact SLRU
+		// at the snapshot LSN. Lock-only members never remove a tuple; only the (single)
+		// update/delete member's transaction decides visibility.
+		if resolver == nil {
+			return false, fmt.Errorf("%w: nil resolver for multixact xmax=%d", ErrMultiXactUnsupported, h.Xmax)
+		}
+		upd, hasUpd, err := resolver.MultiXactUpdateXid(ctx, snap.TenantID, snap.Generation, snap.LSN, h.Xmax)
+		if err != nil {
+			return false, err
+		}
+		if !hasUpd {
+			return true, nil
+		}
+		xmax = upd
 	}
 
 	if (h.Infomask&HeapXmaxCommitted) == 0 {
 		// Check if xmax is in-progress in snapshot or aborted/in-progress in pg_xact.
-		deleted, err := xidCommittedAtSnapshot(ctx, snap.TenantID, h.Xmax, snap, false, resolver)
+		deleted, err := xidCommittedAtSnapshot(ctx, snap.TenantID, xmax, snap, false, resolver)
 		if err != nil {
 			return false, err
 		}
 		return !deleted, nil
 	}
 
-	deleted, err := xidCommittedAtSnapshot(ctx, snap.TenantID, h.Xmax, snap, true, resolver)
+	deleted, err := xidCommittedAtSnapshot(ctx, snap.TenantID, xmax, snap, true, resolver)
 	if err != nil {
 		return false, err
 	}
