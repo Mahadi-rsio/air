@@ -36,7 +36,15 @@ type SQLiteServerConfig struct {
 	CacheDir                      string
 	L1CacheBytes                  int64
 	MaxConcurrentQueriesPerTenant int
+	ReadersPerTenant              int
 	QueryTimeout                  time.Duration
+}
+
+type sqliteReaderSlot struct {
+	conn       *SQLiteConn
+	vtabIDs    map[string]uint64
+	catalogLSN uint64
+	generation string
 }
 
 // SQLiteTenantStore holds the per-tenant SQLite database files and read/write connections.
@@ -46,6 +54,8 @@ type SQLiteTenantStore struct {
 	DBPath       string
 	Writer       *SQLiteConn
 	Reader       *SQLiteConn
+	readerPool   chan *sqliteReaderSlot
+	readers      []*sqliteReaderSlot
 	SyncedLSN    atomic.Uint64
 	NativeMode   bool
 	vtabIDs      map[string]uint64
@@ -128,6 +138,12 @@ func NewSQLiteReadServer(cfg SQLiteServerConfig) (*SQLiteReadServer, error) {
 	}
 	if cfg.MaxConcurrentQueriesPerTenant <= 0 {
 		cfg.MaxConcurrentQueriesPerTenant = 16
+	}
+	if cfg.ReadersPerTenant <= 0 {
+		cfg.ReadersPerTenant = 4
+	}
+	if cfg.ReadersPerTenant > cfg.MaxConcurrentQueriesPerTenant {
+		cfg.ReadersPerTenant = cfg.MaxConcurrentQueriesPerTenant
 	}
 	if cfg.QueryTimeout <= 0 {
 		cfg.QueryTimeout = 30 * time.Second
@@ -370,7 +386,15 @@ func (s *SQLiteReadServer) Stop() error {
 		for _, vid := range ts.vtabIDs {
 			UnregisterNativeTable(vid)
 		}
-		if ts.Reader != nil {
+		for _, slot := range ts.readers {
+			for _, vid := range slot.vtabIDs {
+				UnregisterNativeTable(vid)
+			}
+			if slot.conn != nil {
+				_ = slot.conn.Close()
+			}
+		}
+		if len(ts.readers) == 0 && ts.Reader != nil {
 			_ = ts.Reader.Close()
 		}
 		if ts.Writer != nil {
@@ -411,22 +435,45 @@ func (s *SQLiteReadServer) ensureTenantLocked(tenantID string) (*SQLiteTenantSto
 		return ts, nil
 	}
 	if s.nativeAdapter != nil && tenantID != "postgres" {
-		conn, err := OpenSQLiteConn(":memory:", false, s.cfg.CacheKB)
-		if err != nil {
-			return nil, err
+		n := s.cfg.ReadersPerTenant
+		if n <= 0 {
+			n = 4
 		}
-		if err := conn.RegisterAirPGModule(); err != nil {
-			_ = conn.Close()
-			return nil, err
+		pool := make(chan *sqliteReaderSlot, n)
+		slots := make([]*sqliteReaderSlot, 0, n)
+		for i := 0; i < n; i++ {
+			conn, err := OpenSQLiteConn(":memory:", false, s.cfg.CacheKB)
+			if err != nil {
+				for _, sl := range slots {
+					_ = sl.conn.Close()
+				}
+				return nil, err
+			}
+			if err := conn.RegisterAirPGModule(); err != nil {
+				_ = conn.Close()
+				for _, sl := range slots {
+					_ = sl.conn.Close()
+				}
+				return nil, err
+			}
+			conn.readOnly = true
+			conn.SetReadOnlyAuthorizer(true)
+			sl := &sqliteReaderSlot{
+				conn:    conn,
+				vtabIDs: make(map[string]uint64),
+			}
+			slots = append(slots, sl)
+			pool <- sl
 		}
-		conn.readOnly = true
-		conn.SetReadOnlyAuthorizer(true)
 		ts := &SQLiteTenantStore{
 			TenantID:   tenantID,
 			DBPath:     ":memory:",
-			Reader:     conn,
+			Reader:     slots[0].conn,
+			readerPool: pool,
+			readers:    slots,
 			NativeMode: true,
 			vtabIDs:    make(map[string]uint64),
+			sem:        make(chan struct{}, s.cfg.MaxConcurrentQueriesPerTenant),
 		}
 		s.tenants[tenantID] = ts
 		return ts, nil
@@ -1145,6 +1192,49 @@ func (s *SQLiteReadServer) refreshNativeCatalogWithSnap(ctx context.Context, ts 
 	return nil
 }
 
+func (s *SQLiteReadServer) refreshNativeCatalogOnSlot(ctx context.Context, ts *SQLiteTenantStore, slot *sqliteReaderSlot, snap *ReadSnapshot) error {
+	if !ts.NativeMode || s.nativeAdapter == nil || snap == nil || slot == nil {
+		return nil
+	}
+	if snap.LSN > 0 {
+		ts.SyncedLSN.Store(snap.LSN)
+	}
+	if snap.LSN <= slot.catalogLSN && len(slot.vtabIDs) > 0 && slot.generation == snap.Generation {
+		return nil
+	}
+
+	tables, err := DiscoverCatalog(ctx, s.nativeAdapter, s.nativeCLOG, snap, ts.TenantID)
+	if err != nil {
+		return err
+	}
+
+	slot.conn.SetReadOnlyAuthorizer(false)
+	defer slot.conn.SetReadOnlyAuthorizer(true)
+
+	seen := make(map[string]struct{}, len(tables))
+	for _, tbl := range tables {
+		seen[tbl.Name] = struct{}{}
+		if oldID, ok := slot.vtabIDs[tbl.Name]; ok {
+			UnregisterNativeTable(oldID)
+		}
+		vid, err := slot.conn.RegisterNativeTable(ts.TenantID, snap.Generation, tbl, s.nativeAdapter, s.nativeCLOG)
+		if err != nil {
+			continue
+		}
+		slot.vtabIDs[tbl.Name] = vid
+	}
+	for name, oldID := range slot.vtabIDs {
+		if _, ok := seen[name]; !ok {
+			_ = slot.conn.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s;", quoteSQLiteIdent(name)))
+			UnregisterNativeTable(oldID)
+			delete(slot.vtabIDs, name)
+		}
+	}
+	slot.generation = snap.Generation
+	slot.catalogLSN = snap.LSN
+	return nil
+}
+
 func (s *SQLiteReadServer) executeReaderQuery(ctx context.Context, ts *SQLiteTenantStore, sqliteSQL string, args []string) (*SQLiteResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1184,6 +1274,31 @@ func (s *SQLiteReadServer) executeReaderQuery(ctx context.Context, ts *SQLiteTen
 			return nil, err
 		}
 		defer func() { _ = s.nativeAdapter.ReleaseSnapshot(snap) }()
+
+		if ts.readerPool != nil {
+			var slot *sqliteReaderSlot
+			select {
+			case slot = <-ts.readerPool:
+				defer func() { ts.readerPool <- slot }()
+			case <-ctx.Done():
+				s.queriesCancelled.Add(1)
+				return nil, ctx.Err()
+			}
+			if rerr := s.refreshNativeCatalogOnSlot(ctx, ts, slot, snap); rerr != nil {
+				s.queriesFailed.Add(1)
+				return nil, rerr
+			}
+			res, err := slot.conn.QueryWithContext(ctx, snap, sqliteSQL, args)
+			if err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					s.queriesCancelled.Add(1)
+				} else {
+					s.queriesFailed.Add(1)
+				}
+				return nil, err
+			}
+			return res, nil
+		}
 
 		if rerr := s.refreshNativeCatalogWithSnap(ctx, ts, snap); rerr != nil {
 			s.queriesFailed.Add(1)
@@ -1262,6 +1377,26 @@ func tokenizeSQLWords(sql string) []string {
 					i++
 				}
 			}
+			continue
+		}
+		if (c == 'E' || c == 'e') && i+1 < n && sql[i+1] == '\'' {
+			i += 2
+			for i < n {
+				if sql[i] == '\\' && i+1 < n {
+					i += 2
+					continue
+				}
+				if sql[i] == '\'' {
+					if i+1 < n && sql[i+1] == '\'' {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+			words = append(words, "'")
 			continue
 		}
 		if c == '\'' {

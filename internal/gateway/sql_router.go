@@ -112,6 +112,28 @@ func tokenizeStatements(sql string) [][]sqlToken {
 			continue
 		}
 
+		// PostgreSQL escape-string literal E'...' / e'...'
+		if (c == 'E' || c == 'e') && i+1 < n && sql[i+1] == '\'' {
+			i += 2
+			for i < n {
+				if sql[i] == '\\' && i+1 < n {
+					i += 2
+					continue
+				}
+				if sql[i] == '\'' {
+					if i+1 < n && sql[i+1] == '\'' {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+			stmts[len(stmts)-1] = append(stmts[len(stmts)-1], sqlToken{kind: tokSymbol, upper: "'"})
+			continue
+		}
+
 		// Single-quoted string literal
 		if c == '\'' {
 			i++

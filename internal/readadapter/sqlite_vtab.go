@@ -273,8 +273,9 @@ type pgVTabCursor struct {
 }
 
 type queryExecContext struct {
-	ctx  context.Context
-	snap *ReadSnapshot
+	ctx     context.Context
+	snap    *ReadSnapshot
+	lastErr error
 }
 
 var (
@@ -837,6 +838,9 @@ func goAirPGFilter(cursorID C.ulonglong, idxStr *C.char, argc C.int, argv **C.sq
 		ForkNum:    0,
 	})
 	if err != nil {
+		if qctx := getActiveQueryContext(cur.spec.db); qctx != nil && qctx.lastErr == nil {
+			qctx.lastErr = err
+		}
 		cur.resetResources()
 		cur.eof = true
 		return C.SQLITE_ERROR
@@ -845,6 +849,9 @@ func goAirPGFilter(cursorID C.ulonglong, idxStr *C.char, argc C.int, argv **C.sq
 
 	meta, err := cur.spec.Adapter.GetRelationMetadata(ctx, rel, cur.snap)
 	if err != nil {
+		if qctx := getActiveQueryContext(cur.spec.db); qctx != nil && qctx.lastErr == nil {
+			qctx.lastErr = err
+		}
 		cur.resetResources()
 		cur.eof = true
 		return C.SQLITE_ERROR
@@ -856,6 +863,9 @@ func goAirPGFilter(cursorID C.ulonglong, idxStr *C.char, argc C.int, argv **C.sq
 	cur.nblocks = meta.NBlocks
 
 	if err := cur.loadNextBatch(ctx); err != nil {
+		if qctx := getActiveQueryContext(cur.spec.db); qctx != nil && qctx.lastErr == nil {
+			qctx.lastErr = err
+		}
 		cur.resetResources()
 		cur.eof = true
 		return C.SQLITE_ERROR

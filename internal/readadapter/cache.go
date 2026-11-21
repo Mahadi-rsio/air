@@ -195,7 +195,7 @@ func (c *TieredCacheBackend) GetRelExists(ctx context.Context, tenantID string, 
 }
 
 func (c *TieredCacheBackend) GetPageAtLSN(ctx context.Context, tenantID string, key pageserver.Key, lsn uint64) ([]byte, error) {
-	if key.Kind != pageserver.KeyKindRelBlock {
+	if key.Kind != pageserver.KeyKindRelBlock || lsn == 0 || lsn == ^uint64(0) {
 		c.l3Fetches.Add(1)
 		return c.l3.GetPageAtLSN(ctx, tenantID, key, lsn)
 	}
@@ -227,9 +227,11 @@ func (c *TieredCacheBackend) GetPageAtLSN(ctx context.Context, tenantID string, 
 		c.l2Misses.Add(1)
 	}
 
-	v, err, shared := c.sfGroup.Do(ck.sfKey(), func() (any, error) {
+	ch := c.sfGroup.DoChan(ck.sfKey(), func() (any, error) {
 		c.l3Fetches.Add(1)
-		pg, err := c.l3.GetPageAtLSN(ctx, tenantID, key, lsn)
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+		pg, err := c.l3.GetPageAtLSN(fetchCtx, tenantID, key, lsn)
 		if err != nil {
 			return nil, err
 		}
@@ -243,21 +245,30 @@ func (c *TieredCacheBackend) GetPageAtLSN(ctx context.Context, tenantID string, 
 		copy(out, pg)
 		return out, nil
 	})
-	if shared {
-		c.stampedesPrevented.Add(1)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.Shared {
+			c.stampedesPrevented.Add(1)
+		}
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		pg := res.Val.([]byte)
+		out := make([]byte, len(pg))
+		copy(out, pg)
+		return out, nil
 	}
-	if err != nil {
-		return nil, err
-	}
-	pg := v.([]byte)
-	out := make([]byte, len(pg))
-	copy(out, pg)
-	return out, nil
 }
 
 func (c *TieredCacheBackend) GetPageBatch(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, startBlock, nblocks uint32, lsn uint64) ([]byte, uint32, error) {
 	if nblocks == 0 {
 		return nil, 0, nil
+	}
+	if lsn == 0 || lsn == ^uint64(0) {
+		c.l3Fetches.Add(1)
+		return c.l3.GetPageBatch(ctx, tenantID, spcOID, dbOID, relNumber, forkNum, startBlock, nblocks, lsn)
 	}
 	gen := c.l3.GetTenantGeneration(tenantID)
 	out := make([]byte, int(nblocks)*PGPageSize)

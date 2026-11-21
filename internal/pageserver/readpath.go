@@ -66,6 +66,11 @@ func (t *Timeline) SeedSLRUPage(key Key, page []byte) {
 	copy(cp, page)
 	t.mu.Lock()
 	t.slruPages[key] = cp
+	t.inMem.Put(key, WALDelta{
+		LSN:       1,
+		Flags:     EntryFlagPageImage,
+		PageImage: cp,
+	})
 	t.mu.Unlock()
 }
 

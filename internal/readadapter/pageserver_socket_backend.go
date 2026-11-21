@@ -315,75 +315,13 @@ func (b *PageserverSocketBackend) roundTrip(ctx context.Context, req pageserver.
 			}
 			return pageserver.RespHeader{}, nil, err
 		}
-
-		conn, err := b.acquireConn(ctx)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		dl, _ := ctx.Deadline()
-		_ = conn.SetDeadline(dl)
-
-		// Cancel socket I/O immediately if ctx is cancelled mid-flight.
-		var cancelDone chan struct{}
-		if ctx.Done() != nil {
-			stopWatch := make(chan struct{})
-			cancelDone = make(chan struct{})
-			go func(c net.Conn) {
-				defer close(cancelDone)
-				select {
-				case <-ctx.Done():
-					_ = c.SetDeadline(time.Now())
-				case <-stopWatch:
-				}
-			}(conn)
-			defer func(sw chan struct{}, cd chan struct{}) {
-				close(sw)
-				<-cd
-			}(stopWatch, cancelDone)
-		}
-
-		if err := writeFull(conn, reqBuf[:]); err != nil {
-			b.releaseConn(conn, true)
-			lastErr = err
-			continue
-		}
-		if _, err := io.ReadFull(conn, respBuf[:]); err != nil {
-			b.releaseConn(conn, true)
-			lastErr = err
-			continue
-		}
-		resp, err := decodeRespHeader(respBuf[:])
-		if err != nil {
-			b.releaseConn(conn, true)
-			b.failuresTotal.Add(1)
-			return pageserver.RespHeader{}, nil, err
-		}
-		if resp.PayloadLen > maxPayloadLen {
-			b.releaseConn(conn, true)
-			b.failuresTotal.Add(1)
-			return pageserver.RespHeader{}, nil, fmt.Errorf("%w: payload len %d exceeds max %d", pageserver.ErrBadProtocol, resp.PayloadLen, maxPayloadLen)
-		}
-		var payload []byte
-		if resp.PayloadLen > 0 {
-			payload = make([]byte, resp.PayloadLen)
-			if _, err := io.ReadFull(conn, payload); err != nil {
-				b.releaseConn(conn, true)
-				lastErr = err
-				continue
-			}
-		}
-
-		b.releaseConn(conn, false)
-		switch resp.Status {
-		case pageserver.StatusOK:
+		resp, payload, retry, err := b.roundTripOnce(ctx, req, reqBuf[:], &respBuf, maxPayloadLen)
+		if err == nil {
 			return resp, payload, nil
-		case pageserver.StatusNotFound:
-			return resp, nil, ErrNotFound
-		default:
-			b.failuresTotal.Add(1)
-			return resp, nil, fmt.Errorf("readadapter: pageserver op=%d status=%d", req.Op, resp.Status)
+		}
+		lastErr = err
+		if !retry {
+			return resp, nil, err
 		}
 	}
 
@@ -392,6 +330,91 @@ func (b *PageserverSocketBackend) roundTrip(ctx context.Context, req pageserver.
 		b.timeoutsTotal.Add(1)
 	}
 	return pageserver.RespHeader{}, nil, lastErr
+}
+
+func (b *PageserverSocketBackend) drainIdleConns() {
+	b.poolMu.Lock()
+	conns := b.idleConns
+	b.idleConns = nil
+	b.poolMu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+		b.activeConns.Add(-1)
+	}
+}
+
+func (b *PageserverSocketBackend) roundTripOnce(
+	ctx context.Context,
+	req pageserver.ReqHeader,
+	reqBuf []byte,
+	respBuf *[pageserver.RespHeaderSize]byte,
+	maxPayloadLen uint32,
+) (pageserver.RespHeader, []byte, bool, error) {
+	conn, err := b.acquireConn(ctx)
+	if err != nil {
+		return pageserver.RespHeader{}, nil, true, err
+	}
+
+	dl, _ := ctx.Deadline()
+	_ = conn.SetDeadline(dl)
+
+	if ctx.Done() != nil {
+		stopWatch := make(chan struct{})
+		cancelDone := make(chan struct{})
+		go func(c net.Conn) {
+			defer close(cancelDone)
+			select {
+			case <-ctx.Done():
+				_ = c.SetDeadline(time.Now())
+			case <-stopWatch:
+			}
+		}(conn)
+		defer func() {
+			close(stopWatch)
+			<-cancelDone
+		}()
+	}
+
+	if err := writeFull(conn, reqBuf); err != nil {
+		b.releaseConn(conn, true)
+		b.drainIdleConns()
+		return pageserver.RespHeader{}, nil, true, err
+	}
+	if _, err := io.ReadFull(conn, respBuf[:]); err != nil {
+		b.releaseConn(conn, true)
+		b.drainIdleConns()
+		return pageserver.RespHeader{}, nil, true, err
+	}
+	resp, err := decodeRespHeader(respBuf[:])
+	if err != nil {
+		b.releaseConn(conn, true)
+		b.failuresTotal.Add(1)
+		return pageserver.RespHeader{}, nil, false, err
+	}
+	if resp.PayloadLen > maxPayloadLen {
+		b.releaseConn(conn, true)
+		b.failuresTotal.Add(1)
+		return pageserver.RespHeader{}, nil, false, fmt.Errorf("%w: payload len %d exceeds max %d", pageserver.ErrBadProtocol, resp.PayloadLen, maxPayloadLen)
+	}
+	var payload []byte
+	if resp.PayloadLen > 0 {
+		payload = make([]byte, resp.PayloadLen)
+		if _, err := io.ReadFull(conn, payload); err != nil {
+			b.releaseConn(conn, true)
+			return pageserver.RespHeader{}, nil, true, err
+		}
+	}
+
+	b.releaseConn(conn, false)
+	switch resp.Status {
+	case pageserver.StatusOK:
+		return resp, payload, false, nil
+	case pageserver.StatusNotFound:
+		return resp, nil, false, ErrNotFound
+	default:
+		b.failuresTotal.Add(1)
+		return resp, nil, false, fmt.Errorf("readadapter: pageserver op=%d status=%d", req.Op, resp.Status)
+	}
 }
 
 // GetTenantInfo queries the active generation and latest ingested WAL LSN for tenantID.

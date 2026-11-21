@@ -238,3 +238,128 @@ func BenchmarkReadEngineSQLiteQuery(b *testing.B) {
 	}
 }
 
+func BenchmarkReadEnginePageserverSocket(b *testing.B) {
+	tmpDir := b.TempDir()
+	sockPath := filepath.Join(tmpDir, "ps.sock")
+	ps, err := pageserver.New(pageserver.Config{
+		SocketPath: sockPath,
+		LayerDir:   filepath.Join(tmpDir, "layers"),
+	})
+	if err != nil {
+		b.Fatalf("pageserver.New: %v", err)
+	}
+	defer ps.Close()
+	if err := ps.Start(context.Background()); err != nil {
+		b.Fatalf("ps.Start: %v", err)
+	}
+
+	const (
+		tenantID = "bench-sock"
+		lsn      = uint64(0x10000)
+	)
+	ps.EnsureTenant(tenantID, 1)
+	ps.SetTenantGeneration(tenantID, "gen-1")
+	pg := bytes.Repeat([]byte{0x88}, PGPageSize)
+	if err := ps.PutPageBatch(context.Background(), tenantID, 1663, 5, 60004, 0, 0, 1, lsn, pg); err != nil {
+		b.Fatalf("PutPageBatch: %v", err)
+	}
+
+	sb := NewPageserverSocketBackend(sockPath)
+	defer sb.Close()
+	ctx := context.Background()
+	key := pageserver.RelBlockKey(1663, 5, 60004, 0, 0)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := sb.GetPageAtLSN(ctx, tenantID, key, lsn); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkReadEngineAirPGVTab(b *testing.B) {
+	tmpDir := b.TempDir()
+	sockPath := filepath.Join(tmpDir, "ps.sock")
+	ps, err := pageserver.New(pageserver.Config{
+		SocketPath: sockPath,
+		LayerDir:   filepath.Join(tmpDir, "layers"),
+	})
+	if err != nil {
+		b.Fatalf("pageserver.New: %v", err)
+	}
+	defer ps.Close()
+	if err := ps.Start(context.Background()); err != nil {
+		b.Fatalf("ps.Start: %v", err)
+	}
+
+	const (
+		tenantID = "bench-vtab"
+		gen      = "gen-1"
+		dbOID    = uint32(16384)
+		relNode  = uint32(60005)
+		lsn      = uint64(0x10000)
+	)
+	ps.EnsureTenant(tenantID, 1)
+	ps.SetTenantGeneration(tenantID, gen)
+
+	var tuples [][]byte
+	for i := int32(1); i <= 50; i++ {
+		var tb tupleBuilder
+		tb.addInt4(i)
+		tb.addText("user-row")
+		tuples = append(tuples, buildHeapTuple(FrozenTransactionID, 0, HeapXminFrozen|HeapXmaxInvalid, tb.buf))
+	}
+	if err := ps.PutPageBatch(context.Background(), tenantID, PGDefaultTablespaceOID, dbOID, relNode, 0, 0, 1, lsn, buildPG17HeapPage(lsn, tuples)); err != nil {
+		b.Fatalf("PutPageBatch: %v", err)
+	}
+
+	sb := NewPageserverSocketBackend(sockPath)
+	defer sb.Close()
+	cache, err := NewTieredCacheBackend(sb, CacheConfig{L1MaxBytes: 16 * PGPageSize})
+	if err != nil {
+		b.Fatalf("NewTieredCacheBackend: %v", err)
+	}
+	snaps := NewStaticSnapshotProvider()
+	snaps.SetSnapshot(tenantID, gen, SnapshotInfo{LSN: lsn})
+	ad := NewAdapter(cache, snaps)
+	clog := NewCLOGResolver(cache)
+
+	conn, err := OpenSQLiteConn(":memory:", false, 4096)
+	if err != nil {
+		b.Fatalf("OpenSQLiteConn: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.RegisterAirPGModule()
+
+	tbl := DiscoveredTable{
+		Schema: "public", Name: "users", RelOID: relNode, SpcOID: PGDefaultTablespaceOID, DbOID: dbOID, RelNumber: relNode,
+		Columns: []DiscoveredColumn{
+			{Name: "id", AttNum: 1, PGTypeOID: 23, ColType: ColInt4, SQLiteType: "INTEGER"},
+			{Name: "name", AttNum: 2, PGTypeOID: 25, ColType: ColText, SQLiteType: "TEXT"},
+		},
+	}
+	uid, err := conn.RegisterNativeTable(tenantID, gen, tbl, ad, clog)
+	if err != nil {
+		b.Fatalf("RegisterNativeTable: %v", err)
+	}
+	defer UnregisterNativeTable(uid)
+	_ = conn.Exec("PRAGMA query_only=ON;")
+	conn.SetReadOnlyAuthorizer(true)
+
+	ctx := context.Background()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		snap, err := ad.GetSnapshot(ctx, tenantID, gen)
+		if err != nil {
+			b.Fatal(err)
+		}
+		res, err := conn.QueryWithContext(ctx, snap, "SELECT name FROM users WHERE id = 25", nil)
+		_ = ad.ReleaseSnapshot(snap)
+		if err != nil || len(res.Rows) != 1 {
+			b.Fatalf("vtab query failed: err=%v rows=%d", err, len(res.Rows))
+		}
+	}
+}
+

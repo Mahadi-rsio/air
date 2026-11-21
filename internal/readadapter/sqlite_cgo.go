@@ -312,10 +312,11 @@ func (c *SQLiteConn) QueryWithContext(ctx context.Context, snap *ReadSnapshot, s
 		}()
 	}
 
-	setActiveQueryContext(unsafe.Pointer(c.db), &queryExecContext{
+	qctx := &queryExecContext{
 		ctx:  ctx,
 		snap: snap,
-	})
+	}
+	setActiveQueryContext(unsafe.Pointer(c.db), qctx)
 	defer clearActiveQueryContext(unsafe.Pointer(c.db))
 
 	csql := C.CString(sql)
@@ -439,6 +440,12 @@ func (c *SQLiteConn) QueryWithContext(ctx context.Context, snap *ReadSnapshot, s
 		} else if stepRC == C.SQLITE_AUTH {
 			return nil, &SQLiteReadOnlyError{Message: C.GoString(C.sqlite3_errmsg(c.db))}
 		} else {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			if qctx.lastErr != nil {
+				return nil, qctx.lastErr
+			}
 			return nil, fmt.Errorf("%s", C.GoString(C.sqlite3_errmsg(c.db)))
 		}
 	}
