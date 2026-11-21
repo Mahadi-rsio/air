@@ -356,31 +356,61 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 			status = 0x02 // XactStatusAborted
 		}
 		if status != 0 {
-			const clogXactsPerPage = uint32(PageSize) * 4
-			pageNum := rec.XID / clogXactsPerPage
-			slruKey := Key{Kind: KeyKindSLRU, SpcOID: 0, BlockNum: pageNum}
-			page := make([]byte, PageSize)
-			if cur, ok := t.slruPages[slruKey]; ok && len(cur) == PageSize {
-				copy(page, cur)
-			} else if deltas := t.inMem.Lookup(slruKey, ^uint64(0)); len(deltas) > 0 {
-				for i := len(deltas) - 1; i >= 0; i-- {
-					if (deltas[i].Flags&EntryFlagPageImage) != 0 && len(deltas[i].PageImage) == PageSize {
-						copy(page, deltas[i].PageImage)
-						break
+			markCLOG := func(xid uint32) {
+				if xid < 3 {
+					return
+				}
+				const clogXactsPerPage = uint32(PageSize) * 4
+				pageNum := xid / clogXactsPerPage
+				slruKey := Key{Kind: KeyKindSLRU, SpcOID: 0, BlockNum: pageNum}
+				page := make([]byte, PageSize)
+				if cur, ok := t.slruPages[slruKey]; ok && len(cur) == PageSize {
+					copy(page, cur)
+				} else if deltas := t.inMem.Lookup(slruKey, ^uint64(0)); len(deltas) > 0 {
+					for i := len(deltas) - 1; i >= 0; i-- {
+						if (deltas[i].Flags&EntryFlagPageImage) != 0 && len(deltas[i].PageImage) == PageSize {
+							copy(page, deltas[i].PageImage)
+							break
+						}
+					}
+				}
+				pageIdx := xid % clogXactsPerPage
+				byteIdx := pageIdx / 4
+				bitShift := (pageIdx % 4) * 2
+				mask := byte(0x03 << bitShift)
+				page[byteIdx] = (page[byteIdx] &^ mask) | ((status & 0x03) << bitShift)
+				t.slruPages[slruKey] = page
+				t.inMem.Put(slruKey, WALDelta{
+					LSN:       rec.EndLSN,
+					Flags:     EntryFlagPageImage,
+					PageImage: page,
+				})
+			}
+
+			markCLOG(rec.XID)
+
+			// Parse subtransactions if XLOG_XACT_HAS_INFO (0x80) and XACT_XINFO_HAS_SUBXACTS (0x10) are set.
+			const (
+				xlogXactHasInfo      = 0x80
+				xactXinfoHasDBInfo   = 0x0001
+				xactXinfoHasSubxacts = 0x0010
+			)
+			if (rec.Info&xlogXactHasInfo) != 0 && len(rec.MainData) >= 12 {
+				xinfo := binary.LittleEndian.Uint32(rec.MainData[8:12])
+				off := 12
+				if (xinfo & xactXinfoHasDBInfo) != 0 {
+					off += 8
+				}
+				if (xinfo&xactXinfoHasSubxacts) != 0 && off+4 <= len(rec.MainData) {
+					nsub := int(binary.LittleEndian.Uint32(rec.MainData[off : off+4]))
+					off += 4
+					for i := 0; i < nsub && off+4 <= len(rec.MainData); i++ {
+						subXID := binary.LittleEndian.Uint32(rec.MainData[off : off+4])
+						off += 4
+						markCLOG(subXID)
 					}
 				}
 			}
-			pageIdx := rec.XID % clogXactsPerPage
-			byteIdx := pageIdx / 4
-			bitShift := (pageIdx % 4) * 2
-			mask := byte(0x03 << bitShift)
-			page[byteIdx] = (page[byteIdx] &^ mask) | ((status & 0x03) << bitShift)
-			t.slruPages[slruKey] = page
-			t.inMem.Put(slruKey, WALDelta{
-				LSN:       rec.EndLSN,
-				Flags:     EntryFlagPageImage,
-				PageImage: page,
-			})
 		}
 	}
 

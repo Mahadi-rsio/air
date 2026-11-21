@@ -164,7 +164,10 @@ func scanCatalogRelation(
 					continue
 				}
 				vis, err := IsVisibleWithCLOG(ctx, thdr, snap, clog)
-				if err != nil || !vis {
+				if err != nil {
+					return nil, err
+				}
+				if !vis {
 					continue
 				}
 				vals, err := DecodeHeapColumns(tup, thdr, cols)

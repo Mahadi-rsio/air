@@ -54,10 +54,33 @@ static int air_bind_text(sqlite3_stmt *stmt, int idx, const char *val, int n) {
 static int air_bind_blob(sqlite3_stmt *stmt, int idx, const void *val, int n) {
 	return sqlite3_bind_blob(stmt, idx, val, n, SQLITE_TRANSIENT);
 }
+
+static int air_progress_cb(void *arg) {
+	int *cancelled = (int *)arg;
+	if (cancelled != NULL && __atomic_load_n(cancelled, __ATOMIC_RELAXED) != 0) {
+		return 1;
+	}
+	return 0;
+}
+
+static void air_set_cancelled(int *cancelled) {
+	if (cancelled != NULL) {
+		__atomic_store_n(cancelled, 1, __ATOMIC_RELAXED);
+	}
+}
+
+static void air_install_progress_handler(sqlite3 *db, int *cancelled) {
+	if (cancelled != NULL) {
+		sqlite3_progress_handler(db, 100, air_progress_cb, (void *)cancelled);
+	} else {
+		sqlite3_progress_handler(db, 0, NULL, NULL);
+	}
+}
 */
 import "C"
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"unsafe"
@@ -245,11 +268,55 @@ func declTypeToPG(decl string) (uint32, int16) {
 
 // Query executes a SQL statement with optional positional parameters and returns all rows.
 func (c *SQLiteConn) Query(sql string, args []string) (*SQLiteResult, error) {
+	return c.QueryWithContext(context.Background(), nil, sql, args)
+}
+
+// QueryWithContext executes a SQL statement under ctx and an optional shared ReadSnapshot.
+func (c *SQLiteConn) QueryWithContext(ctx context.Context, snap *ReadSnapshot, sql string, args []string) (*SQLiteResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.db == nil {
 		return nil, fmt.Errorf("sqlite connection closed")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if ctx.Done() != nil {
+		cancelPtr := (*C.int)(C.malloc(C.size_t(unsafe.Sizeof(C.int(0)))))
+		*cancelPtr = 0
+		stopWatch := make(chan struct{})
+		doneCh := make(chan struct{})
+		C.air_install_progress_handler(c.db, cancelPtr)
+		go func() {
+			defer close(doneCh)
+			select {
+			case <-ctx.Done():
+				C.air_set_cancelled(cancelPtr)
+				C.sqlite3_interrupt(c.db)
+			case <-stopWatch:
+			}
+		}()
+		defer func() {
+			close(stopWatch)
+			<-doneCh
+			C.air_install_progress_handler(c.db, nil)
+			C.free(unsafe.Pointer(cancelPtr))
+		}()
+	}
+
+	setActiveQueryContext(unsafe.Pointer(c.db), &queryExecContext{
+		ctx:  ctx,
+		snap: snap,
+	})
+	defer clearActiveQueryContext(unsafe.Pointer(c.db))
 
 	csql := C.CString(sql)
 	defer C.free(unsafe.Pointer(csql))

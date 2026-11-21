@@ -19,7 +19,7 @@ typedef struct {
 extern int goAirPGConnect(sqlite3 *db, int argc, char **argv, unsigned long long *out_id, char **out_ddl);
 extern int goAirPGOpen(unsigned long long vtab_id, unsigned long long *out_cursor_id);
 extern int goAirPGClose(unsigned long long cursor_id);
-extern int goAirPGFilter(unsigned long long cursor_id);
+extern int goAirPGFilter(unsigned long long cursor_id, char *idx_str, int argc, sqlite3_value **argv);
 extern int goAirPGNext(unsigned long long cursor_id);
 extern int goAirPGEof(unsigned long long cursor_id);
 extern int goAirPGColumn(unsigned long long cursor_id, sqlite3_context *ctx, int col_idx);
@@ -61,8 +61,63 @@ static int air_pg_connect(
 
 static int air_pg_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *pIdxInfo) {
 	(void)pVtab;
-	pIdxInfo->estimatedCost = 1000.0;
-	pIdxInfo->estimatedRows = 1000;
+	int has_eq = 0;
+	int has_range = 0;
+	int arg_idx = 1;
+
+	sqlite3_str *str = sqlite3_str_new(NULL);
+	sqlite3_str_appendf(str, "%llx|", (unsigned long long)pIdxInfo->colUsed);
+
+	for (int i = 0; i < pIdxInfo->nConstraint; i++) {
+		if (!pIdxInfo->aConstraint[i].usable || pIdxInfo->aConstraint[i].iColumn < 0) {
+			continue;
+		}
+		unsigned char op = pIdxInfo->aConstraint[i].op;
+		int needs_arg = 0;
+		switch (op) {
+			case SQLITE_INDEX_CONSTRAINT_EQ:
+				has_eq = 1;
+				needs_arg = 1;
+				break;
+			case SQLITE_INDEX_CONSTRAINT_GT:
+			case SQLITE_INDEX_CONSTRAINT_LE:
+			case SQLITE_INDEX_CONSTRAINT_LT:
+			case SQLITE_INDEX_CONSTRAINT_GE:
+				has_range = 1;
+				needs_arg = 1;
+				break;
+			case SQLITE_INDEX_CONSTRAINT_ISNULL:
+			case SQLITE_INDEX_CONSTRAINT_ISNOTNULL:
+				has_range = 1;
+				needs_arg = 0;
+				break;
+			default:
+				continue;
+		}
+		if (needs_arg) {
+			pIdxInfo->aConstraintUsage[i].argvIndex = arg_idx++;
+		}
+		pIdxInfo->aConstraintUsage[i].omit = 0;
+		sqlite3_str_appendf(str, "%d:%d,", pIdxInfo->aConstraint[i].iColumn, (int)op);
+	}
+
+	char *encoded = sqlite3_str_finish(str);
+	if (encoded == NULL) {
+		return SQLITE_NOMEM;
+	}
+	pIdxInfo->idxStr = encoded;
+	pIdxInfo->needToFreeIdxStr = 1;
+
+	if (has_eq) {
+		pIdxInfo->estimatedCost = 100.0;
+		pIdxInfo->estimatedRows = 10;
+	} else if (has_range) {
+		pIdxInfo->estimatedCost = 500.0;
+		pIdxInfo->estimatedRows = 100;
+	} else {
+		pIdxInfo->estimatedCost = 10000.0;
+		pIdxInfo->estimatedRows = 10000;
+	}
 	return SQLITE_OK;
 }
 
@@ -104,11 +159,8 @@ static int air_pg_filter(
 	sqlite3_value **argv
 ) {
 	(void)idxNum;
-	(void)idxStr;
-	(void)argc;
-	(void)argv;
 	air_pg_cursor *c = (air_pg_cursor *)pCur;
-	return goAirPGFilter(c->go_id);
+	return goAirPGFilter(c->go_id, (char *)idxStr, argc, argv);
 }
 
 static int air_pg_next(sqlite3_vtab_cursor *pCur) {
@@ -185,6 +237,7 @@ import (
 
 type pgVTabSpec struct {
 	ID         uint64
+	db         unsafe.Pointer // *C.sqlite3
 	TenantID   string
 	Generation string
 	Table      DiscoveredTable
@@ -194,16 +247,34 @@ type pgVTabSpec struct {
 	CLOG       *CLOGResolver
 }
 
+type vtabFilter struct {
+	allColIdx int
+	op        int
+	valType   int // C.SQLITE_INTEGER, C.SQLITE_FLOAT, C.SQLITE_TEXT, C.SQLITE_BLOB, C.SQLITE_NULL
+	intVal    int64
+	floatVal  float64
+	strVal    string
+}
+
 type pgVTabCursor struct {
-	spec        *pgVTabSpec
-	snap        *ReadSnapshot
-	rel         *RelationHandle
-	nblocks     uint32
-	nextBlock   uint32
-	pageRows    [][]any
-	pageRowIdx  int
-	rowid       int64
-	eof         bool
+	spec       *pgVTabSpec
+	ctx        context.Context
+	snap       *ReadSnapshot
+	ownsSnap   bool
+	rel        *RelationHandle
+	nblocks    uint32
+	nextBlock  uint32
+	neededCols []bool
+	filters    []vtabFilter
+	pageRows   [][]any
+	pageRowIdx int
+	rowid      int64
+	eof        bool
+}
+
+type queryExecContext struct {
+	ctx  context.Context
+	snap *ReadSnapshot
 }
 
 var (
@@ -215,7 +286,48 @@ var (
 
 	cursorMu  sync.RWMutex
 	cursorMap = make(map[uint64]*pgVTabCursor)
+
+	activeQueryMu  sync.RWMutex
+	activeQueryMap = make(map[unsafe.Pointer]*queryExecContext)
+
+	vtabPagesRead     atomic.Uint64
+	vtabTuplesDecoded atomic.Uint64
+	vtabColsDecoded   atomic.Uint64
+	vtabRowsMatched   atomic.Uint64
 )
+
+// VTabStats returns cumulative virtual table scan, decode, and match counters.
+func VTabStats() (pagesRead, tuplesDecoded, colsDecoded, rowsMatched uint64) {
+	return vtabPagesRead.Load(), vtabTuplesDecoded.Load(), vtabColsDecoded.Load(), vtabRowsMatched.Load()
+}
+
+func setActiveQueryContext(db unsafe.Pointer, qctx *queryExecContext) {
+	if db == nil {
+		return
+	}
+	activeQueryMu.Lock()
+	activeQueryMap[db] = qctx
+	activeQueryMu.Unlock()
+}
+
+func clearActiveQueryContext(db unsafe.Pointer) {
+	if db == nil {
+		return
+	}
+	activeQueryMu.Lock()
+	delete(activeQueryMap, db)
+	activeQueryMu.Unlock()
+}
+
+func getActiveQueryContext(db unsafe.Pointer) *queryExecContext {
+	if db == nil {
+		return nil
+	}
+	activeQueryMu.RLock()
+	qctx := activeQueryMap[db]
+	activeQueryMu.RUnlock()
+	return qctx
+}
 
 // RegisterAirPGModule registers the read-only "air_pg" SQLite virtual table module
 // on this SQLiteConn.
@@ -251,6 +363,7 @@ func (c *SQLiteConn) RegisterNativeTable(tenantID, generation string, tbl Discov
 	id := vtabNextID.Add(1)
 	spec := &pgVTabSpec{
 		ID:         id,
+		db:         unsafe.Pointer(c.db),
 		TenantID:   tenantID,
 		Generation: generation,
 		Table:      tbl,
@@ -342,9 +455,15 @@ func (cur *pgVTabCursor) resetResources() {
 		cur.rel = nil
 	}
 	if cur.snap != nil {
-		cur.spec.Adapter.ReleaseSnapshot(cur.snap)
+		if cur.ownsSnap {
+			cur.spec.Adapter.ReleaseSnapshot(cur.snap)
+		}
 		cur.snap = nil
+		cur.ownsSnap = false
 	}
+	cur.ctx = nil
+	cur.neededCols = nil
+	cur.filters = nil
 	cur.pageRows = nil
 	cur.pageRowIdx = 0
 }
@@ -361,12 +480,161 @@ func goAirPGClose(cursorID C.ulonglong) C.int {
 	return C.SQLITE_OK
 }
 
+func toFloat64(v any) (float64, bool) {
+	switch n := v.(type) {
+	case int16:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case uint32:
+		return float64(n), true
+	case float64:
+		return n, true
+	case bool:
+		if n {
+			return 1, true
+		}
+		return 0, true
+	default:
+		return 0, false
+	}
+}
+
+func toInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int16:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case int64:
+		return n, true
+	case uint32:
+		return int64(n), true
+	case bool:
+		if n {
+			return 1, true
+		}
+		return 0, true
+	default:
+		return 0, false
+	}
+}
+
+func toStringVal(v any) (string, bool) {
+	switch s := v.(type) {
+	case string:
+		return s, true
+	case byte:
+		return string([]byte{s}), true
+	default:
+		return "", false
+	}
+}
+
+func evalFilter(f vtabFilter, val any) bool {
+	switch f.op {
+	case int(C.SQLITE_INDEX_CONSTRAINT_ISNULL):
+		return val == nil
+	case int(C.SQLITE_INDEX_CONSTRAINT_ISNOTNULL):
+		return val != nil
+	}
+	if val == nil || f.valType == int(C.SQLITE_NULL) {
+		return false
+	}
+
+	var cmp int
+	switch f.valType {
+	case int(C.SQLITE_INTEGER):
+		if iv, ok := toInt64(val); ok {
+			if iv < f.intVal {
+				cmp = -1
+			} else if iv > f.intVal {
+				cmp = 1
+			}
+		} else if fv, ok := toFloat64(val); ok {
+			target := float64(f.intVal)
+			if fv < target {
+				cmp = -1
+			} else if fv > target {
+				cmp = 1
+			}
+		} else {
+			return true // let SQLite evaluate cross-type affinity
+		}
+	case int(C.SQLITE_FLOAT):
+		if fv, ok := toFloat64(val); ok {
+			if fv < f.floatVal {
+				cmp = -1
+			} else if fv > f.floatVal {
+				cmp = 1
+			}
+		} else {
+			return true
+		}
+	case int(C.SQLITE_TEXT):
+		if sv, ok := toStringVal(val); ok {
+			if sv < f.strVal {
+				cmp = -1
+			} else if sv > f.strVal {
+				cmp = 1
+			}
+		} else {
+			return true
+		}
+	default:
+		return true
+	}
+
+	switch f.op {
+	case int(C.SQLITE_INDEX_CONSTRAINT_EQ):
+		return cmp == 0
+	case int(C.SQLITE_INDEX_CONSTRAINT_LT):
+		return cmp < 0
+	case int(C.SQLITE_INDEX_CONSTRAINT_LE):
+		return cmp <= 0
+	case int(C.SQLITE_INDEX_CONSTRAINT_GT):
+		return cmp > 0
+	case int(C.SQLITE_INDEX_CONSTRAINT_GE):
+		return cmp >= 0
+	default:
+		return true
+	}
+}
+
+func (cur *pgVTabCursor) matchesFilters(vals []any) bool {
+	for _, f := range cur.filters {
+		if f.allColIdx < 0 || f.allColIdx >= len(vals) {
+			continue
+		}
+		if !evalFilter(f, vals[f.allColIdx]) {
+			return false
+		}
+	}
+	return true
+}
+
 func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 	cur.pageRows = nil
 	cur.pageRowIdx = 0
 
+	var decodedColsPerTuple uint64
+	if cur.neededCols == nil {
+		decodedColsPerTuple = uint64(len(cur.spec.AllCols))
+	} else {
+		for _, need := range cur.neededCols {
+			if need {
+				decodedColsPerTuple++
+			}
+		}
+	}
+
 	const batchBlocks uint32 = 16
 	for cur.nextBlock < cur.nblocks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		n := batchBlocks
 		if cur.nextBlock+n > cur.nblocks {
 			n = cur.nblocks - cur.nextBlock
@@ -378,33 +646,46 @@ func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 		cur.nextBlock += n
 
 		for _, pd := range pages {
+			vtabPagesRead.Add(1)
+			if IsZeroPage(pd.Data) {
+				continue
+			}
 			phdr, err := ParsePageHeader(pd.Data)
 			if err != nil {
-				continue
+				return err
 			}
 			lps := ParseLinePointers(pd.Data, phdr)
 			for _, lp := range lps {
-				if lp.Flags != LPNormal || lp.Length < PGSizeOfHeapTupleHdr {
+				if lp.Flags != LPNormal {
 					continue
+				}
+				if err := ValidateLinePointer(lp, phdr); err != nil {
+					return err
 				}
 				start := int(lp.Offset)
 				end := start + int(lp.Length)
-				if start < PGPageHeaderSize || end > len(pd.Data) {
-					continue
-				}
 				tup := pd.Data[start:end]
 				thdr, err := ParseHeapTupleHeader(tup)
 				if err != nil {
-					continue
+					return err
 				}
 				vis, err := IsVisibleWithCLOG(ctx, thdr, cur.snap, cur.spec.CLOG)
-				if err != nil || !vis {
-					continue
-				}
-				vals, err := DecodeHeapColumns(tup, thdr, cur.spec.AllCols)
 				if err != nil {
+					return err
+				}
+				if !vis {
 					continue
 				}
+				vals, err := DecodeHeapColumnsProjected(tup, thdr, cur.spec.AllCols, cur.neededCols)
+				if err != nil {
+					return err
+				}
+				vtabTuplesDecoded.Add(1)
+				vtabColsDecoded.Add(decodedColsPerTuple)
+				if !cur.matchesFilters(vals) {
+					continue
+				}
+				vtabRowsMatched.Add(1)
 				cur.pageRows = append(cur.pageRows, vals)
 			}
 		}
@@ -416,8 +697,89 @@ func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 	return nil
 }
 
+func (cur *pgVTabCursor) parseFilterPlan(idxStr string, argc int, argv **C.sqlite3_value) {
+	needed := make([]bool, len(cur.spec.AllCols))
+	hasColMask := false
+
+	if idxStr != "" {
+		parts := strings.SplitN(idxStr, "|", 2)
+		if len(parts) >= 1 && parts[0] != "" {
+			if colUsed, err := strconv.ParseUint(parts[0], 16, 64); err == nil {
+				hasColMask = true
+				if (colUsed >> 63) != 0 {
+					for _, allIdx := range cur.spec.VisibleIdx {
+						needed[allIdx] = true
+					}
+				} else {
+					for visIdx, allIdx := range cur.spec.VisibleIdx {
+						if visIdx < 63 && (colUsed&(1<<uint(visIdx))) != 0 {
+							needed[allIdx] = true
+						}
+					}
+				}
+			}
+		}
+
+		if len(parts) == 2 && parts[1] != "" {
+			var argVals []*C.sqlite3_value
+			if argc > 0 && argv != nil {
+				argVals = unsafe.Slice(argv, argc)
+			}
+			argIdx := 0
+			for _, item := range strings.Split(parts[1], ",") {
+				if item == "" {
+					continue
+				}
+				kv := strings.SplitN(item, ":", 2)
+				if len(kv) != 2 {
+					continue
+				}
+				visCol, err1 := strconv.Atoi(kv[0])
+				op, err2 := strconv.Atoi(kv[1])
+				if err1 != nil || err2 != nil || visCol < 0 || visCol >= len(cur.spec.VisibleIdx) {
+					continue
+				}
+				allCol := cur.spec.VisibleIdx[visCol]
+				needed[allCol] = true
+
+				f := vtabFilter{
+					allColIdx: allCol,
+					op:        op,
+				}
+				if op != int(C.SQLITE_INDEX_CONSTRAINT_ISNULL) && op != int(C.SQLITE_INDEX_CONSTRAINT_ISNOTNULL) {
+					if argIdx >= len(argVals) {
+						continue
+					}
+					v := argVals[argIdx]
+					argIdx++
+					f.valType = int(C.sqlite3_value_type(v))
+					switch f.valType {
+					case int(C.SQLITE_INTEGER):
+						f.intVal = int64(C.sqlite3_value_int64(v))
+					case int(C.SQLITE_FLOAT):
+						f.floatVal = float64(C.sqlite3_value_double(v))
+					case int(C.SQLITE_TEXT):
+						n := C.sqlite3_value_bytes(v)
+						p := C.sqlite3_value_text(v)
+						if n > 0 && p != nil {
+							f.strVal = C.GoStringN((*C.char)(unsafe.Pointer(p)), n)
+						}
+					}
+				}
+				cur.filters = append(cur.filters, f)
+			}
+		}
+	}
+
+	if hasColMask {
+		cur.neededCols = needed
+	} else {
+		cur.neededCols = nil
+	}
+}
+
 //export goAirPGFilter
-func goAirPGFilter(cursorID C.ulonglong) C.int {
+func goAirPGFilter(cursorID C.ulonglong, idxStr *C.char, argc C.int, argv **C.sqlite3_value) C.int {
 	cursorMu.RLock()
 	cur, ok := cursorMap[uint64(cursorID)]
 	cursorMu.RUnlock()
@@ -429,14 +791,42 @@ func goAirPGFilter(cursorID C.ulonglong) C.int {
 	cur.eof = false
 	cur.rowid = 0
 	cur.nextBlock = 0
+	if idxStr != nil {
+		cur.parseFilterPlan(C.GoString(idxStr), int(argc), argv)
+	}
 
 	ctx := context.Background()
-	snap, err := cur.spec.Adapter.GetSnapshot(ctx, cur.spec.TenantID, cur.spec.Generation)
-	if err != nil {
-		cur.eof = true
-		return C.SQLITE_ERROR
+	var sharedSnap *ReadSnapshot
+	if qctx := getActiveQueryContext(cur.spec.db); qctx != nil {
+		if qctx.ctx != nil {
+			ctx = qctx.ctx
+		}
+		if qctx.snap != nil {
+			if qctx.snap.TenantID != cur.spec.TenantID || qctx.snap.Generation != cur.spec.Generation || qctx.snap.released.Load() {
+				cur.eof = true
+				return C.SQLITE_ERROR
+			}
+			sharedSnap = qctx.snap
+		}
 	}
-	cur.snap = snap
+	if err := ctx.Err(); err != nil {
+		cur.eof = true
+		return C.SQLITE_INTERRUPT
+	}
+	cur.ctx = ctx
+
+	if sharedSnap != nil {
+		cur.snap = sharedSnap
+		cur.ownsSnap = false
+	} else {
+		snap, err := cur.spec.Adapter.GetSnapshot(ctx, cur.spec.TenantID, cur.spec.Generation)
+		if err != nil {
+			cur.eof = true
+			return C.SQLITE_ERROR
+		}
+		cur.snap = snap
+		cur.ownsSnap = true
+	}
 
 	rel, err := cur.spec.Adapter.OpenRelation(ctx, RelationSpec{
 		TenantID:   cur.spec.TenantID,
@@ -453,7 +843,7 @@ func goAirPGFilter(cursorID C.ulonglong) C.int {
 	}
 	cur.rel = rel
 
-	meta, err := cur.spec.Adapter.GetRelationMetadata(ctx, rel, snap)
+	meta, err := cur.spec.Adapter.GetRelationMetadata(ctx, rel, cur.snap)
 	if err != nil {
 		cur.resetResources()
 		cur.eof = true
@@ -466,6 +856,7 @@ func goAirPGFilter(cursorID C.ulonglong) C.int {
 	cur.nblocks = meta.NBlocks
 
 	if err := cur.loadNextBatch(ctx); err != nil {
+		cur.resetResources()
 		cur.eof = true
 		return C.SQLITE_ERROR
 	}
@@ -493,7 +884,12 @@ func goAirPGNext(cursorID C.ulonglong) C.int {
 		return C.SQLITE_OK
 	}
 
-	if err := cur.loadNextBatch(context.Background()); err != nil {
+	ctx := cur.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := cur.loadNextBatch(ctx); err != nil {
+		cur.resetResources()
 		cur.eof = true
 		return C.SQLITE_ERROR
 	}

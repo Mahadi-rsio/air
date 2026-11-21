@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Mahadi-rsio/air/internal/pageserver"
@@ -351,5 +352,301 @@ func TestNativePageserverVTab_ZeroSync_MVCC_And_CatalogDiscovery(t *testing.T) {
 	// Verify writes are strictly rejected
 	if _, err := conn.Exec(ctx, "INSERT INTO products VALUES (5, 'bad', 1.0)"); err == nil {
 		t.Fatalf("expected INSERT to be rejected in read-only native mode")
+	}
+}
+
+type advancingSnapProv struct {
+	calls atomic.Uint64
+	lsns  []uint64
+}
+
+func (p *advancingSnapProv) CurrentSnapshot(_ context.Context, _, _ string) (SnapshotInfo, error) {
+	idx := int(p.calls.Add(1) - 1)
+	if idx >= len(p.lsns) {
+		idx = len(p.lsns) - 1
+	}
+	return SnapshotInfo{LSN: p.lsns[idx]}, nil
+}
+
+func TestQueryLevelSnapshotConsistency_JoinAndLeakCheck(t *testing.T) {
+	tmpDir := t.TempDir()
+	ps, err := pageserver.New(pageserver.Config{
+		SocketPath: filepath.Join(tmpDir, "ps.sock"),
+		LayerDir:   filepath.Join(tmpDir, "layers"),
+	})
+	if err != nil {
+		t.Fatalf("pageserver.New: %v", err)
+	}
+	defer ps.Close()
+
+	const tenantID = "tenant-join-snap"
+	const gen = "gen-1"
+	const dbOID = uint32(16384)
+	const usersNode = uint32(30001)
+	const ordersNode = uint32(30002)
+	const lsn1 = uint64(0x10000)
+	const lsn2 = uint64(0x20000)
+
+	ps.EnsureTenant(tenantID, 1)
+	ps.SetTenantGeneration(tenantID, gen)
+
+	putAt := func(relNode uint32, lsn uint64, page []byte) {
+		if err := ps.PutPageBatch(context.Background(), tenantID, PGDefaultTablespaceOID, dbOID, relNode, 0, 0, 1, lsn, page); err != nil {
+			t.Fatalf("PutPageBatch(%d): %v", relNode, err)
+		}
+	}
+
+	makeUser := func(id int32, name string) []byte {
+		var b tupleBuilder
+		b.addInt4(id)
+		b.addText(name)
+		return buildHeapTuple(FrozenTransactionID, 0, HeapXminFrozen|HeapXmaxInvalid, b.buf)
+	}
+	makeOrder := func(oid, uid, amt int32) []byte {
+		var b tupleBuilder
+		b.addInt4(oid)
+		b.addInt4(uid)
+		b.addInt4(amt)
+		return buildHeapTuple(FrozenTransactionID, 0, HeapXminFrozen|HeapXmaxInvalid, b.buf)
+	}
+
+	// At LSN1: user 1 ("alice") has order 10 (amount 100).
+	// At LSN2: user 2 ("bob") is added, and order 10 is updated to amount 999.
+	putAt(usersNode, lsn1, buildPG17HeapPage(lsn1, [][]byte{makeUser(1, "alice")}))
+	putAt(ordersNode, lsn1, buildPG17HeapPage(lsn1, [][]byte{makeOrder(10, 1, 100)}))
+
+	putAt(usersNode, lsn2, buildPG17HeapPage(lsn2, [][]byte{makeUser(1, "alice"), makeUser(2, "bob")}))
+	putAt(ordersNode, lsn2, buildPG17HeapPage(lsn2, [][]byte{makeOrder(10, 1, 999), makeOrder(20, 2, 200)}))
+
+	snapProv := &advancingSnapProv{lsns: []uint64{lsn1, lsn2}}
+	adapter := NewAdapter(ps, snapProv)
+	clog := NewCLOGResolver(ps)
+
+	conn, err := OpenSQLiteConn(":memory:", false, 4096)
+	if err != nil {
+		t.Fatalf("OpenSQLiteConn: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.RegisterAirPGModule(); err != nil {
+		t.Fatalf("RegisterAirPGModule: %v", err)
+	}
+
+	usersTbl := DiscoveredTable{
+		Schema: "public", Name: "users", RelOID: usersNode, SpcOID: PGDefaultTablespaceOID, DbOID: dbOID, RelNumber: usersNode,
+		Columns: []DiscoveredColumn{
+			{Name: "id", AttNum: 1, PGTypeOID: 23, ColType: ColInt4, SQLiteType: "INTEGER"},
+			{Name: "name", AttNum: 2, PGTypeOID: 25, ColType: ColText, SQLiteType: "TEXT"},
+		},
+	}
+	ordersTbl := DiscoveredTable{
+		Schema: "public", Name: "orders", RelOID: ordersNode, SpcOID: PGDefaultTablespaceOID, DbOID: dbOID, RelNumber: ordersNode,
+		Columns: []DiscoveredColumn{
+			{Name: "id", AttNum: 1, PGTypeOID: 23, ColType: ColInt4, SQLiteType: "INTEGER"},
+			{Name: "user_id", AttNum: 2, PGTypeOID: 23, ColType: ColInt4, SQLiteType: "INTEGER"},
+			{Name: "amount", AttNum: 3, PGTypeOID: 23, ColType: ColInt4, SQLiteType: "INTEGER"},
+		},
+	}
+
+	uid, err := conn.RegisterNativeTable(tenantID, gen, usersTbl, adapter, clog)
+	if err != nil {
+		t.Fatalf("RegisterNativeTable users: %v", err)
+	}
+	defer UnregisterNativeTable(uid)
+	oid, err := conn.RegisterNativeTable(tenantID, gen, ordersTbl, adapter, clog)
+	if err != nil {
+		t.Fatalf("RegisterNativeTable orders: %v", err)
+	}
+	defer UnregisterNativeTable(oid)
+	_ = conn.Exec("PRAGMA query_only=ON;")
+	conn.SetReadOnlyAuthorizer(true)
+
+	ctx := context.Background()
+	snap, err := adapter.GetSnapshot(ctx, tenantID, gen)
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	res, err := conn.QueryWithContext(ctx, snap, "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id ORDER BY u.id", nil)
+	_ = adapter.ReleaseSnapshot(snap)
+	if err != nil {
+		t.Fatalf("JOIN QueryWithContext: %v", err)
+	}
+
+	// Must have called CurrentSnapshot ONLY ONCE (at query start), so both tables see LSN1 (alice, 100), never (alice, 999).
+	if gotCalls := snapProv.calls.Load(); gotCalls != 1 {
+		t.Fatalf("expected 1 snapshot acquisition for JOIN, got %d", gotCalls)
+	}
+	if len(res.Rows) != 1 || res.Rows[0][0].Text != "alice" || res.Rows[0][1].Int64 != 100 {
+		t.Fatalf("JOIN observed inconsistent state: %+v", res.Rows)
+	}
+	if active := adapter.ActiveSnapshotCount(); active != 0 {
+		t.Fatalf("expected 0 active snapshots after query, got %d", active)
+	}
+
+	// Cancelled context must fail cleanly without leaking snapshots.
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	snap2, err := adapter.GetSnapshot(ctx, tenantID, gen)
+	if err != nil {
+		t.Fatalf("GetSnapshot 2: %v", err)
+	}
+	_, err = conn.QueryWithContext(cctx, snap2, "SELECT * FROM users", nil)
+	_ = adapter.ReleaseSnapshot(snap2)
+	if err == nil {
+		t.Fatalf("expected error on cancelled context")
+	}
+	if active := adapter.ActiveSnapshotCount(); active != 0 {
+		t.Fatalf("expected 0 active snapshots after cancelled query, got %d", active)
+	}
+}
+
+func TestVTabQueryOptimizationAndReadOnlyGuard(t *testing.T) {
+	tmpDir := t.TempDir()
+	ps, err := pageserver.New(pageserver.Config{
+		SocketPath: filepath.Join(tmpDir, "ps.sock"),
+		LayerDir:   filepath.Join(tmpDir, "layers"),
+	})
+	if err != nil {
+		t.Fatalf("pageserver.New: %v", err)
+	}
+	defer ps.Close()
+
+	const tenantID = "tenant-opt"
+	const gen = "gen-1"
+	const dbOID = uint32(16384)
+	const usersNode = uint32(30055)
+	const lsn = uint64(0x10000)
+
+	ps.EnsureTenant(tenantID, 1)
+	ps.SetTenantGeneration(tenantID, gen)
+
+	// Build 3 users:
+	// 1: id=100, age=25, name="alice", status="active", created_at="2026-05-01", email=NULL
+	// 2: id=101, age=17, name="bob",   status="inactive", created_at="2025-01-01", email="bob@x.com"
+	// 3: id=102, age=30, name="carol", status="active", created_at="2026-06-15", email="carol@x.com"
+	makeUser := func(id, age int32, name, status, createdAt string, email *string) []byte {
+		var b tupleBuilder
+		b.addInt4(id)
+		b.addInt4(age)
+		b.addText(name)
+		b.addText(status)
+		b.addText(createdAt)
+		if email != nil {
+			b.addText(*email)
+		}
+		tup := make([]byte, 24+len(b.buf))
+		binary.LittleEndian.PutUint32(tup[0:4], FrozenTransactionID)
+		infomask := HeapXminFrozen | HeapXmaxInvalid
+		if email == nil {
+			infomask |= HeapHasNull
+			tup[23] = 0x1F // cols 0..4 non-null, col 5 null
+		}
+		binary.LittleEndian.PutUint16(tup[20:22], infomask)
+		tup[22] = 24
+		copy(tup[24:], b.buf)
+		return tup
+	}
+	sBob := "bob@x.com"
+	sCarol := "carol@x.com"
+	pg := buildPG17HeapPage(lsn, [][]byte{
+		makeUser(100, 25, "alice", "active", "2026-05-01", nil),
+		makeUser(101, 17, "bob", "inactive", "2025-01-01", &sBob),
+		makeUser(102, 30, "carol", "active", "2026-06-15", &sCarol),
+	})
+	if err := ps.PutPageBatch(context.Background(), tenantID, PGDefaultTablespaceOID, dbOID, usersNode, 0, 0, 1, lsn, pg); err != nil {
+		t.Fatalf("PutPageBatch: %v", err)
+	}
+
+	snapProv := NewStaticSnapshotProvider()
+	snapProv.SetSnapshot(tenantID, gen, SnapshotInfo{LSN: lsn})
+	adapter := NewAdapter(ps, snapProv)
+	clog := NewCLOGResolver(ps)
+
+	conn, err := OpenSQLiteConn(":memory:", false, 4096)
+	if err != nil {
+		t.Fatalf("OpenSQLiteConn: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.RegisterAirPGModule(); err != nil {
+		t.Fatalf("RegisterAirPGModule: %v", err)
+	}
+
+	usersTbl := DiscoveredTable{
+		Schema: "public", Name: "users", RelOID: usersNode, SpcOID: PGDefaultTablespaceOID, DbOID: dbOID, RelNumber: usersNode,
+		Columns: []DiscoveredColumn{
+			{Name: "id", AttNum: 1, PGTypeOID: 23, ColType: ColInt4, SQLiteType: "INTEGER"},
+			{Name: "age", AttNum: 2, PGTypeOID: 23, ColType: ColInt4, SQLiteType: "INTEGER"},
+			{Name: "name", AttNum: 3, PGTypeOID: 25, ColType: ColText, SQLiteType: "TEXT"},
+			{Name: "status", AttNum: 4, PGTypeOID: 25, ColType: ColText, SQLiteType: "TEXT"},
+			{Name: "created_at", AttNum: 5, PGTypeOID: 25, ColType: ColText, SQLiteType: "TEXT"},
+			{Name: "email", AttNum: 6, PGTypeOID: 25, ColType: ColText, SQLiteType: "TEXT"},
+		},
+	}
+	uid, err := conn.RegisterNativeTable(tenantID, gen, usersTbl, adapter, clog)
+	if err != nil {
+		t.Fatalf("RegisterNativeTable: %v", err)
+	}
+	defer UnregisterNativeTable(uid)
+	_ = conn.Exec("PRAGMA query_only=ON;")
+	conn.SetReadOnlyAuthorizer(true)
+
+	// 1. Point lookup + projection pushdown measurement:
+	_, beforeTup, beforeCols, beforeMatched := VTabStats()
+	res, err := conn.Query("SELECT name FROM users WHERE id = 100", nil)
+	if err != nil {
+		t.Fatalf("point lookup: %v", err)
+	}
+	if len(res.Rows) != 1 || res.Rows[0][0].Text != "alice" {
+		t.Fatalf("point lookup got %+v", res.Rows)
+	}
+	_, afterTup, afterCols, afterMatched := VTabStats()
+	if afterTup-beforeTup != 3 {
+		t.Fatalf("expected 3 tuples scanned, got %d", afterTup-beforeTup)
+	}
+	// Only 2 columns (id + name) out of 6 should be decoded per tuple -> 6 cols total instead of 18!
+	if afterCols-beforeCols != 6 {
+		t.Fatalf("expected 6 columns decoded with projection pushdown, got %d", afterCols-beforeCols)
+	}
+	// Only 1 row matched pushed-down filter!
+	if afterMatched-beforeMatched != 1 {
+		t.Fatalf("expected 1 row matched pushed-down filter, got %d", afterMatched-beforeMatched)
+	}
+
+	// 2. Range query: age > 18
+	res, err = conn.Query("SELECT id FROM users WHERE age > 18 ORDER BY id", nil)
+	if err != nil || len(res.Rows) != 2 || res.Rows[0][0].Int64 != 100 || res.Rows[1][0].Int64 != 102 {
+		t.Fatalf("age > 18 got %+v err=%v", res, err)
+	}
+
+	// 3. Projection + string equality: status = 'active'
+	res, err = conn.Query("SELECT name FROM users WHERE status = 'active' ORDER BY name", nil)
+	if err != nil || len(res.Rows) != 2 || res.Rows[0][0].Text != "alice" || res.Rows[1][0].Text != "carol" {
+		t.Fatalf("status = active got %+v err=%v", res, err)
+	}
+
+	// 4. BETWEEN
+	res, err = conn.Query("SELECT id FROM users WHERE created_at BETWEEN '2026-01-01' AND '2026-12-31' ORDER BY id", nil)
+	if err != nil || len(res.Rows) != 2 || res.Rows[0][0].Int64 != 100 || res.Rows[1][0].Int64 != 102 {
+		t.Fatalf("BETWEEN got %+v err=%v", res, err)
+	}
+
+	// 5. IS NULL
+	res, err = conn.Query("SELECT id FROM users WHERE email IS NULL", nil)
+	if err != nil || len(res.Rows) != 1 || res.Rows[0][0].Int64 != 100 {
+		t.Fatalf("IS NULL got %+v err=%v", res, err)
+	}
+
+	// 6. Lexical read-only guard tests
+	badSQLs := []string{
+		"/* leading comment */ INSERT INTO users VALUES (1,2,'a','b','c','d')",
+		"WITH c AS(DELETE FROM users) SELECT * FROM c",
+		"SELECT * FROM users FOR UPDATE",
+		"SELECT 1; DROP TABLE users",
+		"PRAGMA writable_schema = ON",
+	}
+	for _, bsql := range badSQLs {
+		toks := tokenizeSQLWords(bsql)
+		if len(toks) == 0 {
+			t.Fatalf("expected tokens for %q", bsql)
+		}
 	}
 }

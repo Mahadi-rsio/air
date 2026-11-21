@@ -159,3 +159,81 @@ func TestTieredCacheL1L2L3AndCorruptionRecovery(t *testing.T) {
 		t.Fatalf("expected L3 fetch after InvalidateTenant")
 	}
 }
+
+func TestTieredCacheStampedeAndRestartRecovery(t *testing.T) {
+	ps, err := pageserver.New(pageserver.Config{
+		SocketPath: filepath.Join(t.TempDir(), "ps.sock"),
+		LayerDir:   filepath.Join(t.TempDir(), "layers"),
+	})
+	if err != nil {
+		t.Fatalf("pageserver.New: %v", err)
+	}
+	defer ps.Close()
+
+	const (
+		tenantID  = "tenant-stampede"
+		gen       = "gen-1"
+		spcOID    = uint32(1663)
+		dbOID     = uint32(5)
+		relNumber = uint32(30009)
+		lsn       = uint64(0x10000)
+	)
+	ps.EnsureTenant(tenantID, 1)
+	ps.SetTenantGeneration(tenantID, gen)
+	page0 := bytes.Repeat([]byte{0x5A}, PGPageSize)
+	if err := ps.PutPageBatch(context.Background(), tenantID, spcOID, dbOID, relNumber, 0, 0, 1, lsn, page0); err != nil {
+		t.Fatalf("PutPageBatch: %v", err)
+	}
+
+	l2Dir := filepath.Join(t.TempDir(), "l2-restart")
+	cache1, err := NewTieredCacheBackend(ps, CacheConfig{
+		L1MaxBytes: PGPageSize,
+		L2Dir:      l2Dir,
+		L2MaxBytes: 16 * PGPageSize,
+	})
+	if err != nil {
+		t.Fatalf("NewTieredCacheBackend 1: %v", err)
+	}
+
+	// Fire 20 concurrent misses for the exact same page -> singleflight collapses to 1 L3 fetch.
+	const N = 20
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	key := pageserver.RelBlockKey(spcOID, dbOID, relNumber, 0, 0)
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			pg, err := cache1.GetPageAtLSN(context.Background(), tenantID, key, lsn)
+			if err != nil || !bytes.Equal(pg, page0) {
+				t.Errorf("GetPageAtLSN failed: err=%v", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	st1 := cache1.Stats()
+	if st1.L3Fetches != 1 {
+		t.Fatalf("expected L3Fetches=1 under concurrent miss stampede, got %d", st1.L3Fetches)
+	}
+
+	// Simulate restart: open a brand-new TieredCacheBackend pointing to the same l2Dir.
+	cache2, err := NewTieredCacheBackend(ps, CacheConfig{
+		L1MaxBytes: PGPageSize,
+		L2Dir:      l2Dir,
+		L2MaxBytes: 16 * PGPageSize,
+	})
+	if err != nil {
+		t.Fatalf("NewTieredCacheBackend 2: %v", err)
+	}
+	pg, err := cache2.GetPageAtLSN(context.Background(), tenantID, key, lsn)
+	if err != nil || !bytes.Equal(pg, page0) {
+		t.Fatalf("restart L2 recovery failed: err=%v", err)
+	}
+	st2 := cache2.Stats()
+	if st2.L2Hits != 1 || st2.L3Fetches != 0 {
+		t.Fatalf("expected L2Hits=1 and L3Fetches=0 after restart, got %+v", st2)
+	}
+}

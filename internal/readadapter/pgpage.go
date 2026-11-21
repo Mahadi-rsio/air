@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"time"
 )
 
 const (
@@ -21,15 +22,24 @@ const (
 	LPRedirect uint16 = 2
 	LPDead     uint16 = 3
 
-	HeapHasNull       uint16 = 0x0001
-	HeapHasVarwidth   uint16 = 0x0002
-	HeapXminCommitted uint16 = 0x0100
-	HeapXminInvalid   uint16 = 0x0200
-	HeapXminFrozen    uint16 = HeapXminCommitted | HeapXminInvalid
-	HeapXmaxCommitted uint16 = 0x0400
-	HeapXmaxInvalid   uint16 = 0x0800
-	HeapXmaxIsMulti   uint16 = 0x1000
-	HeapXmaxLockOnly  uint16 = 0x0080
+	HeapHasNull        uint16 = 0x0001
+	HeapHasVarwidth    uint16 = 0x0002
+	HeapHasExternal    uint16 = 0x0004
+	HeapXmaxKeyShrLock uint16 = 0x0010
+	HeapXmaxExclLock   uint16 = 0x0040
+	HeapXmaxLockOnly   uint16 = 0x0080
+	HeapXmaxLockBits   uint16 = HeapXmaxExclLock | HeapXmaxKeyShrLock | HeapXmaxLockOnly
+	HeapXminCommitted  uint16 = 0x0100
+	HeapXminInvalid    uint16 = 0x0200
+	HeapXminFrozen     uint16 = HeapXminCommitted | HeapXminInvalid
+	HeapXmaxCommitted  uint16 = 0x0400
+	HeapXmaxInvalid    uint16 = 0x0800
+	HeapXmaxIsMulti    uint16 = 0x1000
+	HeapUpdated        uint16 = 0x2000
+
+	HeapNattsMask uint16 = 0x07FF
+	HeapHOTUpdate uint16 = 0x4000
+	HeapOnlyTuple uint16 = 0x8000
 
 	InvalidTransactionID     uint32 = 0
 	BootstrapTransactionID   uint32 = 1
@@ -42,7 +52,9 @@ const (
 )
 
 var (
-	ErrInvalidPage = errors.New("readadapter: invalid PostgreSQL 17 page")
+	ErrInvalidPage       = errors.New("readadapter: invalid PostgreSQL 17 page")
+	ErrTOASTUnsupported  = errors.New("readadapter: TOAST/compressed value requires primary fallback")
+	ErrUnsupportedType   = errors.New("readadapter: unsupported PostgreSQL column type requires primary fallback")
 )
 
 // PageHeader represents PostgreSQL 17 PageHeaderData (24 bytes).
@@ -77,10 +89,20 @@ func ParsePageHeader(page []byte) (PageHeader, error) {
 	if hdr.PageSizeVersion != PGExpectedPageSizeVer {
 		return hdr, fmt.Errorf("%w: pd_pagesize_version=0x%04x want=0x%04x", ErrInvalidPage, hdr.PageSizeVersion, PGExpectedPageSizeVer)
 	}
-	if hdr.Lower < PGPageHeaderSize || hdr.Lower > hdr.Upper || hdr.Upper > hdr.Special || hdr.Special > PGPageSize {
+	if hdr.Lower < PGPageHeaderSize || hdr.Lower > hdr.Upper || hdr.Upper > hdr.Special || hdr.Special > PGPageSize || (hdr.Lower-PGPageHeaderSize)%4 != 0 {
 		return hdr, fmt.Errorf("%w: invalid offsets lower=%d upper=%d special=%d", ErrInvalidPage, hdr.Lower, hdr.Upper, hdr.Special)
 	}
 	return hdr, nil
+}
+
+// IsZeroPage returns true if an 8 KiB page is completely zeroed (uninitialized PG page).
+func IsZeroPage(page []byte) bool {
+	for _, b := range page {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // LinePointer represents PostgreSQL ItemIdData (4 bytes).
@@ -88,6 +110,21 @@ type LinePointer struct {
 	Offset uint16
 	Flags  uint16
 	Length uint16
+}
+
+// ValidateLinePointer checks that an LPNormal line pointer points within [hdr.Upper, hdr.Special]
+// and is large enough for a HeapTupleHeaderData.
+func ValidateLinePointer(lp LinePointer, hdr PageHeader) error {
+	if lp.Flags != LPNormal {
+		return nil
+	}
+	if lp.Length < PGSizeOfHeapTupleHdr {
+		return fmt.Errorf("%w: line pointer length %d < %d", ErrInvalidPage, lp.Length, PGSizeOfHeapTupleHdr)
+	}
+	if lp.Offset < hdr.Upper || int(lp.Offset)+int(lp.Length) > int(hdr.Special) {
+		return fmt.Errorf("%w: line pointer out of bounds off=%d len=%d upper=%d special=%d", ErrInvalidPage, lp.Offset, lp.Length, hdr.Upper, hdr.Special)
+	}
+	return nil
 }
 
 // ParseLinePointers extracts all ItemIdData entries between PGPageHeaderSize and hdr.Lower.
@@ -138,16 +175,30 @@ func ParseHeapTupleHeader(tup []byte) (HeapTupleHeader, error) {
 	return h, nil
 }
 
+func heapXmaxIsLockedOnly(infomask uint16) bool {
+	if (infomask & HeapXmaxLockOnly) != 0 {
+		return true
+	}
+	return (infomask & (HeapXmaxIsMulti | HeapXmaxLockBits)) == HeapXmaxExclLock
+}
+
 // IsVisible evaluates MVCC snapshot visibility for a heap tuple header.
 func (h HeapTupleHeader) IsVisible(snap *ReadSnapshot, committedXIDs map[uint32]bool) bool {
-	if (h.Infomask & HeapXminInvalid) != 0 {
-		return false
+	xminFrozen := (h.Infomask & HeapXminFrozen) == HeapXminFrozen
+	if !xminFrozen {
+		if (h.Infomask&HeapXminCommitted) == 0 && (h.Infomask&HeapXminInvalid) != 0 {
+			return false
+		}
+		if !xidVisible(h.Xmin, snap, committedXIDs, (h.Infomask&HeapXminCommitted) != 0) {
+			return false
+		}
 	}
-	if !xidVisible(h.Xmin, snap, committedXIDs, (h.Infomask&HeapXminCommitted) != 0) {
-		return false
-	}
-	if (h.Infomask & HeapXmaxInvalid) != 0 || h.Xmax == 0 {
+	if (h.Infomask&HeapXmaxInvalid) != 0 || h.Xmax == InvalidTransactionID || heapXmaxIsLockedOnly(h.Infomask) {
 		return true
+	}
+	if (h.Infomask & HeapXmaxIsMulti) != 0 {
+		// Cannot resolve MultiXact without pg_multixact SLRU.
+		return false
 	}
 	// If xmax committed and is visible in snapshot, tuple is deleted.
 	if xidVisible(h.Xmax, snap, committedXIDs, (h.Infomask&HeapXmaxCommitted) != 0) {
@@ -157,14 +208,17 @@ func (h HeapTupleHeader) IsVisible(snap *ReadSnapshot, committedXIDs map[uint32]
 }
 
 func xidVisible(xid uint32, snap *ReadSnapshot, committedXIDs map[uint32]bool, hintCommitted bool) bool {
-	if xid == 0 {
+	if xid == InvalidTransactionID {
 		return false
 	}
-	if xid == 1 || xid == 2 { // Bootstrap / FrozenTransactionId
+	if xid == BootstrapTransactionID || xid == FrozenTransactionID {
 		return true
 	}
-	if snap != nil && snap.Xmax != 0 {
-		if xid >= snap.Xmax {
+	if snap != nil {
+		if snap.Xmin != 0 && TransactionIdPrecedes(xid, snap.Xmin) {
+			return hintCommitted || (committedXIDs != nil && committedXIDs[xid])
+		}
+		if snap.Xmax != 0 && TransactionIdFollowsOrEquals(xid, snap.Xmax) {
 			return false
 		}
 		for _, active := range snap.ActiveXIPs {
@@ -197,6 +251,10 @@ const (
 	ColName
 	ColFloat4
 	ColBytea
+	ColDate
+	ColTimestamp
+	ColUUID
+	ColUnsupported
 )
 
 // PGTypeOIDToColumnType maps a PostgreSQL pg_type OID to a native tuple ColumnType
@@ -217,14 +275,22 @@ func PGTypeOIDToColumnType(oid uint32) (ColumnType, string) {
 		return ColInt2, "INTEGER"
 	case 23: // int4 / integer
 		return ColInt4, "INTEGER"
+	case 25, 1042, 1043, 114, 142: // text, bpchar, varchar, json, xml
+		return ColText, "TEXT"
 	case 26, 28, 29: // oid, xid, cid
 		return ColOID, "BIGINT"
 	case 700: // float4 / real
 		return ColFloat4, "REAL"
 	case 701: // float8 / double precision
 		return ColFloat8, "REAL"
-	default: // text (25), varchar (1043), bpchar (1042), json/jsonb, numeric, etc.
-		return ColText, "TEXT"
+	case 1082: // date
+		return ColDate, "TEXT"
+	case 1114, 1184: // timestamp, timestamptz
+		return ColTimestamp, "TEXT"
+	case 2950: // uuid
+		return ColUUID, "TEXT"
+	default:
+		return ColUnsupported, "TEXT"
 	}
 }
 
@@ -232,169 +298,284 @@ func alignUp(off, align int) int {
 	return (off + align - 1) &^ (align - 1)
 }
 
-// DecodeHeapColumns decodes attributes from a PG17 heap tuple according to cols.
+var pgEpoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// pgLZDecompress implements PostgreSQL's PGLZ decompression algorithm.
+func pgLZDecompress(src []byte, rawSize int) ([]byte, error) {
+	if rawSize < 0 || rawSize > 64*1024*1024 {
+		return nil, fmt.Errorf("%w: invalid pglz rawSize=%d", ErrInvalidPage, rawSize)
+	}
+	dst := make([]byte, 0, rawSize)
+	sp := 0
+	for sp < len(src) && len(dst) < rawSize {
+		ctrl := src[sp]
+		sp++
+		for bit := 0; bit < 8 && sp < len(src) && len(dst) < rawSize; bit++ {
+			if (ctrl & (1 << uint(bit))) != 0 {
+				if sp+2 > len(src) {
+					return nil, fmt.Errorf("%w: truncated pglz backreference", ErrInvalidPage)
+				}
+				b0 := int(src[sp])
+				b1 := int(src[sp+1])
+				sp += 2
+				matchLen := (b0 & 0x0f) + 3
+				matchOff := ((b0 & 0xf0) << 4) | b1
+				if matchLen == 18 {
+					if sp >= len(src) {
+						return nil, fmt.Errorf("%w: truncated pglz extended length", ErrInvalidPage)
+					}
+					matchLen += int(src[sp])
+					sp++
+				}
+				if matchOff <= 0 || matchOff > len(dst) {
+					return nil, fmt.Errorf("%w: invalid pglz backreference offset=%d len=%d", ErrInvalidPage, matchOff, len(dst))
+				}
+				for k := 0; k < matchLen && len(dst) < rawSize; k++ {
+					dst = append(dst, dst[len(dst)-matchOff])
+				}
+			} else {
+				dst = append(dst, src[sp])
+				sp++
+			}
+		}
+	}
+	if len(dst) != rawSize {
+		return nil, fmt.Errorf("%w: pglz decompressed len=%d want=%d", ErrInvalidPage, len(dst), rawSize)
+	}
+	return dst, nil
+}
+
+func decodeVarlena(tup []byte, off int, needValue bool) ([]byte, int, error) {
+	if off >= len(tup) {
+		return nil, off, fmt.Errorf("%w: varlena out of bounds", ErrInvalidPage)
+	}
+	b0 := tup[off]
+	if (b0 & 0x01) != 0 {
+		// 1-byte varlena header (short or external TOAST pointer)
+		if b0 == 0x01 {
+			if off+18 > len(tup) {
+				return nil, off, fmt.Errorf("%w: toast pointer out of bounds", ErrInvalidPage)
+			}
+			if !needValue {
+				return nil, off + 18, nil
+			}
+			return nil, off + 18, ErrTOASTUnsupported
+		}
+		totalLen := int(b0 >> 1)
+		if totalLen < 1 || off+totalLen > len(tup) {
+			return nil, off, fmt.Errorf("%w: short varlena out of bounds (len=%d)", ErrInvalidPage, totalLen)
+		}
+		if !needValue {
+			return nil, off + totalLen, nil
+		}
+		return tup[off+1 : off+totalLen], off + totalLen, nil
+	}
+
+	// 4-byte varlena header (4-byte aligned)
+	off = alignUp(off, 4)
+	if off+4 > len(tup) {
+		return nil, off, fmt.Errorf("%w: varlena4 header out of bounds", ErrInvalidPage)
+	}
+	hdr4 := binary.LittleEndian.Uint32(tup[off : off+4])
+	totalLen := int(hdr4 >> 2)
+	if totalLen < 4 || off+totalLen > len(tup) {
+		return nil, off, fmt.Errorf("%w: invalid varlena4 length %d", ErrInvalidPage, totalLen)
+	}
+	if (hdr4 & 0x02) != 0 {
+		if !needValue {
+			return nil, off + totalLen, nil
+		}
+		if totalLen < 8 {
+			return nil, off, fmt.Errorf("%w: compressed varlena too short (%d)", ErrInvalidPage, totalLen)
+		}
+		tcinfo := binary.LittleEndian.Uint32(tup[off+4 : off+8])
+		rawSize := int(tcinfo & 0x3FFFFFFF)
+		method := tcinfo >> 30
+		if method != 0 {
+			// LZ4 or unknown compression method -> route to primary
+			return nil, off + totalLen, ErrTOASTUnsupported
+		}
+		decompressed, err := pgLZDecompress(tup[off+8:off+totalLen], rawSize)
+		if err != nil {
+			return nil, off, err
+		}
+		return decompressed, off + totalLen, nil
+	}
+	if !needValue {
+		return nil, off + totalLen, nil
+	}
+	return tup[off+4 : off+totalLen], off + totalLen, nil
+}
+
+// DecodeHeapColumns decodes all attributes from a PG17 heap tuple according to cols.
 func DecodeHeapColumns(tup []byte, hdr HeapTupleHeader, cols []ColumnType) ([]any, error) {
+	return DecodeHeapColumnsProjected(tup, hdr, cols, nil)
+}
+
+// DecodeHeapColumnsProjected decodes attributes from a PG17 heap tuple.
+// When needed != nil, columns with needed[i] == false are skipped without
+// allocating or decompressing values (returning nil in their slot).
+func DecodeHeapColumnsProjected(tup []byte, hdr HeapTupleHeader, cols []ColumnType, needed []bool) ([]any, error) {
 	off := int(hdr.Hoff)
 	vals := make([]any, len(cols))
+	natts := int(hdr.Infomask2 & HeapNattsMask)
 	for i, ct := range cols {
-		if (hdr.Infomask&HeapHasNull) != 0 && len(hdr.NullBits) > i/8 {
+		if natts > 0 && i >= natts {
+			vals[i] = nil
+			continue
+		}
+		if (hdr.Infomask & HeapHasNull) != 0 {
+			if i/8 >= len(hdr.NullBits) {
+				return nil, fmt.Errorf("%w: null bitmap too short for att %d", ErrInvalidPage, i)
+			}
 			if (hdr.NullBits[i/8] & (1 << uint(i%8))) == 0 {
 				vals[i] = nil
 				continue
 			}
 		}
+		want := needed == nil || (i < len(needed) && needed[i])
 		switch ct {
 		case ColBool:
 			if off+1 > len(tup) {
 				return nil, fmt.Errorf("%w: bool out of bounds", ErrInvalidPage)
 			}
-			vals[i] = tup[off] != 0
+			if want {
+				vals[i] = tup[off] != 0
+			}
 			off++
 		case ColChar:
 			if off+1 > len(tup) {
 				return nil, fmt.Errorf("%w: char out of bounds", ErrInvalidPage)
 			}
-			vals[i] = byte(tup[off])
+			if want {
+				vals[i] = byte(tup[off])
+			}
 			off++
 		case ColInt2:
 			off = alignUp(off, 2)
 			if off+2 > len(tup) {
 				return nil, fmt.Errorf("%w: int2 out of bounds", ErrInvalidPage)
 			}
-			vals[i] = int16(binary.LittleEndian.Uint16(tup[off : off+2]))
+			if want {
+				vals[i] = int16(binary.LittleEndian.Uint16(tup[off : off+2]))
+			}
 			off += 2
 		case ColOID:
 			off = alignUp(off, 4)
 			if off+4 > len(tup) {
 				return nil, fmt.Errorf("%w: oid out of bounds", ErrInvalidPage)
 			}
-			vals[i] = binary.LittleEndian.Uint32(tup[off : off+4])
+			if want {
+				vals[i] = binary.LittleEndian.Uint32(tup[off : off+4])
+			}
 			off += 4
 		case ColName:
 			// PostgreSQL NameData is 64 bytes, 1-byte aligned, NUL-terminated.
 			if off+64 > len(tup) {
 				return nil, fmt.Errorf("%w: name out of bounds", ErrInvalidPage)
 			}
-			raw := tup[off : off+64]
-			end := 0
-			for end < 64 && raw[end] != 0 {
-				end++
+			if want {
+				raw := tup[off : off+64]
+				end := 0
+				for end < 64 && raw[end] != 0 {
+					end++
+				}
+				vals[i] = string(raw[:end])
 			}
-			vals[i] = string(raw[:end])
 			off += 64
 		case ColFloat4:
 			off = alignUp(off, 4)
 			if off+4 > len(tup) {
 				return nil, fmt.Errorf("%w: float4 out of bounds", ErrInvalidPage)
 			}
-			vals[i] = float64(math.Float32frombits(binary.LittleEndian.Uint32(tup[off : off+4])))
+			if want {
+				vals[i] = float64(math.Float32frombits(binary.LittleEndian.Uint32(tup[off : off+4])))
+			}
 			off += 4
 		case ColBytea:
-			if off >= len(tup) {
-				return nil, fmt.Errorf("%w: bytea out of bounds", ErrInvalidPage)
+			raw, nextOff, err := decodeVarlena(tup, off, want)
+			if err != nil {
+				return nil, err
 			}
-			b0 := tup[off]
-			if (b0 & 0x01) != 0 {
-				if b0 == 0x01 {
-					if off+18 > len(tup) {
-						return nil, fmt.Errorf("%w: bytea toast pointer out of bounds", ErrInvalidPage)
-					}
-					vals[i] = []byte{}
-					off += 18
-				} else {
-					totalLen := int(b0 >> 1)
-					if off+totalLen > len(tup) {
-						return nil, fmt.Errorf("%w: short bytea out of bounds", ErrInvalidPage)
-					}
-					cp := make([]byte, totalLen-1)
-					copy(cp, tup[off+1:off+totalLen])
-					vals[i] = cp
-					off += totalLen
-				}
-			} else {
-				off = alignUp(off, 4)
-				if off+4 > len(tup) {
-					return nil, fmt.Errorf("%w: bytea4 header out of bounds", ErrInvalidPage)
-				}
-				hdr4 := binary.LittleEndian.Uint32(tup[off : off+4])
-				totalLen := int(hdr4 >> 2)
-				if (hdr4 & 0x02) != 0 {
-					vals[i] = []byte{}
-					off += totalLen
-				} else {
-					if off+totalLen > len(tup) {
-						return nil, fmt.Errorf("%w: bytea4 body out of bounds", ErrInvalidPage)
-					}
-					cp := make([]byte, totalLen-4)
-					copy(cp, tup[off+4:off+totalLen])
-					vals[i] = cp
-					off += totalLen
-				}
+			if want {
+				cp := make([]byte, len(raw))
+				copy(cp, raw)
+				vals[i] = cp
 			}
+			off = nextOff
 		case ColInt4:
 			off = alignUp(off, 4)
 			if off+4 > len(tup) {
 				return nil, fmt.Errorf("%w: int4 out of bounds", ErrInvalidPage)
 			}
-			vals[i] = int32(binary.LittleEndian.Uint32(tup[off : off+4]))
+			if want {
+				vals[i] = int32(binary.LittleEndian.Uint32(tup[off : off+4]))
+			}
 			off += 4
 		case ColInt8:
 			off = alignUp(off, 8)
 			if off+8 > len(tup) {
 				return nil, fmt.Errorf("%w: int8 out of bounds", ErrInvalidPage)
 			}
-			vals[i] = int64(binary.LittleEndian.Uint64(tup[off : off+8]))
+			if want {
+				vals[i] = int64(binary.LittleEndian.Uint64(tup[off : off+8]))
+			}
 			off += 8
 		case ColFloat8:
 			off = alignUp(off, 8)
 			if off+8 > len(tup) {
 				return nil, fmt.Errorf("%w: float8 out of bounds", ErrInvalidPage)
 			}
-			vals[i] = math.Float64frombits(binary.LittleEndian.Uint64(tup[off : off+8]))
+			if want {
+				vals[i] = math.Float64frombits(binary.LittleEndian.Uint64(tup[off : off+8]))
+			}
 			off += 8
 		case ColText:
-			if off >= len(tup) {
-				return nil, fmt.Errorf("%w: text out of bounds", ErrInvalidPage)
+			raw, nextOff, err := decodeVarlena(tup, off, want)
+			if err != nil {
+				return nil, err
 			}
-			b0 := tup[off]
-			if (b0 & 0x01) != 0 {
-				// 1-byte varlena header (short or external TOAST pointer)
-				if b0 == 0x01 {
-					// External TOAST pointer: 1-byte tag + 1-byte vartag_external + varatt_external (16B)
-					if off+18 > len(tup) {
-						return nil, fmt.Errorf("%w: toast pointer out of bounds", ErrInvalidPage)
-					}
-					rawSize := binary.LittleEndian.Uint32(tup[off+2 : off+6])
-					vals[i] = fmt.Sprintf("<TOAST_EXTERNAL len=%d>", rawSize)
-					off += 18
-				} else {
-					totalLen := int(b0 >> 1)
-					if off+totalLen > len(tup) {
-						return nil, fmt.Errorf("%w: short varlena out of bounds", ErrInvalidPage)
-					}
-					vals[i] = string(tup[off+1 : off+totalLen])
-					off += totalLen
-				}
-			} else {
-				// 4-byte varlena header (4-byte aligned)
-				off = alignUp(off, 4)
-				if off+4 > len(tup) {
-					return nil, fmt.Errorf("%w: varlena4 header out of bounds", ErrInvalidPage)
-				}
-				hdr4 := binary.LittleEndian.Uint32(tup[off : off+4])
-				totalLen := int(hdr4 >> 2)
-				if (hdr4 & 0x02) != 0 {
-					// PGLZ/LZ4 compressed inline varlena
-					vals[i] = fmt.Sprintf("<COMPRESSED_VARLENA len=%d>", totalLen)
-					off += totalLen
-				} else {
-					if off+totalLen > len(tup) {
-						return nil, fmt.Errorf("%w: varlena4 body out of bounds", ErrInvalidPage)
-					}
-					vals[i] = string(tup[off+4 : off+totalLen])
-					off += totalLen
-				}
+			if want {
+				vals[i] = string(raw)
 			}
+			off = nextOff
+		case ColDate:
+			off = alignUp(off, 4)
+			if off+4 > len(tup) {
+				return nil, fmt.Errorf("%w: date out of bounds", ErrInvalidPage)
+			}
+			if want {
+				days := int32(binary.LittleEndian.Uint32(tup[off : off+4]))
+				vals[i] = pgEpoch.AddDate(0, 0, int(days)).Format("2006-01-02")
+			}
+			off += 4
+		case ColTimestamp:
+			off = alignUp(off, 8)
+			if off+8 > len(tup) {
+				return nil, fmt.Errorf("%w: timestamp out of bounds", ErrInvalidPage)
+			}
+			if want {
+				usec := int64(binary.LittleEndian.Uint64(tup[off : off+8]))
+				t := pgEpoch.Add(time.Duration(usec) * time.Microsecond)
+				vals[i] = t.Format("2006-01-02 15:04:05.999999")
+			}
+			off += 8
+		case ColUUID:
+			if off+16 > len(tup) {
+				return nil, fmt.Errorf("%w: uuid out of bounds", ErrInvalidPage)
+			}
+			if want {
+				u := tup[off : off+16]
+				vals[i] = fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+					binary.BigEndian.Uint32(u[0:4]),
+					binary.BigEndian.Uint16(u[4:6]),
+					binary.BigEndian.Uint16(u[6:8]),
+					binary.BigEndian.Uint16(u[8:10]),
+					u[10:16])
+			}
+			off += 16
+		default:
+			return nil, fmt.Errorf("%w: column %d type %d", ErrUnsupportedType, i, ct)
 		}
 	}
 	return vals, nil

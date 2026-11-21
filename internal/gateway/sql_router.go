@@ -288,18 +288,14 @@ func classifySingleStatement(toks []sqlToken) RouteDecision {
 		return RouteDecision{RouteTargetWriteEngine, RouteReasonWriteDML}
 	}
 
-	// BEGIN / START TRANSACTION READ WRITE -> WriteEngine; READ ONLY or plain BEGIN -> ReadEngine
-	if head == "BEGIN" || head == "START" {
-		for i := 1; i+1 < len(toks); i++ {
-			if toks[i].upper == "READ" && toks[i+1].upper == "WRITE" {
-				return RouteDecision{RouteTargetWriteEngine, RouteReasonTransactionWriteState}
-			}
-		}
-		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}
+	// Transaction boundaries must execute on WriteEngine so multi-statement
+	// transactions remain atomic and post-commit LSNs are captured accurately.
+	if head == "BEGIN" || head == "START" || head == "COMMIT" || head == "END" || head == "ROLLBACK" {
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonTransactionWriteState}
 	}
 
 	switch head {
-	case "COMMIT", "END", "ROLLBACK", "SHOW", "DISCARD", "DEALLOCATE":
+	case "SHOW", "DISCARD", "DEALLOCATE":
 		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}
 	case "SET", "RESET":
 		for i := 1; i < len(toks); i++ {

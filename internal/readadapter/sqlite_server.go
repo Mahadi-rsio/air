@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,31 +24,59 @@ import (
 
 // SQLiteServerConfig configures the shared SQLite read-only engine server.
 type SQLiteServerConfig struct {
-	ListenHost      string
-	PGPort          int
-	DataDir         string
-	PrimaryConnInfo string
-	CacheKB         int
-	Adapter          *Adapter
-	PageserverSocket string
-	NativeBackend    StorageBackend
-	NativeSnapProv   SnapshotProvider
-	CacheDir         string
-	L1CacheBytes     int64
+	ListenHost                    string
+	PGPort                        int
+	DataDir                       string
+	PrimaryConnInfo               string
+	CacheKB                       int
+	Adapter                       *Adapter
+	PageserverSocket              string
+	NativeBackend                 StorageBackend
+	NativeSnapProv                SnapshotProvider
+	CacheDir                      string
+	L1CacheBytes                  int64
+	MaxConcurrentQueriesPerTenant int
+	QueryTimeout                  time.Duration
 }
 
 // SQLiteTenantStore holds the per-tenant SQLite database files and read/write connections.
 type SQLiteTenantStore struct {
-	TenantID   string
-	Generation string
-	DBPath     string
-	Writer     *SQLiteConn
-	Reader     *SQLiteConn
-	SyncedLSN  atomic.Uint64
-	NativeMode bool
-	vtabIDs    map[string]uint64
-	catalogLSN uint64
-	mu         sync.Mutex
+	TenantID     string
+	Generation   string
+	DBPath       string
+	Writer       *SQLiteConn
+	Reader       *SQLiteConn
+	SyncedLSN    atomic.Uint64
+	NativeMode   bool
+	vtabIDs      map[string]uint64
+	catalogLSN   uint64
+	sem          chan struct{}
+	queriesTotal atomic.Uint64
+	mu           sync.Mutex
+}
+
+// ReadServerMetrics provides structured production diagnostics for SQLiteReadServer.
+type ReadServerMetrics struct {
+	QueriesTotal        uint64            `json:"queries_total"`
+	QueriesSucceeded    uint64            `json:"queries_succeeded"`
+	QueriesFailed       uint64            `json:"queries_failed"`
+	QueriesCancelled    uint64            `json:"queries_cancelled"`
+	WritesBlocked       uint64            `json:"writes_blocked"`
+	ActiveQueries       int64             `json:"active_queries"`
+	LatencyP50Ms        float64           `json:"latency_p50_ms"`
+	LatencyP95Ms        float64           `json:"latency_p95_ms"`
+	LatencyP99Ms        float64           `json:"latency_p99_ms"`
+	Cache               CacheStats        `json:"cache"`
+	Pageserver          PageserverSocketStats `json:"pageserver"`
+	ActiveSnapshots     int               `json:"active_snapshots"`
+	SnapshotAcqFailures uint64            `json:"snapshot_acq_failures"`
+	GlobalLSN           uint64            `json:"global_lsn"`
+	ActiveTenants       int               `json:"active_tenants"`
+	PerTenantQueries    map[string]uint64 `json:"per_tenant_queries"`
+	VTabPagesRead       uint64            `json:"vtab_pages_read"`
+	VTabTuplesDecoded   uint64            `json:"vtab_tuples_decoded"`
+	VTabColsDecoded     uint64            `json:"vtab_cols_decoded"`
+	VTabRowsMatched     uint64            `json:"vtab_rows_matched"`
 }
 
 // SQLiteReadServer is a shared, multi-tenant SQLite read-only execution server
@@ -63,6 +92,7 @@ type SQLiteReadServer struct {
 	nativeAdapter *Adapter
 	nativeCLOG    *CLOGResolver
 	nativeSock    *PageserverSocketBackend
+	nativeCache   *TieredCacheBackend
 
 	mu      sync.RWMutex
 	state   string
@@ -73,10 +103,19 @@ type SQLiteReadServer struct {
 	wg     sync.WaitGroup
 	stopCh chan struct{}
 
-	queriesAllowed atomic.Uint64
-	writesBlocked  atomic.Uint64
-	globalLSN      atomic.Uint64
-	connSeq        atomic.Uint32
+	queriesAllowed      atomic.Uint64
+	queriesFailed       atomic.Uint64
+	queriesCancelled    atomic.Uint64
+	activeQueries       atomic.Int64
+	writesBlocked       atomic.Uint64
+	snapshotAcqFailures atomic.Uint64
+	globalLSN           atomic.Uint64
+	connSeq             atomic.Uint32
+
+	latMu  sync.Mutex
+	latBuf [1024]float64
+	latIdx int
+	latCnt int
 }
 
 // NewSQLiteReadServer creates a new shared SQLiteReadServer.
@@ -86,6 +125,12 @@ func NewSQLiteReadServer(cfg SQLiteServerConfig) (*SQLiteReadServer, error) {
 	}
 	if cfg.CacheKB <= 0 {
 		cfg.CacheKB = 32768 // 32 MiB page cache
+	}
+	if cfg.MaxConcurrentQueriesPerTenant <= 0 {
+		cfg.MaxConcurrentQueriesPerTenant = 16
+	}
+	if cfg.QueryTimeout <= 0 {
+		cfg.QueryTimeout = 30 * time.Second
 	}
 	root := filepath.Join(cfg.DataDir, "shared")
 	dbDir := filepath.Join(root, "sqlite")
@@ -133,6 +178,7 @@ func NewSQLiteReadServer(cfg SQLiteServerConfig) (*SQLiteReadServer, error) {
 		if err != nil {
 			return nil, fmt.Errorf("init native tiered cache: %w", err)
 		}
+		s.nativeCache = tiered
 		s.nativeAdapter = NewAdapter(tiered, snapProv)
 		s.nativeCLOG = NewCLOGResolver(tiered)
 	}
@@ -162,6 +208,83 @@ func (s *SQLiteReadServer) State() string {
 // Stats returns total allowed read queries and blocked write attempts across all tenants.
 func (s *SQLiteReadServer) Stats() (allowed uint64, blocked uint64) {
 	return s.queriesAllowed.Load(), s.writesBlocked.Load()
+}
+
+func (s *SQLiteReadServer) recordLatency(d time.Duration) {
+	ms := float64(d.Microseconds()) / 1000.0
+	s.latMu.Lock()
+	s.latBuf[s.latIdx] = ms
+	s.latIdx = (s.latIdx + 1) % len(s.latBuf)
+	if s.latCnt < len(s.latBuf) {
+		s.latCnt++
+	}
+	s.latMu.Unlock()
+}
+
+// DetailedMetrics returns comprehensive query, cache, pageserver, consistency, and resource metrics.
+func (s *SQLiteReadServer) DetailedMetrics() ReadServerMetrics {
+	succeeded := s.queriesAllowed.Load()
+	failed := s.queriesFailed.Load()
+	cancelled := s.queriesCancelled.Load()
+
+	s.latMu.Lock()
+	n := s.latCnt
+	samples := make([]float64, n)
+	copy(samples, s.latBuf[:n])
+	s.latMu.Unlock()
+
+	var p50, p95, p99 float64
+	if n > 0 {
+		sort.Float64s(samples)
+		p50 = samples[(n-1)*50/100]
+		p95 = samples[(n-1)*95/100]
+		p99 = samples[(n-1)*99/100]
+	}
+
+	s.mu.RLock()
+	perTenant := make(map[string]uint64, len(s.tenants))
+	for id, ts := range s.tenants {
+		perTenant[id] = ts.queriesTotal.Load()
+	}
+	activeTenants := len(s.tenants)
+	s.mu.RUnlock()
+
+	var cacheStats CacheStats
+	if s.nativeCache != nil {
+		cacheStats = s.nativeCache.Stats()
+	}
+	var psStats PageserverSocketStats
+	if s.nativeSock != nil {
+		psStats = s.nativeSock.Stats()
+	}
+	var activeSnaps int
+	if s.nativeAdapter != nil {
+		activeSnaps = s.nativeAdapter.ActiveSnapshotCount()
+	}
+	pagesRead, tuplesDecoded, colsDecoded, rowsMatched := VTabStats()
+
+	return ReadServerMetrics{
+		QueriesTotal:        succeeded + failed + cancelled,
+		QueriesSucceeded:    succeeded,
+		QueriesFailed:       failed,
+		QueriesCancelled:    cancelled,
+		WritesBlocked:       s.writesBlocked.Load(),
+		ActiveQueries:       s.activeQueries.Load(),
+		LatencyP50Ms:        p50,
+		LatencyP95Ms:        p95,
+		LatencyP99Ms:        p99,
+		Cache:               cacheStats,
+		Pageserver:          psStats,
+		ActiveSnapshots:     activeSnaps,
+		SnapshotAcqFailures: s.snapshotAcqFailures.Load(),
+		GlobalLSN:           s.globalLSN.Load(),
+		ActiveTenants:       activeTenants,
+		PerTenantQueries:    perTenant,
+		VTabPagesRead:       pagesRead,
+		VTabTuplesDecoded:   tuplesDecoded,
+		VTabColsDecoded:     colsDecoded,
+		VTabRowsMatched:     rowsMatched,
+	}
 }
 
 // Tenants returns the list of registered tenant IDs.
@@ -712,6 +835,7 @@ type sqlitePortal struct {
 
 type sqliteClientSession struct {
 	srv         *SQLiteReadServer
+	ctx         context.Context
 	conn        net.Conn
 	tenantID    string
 	user        string
@@ -721,7 +845,24 @@ type sqliteClientSession struct {
 	portals     map[string]*sqlitePortal
 }
 
+func (sess *sqliteClientSession) sessionCtx() context.Context {
+	if sess.ctx != nil {
+		return sess.ctx
+	}
+	return context.Background()
+}
+
 func (s *SQLiteReadServer) serveConn(c net.Conn) {
+	connCtx, connCancel := context.WithCancel(context.Background())
+	defer connCancel()
+	go func() {
+		select {
+		case <-s.stopCh:
+			connCancel()
+		case <-connCtx.Done():
+		}
+	}()
+
 	params, ok := s.performHandshake(c)
 	if !ok {
 		return
@@ -756,6 +897,7 @@ func (s *SQLiteReadServer) serveConn(c net.Conn) {
 
 	sess := &sqliteClientSession{
 		srv:      s,
+		ctx:      connCtx,
 		conn:     c,
 		tenantID: dbName,
 		user:     params["user"],
@@ -953,6 +1095,13 @@ func (s *SQLiteReadServer) refreshNativeCatalog(ctx context.Context, ts *SQLiteT
 		return err
 	}
 	defer func() { _ = s.nativeAdapter.ReleaseSnapshot(snap) }()
+	return s.refreshNativeCatalogWithSnap(ctx, ts, snap)
+}
+
+func (s *SQLiteReadServer) refreshNativeCatalogWithSnap(ctx context.Context, ts *SQLiteTenantStore, snap *ReadSnapshot) error {
+	if !ts.NativeMode || s.nativeAdapter == nil || snap == nil {
+		return nil
+	}
 
 	if snap.LSN > 0 {
 		ts.SyncedLSN.Store(snap.LSN)
@@ -996,6 +1145,64 @@ func (s *SQLiteReadServer) refreshNativeCatalog(ctx context.Context, ts *SQLiteT
 	return nil
 }
 
+func (s *SQLiteReadServer) executeReaderQuery(ctx context.Context, ts *SQLiteTenantStore, sqliteSQL string, args []string) (*SQLiteResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.cfg.QueryTimeout)
+		defer cancel()
+	}
+
+	if ts.sem != nil {
+		select {
+		case ts.sem <- struct{}{}:
+			defer func() { <-ts.sem }()
+		case <-ctx.Done():
+			s.queriesCancelled.Add(1)
+			return nil, ctx.Err()
+		}
+	}
+
+	start := time.Now()
+	s.activeQueries.Add(1)
+	ts.queriesTotal.Add(1)
+	defer func() {
+		s.activeQueries.Add(-1)
+		s.recordLatency(time.Since(start))
+	}()
+
+	var snap *ReadSnapshot
+	if ts.NativeMode && s.nativeAdapter != nil {
+		gen := s.nativeAdapter.backend.GetTenantGeneration(ts.TenantID)
+		var err error
+		snap, err = s.nativeAdapter.GetSnapshot(ctx, ts.TenantID, gen)
+		if err != nil {
+			s.snapshotAcqFailures.Add(1)
+			s.queriesFailed.Add(1)
+			return nil, err
+		}
+		defer func() { _ = s.nativeAdapter.ReleaseSnapshot(snap) }()
+
+		if rerr := s.refreshNativeCatalogWithSnap(ctx, ts, snap); rerr != nil {
+			s.queriesFailed.Add(1)
+			return nil, rerr
+		}
+	}
+
+	res, err := ts.Reader.QueryWithContext(ctx, snap, sqliteSQL, args)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			s.queriesCancelled.Add(1)
+		} else {
+			s.queriesFailed.Add(1)
+		}
+		return nil, err
+	}
+	return res, nil
+}
+
 func (sess *sqliteClientSession) currentTenantLSN() uint64 {
 	ts, err := sess.srv.getOrCreateTenant(sess.tenantID)
 	if err == nil && ts != nil {
@@ -1024,14 +1231,117 @@ func (sess *sqliteClientSession) rejectWrite(reason string) error {
 	return &SQLiteReadOnlyError{Message: reason}
 }
 
+func tokenizeSQLWords(sql string) []string {
+	var words []string
+	n := len(sql)
+	i := 0
+	for i < n {
+		c := sql[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			i++
+			continue
+		}
+		if c == '-' && i+1 < n && sql[i+1] == '-' {
+			i += 2
+			for i < n && sql[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if c == '/' && i+1 < n && sql[i+1] == '*' {
+			i += 2
+			depth := 1
+			for i < n && depth > 0 {
+				if sql[i] == '/' && i+1 < n && sql[i+1] == '*' {
+					depth++
+					i += 2
+				} else if sql[i] == '*' && i+1 < n && sql[i+1] == '/' {
+					depth--
+					i += 2
+				} else {
+					i++
+				}
+			}
+			continue
+		}
+		if c == '\'' {
+			i++
+			for i < n {
+				if sql[i] == '\'' {
+					if i+1 < n && sql[i+1] == '\'' {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+			words = append(words, "'")
+			continue
+		}
+		if c == '"' {
+			i++
+			var b strings.Builder
+			for i < n {
+				if sql[i] == '"' {
+					if i+1 < n && sql[i+1] == '"' {
+						b.WriteByte('"')
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				b.WriteByte(sql[i])
+				i++
+			}
+			words = append(words, strings.ToUpper(b.String()))
+			continue
+		}
+		if c == '$' {
+			tagEnd := i + 1
+			for tagEnd < n && ((sql[tagEnd] >= 'a' && sql[tagEnd] <= 'z') ||
+				(sql[tagEnd] >= 'A' && sql[tagEnd] <= 'Z') ||
+				(sql[tagEnd] >= '0' && sql[tagEnd] <= '9') ||
+				sql[tagEnd] == '_') {
+				tagEnd++
+			}
+			if tagEnd < n && sql[tagEnd] == '$' {
+				tag := sql[i : tagEnd+1]
+				if closeIdx := strings.Index(sql[tagEnd+1:], tag); closeIdx >= 0 {
+					i = tagEnd + 1 + closeIdx + len(tag)
+				} else {
+					i = n
+				}
+				words = append(words, "$$")
+				continue
+			}
+		}
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' {
+			start := i
+			i++
+			for i < n && ((sql[i] >= 'a' && sql[i] <= 'z') || (sql[i] >= 'A' && sql[i] <= 'Z') || (sql[i] >= '0' && sql[i] <= '9') || sql[i] == '_') {
+				i++
+			}
+			words = append(words, strings.ToUpper(sql[start:i]))
+			continue
+		}
+		if c == ';' {
+			words = append(words, ";")
+		}
+		i++
+	}
+	return words
+}
+
 func (sess *sqliteClientSession) execSingleStatement(stmt string, args []string, out *bytes.Buffer) error {
 	s := strings.TrimSpace(stmt)
 	if s == "" {
 		writePGEmptyQuery(out)
 		return nil
 	}
-	upper := strings.ToUpper(s)
-	fields := strings.Fields(upper)
+	fields := tokenizeSQLWords(s)
 	if len(fields) == 0 {
 		writePGEmptyQuery(out)
 		return nil
@@ -1042,7 +1352,7 @@ func (sess *sqliteClientSession) execSingleStatement(stmt string, args []string,
 	switch head {
 	case "BEGIN", "START":
 		for i := 1; i+1 < len(fields); i++ {
-			if fields[i] == "READ" && strings.TrimPrefix(fields[i+1], ",") == "WRITE" {
+			if fields[i] == "READ" && fields[i+1] == "WRITE" {
 				return sess.rejectWrite("READ WRITE transactions are not permitted")
 			}
 		}
@@ -1134,26 +1444,35 @@ func (sess *sqliteClientSession) execSingleStatement(stmt string, args []string,
 	case "EXPLAIN":
 		return sess.handleExplainStmt(s, args, out)
 
-	case "INSERT", "UPDATE", "DELETE", "MERGE":
+	case "INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE":
 		return sess.rejectWrite("DML statements (INSERT/UPDATE/DELETE/MERGE) are not permitted")
 
-	case "CREATE", "ALTER", "DROP", "TRUNCATE", "GRANT", "REVOKE", "VACUUM", "CLUSTER", "REINDEX", "DO", "CALL", "LOCK":
+	case "CREATE", "ALTER", "DROP", "TRUNCATE", "GRANT", "REVOKE", "VACUUM", "CLUSTER", "REINDEX", "DO", "CALL", "LOCK", "ATTACH", "DETACH", "PRAGMA":
 		return sess.rejectWrite(fmt.Sprintf("%s is not permitted on read-only SQLite engine", head))
+
+	case "SELECT", "WITH", "VALUES", "TABLE":
+		// Allowed read-only query heads; validated below.
+	default:
+		return sess.rejectWrite(fmt.Sprintf("unsupported statement %s on read-only SQLite engine", head))
 	}
 
-	// Check for modifying CTEs, SELECT INTO, or row locking (FOR UPDATE / FOR SHARE)
-	for i := 1; i < len(fields); i++ {
-		w := strings.Trim(fields[i], "();,")
+	// Check for modifying CTEs, SELECT INTO, multi-statement writes, or row locking (FOR UPDATE / FOR SHARE)
+	for i := 0; i < len(fields); i++ {
+		w := fields[i]
 		switch w {
-		case "INSERT", "UPDATE", "DELETE", "MERGE":
-			return sess.rejectWrite("data-modifying CTEs are not permitted")
+		case ";":
+			if i+1 < len(fields) {
+				return sess.rejectWrite("multi-statement execution is not permitted")
+			}
+		case "INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE", "CREATE", "ALTER", "DROP", "TRUNCATE", "ATTACH", "DETACH", "PRAGMA":
+			return sess.rejectWrite("data-modifying CTEs or DDL are not permitted")
 		case "INTO":
 			if head == "SELECT" {
 				return sess.rejectWrite("SELECT INTO is not permitted")
 			}
 		case "FOR":
 			if i+1 < len(fields) {
-				nxt := strings.Trim(fields[i+1], "();,")
+				nxt := fields[i+1]
 				if nxt == "UPDATE" || nxt == "SHARE" || nxt == "NO" || nxt == "KEY" {
 					return sess.rejectWrite("SELECT ... FOR UPDATE/SHARE row locking is not permitted")
 				}
@@ -1162,6 +1481,7 @@ func (sess *sqliteClientSession) execSingleStatement(stmt string, args []string,
 	}
 
 	// 2. Intercept synthetic PostgreSQL LSN and status introspection queries
+	upper := strings.ToUpper(s)
 	if strings.Contains(upper, "PG_LAST_WAL_REPLAY_LSN()") || strings.Contains(upper, "PG_CURRENT_WAL_LSN()") {
 		lsnStr := FormatPGLSN(sess.currentTenantLSN())
 		sess.srv.queriesAllowed.Add(1)
@@ -1197,18 +1517,13 @@ func (sess *sqliteClientSession) execSingleStatement(stmt string, args []string,
 	if err != nil {
 		return err
 	}
-	// If configured with native Pageserver storage, refresh virtual tables on demand.
-	if ts.NativeMode {
-		if rerr := sess.srv.refreshNativeCatalog(context.Background(), ts); rerr != nil {
-			return rerr
-		}
-	} else if sess.srv.cfg.PrimaryConnInfo != "" && sess.tenantID != "postgres" {
+	if !ts.NativeMode && sess.srv.cfg.PrimaryConnInfo != "" && sess.tenantID != "postgres" {
 		// If configured with PrimaryConnInfo and not yet synced, sync on demand.
 		_ = sess.srv.SyncFromPrimary(context.Background(), sess.tenantID, sess.srv.cfg.PrimaryConnInfo)
 	}
 
 	sqliteSQL, _ := translatePGToSQLite(s)
-	res, err := ts.Reader.Query(sqliteSQL, args)
+	res, err := sess.srv.executeReaderQuery(sess.sessionCtx(), ts, sqliteSQL, args)
 	if err != nil {
 		var roErr *SQLiteReadOnlyError
 		if errors.As(err, &roErr) {
@@ -1287,7 +1602,7 @@ func (sess *sqliteClientSession) handleCopyToStdout(innerSQL string, out *bytes.
 		return err
 	}
 	sq, _ := translatePGToSQLite(innerSQL)
-	res, err := ts.Reader.Query(sq, nil)
+	res, err := sess.srv.executeReaderQuery(sess.sessionCtx(), ts, sq, nil)
 	if err != nil {
 		return err
 	}
@@ -1570,15 +1885,12 @@ func (sess *sqliteClientSession) describeColumns(ps *sqlitePreparedStmt, args []
 	if err != nil {
 		return nil
 	}
-	if ts.NativeMode {
-		_ = sess.srv.refreshNativeCatalog(context.Background(), ts)
-	}
 	dummyArgs := args
 	if len(dummyArgs) < ps.ParamCount {
 		dummyArgs = make([]string, ps.ParamCount)
 		copy(dummyArgs, args)
 	}
-	res, err := ts.Reader.Query(ps.SQLiteSQL, dummyArgs)
+	res, err := sess.srv.executeReaderQuery(context.Background(), ts, ps.SQLiteSQL, dummyArgs)
 	if err != nil || res == nil {
 		return nil
 	}

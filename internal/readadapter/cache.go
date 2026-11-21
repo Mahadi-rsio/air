@@ -10,10 +10,14 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Mahadi-rsio/air/internal/pageserver"
+	"golang.org/x/sync/singleflight"
 )
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
@@ -38,18 +42,24 @@ type PageCacheKey struct {
 	LSN        uint64
 }
 
-// CacheStats reports L1/L2/L3 hit, miss, eviction, corruption, and usage counters.
+func (k PageCacheKey) sfKey() string {
+	return fmt.Sprintf("%s|%s|%d|%d|%d|%d|%d|%d",
+		k.TenantID, k.Generation, k.SpcOID, k.DbOID, k.RelNumber, k.ForkNum, k.BlockNum, k.LSN)
+}
+
+// CacheStats reports L1/L2/L3 hit, miss, eviction, corruption, stampede, and usage counters.
 type CacheStats struct {
-	L1Hits       uint64
-	L1Misses     uint64
-	L1Evictions  uint64
-	L1Bytes      int64
-	L2Hits       uint64
-	L2Misses     uint64
-	L2Evictions  uint64
-	L2Corrupt    uint64
-	L2Bytes      int64
-	L3Fetches    uint64
+	L1Hits             uint64
+	L1Misses           uint64
+	L1Evictions        uint64
+	L1Bytes            int64
+	L2Hits             uint64
+	L2Misses           uint64
+	L2Evictions        uint64
+	L2Corrupt          uint64
+	L2Bytes            int64
+	L3Fetches          uint64
+	StampedesPrevented uint64
 }
 
 type l1Entry struct {
@@ -71,6 +81,9 @@ type TieredCacheBackend struct {
 	l2Dir      string
 	l2MaxBytes int64
 
+	sfGroup singleflight.Group
+	tmpSeq  atomic.Uint64
+
 	l1Mu    sync.Mutex
 	l1Bytes int64
 	l1List  *list.List
@@ -81,14 +94,15 @@ type TieredCacheBackend struct {
 	l2List  *list.List
 	l2Map   map[PageCacheKey]*list.Element
 
-	l1Hits      atomic.Uint64
-	l1Misses    atomic.Uint64
-	l1Evictions atomic.Uint64
-	l2Hits      atomic.Uint64
-	l2Misses    atomic.Uint64
-	l2Evictions atomic.Uint64
-	l2Corrupt   atomic.Uint64
-	l3Fetches   atomic.Uint64
+	l1Hits             atomic.Uint64
+	l1Misses           atomic.Uint64
+	l1Evictions        atomic.Uint64
+	l2Hits             atomic.Uint64
+	l2Misses           atomic.Uint64
+	l2Evictions        atomic.Uint64
+	l2Corrupt          atomic.Uint64
+	l3Fetches          atomic.Uint64
+	stampedesPrevented atomic.Uint64
 }
 
 // NewTieredCacheBackend creates a multi-level L1+L2+L3 StorageBackend.
@@ -106,6 +120,7 @@ func NewTieredCacheBackend(l3 StorageBackend, cfg CacheConfig) (*TieredCacheBack
 		if cfg.L2MaxBytes <= 0 {
 			cfg.L2MaxBytes = 256 * 1024 * 1024
 		}
+		reconcileL2DirOnStartup(cfg.L2Dir, cfg.L2MaxBytes)
 	}
 	return &TieredCacheBackend{
 		l3:         l3,
@@ -117,6 +132,54 @@ func NewTieredCacheBackend(l3 StorageBackend, cfg CacheConfig) (*TieredCacheBack
 		l2List:     list.New(),
 		l2Map:      make(map[PageCacheKey]*list.Element),
 	}, nil
+}
+
+func reconcileL2DirOnStartup(l2Dir string, maxBytes int64) {
+	type diskFile struct {
+		path    string
+		size    int64
+		modTime time.Time
+	}
+	var files []diskFile
+	var total int64
+	_ = filepath.WalkDir(l2Dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if strings.Contains(name, ".tmp.") {
+			_ = os.Remove(p)
+			return nil
+		}
+		if !strings.HasSuffix(name, ".pg") {
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			return nil
+		}
+		if info.Size() != PGPageSize+4 {
+			_ = os.Remove(p)
+			return nil
+		}
+		total += info.Size()
+		files = append(files, diskFile{path: p, size: info.Size(), modTime: info.ModTime()})
+		return nil
+	})
+	if total <= maxBytes {
+		return
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].modTime.Before(files[j].modTime)
+	})
+	for _, f := range files {
+		if total <= maxBytes {
+			break
+		}
+		if os.Remove(f.path) == nil {
+			total -= f.size
+		}
+	}
 }
 
 func (c *TieredCacheBackend) GetTenantGeneration(tenantID string) string {
@@ -164,17 +227,29 @@ func (c *TieredCacheBackend) GetPageAtLSN(ctx context.Context, tenantID string, 
 		c.l2Misses.Add(1)
 	}
 
-	c.l3Fetches.Add(1)
-	pg, err := c.l3.GetPageAtLSN(ctx, tenantID, key, lsn)
+	v, err, shared := c.sfGroup.Do(ck.sfKey(), func() (any, error) {
+		c.l3Fetches.Add(1)
+		pg, err := c.l3.GetPageAtLSN(ctx, tenantID, key, lsn)
+		if err != nil {
+			return nil, err
+		}
+		if len(pg) == PGPageSize {
+			if c.l2Dir != "" {
+				c.putL2(ck, pg)
+			}
+			c.putL1(ck, pg)
+		}
+		out := make([]byte, len(pg))
+		copy(out, pg)
+		return out, nil
+	})
+	if shared {
+		c.stampedesPrevented.Add(1)
+	}
 	if err != nil {
 		return nil, err
 	}
-	if len(pg) == PGPageSize {
-		if c.l2Dir != "" {
-			c.putL2(ck, pg)
-		}
-		c.putL1(ck, pg)
-	}
+	pg := v.([]byte)
 	out := make([]byte, len(pg))
 	copy(out, pg)
 	return out, nil
@@ -337,16 +412,17 @@ func (c *TieredCacheBackend) Stats() CacheStats {
 	}
 
 	return CacheStats{
-		L1Hits:      c.l1Hits.Load(),
-		L1Misses:    c.l1Misses.Load(),
-		L1Evictions: c.l1Evictions.Load(),
-		L1Bytes:     l1B,
-		L2Hits:      c.l2Hits.Load(),
-		L2Misses:    c.l2Misses.Load(),
-		L2Evictions: c.l2Evictions.Load(),
-		L2Corrupt:   c.l2Corrupt.Load(),
-		L2Bytes:     l2B,
-		L3Fetches:   c.l3Fetches.Load(),
+		L1Hits:             c.l1Hits.Load(),
+		L1Misses:           c.l1Misses.Load(),
+		L1Evictions:        c.l1Evictions.Load(),
+		L1Bytes:            l1B,
+		L2Hits:             c.l2Hits.Load(),
+		L2Misses:           c.l2Misses.Load(),
+		L2Evictions:        c.l2Evictions.Load(),
+		L2Corrupt:          c.l2Corrupt.Load(),
+		L2Bytes:            l2B,
+		L3Fetches:          c.l3Fetches.Load(),
+		StampedesPrevented: c.stampedesPrevented.Load(),
 	}
 }
 
@@ -404,18 +480,26 @@ func (c *TieredCacheBackend) l2PathFor(k PageCacheKey) string {
 func (c *TieredCacheBackend) getL2(k PageCacheKey) ([]byte, bool) {
 	c.l2Mu.Lock()
 	elem, ok := c.l2Map[k]
-	if !ok {
+	var path string
+	if ok {
+		ent := elem.Value.(*l2Entry)
+		path = ent.path
+		c.l2List.MoveToFront(elem)
 		c.l2Mu.Unlock()
-		return nil, false
+	} else {
+		c.l2Mu.Unlock()
+		path = c.l2PathFor(k)
 	}
-	ent := elem.Value.(*l2Entry)
-	path := ent.path
-	c.l2List.MoveToFront(elem)
-	c.l2Mu.Unlock()
 
 	raw, err := os.ReadFile(path)
-	if err != nil || len(raw) != PGPageSize+4 {
-		c.evictCorruptL2(k, path, err == nil)
+	if err != nil {
+		if ok {
+			c.evictCorruptL2(k, path, false)
+		}
+		return nil, false
+	}
+	if len(raw) != PGPageSize+4 {
+		c.evictCorruptL2(k, path, true)
 		return nil, false
 	}
 	gotCRC := binary.LittleEndian.Uint32(raw[PGPageSize:])
@@ -424,7 +508,32 @@ func (c *TieredCacheBackend) getL2(k PageCacheKey) ([]byte, bool) {
 		c.evictCorruptL2(k, path, true)
 		return nil, false
 	}
+	if !ok {
+		c.registerL2Entry(k, path, int64(PGPageSize+4))
+	}
 	return raw[:PGPageSize], true
+}
+
+func (c *TieredCacheBackend) registerL2Entry(k PageCacheKey, path string, fileSize int64) {
+	c.l2Mu.Lock()
+	defer c.l2Mu.Unlock()
+
+	if elem, ok := c.l2Map[k]; ok {
+		c.l2List.MoveToFront(elem)
+		return
+	}
+	for c.l2Bytes+fileSize > c.l2MaxBytes && c.l2List.Len() > 0 {
+		back := c.l2List.Back()
+		ent := back.Value.(*l2Entry)
+		c.l2List.Remove(back)
+		delete(c.l2Map, ent.key)
+		c.l2Bytes -= ent.size
+		_ = os.Remove(ent.path)
+		c.l2Evictions.Add(1)
+	}
+	elem := c.l2List.PushFront(&l2Entry{key: k, path: path, size: fileSize})
+	c.l2Map[k] = elem
+	c.l2Bytes += fileSize
 }
 
 func (c *TieredCacheBackend) evictCorruptL2(k PageCacheKey, path string, countCorrupt bool) {
@@ -460,7 +569,7 @@ func (c *TieredCacheBackend) putL2(k PageCacheKey, pg []byte) {
 	copy(buf[:PGPageSize], pg)
 	binary.LittleEndian.PutUint32(buf[PGPageSize:], crc32.Checksum(pg, crc32cTable))
 
-	tmpPath := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
+	tmpPath := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), c.tmpSeq.Add(1))
 	if err := os.WriteFile(tmpPath, buf, 0o640); err != nil {
 		return
 	}
@@ -469,23 +578,5 @@ func (c *TieredCacheBackend) putL2(k PageCacheKey, pg []byte) {
 		return
 	}
 
-	c.l2Mu.Lock()
-	defer c.l2Mu.Unlock()
-
-	if elem, ok := c.l2Map[k]; ok {
-		c.l2List.MoveToFront(elem)
-		return
-	}
-	for c.l2Bytes+fileSize > c.l2MaxBytes && c.l2List.Len() > 0 {
-		back := c.l2List.Back()
-		ent := back.Value.(*l2Entry)
-		c.l2List.Remove(back)
-		delete(c.l2Map, ent.key)
-		c.l2Bytes -= ent.size
-		_ = os.Remove(ent.path)
-		c.l2Evictions.Add(1)
-	}
-	elem := c.l2List.PushFront(&l2Entry{key: k, path: path, size: fileSize})
-	c.l2Map[k] = elem
-	c.l2Bytes += fileSize
+	c.registerL2Entry(k, path, fileSize)
 }

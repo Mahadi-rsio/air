@@ -84,3 +84,83 @@ func TestPageserverBackendAndStaticSnapshotProvider(t *testing.T) {
 		t.Fatalf("expected NBlocks=1, got %d", meta.NBlocks)
 	}
 }
+
+func TestPageserverSocketBackendConcurrencyAndOverload(t *testing.T) {
+	tmpDir := t.TempDir()
+	sockPath := filepath.Join(tmpDir, "ps.sock")
+	ps, err := pageserver.New(pageserver.Config{
+		SocketPath: sockPath,
+		LayerDir:   filepath.Join(tmpDir, "layers"),
+	})
+	if err != nil {
+		t.Fatalf("pageserver.New: %v", err)
+	}
+	defer ps.Close()
+	if err := ps.Start(context.Background()); err != nil {
+		t.Fatalf("ps.Start: %v", err)
+	}
+
+	const tenantID = "tenant-sock-pool"
+	const spcOID = uint32(1663)
+	const dbOID = uint32(5)
+	const relNum = uint32(20050)
+	const lsn = uint64(0x20000)
+
+	ps.EnsureTenant(tenantID, 1)
+	ps.SetTenantGeneration(tenantID, "gen-1")
+
+	const numBlocks = 16
+	batch := make([]byte, numBlocks*pageserver.PageSize)
+	for blk := 0; blk < numBlocks; blk++ {
+		off := blk * pageserver.PageSize
+		// Stamp block number in first 4 bytes to verify zero cross-talk/corruption.
+		batch[off] = byte(blk)
+		batch[off+1] = byte(blk >> 8)
+		batch[off+2] = 0xAA
+		batch[off+3] = 0x55
+	}
+	if err := ps.PutPageBatch(context.Background(), tenantID, spcOID, dbOID, relNum, 0, 0, numBlocks, lsn, batch); err != nil {
+		t.Fatalf("PutPageBatch: %v", err)
+	}
+
+	sb := NewPageserverSocketBackendWithConfig(PageserverSocketConfig{
+		SocketPath:     sockPath,
+		MaxConns:       4,
+		MaxInFlight:    4,
+		QueueCapacity:  64,
+		RequestTimeout: 5 * 1e9,
+	})
+	defer sb.Close()
+
+	// Fire 48 concurrent page reads across the 4-connection pool and verify exact block correlation.
+	const workers = 48
+	errCh := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		blk := uint32(w % numBlocks)
+		go func(b uint32) {
+			pg, err := sb.GetPageAtLSN(context.Background(), tenantID, pageserver.RelBlockKey(spcOID, dbOID, relNum, 0, b), lsn)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if len(pg) != pageserver.PageSize || pg[0] != byte(b) || pg[2] != 0xAA || pg[3] != 0x55 {
+				errCh <- context.DeadlineExceeded
+				return
+			}
+			errCh <- nil
+		}(blk)
+	}
+	for i := 0; i < workers; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("concurrent GetPageAtLSN failed: %v", err)
+		}
+	}
+
+	st := sb.Stats()
+	if st.ActiveConns < 1 || st.ActiveConns > 4 {
+		t.Fatalf("expected ActiveConns in [1,4], got %d", st.ActiveConns)
+	}
+	if st.RequestsTotal != workers {
+		t.Fatalf("expected RequestsTotal=%d, got %d", workers, st.RequestsTotal)
+	}
+}

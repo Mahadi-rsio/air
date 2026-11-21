@@ -29,6 +29,39 @@ const (
 	SLRUSubtransKind uint32 = 1
 )
 
+var (
+	// ErrMultiXactUnsupported is returned when a tuple's xmax is a MultiXactId
+	// that is not lock-only, requiring safe fallback to the PostgreSQL primary.
+	ErrMultiXactUnsupported = errors.New("readadapter: multixact visibility requires primary fallback")
+
+	// ErrVisibilityUnavailable is returned when authoritative pg_xact/pg_subtrans
+	// visibility status cannot be resolved for an unhinted transaction.
+	ErrVisibilityUnavailable = errors.New("readadapter: transaction visibility status unavailable")
+)
+
+// TransactionIdPrecedes implements PostgreSQL's wraparound-safe TransactionIdPrecedes.
+func TransactionIdPrecedes(id1, id2 uint32) bool {
+	if id1 < FirstNormalTransactionID || id2 < FirstNormalTransactionID {
+		return id1 < id2
+	}
+	return int32(id1-id2) < 0
+}
+
+// TransactionIdPrecedesOrEquals implements PostgreSQL's wraparound-safe TransactionIdPrecedesOrEquals.
+func TransactionIdPrecedesOrEquals(id1, id2 uint32) bool {
+	return id1 == id2 || TransactionIdPrecedes(id1, id2)
+}
+
+// TransactionIdFollows implements PostgreSQL's wraparound-safe TransactionIdFollows.
+func TransactionIdFollows(id1, id2 uint32) bool {
+	return TransactionIdPrecedes(id2, id1)
+}
+
+// TransactionIdFollowsOrEquals implements PostgreSQL's wraparound-safe TransactionIdFollowsOrEquals.
+func TransactionIdFollowsOrEquals(id1, id2 uint32) bool {
+	return id1 == id2 || TransactionIdFollows(id1, id2)
+}
+
 // SLRUKey constructs a Pageserver Key for a pg_xact or pg_subtrans SLRU page.
 func SLRUKey(slruKind uint32, pageNum uint32) pageserver.Key {
 	return pageserver.Key{
@@ -82,10 +115,11 @@ func SetSubtransParent(page []byte, xid, parentXid uint32) error {
 }
 
 type slruCacheKey struct {
-	tenantID string
-	lsn      uint64
-	slruKind uint32
-	pageNum  uint32
+	tenantID   string
+	generation string
+	lsn        uint64
+	slruKind   uint32
+	pageNum    uint32
 }
 
 // CLOGResolver resolves authoritative transaction commit statuses from pg_xact
@@ -106,15 +140,19 @@ func NewCLOGResolver(backend StorageBackend) *CLOGResolver {
 }
 
 func (r *CLOGResolver) fetchSLRUPage(ctx context.Context, tenantID string, lsn, slruKind, pageNum uint32) ([]byte, error) {
-	return r.fetchSLRUPageLSN(ctx, tenantID, uint64(lsn), slruKind, pageNum)
+	return r.fetchSLRUPageLSN(ctx, tenantID, "", uint64(lsn), slruKind, pageNum)
 }
 
-func (r *CLOGResolver) fetchSLRUPageLSN(ctx context.Context, tenantID string, lsn uint64, slruKind, pageNum uint32) ([]byte, error) {
+func (r *CLOGResolver) fetchSLRUPageLSN(ctx context.Context, tenantID, generation string, lsn uint64, slruKind, pageNum uint32) ([]byte, error) {
+	if generation == "" && r.backend != nil {
+		generation = r.backend.GetTenantGeneration(tenantID)
+	}
 	ck := slruCacheKey{
-		tenantID: tenantID,
-		lsn:      lsn,
-		slruKind: slruKind,
-		pageNum:  pageNum,
+		tenantID:   tenantID,
+		generation: generation,
+		lsn:        lsn,
+		slruKind:   slruKind,
+		pageNum:    pageNum,
 	}
 
 	r.mu.RLock()
@@ -149,6 +187,11 @@ func (r *CLOGResolver) fetchSLRUPageLSN(ctx context.Context, tenantID string, ls
 // XidStatus returns the authoritative commit status of xid at snapshot lsn,
 // following pg_subtrans parent links when pg_xact records XactStatusSubCommitted.
 func (r *CLOGResolver) XidStatus(ctx context.Context, tenantID string, lsn uint64, xid uint32) (XactStatus, error) {
+	return r.XidStatusWithGen(ctx, tenantID, "", lsn, xid)
+}
+
+// XidStatusWithGen resolves xid status scoped to a specific tenant generation.
+func (r *CLOGResolver) XidStatusWithGen(ctx context.Context, tenantID, generation string, lsn uint64, xid uint32) (XactStatus, error) {
 	cur := xid
 	for depth := 0; depth < maxSubtransDepth; depth++ {
 		if cur == InvalidTransactionID {
@@ -159,10 +202,10 @@ func (r *CLOGResolver) XidStatus(ctx context.Context, tenantID string, lsn uint6
 		}
 
 		pageNum := cur / clogXactsPerPage
-		pg, err := r.fetchSLRUPageLSN(ctx, tenantID, lsn, SLRUXactKind, pageNum)
+		pg, err := r.fetchSLRUPageLSN(ctx, tenantID, generation, lsn, SLRUXactKind, pageNum)
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
-				return XactStatusInProgress, nil
+				return XactStatusInProgress, fmt.Errorf("%w: pg_xact page %d for xid %d: %v", ErrVisibilityUnavailable, pageNum, cur, err)
 			}
 			return XactStatusInProgress, err
 		}
@@ -175,10 +218,10 @@ func (r *CLOGResolver) XidStatus(ctx context.Context, tenantID string, lsn uint6
 		}
 
 		subPageNum := cur / subtransXactsPerPg
-		subPg, err := r.fetchSLRUPageLSN(ctx, tenantID, lsn, SLRUSubtransKind, subPageNum)
+		subPg, err := r.fetchSLRUPageLSN(ctx, tenantID, generation, lsn, SLRUSubtransKind, subPageNum)
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
-				return XactStatusInProgress, nil
+				return XactStatusInProgress, fmt.Errorf("%w: pg_subtrans page %d for xid %d: %v", ErrVisibilityUnavailable, subPageNum, cur, err)
 			}
 			return XactStatusInProgress, err
 		}
@@ -187,7 +230,7 @@ func (r *CLOGResolver) XidStatus(ctx context.Context, tenantID string, lsn uint6
 			return XactStatusInProgress, err
 		}
 		if parent == InvalidTransactionID || parent == cur {
-			return XactStatusInProgress, nil
+			return XactStatusInProgress, fmt.Errorf("%w: invalid pg_subtrans parent %d for xid %d", ErrVisibilityUnavailable, parent, cur)
 		}
 		cur = parent
 	}
@@ -198,10 +241,10 @@ func xidInSnapshot(xid uint32, snap *ReadSnapshot) bool {
 	if snap == nil {
 		return false
 	}
-	if xid < snap.Xmin {
+	if snap.Xmin != 0 && TransactionIdPrecedes(xid, snap.Xmin) {
 		return false
 	}
-	if xid >= snap.Xmax {
+	if snap.Xmax != 0 && TransactionIdFollowsOrEquals(xid, snap.Xmax) {
 		return true
 	}
 	for _, active := range snap.ActiveXIPs {
@@ -226,9 +269,9 @@ func xidCommittedAtSnapshot(ctx context.Context, tenantID string, xid uint32, sn
 		return true, nil
 	}
 	if resolver == nil {
-		return false, nil
+		return false, fmt.Errorf("%w: nil CLOGResolver for unhinted xid %d", ErrVisibilityUnavailable, xid)
 	}
-	st, err := resolver.XidStatus(ctx, tenantID, snap.LSN, xid)
+	st, err := resolver.XidStatusWithGen(ctx, tenantID, snap.Generation, snap.LSN, xid)
 	if err != nil {
 		return false, err
 	}
@@ -245,7 +288,7 @@ func IsVisibleWithCLOG(ctx context.Context, h HeapTupleHeader, snap *ReadSnapsho
 
 	xminFrozen := (h.Infomask & HeapXminFrozen) == HeapXminFrozen
 	if !xminFrozen {
-		if (h.Infomask & HeapXminInvalid) != 0 {
+		if (h.Infomask&HeapXminCommitted) == 0 && (h.Infomask&HeapXminInvalid) != 0 {
 			return false, nil
 		}
 		ok, err := xidCommittedAtSnapshot(ctx, snap.TenantID, h.Xmin, snap, (h.Infomask&HeapXminCommitted) != 0, resolver)
@@ -254,16 +297,30 @@ func IsVisibleWithCLOG(ctx context.Context, h HeapTupleHeader, snap *ReadSnapsho
 		}
 	}
 
-	if (h.Infomask&HeapXmaxInvalid) != 0 || (h.Infomask&HeapXmaxLockOnly) != 0 || h.Xmax == InvalidTransactionID {
+	if (h.Infomask&HeapXmaxInvalid) != 0 || h.Xmax == InvalidTransactionID {
+		return true, nil
+	}
+
+	if heapXmaxIsLockedOnly(h.Infomask) {
 		return true, nil
 	}
 
 	if (h.Infomask & HeapXmaxIsMulti) != 0 {
-		// MultiXact without HeapXmaxLockOnly: conservative visibility unless hint committed.
-		return (h.Infomask & HeapXmaxCommitted) == 0, nil
+		// MultiXact with potential updater/deleter: cannot resolve without pg_multixact SLRU,
+		// so fail explicitly to trigger safe primary-read fallback.
+		return false, fmt.Errorf("%w: xmax=%d infomask=0x%04x", ErrMultiXactUnsupported, h.Xmax, h.Infomask)
 	}
 
-	deleted, err := xidCommittedAtSnapshot(ctx, snap.TenantID, h.Xmax, snap, (h.Infomask&HeapXmaxCommitted) != 0, resolver)
+	if (h.Infomask&HeapXmaxCommitted) == 0 {
+		// Check if xmax is in-progress in snapshot or aborted/in-progress in pg_xact.
+		deleted, err := xidCommittedAtSnapshot(ctx, snap.TenantID, h.Xmax, snap, false, resolver)
+		if err != nil {
+			return false, err
+		}
+		return !deleted, nil
+	}
+
+	deleted, err := xidCommittedAtSnapshot(ctx, snap.TenantID, h.Xmax, snap, true, resolver)
 	if err != nil {
 		return false, err
 	}

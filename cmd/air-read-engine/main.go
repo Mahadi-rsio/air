@@ -190,6 +190,10 @@ func (re *SharedReadEngine) HTTPHandler() http.Handler {
 			"writes_blocked":  blocked,
 		})
 	})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(re.sqliteRe.DetailedMetrics())
+	})
 	mux.HandleFunc("/v1/tenants/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/v1/tenants/")
 		parts := strings.Split(strings.Trim(path, "/"), "/")
