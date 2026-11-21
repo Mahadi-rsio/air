@@ -34,6 +34,7 @@ type Timeline struct {
 	relSizes          map[Key]uint32
 	relSizeKnown      map[Key]bool
 	allRelSizesSeeded bool
+	slruPages         map[Key][]byte
 	layerSeq          uint64
 }
 
@@ -51,7 +52,21 @@ func NewTimeline(tenantID string, epoch int64, store *LayerStore, redoer WALRedo
 		maxInMemBytes: defaultMaxInMemBytes,
 		relSizes:      make(map[Key]uint32),
 		relSizeKnown:  make(map[Key]bool),
+		slruPages:     make(map[Key][]byte),
 	}
+}
+
+// SeedSLRUPage seeds a baseline 8 KiB SLRU page (e.g. pg_xact) into the Timeline
+// so subsequent WAL XACT updates preserve all previously committed XIDs.
+func (t *Timeline) SeedSLRUPage(key Key, page []byte) {
+	if len(page) != PageSize {
+		return
+	}
+	cp := make([]byte, PageSize)
+	copy(cp, page)
+	t.mu.Lock()
+	t.slruPages[key] = cp
+	t.mu.Unlock()
 }
 
 // SetGeneration sets the immutable generation identifier for this Timeline.
@@ -325,6 +340,46 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 				LSN:     rec.EndLSN,
 				Flags:   EntryFlagRelSize,
 				RelSize: blk.BlockNum + 1,
+			})
+		}
+	}
+
+	// Track XACT commit/abort status in pg_xact SLRU (KeyKindSLRU, SpcOID=0)
+	// so native MVCC readers (CLOGResolver) can resolve uncommitted hint bits.
+	if rec.Rmid == RmXactID && rec.XID >= 3 {
+		op := rec.Info & XLogXactOpMask
+		var status byte
+		switch op {
+		case XLogXactCommit, XLogXactCommitPrepared:
+			status = 0x01 // XactStatusCommitted
+		case XLogXactAbort, XLogXactAbortPrepared:
+			status = 0x02 // XactStatusAborted
+		}
+		if status != 0 {
+			const clogXactsPerPage = uint32(PageSize) * 4
+			pageNum := rec.XID / clogXactsPerPage
+			slruKey := Key{Kind: KeyKindSLRU, SpcOID: 0, BlockNum: pageNum}
+			page := make([]byte, PageSize)
+			if cur, ok := t.slruPages[slruKey]; ok && len(cur) == PageSize {
+				copy(page, cur)
+			} else if deltas := t.inMem.Lookup(slruKey, ^uint64(0)); len(deltas) > 0 {
+				for i := len(deltas) - 1; i >= 0; i-- {
+					if (deltas[i].Flags&EntryFlagPageImage) != 0 && len(deltas[i].PageImage) == PageSize {
+						copy(page, deltas[i].PageImage)
+						break
+					}
+				}
+			}
+			pageIdx := rec.XID % clogXactsPerPage
+			byteIdx := pageIdx / 4
+			bitShift := (pageIdx % 4) * 2
+			mask := byte(0x03 << bitShift)
+			page[byteIdx] = (page[byteIdx] &^ mask) | ((status & 0x03) << bitShift)
+			t.slruPages[slruKey] = page
+			t.inMem.Put(slruKey, WALDelta{
+				LSN:       rec.EndLSN,
+				Flags:     EntryFlagPageImage,
+				PageImage: page,
 			})
 		}
 	}

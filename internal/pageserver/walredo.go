@@ -169,6 +169,9 @@ func (r *DefaultWALRedoer) Redo(ctx context.Context, key Key, basePage []byte, d
 		return cur, err
 	}
 	if r.cfg.WorkerBin == "" {
+		if applied := applyHeapWALRecords(key, cur, pendingWAL); len(applied) == PageSize {
+			return applied, nil
+		}
 		if len(cur) == PageSize {
 			return cur, nil
 		}
@@ -199,7 +202,9 @@ func (r *DefaultWALRedoer) RedoBatch(ctx context.Context, reqs []WALRedoRequest)
 			continue
 		}
 		if r.cfg.WorkerBin == "" {
-			if len(cur) == PageSize {
+			if applied := applyHeapWALRecords(req.Key, cur, pendingWAL); len(applied) == PageSize {
+				pages[i] = applied
+			} else if len(cur) == PageSize {
 				pages[i] = cur
 			} else {
 				errs[i] = fmt.Errorf("pageserver: %d non-FPI WAL records for %s require walredo worker", len(pendingWAL), req.Key)

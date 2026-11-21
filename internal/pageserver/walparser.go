@@ -37,7 +37,14 @@ const (
 	BkpImageCompressZSTD uint8 = 0x10
 
 	RmXLogID uint8 = 0
+	RmXactID uint8 = 1
 	RmSmgrID uint8 = 2
+
+	XLogXactCommit         uint8 = 0x00
+	XLogXactAbort          uint8 = 0x20
+	XLogXactCommitPrepared uint8 = 0x30
+	XLogXactAbortPrepared  uint8 = 0x40
+	XLogXactOpMask         uint8 = 0x70
 
 	XLogSmgrCreate   uint8 = 0x10
 	XLogSmgrTruncate uint8 = 0x20

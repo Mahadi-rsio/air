@@ -54,7 +54,7 @@ func DefaultConfig() Config {
 		MaxUserClientConns:   0,
 		DiscoveryIntervalMS:  2000,
 		ReadEngineHost:       "127.0.0.1",
-		ReadEnginePort:       0,
+		ReadEnginePort:       5433,
 	}
 }
 

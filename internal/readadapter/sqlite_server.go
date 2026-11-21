@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Mahadi-rsio/air/internal/tenant"
 	"github.com/jackc/pgx/v5"
@@ -27,7 +28,12 @@ type SQLiteServerConfig struct {
 	DataDir         string
 	PrimaryConnInfo string
 	CacheKB         int
-	Adapter         *Adapter
+	Adapter          *Adapter
+	PageserverSocket string
+	NativeBackend    StorageBackend
+	NativeSnapProv   SnapshotProvider
+	CacheDir         string
+	L1CacheBytes     int64
 }
 
 // SQLiteTenantStore holds the per-tenant SQLite database files and read/write connections.
@@ -38,6 +44,9 @@ type SQLiteTenantStore struct {
 	Writer     *SQLiteConn
 	Reader     *SQLiteConn
 	SyncedLSN  atomic.Uint64
+	NativeMode bool
+	vtabIDs    map[string]uint64
+	catalogLSN uint64
 	mu         sync.Mutex
 }
 
@@ -50,6 +59,10 @@ type SQLiteReadServer struct {
 	rootDir string
 	dbDir   string
 	sockDir string
+
+	nativeAdapter *Adapter
+	nativeCLOG    *CLOGResolver
+	nativeSock    *PageserverSocketBackend
 
 	mu      sync.RWMutex
 	state   string
@@ -97,6 +110,31 @@ func NewSQLiteReadServer(cfg SQLiteServerConfig) (*SQLiteReadServer, error) {
 		state:   "STOPPED",
 		tenants: make(map[string]*SQLiteTenantStore),
 		stopCh:  make(chan struct{}),
+	}
+	if cfg.NativeBackend != nil || cfg.PageserverSocket != "" {
+		backend := cfg.NativeBackend
+		snapProv := cfg.NativeSnapProv
+		if backend == nil {
+			sock := NewPageserverSocketBackend(cfg.PageserverSocket)
+			s.nativeSock = sock
+			backend = sock
+			if snapProv == nil {
+				snapProv = sock
+			}
+		}
+		l1Bytes := cfg.L1CacheBytes
+		if l1Bytes <= 0 {
+			l1Bytes = 64 * 1024 * 1024
+		}
+		tiered, err := NewTieredCacheBackend(backend, CacheConfig{
+			L1MaxBytes: l1Bytes,
+			L2Dir:      cfg.CacheDir,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("init native tiered cache: %w", err)
+		}
+		s.nativeAdapter = NewAdapter(tiered, snapProv)
+		s.nativeCLOG = NewCLOGResolver(tiered)
 	}
 	s.globalLSN.Store(0x1000000)
 	return s, nil
@@ -206,12 +244,18 @@ func (s *SQLiteReadServer) Stop() error {
 
 	s.wg.Wait()
 	for _, ts := range tenants {
+		for _, vid := range ts.vtabIDs {
+			UnregisterNativeTable(vid)
+		}
 		if ts.Reader != nil {
 			_ = ts.Reader.Close()
 		}
 		if ts.Writer != nil {
 			_ = ts.Writer.Close()
 		}
+	}
+	if s.nativeSock != nil {
+		_ = s.nativeSock.Close()
 	}
 	return nil
 }
@@ -241,6 +285,27 @@ func (s *SQLiteReadServer) EnsureTenantDB(tenantID string) error {
 
 func (s *SQLiteReadServer) ensureTenantLocked(tenantID string) (*SQLiteTenantStore, error) {
 	if ts, ok := s.tenants[tenantID]; ok {
+		return ts, nil
+	}
+	if s.nativeAdapter != nil && tenantID != "postgres" {
+		conn, err := OpenSQLiteConn(":memory:", false, s.cfg.CacheKB)
+		if err != nil {
+			return nil, err
+		}
+		if err := conn.RegisterAirPGModule(); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		conn.readOnly = true
+		conn.SetReadOnlyAuthorizer(true)
+		ts := &SQLiteTenantStore{
+			TenantID:   tenantID,
+			DBPath:     ":memory:",
+			Reader:     conn,
+			NativeMode: true,
+			vtabIDs:    make(map[string]uint64),
+		}
+		s.tenants[tenantID] = ts
 		return ts, nil
 	}
 	dbPath := filepath.Join(s.dbDir, tenantID+".sqlite3")
@@ -680,6 +745,7 @@ func (s *SQLiteReadServer) serveConn(c net.Conn) {
 	writePGParamStatus(&out, "server_version", "17.12 (AIR SQLite Read Engine "+SQLiteVersion()+")")
 	writePGParamStatus(&out, "client_encoding", "UTF8")
 	writePGParamStatus(&out, "DateStyle", "ISO, MDY")
+	writePGParamStatus(&out, "standard_conforming_strings", "on")
 	writePGParamStatus(&out, "default_transaction_read_only", "on")
 	writePGParamStatus(&out, "in_hot_standby", "on")
 	writePGBackendKeyData(&out, pid, 0x51717E01)
@@ -701,6 +767,7 @@ func (s *SQLiteReadServer) serveConn(c net.Conn) {
 			"search_path":                   "public",
 			"client_encoding":               "UTF8",
 			"datestyle":                     "ISO, MDY",
+			"standard_conforming_strings":   "on",
 			"air_ro.enabled":                "on",
 		},
 		stmts:   make(map[string]*sqlitePreparedStmt),
@@ -876,9 +943,75 @@ func translatePGToSQLite(sql string) (string, int) {
 	return s, maxParam
 }
 
+func (s *SQLiteReadServer) refreshNativeCatalog(ctx context.Context, ts *SQLiteTenantStore) error {
+	if !ts.NativeMode || s.nativeAdapter == nil {
+		return nil
+	}
+	gen := s.nativeAdapter.backend.GetTenantGeneration(ts.TenantID)
+	snap, err := s.nativeAdapter.GetSnapshot(ctx, ts.TenantID, gen)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = s.nativeAdapter.ReleaseSnapshot(snap) }()
+
+	if snap.LSN > 0 {
+		ts.SyncedLSN.Store(snap.LSN)
+	}
+
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if snap.LSN <= ts.catalogLSN && len(ts.vtabIDs) > 0 && ts.Generation == snap.Generation {
+		return nil
+	}
+
+	tables, err := DiscoverCatalog(ctx, s.nativeAdapter, s.nativeCLOG, snap, ts.TenantID)
+	if err != nil {
+		return err
+	}
+
+	ts.Reader.SetReadOnlyAuthorizer(false)
+	defer ts.Reader.SetReadOnlyAuthorizer(true)
+
+	seen := make(map[string]struct{}, len(tables))
+	for _, tbl := range tables {
+		seen[tbl.Name] = struct{}{}
+		if oldID, ok := ts.vtabIDs[tbl.Name]; ok {
+			UnregisterNativeTable(oldID)
+		}
+		vid, err := ts.Reader.RegisterNativeTable(ts.TenantID, snap.Generation, tbl, s.nativeAdapter, s.nativeCLOG)
+		if err != nil {
+			continue
+		}
+		ts.vtabIDs[tbl.Name] = vid
+	}
+	for name, oldID := range ts.vtabIDs {
+		if _, ok := seen[name]; !ok {
+			_ = ts.Reader.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s;", quoteSQLiteIdent(name)))
+			UnregisterNativeTable(oldID)
+			delete(ts.vtabIDs, name)
+		}
+	}
+	ts.Generation = snap.Generation
+	ts.catalogLSN = snap.LSN
+	return nil
+}
+
 func (sess *sqliteClientSession) currentTenantLSN() uint64 {
 	ts, err := sess.srv.getOrCreateTenant(sess.tenantID)
 	if err == nil && ts != nil {
+		if ts.NativeMode && sess.srv.nativeAdapter != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			gen := sess.srv.nativeAdapter.backend.GetTenantGeneration(ts.TenantID)
+			if snap, serr := sess.srv.nativeAdapter.GetSnapshot(ctx, ts.TenantID, gen); serr == nil {
+				lsn := snap.LSN
+				_ = sess.srv.nativeAdapter.ReleaseSnapshot(snap)
+				if lsn > 0 {
+					ts.SyncedLSN.Store(lsn)
+					return lsn
+				}
+			}
+		}
 		if lsn := ts.SyncedLSN.Load(); lsn > 0 {
 			return lsn
 		}
@@ -1064,8 +1197,13 @@ func (sess *sqliteClientSession) execSingleStatement(stmt string, args []string,
 	if err != nil {
 		return err
 	}
-	// If configured with PrimaryConnInfo and not yet synced, sync on demand.
-	if sess.srv.cfg.PrimaryConnInfo != "" && sess.tenantID != "postgres" {
+	// If configured with native Pageserver storage, refresh virtual tables on demand.
+	if ts.NativeMode {
+		if rerr := sess.srv.refreshNativeCatalog(context.Background(), ts); rerr != nil {
+			return rerr
+		}
+	} else if sess.srv.cfg.PrimaryConnInfo != "" && sess.tenantID != "postgres" {
+		// If configured with PrimaryConnInfo and not yet synced, sync on demand.
 		_ = sess.srv.SyncFromPrimary(context.Background(), sess.tenantID, sess.srv.cfg.PrimaryConnInfo)
 	}
 
@@ -1431,6 +1569,9 @@ func (sess *sqliteClientSession) describeColumns(ps *sqlitePreparedStmt, args []
 	ts, err := sess.srv.getOrCreateTenant(sess.tenantID)
 	if err != nil {
 		return nil
+	}
+	if ts.NativeMode {
+		_ = sess.srv.refreshNativeCatalog(context.Background(), ts)
 	}
 	dummyArgs := args
 	if len(dummyArgs) < ps.ParamCount {

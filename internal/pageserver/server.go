@@ -119,6 +119,22 @@ func (p *Pageserver) GetTenantGeneration(tenantID string) string {
 	return p.generations[tenantID]
 }
 
+// GetTenantInfo implements TenantInfoProvider, returning the active generation
+// and latest ingested WAL LSN for tenantID.
+func (p *Pageserver) GetTenantInfo(tenantID string) (string, uint64, bool) {
+	p.mu.RLock()
+	tl, ok := p.tenants[tenantID]
+	gen := p.generations[tenantID]
+	p.mu.RUnlock()
+	if !ok {
+		return gen, 0, false
+	}
+	if gen == "" {
+		gen = tl.Generation()
+	}
+	return gen, tl.LastLSN(), true
+}
+
 func (p *Pageserver) isGenerationActive(tenantID, generation string) bool {
 	p.mu.RLock()
 	cur, ok := p.generations[tenantID]
@@ -489,6 +505,66 @@ func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID str
 				},
 			}); err != nil {
 				return err
+			}
+		}
+
+		// KeyKindSLRU (4) > KeyKindRelSize (2): seed pg_xact (CLOG) segments so native MVCC
+		// readers have baseline commit statuses for bootstrapped/pre-existing transactions.
+		xactDir := filepath.Join(pgDataDir, "pg_xact")
+		if xactEntries, err := os.ReadDir(xactDir); err == nil {
+			type xactSeg struct {
+				segNo uint32
+				path  string
+			}
+			var segs []xactSeg
+			for _, ent := range xactEntries {
+				if ent.IsDir() {
+					continue
+				}
+				v, perr := strconv.ParseUint(ent.Name(), 16, 32)
+				if perr != nil {
+					continue
+				}
+				segs = append(segs, xactSeg{segNo: uint32(v), path: filepath.Join(xactDir, ent.Name())})
+			}
+			sort.Slice(segs, func(i, j int) bool { return segs[i].segNo < segs[j].segNo })
+			const slruPagesPerSeg = 32 // 256 KiB / 8 KiB
+			for _, seg := range segs {
+				f, oerr := os.Open(seg.path)
+				if oerr != nil {
+					continue
+				}
+				var blkIdx uint32
+				for {
+					n, rerr := io.ReadFull(f, buf)
+					if n == PageSize {
+						page := make([]byte, PageSize)
+						copy(page, buf)
+						slruKey := Key{Kind: KeyKindSLRU, SpcOID: 0, BlockNum: seg.segNo*slruPagesPerSeg + blkIdx}
+						tl.SeedSLRUPage(slruKey, page)
+						if err := sw.Add(LayerRecord{
+							Key: slruKey,
+							Delta: WALDelta{
+								LSN:       initLSN,
+								Flags:     EntryFlagPageImage,
+								PageImage: page,
+							},
+						}); err != nil {
+							_ = f.Close()
+							return err
+						}
+						wroteAny = true
+						blkIdx++
+					}
+					if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
+						break
+					}
+					if rerr != nil {
+						_ = f.Close()
+						return rerr
+					}
+				}
+				_ = f.Close()
 			}
 		}
 		return nil

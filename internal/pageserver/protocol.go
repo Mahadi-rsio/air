@@ -42,6 +42,8 @@ const (
 	OpGetPageBatch uint16 = 5
 	OpPutPageBatch uint16 = 6
 	OpUnlinkRel    uint16 = 7
+	OpGetSLRUPage  uint16 = 8
+	OpGetTenantInfo uint16 = 9
 )
 
 // Wire response statuses matching AirPsStatus in protocol.h.
@@ -240,6 +242,12 @@ type Service interface {
 	GetDBSize(ctx context.Context, tenantID string, spcOID, dbOID uint32, lsn uint64) (uint64, error)
 	PutPageBatch(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, startBlock, nblocks uint32, lsn uint64, pages []byte) error
 	UnlinkRel(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) error
+}
+
+// TenantInfoProvider is an optional Service extension used by native read engines
+// to query a tenant's active generation and latest ingested WAL LSN over pageserver.sock.
+type TenantInfoProvider interface {
+	GetTenantInfo(tenantID string) (generation string, lastLSN uint64, ok bool)
 }
 
 // UnixServer serves the binary air_smgr protocol over an AF_UNIX stream socket.
@@ -452,6 +460,34 @@ func (s *UnixServer) handleConn(ctx context.Context, conn net.Conn) {
 			err := s.svc.UnlinkRel(ctx, req.TenantID, req.SpcOID, req.DbOID, req.RelNumber, req.ForkNum, req.LSN)
 			if err != nil {
 				status = StatusError
+			}
+		case OpGetSLRUPage:
+			key := Key{
+				Kind:     KeyKindSLRU,
+				SpcOID:   req.SpcOID,
+				BlockNum: req.BlockNum,
+			}
+			page, err := s.svc.GetPageAtLSN(ctx, req.TenantID, key, req.LSN)
+			if errors.Is(err, ErrNotFound) {
+				status = StatusNotFound
+			} else if err != nil {
+				log.Printf("[pageserver] OpGetSLRUPage tenant=%s key=%s lsn=%x err=%v", req.TenantID, key, req.LSN, err)
+				status = StatusError
+			} else {
+				payload = page
+				nblocksOrVal = 1
+			}
+		case OpGetTenantInfo:
+			if tip, ok := s.svc.(TenantInfoProvider); ok {
+				gen, lastLSN, found := tip.GetTenantInfo(req.TenantID)
+				if !found {
+					status = StatusNotFound
+				} else {
+					u64Val = lastLSN
+					payload = []byte(gen)
+				}
+			} else {
+				status = StatusNotFound
 			}
 		default:
 			status = StatusError

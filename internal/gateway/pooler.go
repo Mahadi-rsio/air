@@ -328,6 +328,7 @@ func (p *TenantPool) authenticateClient(client net.Conn, startupUser, expectedPa
 		BuildParamStatus("server_version", "17.12"),
 		BuildParamStatus("client_encoding", "UTF8"),
 		BuildParamStatus("DateStyle", "ISO, MDY"),
+		BuildParamStatus("standard_conforming_strings", "on"),
 		BuildBackendKeyData(gwPID, gwSecret),
 		BuildReadyForQuery('I'),
 	}

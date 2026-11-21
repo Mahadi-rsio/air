@@ -182,7 +182,7 @@ func xidVisible(xid uint32, snap *ReadSnapshot, committedXIDs map[uint32]bool, h
 	return false
 }
 
-// ColumnType identifies a PostgreSQL column type for tuple decoding proof.
+// ColumnType identifies a PostgreSQL column type for tuple decoding.
 type ColumnType int
 
 const (
@@ -190,7 +190,43 @@ const (
 	ColInt8
 	ColFloat8
 	ColText
+	ColBool
+	ColChar
+	ColInt2
+	ColOID
+	ColName
+	ColFloat4
+	ColBytea
 )
+
+// PGTypeOIDToColumnType maps a PostgreSQL pg_type OID to a native tuple ColumnType
+// and SQLite virtual table column declaration type.
+func PGTypeOIDToColumnType(oid uint32) (ColumnType, string) {
+	switch oid {
+	case 16: // bool
+		return ColBool, "BOOLEAN"
+	case 17: // bytea
+		return ColBytea, "BLOB"
+	case 18: // "char"
+		return ColChar, "TEXT"
+	case 19: // name
+		return ColName, "TEXT"
+	case 20: // int8 / bigint
+		return ColInt8, "BIGINT"
+	case 21: // int2 / smallint
+		return ColInt2, "INTEGER"
+	case 23: // int4 / integer
+		return ColInt4, "INTEGER"
+	case 26, 28, 29: // oid, xid, cid
+		return ColOID, "BIGINT"
+	case 700: // float4 / real
+		return ColFloat4, "REAL"
+	case 701: // float8 / double precision
+		return ColFloat8, "REAL"
+	default: // text (25), varchar (1043), bpchar (1042), json/jsonb, numeric, etc.
+		return ColText, "TEXT"
+	}
+}
 
 func alignUp(off, align int) int {
 	return (off + align - 1) &^ (align - 1)
@@ -208,6 +244,93 @@ func DecodeHeapColumns(tup []byte, hdr HeapTupleHeader, cols []ColumnType) ([]an
 			}
 		}
 		switch ct {
+		case ColBool:
+			if off+1 > len(tup) {
+				return nil, fmt.Errorf("%w: bool out of bounds", ErrInvalidPage)
+			}
+			vals[i] = tup[off] != 0
+			off++
+		case ColChar:
+			if off+1 > len(tup) {
+				return nil, fmt.Errorf("%w: char out of bounds", ErrInvalidPage)
+			}
+			vals[i] = byte(tup[off])
+			off++
+		case ColInt2:
+			off = alignUp(off, 2)
+			if off+2 > len(tup) {
+				return nil, fmt.Errorf("%w: int2 out of bounds", ErrInvalidPage)
+			}
+			vals[i] = int16(binary.LittleEndian.Uint16(tup[off : off+2]))
+			off += 2
+		case ColOID:
+			off = alignUp(off, 4)
+			if off+4 > len(tup) {
+				return nil, fmt.Errorf("%w: oid out of bounds", ErrInvalidPage)
+			}
+			vals[i] = binary.LittleEndian.Uint32(tup[off : off+4])
+			off += 4
+		case ColName:
+			// PostgreSQL NameData is 64 bytes, 1-byte aligned, NUL-terminated.
+			if off+64 > len(tup) {
+				return nil, fmt.Errorf("%w: name out of bounds", ErrInvalidPage)
+			}
+			raw := tup[off : off+64]
+			end := 0
+			for end < 64 && raw[end] != 0 {
+				end++
+			}
+			vals[i] = string(raw[:end])
+			off += 64
+		case ColFloat4:
+			off = alignUp(off, 4)
+			if off+4 > len(tup) {
+				return nil, fmt.Errorf("%w: float4 out of bounds", ErrInvalidPage)
+			}
+			vals[i] = float64(math.Float32frombits(binary.LittleEndian.Uint32(tup[off : off+4])))
+			off += 4
+		case ColBytea:
+			if off >= len(tup) {
+				return nil, fmt.Errorf("%w: bytea out of bounds", ErrInvalidPage)
+			}
+			b0 := tup[off]
+			if (b0 & 0x01) != 0 {
+				if b0 == 0x01 {
+					if off+18 > len(tup) {
+						return nil, fmt.Errorf("%w: bytea toast pointer out of bounds", ErrInvalidPage)
+					}
+					vals[i] = []byte{}
+					off += 18
+				} else {
+					totalLen := int(b0 >> 1)
+					if off+totalLen > len(tup) {
+						return nil, fmt.Errorf("%w: short bytea out of bounds", ErrInvalidPage)
+					}
+					cp := make([]byte, totalLen-1)
+					copy(cp, tup[off+1:off+totalLen])
+					vals[i] = cp
+					off += totalLen
+				}
+			} else {
+				off = alignUp(off, 4)
+				if off+4 > len(tup) {
+					return nil, fmt.Errorf("%w: bytea4 header out of bounds", ErrInvalidPage)
+				}
+				hdr4 := binary.LittleEndian.Uint32(tup[off : off+4])
+				totalLen := int(hdr4 >> 2)
+				if (hdr4 & 0x02) != 0 {
+					vals[i] = []byte{}
+					off += totalLen
+				} else {
+					if off+totalLen > len(tup) {
+						return nil, fmt.Errorf("%w: bytea4 body out of bounds", ErrInvalidPage)
+					}
+					cp := make([]byte, totalLen-4)
+					copy(cp, tup[off+4:off+totalLen])
+					vals[i] = cp
+					off += totalLen
+				}
+			}
 		case ColInt4:
 			off = alignUp(off, 4)
 			if off+4 > len(tup) {

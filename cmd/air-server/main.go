@@ -89,6 +89,10 @@ func main() {
 			log.Fatalf("start pageserver: %v", psErr)
 		}
 		ag.SetPageserverConfig(true, cfg.PageserverSocket, cfg.PageserverCacheMB)
+		if !ag.HasAirSmgr() {
+			ag.SetPageserverConfig(false, "", 0)
+			log.Printf("[air-server] air_smgr.so not found; Pageserver running in WAL-receiver mode on %s", cfg.PageserverSocket)
+		}
 		cp.SetPageserver(ps)
 		log.Printf("[air-server] pageserver listening on %s (cache_mb=%d)", cfg.PageserverSocket, cfg.PageserverCacheMB)
 	}

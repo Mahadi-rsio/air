@@ -22,10 +22,12 @@ import (
 type Config struct {
 	HTTPAddr        string
 	ListenHost      string
-	PGPort          int
-	DataDir         string
-	SharedBuffers   string
-	PrimaryConnInfo string
+	PGPort           int
+	DataDir          string
+	SharedBuffers    string
+	PrimaryConnInfo  string
+	PageserverSocket string
+	CacheDir         string
 }
 
 func envOr(key, fallback string) string {
@@ -73,6 +75,8 @@ func loadConfig(args []string) Config {
 	fs.StringVar(&cfg.DataDir, "data-dir", envOr("AIR_READ_ENGINE_DATA_DIR", "/tmp/air-read-engine"), "Read engine data directory")
 	fs.StringVar(&cfg.SharedBuffers, "shared-buffers", envOr("AIR_READ_ENGINE_SHARED_BUFFERS", "32MB"), "SQLite page cache size")
 	fs.StringVar(&cfg.PrimaryConnInfo, "primary-conninfo", envOr("AIR_READ_ENGINE_PRIMARY_CONNINFO", ""), "Optional primary_conninfo for syncing from Write Engine")
+	fs.StringVar(&cfg.PageserverSocket, "pageserver-socket", envOr("AIR_PAGESERVER_SOCKET", ""), "AIR Pageserver Unix socket path for native zero-sync storage reads")
+	fs.StringVar(&cfg.CacheDir, "cache-dir", envOr("AIR_READ_ENGINE_CACHE_DIR", ""), "Optional local NVMe L2 page cache directory")
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("parse flags: %v", err)
 	}
@@ -89,11 +93,13 @@ type SharedReadEngine struct {
 
 func NewSharedReadEngine(cfg Config) (*SharedReadEngine, error) {
 	sq, err := readadapter.NewSQLiteReadServer(readadapter.SQLiteServerConfig{
-		ListenHost:      cfg.ListenHost,
-		PGPort:          cfg.PGPort,
-		DataDir:         cfg.DataDir,
-		PrimaryConnInfo: cfg.PrimaryConnInfo,
-		CacheKB:         parseMemoryToKB(cfg.SharedBuffers, 32768),
+		ListenHost:       cfg.ListenHost,
+		PGPort:           cfg.PGPort,
+		DataDir:          cfg.DataDir,
+		PrimaryConnInfo:  cfg.PrimaryConnInfo,
+		PageserverSocket: cfg.PageserverSocket,
+		CacheDir:         cfg.CacheDir,
+		CacheKB:          parseMemoryToKB(cfg.SharedBuffers, 32768),
 	})
 	if err != nil {
 		return nil, err
