@@ -56,14 +56,20 @@ All runtime configuration is loaded from environment variables first, then overr
 | `AIR_PAGESERVER_ENABLED` | `--pageserver` | `false` | Enable in-process AIR Pageserver over Unix socket. |
 | `AIR_PAGESERVER_SOCKET` | `--pageserver-socket` | `<data-dir>/pageserver.sock` | Unix socket path for `air_smgr` $\leftrightarrow$ `pageserver`. |
 | `AIR_PAGESERVER_CACHE_MB` | `--pageserver-cache-mb` | `256` | Bounded LRU disk cache size (MB) for Pageserver. |
+| `AIR_READ_ENGINE_HOST` | `--read-engine-host` | `127.0.0.1` | Read Engine PG17 host used by `air-gateway` and `air-read-engine`. |
+| `AIR_READ_ENGINE_PORT` | `--read-engine-port` | `0` (`5433` in `air-read-engine`) | Read Engine PG17 port (`0` disables read routing in `air-gateway`). |
+| `AIR_READ_ENGINE_SOCK_DIR` | `--read-engine-sock-dir` | `""` | Optional Read Engine Unix socket directory for `air-gateway`. |
+| `AIR_READ_ENGINE_HTTP_ADDR` | `--http-addr` | `127.0.0.1:8082` | HTTP control/health listen address for `air-read-engine`. |
+| `AIR_READ_ENGINE_PRIMARY_CONNINFO` | `--primary-conninfo` | `""` | Primary Cell libpq conninfo used by `air-read-engine` for `pg_basebackup` hot standby. |
 
 ---
 
 ## 3. Build & Run Locally
 
-### Build Go Server
+### Build Go Server & Read Engine
 ```bash
 go build ./cmd/air-server
+go build ./cmd/air-read-engine
 ```
 
 ### Run `air-server` Locally
@@ -78,6 +84,15 @@ go run ./cmd/air-server \
   --internal-token air_internal_secret
 ```
 
+### Run `air-read-engine` Locally (Optional)
+```bash
+go run ./cmd/air-read-engine \
+  -data-dir /tmp/air-read-engine \
+  -http-addr 127.0.0.1:8082 \
+  -pg-port 5433 \
+  -tenant-id demo_db
+```
+
 ### Build & Run `air-gateway` (Optional)
 ```bash
 make -C gateway all test
@@ -86,7 +101,9 @@ make -C gateway all test
   --gateway-admin-addr 127.0.0.1:8081 \
   --db-grpc-addr 127.0.0.1:9090 \
   --meta-dsn "host=127.0.0.1 port=15432 user=postgres dbname=postgres" \
-  --internal-token air_internal_secret
+  --internal-token air_internal_secret \
+  --read-engine-host 127.0.0.1 \
+  --read-engine-port 5433
 ```
 
 ---

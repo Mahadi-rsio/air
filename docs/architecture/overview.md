@@ -46,7 +46,12 @@ flowchart TB
         KMS["Envelope KMS (AES-256-GCM)<br/>internal/crypto/"]
     end
 
-    subgraph TenantCompute["Per-Tenant PostgreSQL 17 Instance"]
+    subgraph ReadEngineProcess["Read Engine (cmd/air-read-engine)"]
+        REHTTP["Read Engine HTTP (:8082)<br/>/healthz, /v1/tenants/{id}/start"]
+        PGRO["Read-Only PG17 (:5433)<br/>air_ro.so + hot_standby / air_smgr.read_only"]
+    end
+
+    subgraph TenantCompute["Per-Tenant PostgreSQL 17 Write Cell"]
         PG17["postgres (app_user / supautils)"]
         SMGR["air_smgr.so (LFC + Unix Socket IPC)"]
         WALRecv["WAL Stream / Archive Spool"]
@@ -63,7 +68,8 @@ flowchart TB
     HTTPClient --> GWAdmin
     GWWire -->|"Wake / Route (gRPC)"| GRPCAPI
     GWAdmin -->|"Lifecycle RPCs (gRPC)"| GRPCAPI
-    GWWire -->|"Pooled Backend TCP"| PG17
+    GWWire -->|"Writes & Causal Fallback"| PG17
+    GWWire -->|"Read-Only SQL (sql_router)"| PGRO
 
     HTTPAPI --> Ctrl
     GRPCAPI --> Ctrl
@@ -76,7 +82,9 @@ flowchart TB
     Cell --> PG17
     Cell --> KMS
     PG17 --> SMGR
+    PG17 -->|"Streaming Replication (pg_basebackup)"| PGRO
     SMGR <-->|"GetPage@LSN (Unix Socket)"| PS
+    PGRO <-->|"GetPage@LSN (air_smgr.read_only)"| PS
     PG17 -->|"Physical Replication / WAL"| WALRecv
     WALRecv --> PS
     WALRecv --> Bkp
@@ -94,13 +102,15 @@ flowchart TB
 | Component | Package / Directory | Primary Responsibilities |
 | :--- | :--- | :--- |
 | **Server Entrypoint** | [cmd/air-server](file:///workspaces/air/cmd/air-server/main.go) | Parses flags/env ([internal/config](file:///workspaces/air/internal/config/config.go)), initializes `cell.Agent`, `pageserver.Server`, and `control.Service`, runs startup reconciliation, and serves HTTP (`:8080`) + gRPC (`:9090`). |
+| **Read Engine Entrypoint** | [cmd/air-read-engine](file:///workspaces/air/cmd/air-read-engine/main.go) | Supervises standalone read-only PostgreSQL 17 instances (`air_ro.so`, `hot_standby = on`, `pg_basebackup` streaming standby or `air_smgr.read_only`) with HTTP control on `:8082`. |
 | **Control Plane** | [internal/control](file:///workspaces/air/internal/control/control.go) | Manages metadata tables (`clusters`, `api_keys`, `backup_ops`, `restore_ops`), tenant state transitions, `singleflight` wake coalescing, idle suspend reaper, cold offload worker, and backup/restore orchestration. |
 | **Cell Agent** | [internal/cell](file:///workspaces/air/internal/cell/agent.go) | Manages local PostgreSQL 17 processes, warm `initdb` pool, `flock` lockfiles, `cgroup v2` limits, `supautils` configuration, cooperative drain checks, and local `EnvelopeKMS` access. |
 | **Pageserver** | [internal/pageserver](file:///workspaces/air/internal/pageserver/server.go) | Consumes PostgreSQL WAL via replication or local PGDATA segments, maintains per-timeline `InMemoryLayer`, L0/L1/Image disk layers, serves `GetPage@LSN` to `air_smgr.so`, and uploads CAU layers to R2. |
-| **Storage Manager Extension** | [extensions/air_smgr](file:///workspaces/air/extensions/air_smgr/air_smgr.c) | Custom PostgreSQL 17 `f_smgr` implementation with a local file cache (LFC) and Unix socket client to `pageserver`. |
+| **Storage Manager Extension** | [extensions/air_smgr](file:///workspaces/air/extensions/air_smgr/air_smgr.c) | Custom PostgreSQL 17 `f_smgr` implementation with a local file cache (LFC), `air_smgr.read_only` mode, and Unix socket client to `pageserver`. |
+| **Read-Only Guard Extension** | [extensions/air_ro](file:///workspaces/air/extensions/air_ro/air_ro.c) | Native PG17 C extension (`air_ro.enabled = on`) enforcing read-only execution across `ExecutorStart_hook`, `ProcessUtility_hook`, and `object_access_hook`. |
 | **Backup & PITR** | [internal/backup](file:///workspaces/air/internal/backup/pitr_dag.go) | Executes encrypted `pg_basebackup` (FULL and INCR), WAL spooling and archival, immutable `BackupManifest` publication, object/checksum verification, and `StagePITRRestore` recovery. |
 | **Fencing & CAS** | [internal/fencing](file:///workspaces/air/internal/fencing/r2_cas.go) | Enforces `CLOCK_MONOTONIC` lease watchdog checks and R2 ETag CAS (`If-Match` / `If-None-Match`) updates on `tenants/{tenant_id}/manifest.json`. |
-| **C++20 Gateway** | [gateway/src](file:///workspaces/air/gateway/src/main.cpp) | Accepts client PostgreSQL connections (`:5432`), enforces TLS 1.2+ and `SNI == database`, pools backend connections in transaction mode, and triggers tenant wake via gRPC. |
+| **C++20 Gateway** | [gateway/src](file:///workspaces/air/gateway/src/main.cpp) | Accepts client PostgreSQL connections (`:5432`), enforces TLS 1.2+ and `SNI == database`, pools backend connections in transaction mode, routes read-only queries to Read Engine with LSN causal-lag fallback, and triggers tenant wake via gRPC. |
 
 ---
 

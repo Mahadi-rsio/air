@@ -17,7 +17,9 @@ AIR is a production-oriented, multi-tenant PostgreSQL 17 platform featuring a Go
 
 ```text
 .
-├── cmd/air-server/          # Air DB server entrypoint (Control Plane HTTP + gRPC + Cell Agent + Pageserver)
+├── cmd/
+│   ├── air-server/          # Air DB server entrypoint (Control Plane HTTP + gRPC + Cell Agent + Pageserver)
+│   └── air-read-engine/     # Standalone Read Engine entrypoint (read-only PG17 with air_ro + air_smgr.read_only)
 ├── gateway/                 # Standalone C++20 PG Gateway & Pooler (PG wire :5432, Admin API :8081, gRPC client)
 ├── proto/                   # Protobuf / gRPC contract (airdb.proto: AirDBControl)
 ├── internal/
@@ -78,10 +80,10 @@ Runs the suites in [tests/e2e/](file:///workspaces/air/tests/e2e) against real P
 go test -v -race -count=1 ./...
 ```
 
-### Running `air-server` and C++ `air-gateway` Locally
+### Running `air-server`, `air-read-engine`, and C++ `air-gateway` Locally
 
 ```bash
-# 1. Start air-server (Control Plane HTTP :8080 + Air DB gRPC :9090)
+# 1. Start air-server (Control Plane HTTP :8080 + Air DB gRPC :9090 + Cell)
 go run ./cmd/air-server \
   -data-dir /tmp/air-live \
   -http-addr 127.0.0.1:8080 \
@@ -91,14 +93,23 @@ go run ./cmd/air-server \
   -bootstrap-api-key air_live_demo_secret_token_12345 \
   -internal-token air_internal_secret
 
-# 2. Build and start C++ air-gateway (PG Pooler :5432 + Admin API :8081)
+# 2. Start air-read-engine (optional standalone read-only PG17 engine :5433, HTTP :8082)
+go run ./cmd/air-read-engine \
+  -data-dir /tmp/air-read-engine \
+  -http-addr 127.0.0.1:8082 \
+  -pg-port 5433 \
+  -tenant-id demo_db
+
+# 3. Build and start C++ air-gateway (PG Pooler :5432 + Admin API :8081)
 make -C gateway all test
 ./gateway/air-gateway \
   --gateway-addr 127.0.0.1:5432 \
   --gateway-admin-addr 127.0.0.1:8081 \
   --db-grpc-addr 127.0.0.1:9090 \
   --meta-dsn "host=127.0.0.1 port=15432 user=postgres dbname=postgres" \
-  --internal-token air_internal_secret
+  --internal-token air_internal_secret \
+  --read-engine-host 127.0.0.1 \
+  --read-engine-port 5433
 ```
 
 ### Fly.io Deployment ([fly.toml](file:///workspaces/air/fly.toml))
