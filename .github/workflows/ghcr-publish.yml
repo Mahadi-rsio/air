@@ -39,20 +39,21 @@ jobs:
           go test -v -race ./internal/...
 
   test-gateway:
-    name: Test C++ (air-gateway)
+    name: Test Go (air-gateway)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
       - name: Build and test air-gateway
         run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
-            pkg-config libpq-dev libssl-dev \
-            libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc
-          protoc -Iproto --cpp_out=gateway/src/pb --grpc_out=gateway/src/pb \
-            --plugin=protoc-gen-grpc=/usr/bin/grpc_cpp_plugin proto/airdb.proto
-          make -C gateway -j"$(nproc)" all test
+          go build -v ./cmd/air-gateway
+          go test -v -race ./internal/gateway/...
 
   build-air-server:
     name: Build & Push air-server Image
