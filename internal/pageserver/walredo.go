@@ -175,7 +175,15 @@ func (r *DefaultWALRedoer) Redo(ctx context.Context, key Key, basePage []byte, d
 		if len(cur) == PageSize {
 			return cur, nil
 		}
-		return nil, fmt.Errorf("pageserver: %d non-FPI WAL records for %s require walredo worker", len(pendingWAL), key)
+		var rmid uint8
+		var rinfo uint8
+		if len(pendingWAL) > 0 {
+			if rec0, rerr := DecodeWALRecord(0, pendingWAL[0]); rerr == nil {
+				rmid = rec0.Rmid
+				rinfo = rec0.Info
+			}
+		}
+		return nil, fmt.Errorf("pageserver: %d non-FPI WAL records (rmid=%d info=0x%02x) for %s require walredo worker", len(pendingWAL), rmid, rinfo, key)
 	}
 	return r.submitJob(ctx, key, cur, pendingWAL)
 }
@@ -207,7 +215,15 @@ func (r *DefaultWALRedoer) RedoBatch(ctx context.Context, reqs []WALRedoRequest)
 			} else if len(cur) == PageSize {
 				pages[i] = cur
 			} else {
-				errs[i] = fmt.Errorf("pageserver: %d non-FPI WAL records for %s require walredo worker", len(pendingWAL), req.Key)
+				var rmid uint8
+				var rinfo uint8
+				if len(pendingWAL) > 0 {
+					if rec0, rerr := DecodeWALRecord(0, pendingWAL[0]); rerr == nil {
+						rmid = rec0.Rmid
+						rinfo = rec0.Info
+					}
+				}
+				errs[i] = fmt.Errorf("pageserver: %d non-FPI WAL records (rmid=%d info=0x%02x) for %s require walredo worker", len(pendingWAL), rmid, rinfo, req.Key)
 			}
 			continue
 		}

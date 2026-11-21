@@ -332,6 +332,11 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 		}
 		if blk.HasImage {
 			if page, err := RestoreBkpImage(blk); err == nil {
+				if blk.ImageApply && len(rec.RawRecord) > 0 {
+					if applied := applyHeapWALRecords(key, page, [][]byte{rec.RawRecord}); len(applied) == PageSize {
+						page = applied
+					}
+				}
 				delta.Flags |= EntryFlagPageImage
 				delta.PageImage = page
 			}

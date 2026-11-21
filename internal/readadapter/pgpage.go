@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
+	"unsafe"
 )
 
 const (
@@ -130,7 +132,16 @@ func ValidateLinePointer(lp LinePointer, hdr PageHeader) error {
 // ParseLinePointers extracts all ItemIdData entries between PGPageHeaderSize and hdr.Lower.
 func ParseLinePointers(page []byte, hdr PageHeader) []LinePointer {
 	n := int(hdr.Lower-PGPageHeaderSize) / 4
-	out := make([]LinePointer, 0, n)
+	return ParseLinePointersInto(page, hdr, make([]LinePointer, 0, n))
+}
+
+// ParseLinePointersInto appends all ItemIdData entries into dst[:0], reusing capacity.
+func ParseLinePointersInto(page []byte, hdr PageHeader, dst []LinePointer) []LinePointer {
+	n := int(hdr.Lower-PGPageHeaderSize) / 4
+	out := dst[:0]
+	if cap(out) < n {
+		out = make([]LinePointer, 0, n)
+	}
 	for i := 0; i < n; i++ {
 		raw := binary.LittleEndian.Uint32(page[PGPageHeaderSize+i*4 : PGPageHeaderSize+(i+1)*4])
 		out = append(out, LinePointer{
@@ -579,6 +590,234 @@ func DecodeHeapColumnsProjected(tup []byte, hdr HeapTupleHeader, cols []ColumnTy
 		}
 	}
 	return vals, nil
+}
+
+// ValKind discriminates a decoded HeapVal without interface{} boxing.
+type ValKind uint8
+
+const (
+	ValNull ValKind = iota
+	ValInt64
+	ValFloat64
+	ValBool
+	ValByte
+	ValString
+	ValBytes
+)
+
+// HeapVal stores a decoded PostgreSQL column value without interface{} boxing.
+type HeapVal struct {
+	Kind ValKind
+	I64  int64
+	F64  float64
+	Str  string
+	Raw  []byte
+}
+
+// CloneStrings copies any transient string/byte slices so the HeapVal is safe
+// to retain beyond the lifetime of the underlying page buffer.
+func (v *HeapVal) Materialize() {
+	if v.Kind == ValString && len(v.Str) > 0 {
+		v.Str = strings.Clone(v.Str)
+	} else if v.Kind == ValBytes && len(v.Raw) > 0 {
+		cp := make([]byte, len(v.Raw))
+		copy(cp, v.Raw)
+		v.Raw = cp
+	}
+}
+
+// DecodeHeapColumnsInto decodes projected columns directly into dst (len(dst) >= len(cols))
+// without []any or interface{} allocations. When copyStrings is false, string/byte
+// values alias tup directly and must be materialized before outliving tup.
+func DecodeHeapColumnsInto(tup []byte, hdr HeapTupleHeader, cols []ColumnType, needed []bool, dst []HeapVal, copyStrings bool) error {
+	off := int(hdr.Hoff)
+	natts := int(hdr.Infomask2 & HeapNattsMask)
+	for i, ct := range cols {
+		if natts > 0 && i >= natts {
+			dst[i] = HeapVal{Kind: ValNull}
+			continue
+		}
+		if (hdr.Infomask & HeapHasNull) != 0 {
+			if i/8 >= len(hdr.NullBits) {
+				return fmt.Errorf("%w: null bitmap too short for att %d", ErrInvalidPage, i)
+			}
+			if (hdr.NullBits[i/8] & (1 << uint(i%8))) == 0 {
+				dst[i] = HeapVal{Kind: ValNull}
+				continue
+			}
+		}
+		want := needed == nil || (i < len(needed) && needed[i])
+		if !want {
+			dst[i] = HeapVal{Kind: ValNull}
+		}
+		switch ct {
+		case ColBool:
+			if off+1 > len(tup) {
+				return fmt.Errorf("%w: bool out of bounds", ErrInvalidPage)
+			}
+			if want {
+				var b int64
+				if tup[off] != 0 {
+					b = 1
+				}
+				dst[i] = HeapVal{Kind: ValBool, I64: b}
+			}
+			off++
+		case ColChar:
+			if off+1 > len(tup) {
+				return fmt.Errorf("%w: char out of bounds", ErrInvalidPage)
+			}
+			if want {
+				dst[i] = HeapVal{Kind: ValByte, I64: int64(tup[off])}
+			}
+			off++
+		case ColInt2:
+			off = alignUp(off, 2)
+			if off+2 > len(tup) {
+				return fmt.Errorf("%w: int2 out of bounds", ErrInvalidPage)
+			}
+			if want {
+				dst[i] = HeapVal{Kind: ValInt64, I64: int64(int16(binary.LittleEndian.Uint16(tup[off : off+2])))}
+			}
+			off += 2
+		case ColOID:
+			off = alignUp(off, 4)
+			if off+4 > len(tup) {
+				return fmt.Errorf("%w: oid out of bounds", ErrInvalidPage)
+			}
+			if want {
+				dst[i] = HeapVal{Kind: ValInt64, I64: int64(binary.LittleEndian.Uint32(tup[off : off+4]))}
+			}
+			off += 4
+		case ColName:
+			if off+64 > len(tup) {
+				return fmt.Errorf("%w: name out of bounds", ErrInvalidPage)
+			}
+			if want {
+				raw := tup[off : off+64]
+				end := 0
+				for end < 64 && raw[end] != 0 {
+					end++
+				}
+				var s string
+				if end > 0 {
+					if copyStrings {
+						s = string(raw[:end])
+					} else {
+						s = unsafe.String(&raw[0], end)
+					}
+				}
+				dst[i] = HeapVal{Kind: ValString, Str: s}
+			}
+			off += 64
+		case ColFloat4:
+			off = alignUp(off, 4)
+			if off+4 > len(tup) {
+				return fmt.Errorf("%w: float4 out of bounds", ErrInvalidPage)
+			}
+			if want {
+				dst[i] = HeapVal{Kind: ValFloat64, F64: float64(math.Float32frombits(binary.LittleEndian.Uint32(tup[off : off+4])))}
+			}
+			off += 4
+		case ColBytea:
+			raw, nextOff, err := decodeVarlena(tup, off, want)
+			if err != nil {
+				return err
+			}
+			if want {
+				if copyStrings && len(raw) > 0 {
+					cp := make([]byte, len(raw))
+					copy(cp, raw)
+					dst[i] = HeapVal{Kind: ValBytes, Raw: cp}
+				} else {
+					dst[i] = HeapVal{Kind: ValBytes, Raw: raw}
+				}
+			}
+			off = nextOff
+		case ColInt4:
+			off = alignUp(off, 4)
+			if off+4 > len(tup) {
+				return fmt.Errorf("%w: int4 out of bounds", ErrInvalidPage)
+			}
+			if want {
+				dst[i] = HeapVal{Kind: ValInt64, I64: int64(int32(binary.LittleEndian.Uint32(tup[off : off+4])))}
+			}
+			off += 4
+		case ColInt8:
+			off = alignUp(off, 8)
+			if off+8 > len(tup) {
+				return fmt.Errorf("%w: int8 out of bounds", ErrInvalidPage)
+			}
+			if want {
+				dst[i] = HeapVal{Kind: ValInt64, I64: int64(binary.LittleEndian.Uint64(tup[off : off+8]))}
+			}
+			off += 8
+		case ColFloat8:
+			off = alignUp(off, 8)
+			if off+8 > len(tup) {
+				return fmt.Errorf("%w: float8 out of bounds", ErrInvalidPage)
+			}
+			if want {
+				dst[i] = HeapVal{Kind: ValFloat64, F64: math.Float64frombits(binary.LittleEndian.Uint64(tup[off : off+8]))}
+			}
+			off += 8
+		case ColText:
+			raw, nextOff, err := decodeVarlena(tup, off, want)
+			if err != nil {
+				return err
+			}
+			if want {
+				var s string
+				if len(raw) > 0 {
+					if copyStrings {
+						s = string(raw)
+					} else {
+						s = unsafe.String(&raw[0], len(raw))
+					}
+				}
+				dst[i] = HeapVal{Kind: ValString, Str: s}
+			}
+			off = nextOff
+		case ColDate:
+			off = alignUp(off, 4)
+			if off+4 > len(tup) {
+				return fmt.Errorf("%w: date out of bounds", ErrInvalidPage)
+			}
+			if want {
+				days := int32(binary.LittleEndian.Uint32(tup[off : off+4]))
+				dst[i] = HeapVal{Kind: ValString, Str: pgEpoch.AddDate(0, 0, int(days)).Format("2006-01-02")}
+			}
+			off += 4
+		case ColTimestamp:
+			off = alignUp(off, 8)
+			if off+8 > len(tup) {
+				return fmt.Errorf("%w: timestamp out of bounds", ErrInvalidPage)
+			}
+			if want {
+				usec := int64(binary.LittleEndian.Uint64(tup[off : off+8]))
+				t := pgEpoch.Add(time.Duration(usec) * time.Microsecond)
+				dst[i] = HeapVal{Kind: ValString, Str: t.Format("2006-01-02 15:04:05.999999")}
+			}
+			off += 8
+		case ColUUID:
+			if off+16 > len(tup) {
+				return fmt.Errorf("%w: uuid out of bounds", ErrInvalidPage)
+			}
+			if want {
+				u := tup[off : off+16]
+				dst[i] = HeapVal{Kind: ValString, Str: fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+					binary.BigEndian.Uint32(u[0:4]),
+					binary.BigEndian.Uint16(u[4:6]),
+					binary.BigEndian.Uint16(u[6:8]),
+					binary.BigEndian.Uint16(u[8:10]),
+					u[10:16])}
+			}
+			off += 16
+		default:
+			return fmt.Errorf("%w: column %d type %d", ErrUnsupportedType, i, ct)
+		}
+	}
+	return nil
 }
 
 // BTPageOpaque represents PostgreSQL 17 BTPageOpaqueData (16 bytes at pd_special).

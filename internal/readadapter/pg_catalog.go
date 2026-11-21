@@ -48,11 +48,25 @@ var (
 		ColChar, // 5: datlocprovider
 		ColBool, // 6: datistemplate
 		ColBool, // 7: datallowconn
-		ColBool, // 8: dathasloginevt
+		ColBool, // 8: dathasloginevt (PG17+)
 		ColInt4, // 9: datconnlimit
 		ColOID,  // 10: datfrozenxid
 		ColOID,  // 11: datminmxid
 		ColOID,  // 12: dattablespace
+	}
+
+	pgDatabaseColsPG15 = []ColumnType{
+		ColOID,  // 1: oid
+		ColName, // 2: datname
+		ColOID,  // 3: datdba
+		ColInt4, // 4: encoding
+		ColChar, // 5: datlocprovider
+		ColBool, // 6: datistemplate
+		ColBool, // 7: datallowconn
+		ColInt4, // 8: datconnlimit (PG15: no dathasloginevt)
+		ColOID,  // 9: datfrozenxid
+		ColOID,  // 10: datminmxid
+		ColOID,  // 11: dattablespace
 	}
 
 	pgNamespaceCols = []ColumnType{
@@ -99,6 +113,28 @@ var (
 		ColChar, // 16: attidentity
 		ColChar, // 17: attgenerated
 		ColBool, // 18: attisdropped
+	}
+
+	pgAttributeColsPG15 = []ColumnType{
+		ColOID,  // 1: attrelid
+		ColName, // 2: attname
+		ColOID,  // 3: atttypid
+		ColInt4, // 4: attstattarget (PG15)
+		ColInt2, // 5: attlen
+		ColInt2, // 6: attnum
+		ColInt4, // 7: attndims (int4 in PG15)
+		ColInt4, // 8: attcacheoff
+		ColInt4, // 9: atttypmod
+		ColBool, // 10: attbyval
+		ColChar, // 11: attalign
+		ColChar, // 12: attstorage
+		ColChar, // 13: attcompression
+		ColBool, // 14: attnotnull
+		ColBool, // 15: atthasdef
+		ColBool, // 16: atthasmissing
+		ColChar, // 17: attidentity
+		ColChar, // 18: attgenerated
+		ColBool, // 19: attisdropped
 	}
 )
 
@@ -170,7 +206,13 @@ func scanCatalogRelation(
 				if !vis {
 					continue
 				}
-				vals, err := DecodeHeapColumns(tup, thdr, cols)
+				decodeCols := cols
+				if relNumber == PGDatabaseRelID && (thdr.Infomask2&HeapNattsMask) == 16 {
+					decodeCols = pgDatabaseColsPG15
+				} else if relNumber == PGAttributeRelID && (thdr.Infomask2&HeapNattsMask) == 26 {
+					decodeCols = pgAttributeColsPG15
+				}
+				vals, err := DecodeHeapColumns(tup, thdr, decodeCols)
 				if err != nil {
 					continue
 				}
@@ -209,8 +251,14 @@ func DiscoverCatalog(
 		name, _ := r[1].(string)
 		oid, _ := r[0].(uint32)
 		spc := PGDefaultTablespaceOID
-		if s, ok := r[11].(uint32); ok && s != 0 {
-			spc = s
+		spcIdx := 11
+		if len(r) == len(pgDatabaseColsPG15) {
+			spcIdx = 10
+		}
+		if spcIdx < len(r) {
+			if s, ok := r[spcIdx].(uint32); ok && s != 0 {
+				spc = s
+			}
 		}
 		if name == dbName {
 			dbOID = oid
@@ -293,13 +341,19 @@ func DiscoverCatalog(
 		if !ok {
 			continue
 		}
-		attNum, _ := r[4].(int16)
+		attNumIdx := 4
+		droppedIdx := 17
+		if len(r) == len(pgAttributeColsPG15) {
+			attNumIdx = 5
+			droppedIdx = 18
+		}
+		attNum, _ := r[attNumIdx].(int16)
 		if attNum <= 0 {
 			continue
 		}
 		attName, _ := r[1].(string)
 		attTypID, _ := r[2].(uint32)
-		isDropped, _ := r[17].(bool)
+		isDropped, _ := r[droppedIdx].(bool)
 		colType, sqliteType := PGTypeOIDToColumnType(attTypID)
 		tbl.Columns = append(tbl.Columns, DiscoveredColumn{
 			Name:       attName,

@@ -266,7 +266,11 @@ type pgVTabCursor struct {
 	nextBlock  uint32
 	neededCols []bool
 	filters    []vtabFilter
-	pageRows   [][]any
+	rowStride  int
+	rows       []HeapVal
+	numRows    int
+	rowBuf     []HeapVal
+	lpBuf      []LinePointer
 	pageRowIdx int
 	rowid      int64
 	eof        bool
@@ -463,9 +467,10 @@ func (cur *pgVTabCursor) resetResources() {
 		cur.ownsSnap = false
 	}
 	cur.ctx = nil
-	cur.neededCols = nil
-	cur.filters = nil
-	cur.pageRows = nil
+	cur.neededCols = cur.neededCols[:0]
+	cur.filters = cur.filters[:0]
+	cur.rows = cur.rows[:0]
+	cur.numRows = 0
 	cur.pageRowIdx = 0
 }
 
@@ -481,80 +486,47 @@ func goAirPGClose(cursorID C.ulonglong) C.int {
 	return C.SQLITE_OK
 }
 
-func toFloat64(v any) (float64, bool) {
-	switch n := v.(type) {
-	case int16:
-		return float64(n), true
-	case int32:
-		return float64(n), true
-	case int64:
-		return float64(n), true
-	case uint32:
-		return float64(n), true
-	case float64:
-		return n, true
-	case bool:
-		if n {
-			return 1, true
-		}
-		return 0, true
+func heapValToFloat64(v HeapVal) (float64, bool) {
+	switch v.Kind {
+	case ValInt64, ValBool, ValByte:
+		return float64(v.I64), true
+	case ValFloat64:
+		return v.F64, true
 	default:
 		return 0, false
 	}
 }
 
-func toInt64(v any) (int64, bool) {
-	switch n := v.(type) {
-	case int16:
-		return int64(n), true
-	case int32:
-		return int64(n), true
-	case int64:
-		return n, true
-	case uint32:
-		return int64(n), true
-	case bool:
-		if n {
-			return 1, true
-		}
-		return 0, true
+func heapValToInt64(v HeapVal) (int64, bool) {
+	switch v.Kind {
+	case ValInt64, ValBool, ValByte:
+		return v.I64, true
 	default:
 		return 0, false
 	}
 }
 
-func toStringVal(v any) (string, bool) {
-	switch s := v.(type) {
-	case string:
-		return s, true
-	case byte:
-		return string([]byte{s}), true
-	default:
-		return "", false
-	}
-}
-
-func evalFilter(f vtabFilter, val any) bool {
+func evalFilterVal(f vtabFilter, val HeapVal) bool {
 	switch f.op {
 	case int(C.SQLITE_INDEX_CONSTRAINT_ISNULL):
-		return val == nil
+		return val.Kind == ValNull
 	case int(C.SQLITE_INDEX_CONSTRAINT_ISNOTNULL):
-		return val != nil
+		return val.Kind != ValNull
 	}
-	if val == nil || f.valType == int(C.SQLITE_NULL) {
+	if val.Kind == ValNull || f.valType == int(C.SQLITE_NULL) {
 		return false
 	}
 
 	var cmp int
 	switch f.valType {
 	case int(C.SQLITE_INTEGER):
-		if iv, ok := toInt64(val); ok {
+		if iv, ok := heapValToInt64(val); ok {
 			if iv < f.intVal {
 				cmp = -1
 			} else if iv > f.intVal {
 				cmp = 1
 			}
-		} else if fv, ok := toFloat64(val); ok {
+		} else if fv, ok := heapValToFloat64(val); ok {
 			target := float64(f.intVal)
 			if fv < target {
 				cmp = -1
@@ -562,10 +534,10 @@ func evalFilter(f vtabFilter, val any) bool {
 				cmp = 1
 			}
 		} else {
-			return true // let SQLite evaluate cross-type affinity
+			return true
 		}
 	case int(C.SQLITE_FLOAT):
-		if fv, ok := toFloat64(val); ok {
+		if fv, ok := heapValToFloat64(val); ok {
 			if fv < f.floatVal {
 				cmp = -1
 			} else if fv > f.floatVal {
@@ -575,11 +547,20 @@ func evalFilter(f vtabFilter, val any) bool {
 			return true
 		}
 	case int(C.SQLITE_TEXT):
-		if sv, ok := toStringVal(val); ok {
-			if sv < f.strVal {
+		if val.Kind == ValString {
+			if val.Str < f.strVal {
 				cmp = -1
-			} else if sv > f.strVal {
+			} else if val.Str > f.strVal {
 				cmp = 1
+			}
+		} else if val.Kind == ValByte {
+			b := byte(val.I64)
+			if len(f.strVal) == 0 || b > f.strVal[0] {
+				cmp = 1
+			} else if b < f.strVal[0] {
+				cmp = -1
+			} else if len(f.strVal) > 1 {
+				cmp = -1
 			}
 		} else {
 			return true
@@ -604,12 +585,12 @@ func evalFilter(f vtabFilter, val any) bool {
 	}
 }
 
-func (cur *pgVTabCursor) matchesFilters(vals []any) bool {
+func (cur *pgVTabCursor) matchesFilters(vals []HeapVal) bool {
 	for _, f := range cur.filters {
 		if f.allColIdx < 0 || f.allColIdx >= len(vals) {
 			continue
 		}
-		if !evalFilter(f, vals[f.allColIdx]) {
+		if !evalFilterVal(f, vals[f.allColIdx]) {
 			return false
 		}
 	}
@@ -617,12 +598,20 @@ func (cur *pgVTabCursor) matchesFilters(vals []any) bool {
 }
 
 func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
-	cur.pageRows = nil
+	cur.rows = cur.rows[:0]
+	cur.numRows = 0
 	cur.pageRowIdx = 0
+	ncols := len(cur.spec.AllCols)
+	cur.rowStride = ncols
+	if cap(cur.rowBuf) < ncols {
+		cur.rowBuf = make([]HeapVal, ncols)
+	} else {
+		cur.rowBuf = cur.rowBuf[:ncols]
+	}
 
 	var decodedColsPerTuple uint64
 	if cur.neededCols == nil {
-		decodedColsPerTuple = uint64(len(cur.spec.AllCols))
+		decodedColsPerTuple = uint64(ncols)
 	} else {
 		for _, need := range cur.neededCols {
 			if need {
@@ -655,8 +644,8 @@ func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			lps := ParseLinePointers(pd.Data, phdr)
-			for _, lp := range lps {
+			cur.lpBuf = ParseLinePointersInto(pd.Data, phdr, cur.lpBuf)
+			for _, lp := range cur.lpBuf {
 				if lp.Flags != LPNormal {
 					continue
 				}
@@ -677,20 +666,23 @@ func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 				if !vis {
 					continue
 				}
-				vals, err := DecodeHeapColumnsProjected(tup, thdr, cur.spec.AllCols, cur.neededCols)
-				if err != nil {
+				if err := DecodeHeapColumnsInto(tup, thdr, cur.spec.AllCols, cur.neededCols, cur.rowBuf, false); err != nil {
 					return err
 				}
 				vtabTuplesDecoded.Add(1)
 				vtabColsDecoded.Add(decodedColsPerTuple)
-				if !cur.matchesFilters(vals) {
+				if !cur.matchesFilters(cur.rowBuf) {
 					continue
 				}
+				for j := range cur.rowBuf {
+					cur.rowBuf[j].Materialize()
+				}
 				vtabRowsMatched.Add(1)
-				cur.pageRows = append(cur.pageRows, vals)
+				cur.rows = append(cur.rows, cur.rowBuf...)
+				cur.numRows++
 			}
 		}
-		if len(cur.pageRows) > 0 {
+		if cur.numRows > 0 {
 			return nil
 		}
 	}
@@ -889,7 +881,7 @@ func goAirPGNext(cursorID C.ulonglong) C.int {
 	}
 
 	cur.pageRowIdx++
-	if cur.pageRowIdx < len(cur.pageRows) {
+	if cur.pageRowIdx < cur.numRows {
 		cur.rowid++
 		return C.SQLITE_OK
 	}
@@ -925,7 +917,7 @@ func goAirPGColumn(cursorID C.ulonglong, ctx *C.sqlite3_context, colIdx C.int) C
 	cursorMu.RLock()
 	cur, ok := cursorMap[uint64(cursorID)]
 	cursorMu.RUnlock()
-	if !ok || cur == nil || cur.eof || cur.pageRowIdx >= len(cur.pageRows) {
+	if !ok || cur == nil || cur.eof || cur.pageRowIdx >= cur.numRows {
 		C.sqlite3_result_null(ctx)
 		return C.SQLITE_OK
 	}
@@ -934,54 +926,31 @@ func goAirPGColumn(cursorID C.ulonglong, ctx *C.sqlite3_context, colIdx C.int) C
 		C.sqlite3_result_null(ctx)
 		return C.SQLITE_OK
 	}
-	val := cur.pageRows[cur.pageRowIdx][cur.spec.VisibleIdx[idx]]
-	if val == nil {
+	val := &cur.rows[cur.pageRowIdx*cur.rowStride+cur.spec.VisibleIdx[idx]]
+	switch val.Kind {
+	case ValNull:
 		C.sqlite3_result_null(ctx)
-		return C.SQLITE_OK
-	}
-	switch v := val.(type) {
-	case bool:
-		if v {
-			C.sqlite3_result_int64(ctx, 1)
+	case ValBool, ValInt64:
+		C.sqlite3_result_int64(ctx, C.sqlite3_int64(val.I64))
+	case ValFloat64:
+		C.sqlite3_result_double(ctx, C.double(val.F64))
+	case ValByte:
+		b := byte(val.I64)
+		C.air_result_text_copy(ctx, (*C.char)(unsafe.Pointer(&b)), 1)
+	case ValString:
+		if len(val.Str) == 0 {
+			C.air_result_text_copy(ctx, (*C.char)(unsafe.Pointer(unsafe.StringData(""))), 0)
 		} else {
-			C.sqlite3_result_int64(ctx, 0)
+			C.air_result_text_copy(ctx, (*C.char)(unsafe.Pointer(unsafe.StringData(val.Str))), C.int(len(val.Str)))
 		}
-	case byte:
-		s := string([]byte{v})
-		cs := C.CString(s)
-		C.air_result_text_copy(ctx, cs, C.int(len(s)))
-		C.free(unsafe.Pointer(cs))
-	case int16:
-		C.sqlite3_result_int64(ctx, C.sqlite3_int64(v))
-	case int32:
-		C.sqlite3_result_int64(ctx, C.sqlite3_int64(v))
-	case int64:
-		C.sqlite3_result_int64(ctx, C.sqlite3_int64(v))
-	case uint32:
-		C.sqlite3_result_int64(ctx, C.sqlite3_int64(v))
-	case float64:
-		C.sqlite3_result_double(ctx, C.double(v))
-	case string:
-		if len(v) == 0 {
-			cs := C.CString("")
-			C.air_result_text_copy(ctx, cs, 0)
-			C.free(unsafe.Pointer(cs))
-		} else {
-			cs := C.CString(v)
-			C.air_result_text_copy(ctx, cs, C.int(len(v)))
-			C.free(unsafe.Pointer(cs))
-		}
-	case []byte:
-		if len(v) == 0 {
+	case ValBytes:
+		if len(val.Raw) == 0 {
 			C.air_result_blob_copy(ctx, nil, 0)
 		} else {
-			C.air_result_blob_copy(ctx, unsafe.Pointer(&v[0]), C.int(len(v)))
+			C.air_result_blob_copy(ctx, unsafe.Pointer(&val.Raw[0]), C.int(len(val.Raw)))
 		}
 	default:
-		s := fmt.Sprint(v)
-		cs := C.CString(s)
-		C.air_result_text_copy(ctx, cs, C.int(len(s)))
-		C.free(unsafe.Pointer(cs))
+		C.sqlite3_result_null(ctx)
 	}
 	return C.SQLITE_OK
 }

@@ -281,6 +281,12 @@ func applyHeapWALRecords(key Key, basePage []byte, records [][]byte) []byte {
 					}
 				}
 			}
+		} else if rec.Rmid == RmHeap2ID && (rec.Info&XLogHeapOpMask) == 0x40 {
+			// XLOG_HEAP2_VISIBLE: marks heap page PD_ALL_VISIBLE (0x0004) when base page is present.
+			if len(page) == PageSize {
+				flags := binary.LittleEndian.Uint16(page[10:12])
+				binary.LittleEndian.PutUint16(page[10:12], flags|0x0004)
+			}
 		} else if rec.Rmid == RmHeap2ID && (rec.Info&XLogHeapOpMask) == XLogHeap2MultiInsert {
 			blk := findWALBlock(rec, 0, key)
 			if blk == nil || len(rec.MainData) < 4 {

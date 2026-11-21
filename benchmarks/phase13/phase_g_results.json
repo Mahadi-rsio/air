@@ -1,0 +1,136 @@
+{
+  "tiers": [
+    {
+      "tier": "512MB",
+      "budget_mb": 512,
+      "single_tenant_50c": {
+        "rc": 0,
+        "tps": 3604.66,
+        "processed": 28708,
+        "failed": 0,
+        "error_rate": 0.0,
+        "p50_ms": 13.548,
+        "p95_ms": 22.519,
+        "p99_ms": 27.834,
+        "max_ms": 46.473
+      },
+      "cpu_pct": 172.9,
+      "rss_mb": {
+        "air_server": 175.9,
+        "air_read_engine": 18.0,
+        "air_gateway": 21.7,
+        "postgres_all_tenants": 218.2,
+        "total": 433.8
+      },
+      "cache_hit_ratio": 0.0,
+      "nvme_usage_mb": {
+        "pageserver_and_pgdata": 308.8,
+        "read_engine_l2_cache": 2.47
+      },
+      "multitenant_4x25c": {
+        "total_tps": 3404.9,
+        "max_error_rate": 0.0,
+        "per_tenant_tps": {
+          "pg_t0": 930.83,
+          "pg_t1": 812.46,
+          "pg_t2": 833.37,
+          "pg_t3": 828.24
+        },
+        "per_tenant_p99_ms": {
+          "pg_t0": 56.779,
+          "pg_t1": 56.779,
+          "pg_t2": 56.779,
+          "pg_t3": 56.779
+        }
+      }
+    },
+    {
+      "tier": "1GB",
+      "budget_mb": 1024,
+      "single_tenant_50c": {
+        "rc": 0,
+        "tps": 3712.25,
+        "processed": 29566,
+        "failed": 0,
+        "error_rate": 0.0,
+        "p50_ms": 13.151,
+        "p95_ms": 21.943,
+        "p99_ms": 26.989,
+        "max_ms": 47.721
+      },
+      "cpu_pct": 170.0,
+      "rss_mb": {
+        "air_server": 178.8,
+        "air_read_engine": 17.9,
+        "air_gateway": 21.6,
+        "postgres_all_tenants": 221.1,
+        "total": 439.4
+      },
+      "cache_hit_ratio": 0.0,
+      "nvme_usage_mb": {
+        "pageserver_and_pgdata": 308.8,
+        "read_engine_l2_cache": 2.47
+      },
+      "multitenant_4x25c": {
+        "total_tps": 3340.64,
+        "max_error_rate": 0.0,
+        "per_tenant_tps": {
+          "pg_t0": 862.36,
+          "pg_t1": 819.4,
+          "pg_t2": 823.32,
+          "pg_t3": 835.56
+        },
+        "per_tenant_p99_ms": {
+          "pg_t0": 58.215,
+          "pg_t1": 58.215,
+          "pg_t2": 58.215,
+          "pg_t3": 58.215
+        }
+      }
+    },
+    {
+      "tier": "2GB",
+      "budget_mb": 2048,
+      "single_tenant_50c": {
+        "rc": 0,
+        "tps": 3689.32,
+        "processed": 29376,
+        "failed": 0,
+        "error_rate": 0.0,
+        "p50_ms": 13.211,
+        "p95_ms": 22.289,
+        "p99_ms": 27.116,
+        "max_ms": 38.848
+      },
+      "cpu_pct": 171.7,
+      "rss_mb": {
+        "air_server": 163.6,
+        "air_read_engine": 18.1,
+        "air_gateway": 22.1,
+        "postgres_all_tenants": 205.8,
+        "total": 409.6
+      },
+      "cache_hit_ratio": 0.0,
+      "nvme_usage_mb": {
+        "pageserver_and_pgdata": 308.8,
+        "read_engine_l2_cache": 2.47
+      },
+      "multitenant_4x25c": {
+        "total_tps": 3418.15,
+        "max_error_rate": 0.0,
+        "per_tenant_tps": {
+          "pg_t0": 898.72,
+          "pg_t1": 851.0,
+          "pg_t2": 832.7,
+          "pg_t3": 835.73
+        },
+        "per_tenant_p99_ms": {
+          "pg_t0": 58.083,
+          "pg_t1": 58.083,
+          "pg_t2": 58.083,
+          "pg_t3": 58.083
+        }
+      }
+    }
+  ]
+}

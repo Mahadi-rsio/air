@@ -321,8 +321,7 @@ func (a *Adapter) ReadPages(ctx context.Context, h *RelationHandle, snap *ReadSn
 		if off+pageserver.PageSize > len(buf) {
 			break
 		}
-		p := make([]byte, pageserver.PageSize)
-		copy(p, buf[off:off+pageserver.PageSize])
+		p := buf[off : off+pageserver.PageSize]
 		var pageLSN uint64
 		if hdr, herr := ParsePageHeader(p); herr == nil {
 			pageLSN = hdr.LSN

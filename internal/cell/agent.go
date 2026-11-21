@@ -436,7 +436,20 @@ func (a *Agent) WriteTenantConfigs(tenantID string) error {
 	lfcMaxMB := a.lfcMaxMB
 	a.tenantMu.RUnlock()
 
-	sharedLibs := "supautils"
+	isPG15 := strings.Contains(filepath.Clean(a.pgBin), string(filepath.Separator)+"15"+string(filepath.Separator)) ||
+		strings.HasSuffix(filepath.Clean(a.pgBin), string(filepath.Separator)+"15")
+	hasSupautils := true
+	if isPG15 {
+		supaPath := filepath.Clean(filepath.Join(a.pgBin, "..", "lib", "supautils.so"))
+		if _, err := os.Stat(supaPath); err != nil {
+			hasSupautils = false
+		}
+	}
+
+	var sharedLibList []string
+	if hasSupautils {
+		sharedLibList = append(sharedLibList, "supautils")
+	}
 	smgrConf := ""
 	if psEnabled && psSocket != "" {
 		lfcDir, lfcErr := tenant.SafeSubpath(a.volDir, "lfc", tenantID)
@@ -446,11 +459,28 @@ func (a *Agent) WriteTenantConfigs(tenantID string) error {
 		if err := os.MkdirAll(lfcDir, 0o700); err != nil {
 			return err
 		}
-		sharedLibs = "supautils,air_smgr"
+		sharedLibList = append(sharedLibList, "air_smgr")
 		smgrConf = fmt.Sprintf(
 			"air_smgr.enabled = on\nair_smgr.pageserver_socket = '%s'\nair_smgr.tenant_id = '%s'\nair_smgr.lfc_dir = '%s'\nair_smgr.lfc_max_mb = %d\n",
 			psSocket, tenantID, lfcDir, lfcMaxMB,
 		)
+	}
+	sharedLibs := strings.Join(sharedLibList, ",")
+
+	summarizeLine := "summarize_wal = on\n"
+	if isPG15 {
+		summarizeLine = ""
+	}
+	supautilsConf := ""
+	if hasSupautils {
+		supautilsConf = `supautils.superuser = 'postgres'
+supautils.privileged_role = 'app_user'
+supautils.privileged_extensions = 'pg_stat_statements,pg_trgm'
+supautils.privileged_role_allowed_configs = 'session_replication_role'
+supautils.reserved_roles = 'postgres'
+supautils.reserved_memberships = 'pg_read_server_files,pg_write_server_files,pg_execute_server_program,postgres'
+supautils.restrict_extension_versions = 'error'
+`
 	}
 
 	conf := fmt.Sprintf(`listen_addresses = '127.0.0.1'
@@ -465,20 +495,12 @@ temp_file_limit = 32MB
 password_encryption = 'scram-sha-256'
 wal_level = replica
 min_wal_size = 32MB
-summarize_wal = on
-archive_mode = on
+%sarchive_mode = on
 archive_command = 'cp %%p %s/%%f'
 ssl = off
 logging_collector = off
 shared_preload_libraries = '%s'
-supautils.superuser = 'postgres'
-supautils.privileged_role = 'app_user'
-supautils.privileged_extensions = 'pg_stat_statements,pg_trgm'
-supautils.privileged_role_allowed_configs = 'session_replication_role'
-supautils.reserved_roles = 'postgres'
-supautils.reserved_memberships = 'pg_read_server_files,pg_write_server_files,pg_execute_server_program,postgres'
-supautils.restrict_extension_versions = 'error'
-%s`, port, sockDir, walSpoolDir, sharedLibs, smgrConf)
+%s%s`, port, sockDir, summarizeLine, walSpoolDir, sharedLibs, supautilsConf, smgrConf)
 	if err := os.WriteFile(filepath.Join(pgData, "postgresql.conf"), []byte(conf), 0o600); err != nil {
 		return err
 	}

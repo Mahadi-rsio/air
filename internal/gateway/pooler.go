@@ -481,10 +481,54 @@ func (p *TenantPool) tryExecuteOnReadEngine(st *clientSessionState, wireMsg []by
 		p.releaseReadBackend(rb, true)
 		return false, true
 	}
-	rstats, txStatus, hadErr, relayOK := relayUntilReady(rb, st.client)
-	if !relayOK {
+	firstT, firstBody, err := ReadPGPacket(rb.Conn)
+	if err != nil {
+		p.releaseReadBackend(rb, true)
+		return false, true
+	}
+	if firstT == 'E' {
+		// ReadEngine cannot serve this query (e.g. TOAST, MultiXact, unsupported type/SQL).
+		// Drain until ReadyForQuery ('Z') and safely fall back to PostgreSQL primary.
+		txStatus := byte('I')
+		for {
+			t, b, rerr := ReadPGPacket(rb.Conn)
+			if rerr != nil {
+				p.releaseReadBackend(rb, true)
+				return false, true
+			}
+			if t == 'Z' {
+				if len(b) > 0 {
+					txStatus = b[0]
+				}
+				break
+			}
+		}
+		p.releaseReadBackend(rb, txStatus != 'I')
+		return false, true
+	}
+	if _, err := st.client.Write(BuildPGMessage(firstT, firstBody)); err != nil {
 		p.releaseReadBackend(rb, true)
 		return false, false
+	}
+	var rstats relayStats
+	var txStatus byte = 'I'
+	var hadErr bool
+	if firstT == 'Z' {
+		if len(firstBody) > 0 {
+			txStatus = firstBody[0]
+		}
+	} else {
+		var relayOK bool
+		rstats, txStatus, hadErr, relayOK = relayUntilReady(rb, st.client)
+		if !relayOK {
+			p.releaseReadBackend(rb, true)
+			return false, false
+		}
+	}
+	rstats.bytesOut += uint64(5 + len(firstBody))
+	if firstT == 'D' {
+		rstats.rowsReturned++
+		rstats.dataRowBytes += uint64(len(firstBody))
 	}
 	st.txStatus = txStatus
 	p.releaseReadBackend(rb, hadErr || st.txStatus != 'I')

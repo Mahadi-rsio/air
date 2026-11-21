@@ -73,6 +73,25 @@ type l2Entry struct {
 	size int64
 }
 
+type relMetaKey struct {
+	TenantID   string
+	Generation string
+	SpcOID     uint32
+	DbOID      uint32
+	RelNumber  uint32
+	ForkNum    uint8
+	LSN        uint64
+}
+
+type relMetaVal struct {
+	existsKnown bool
+	exists      bool
+	sizeKnown   bool
+	nblocks     uint32
+}
+
+const maxRelMetaCacheEntries = 4096
+
 // TieredCacheBackend wraps an authoritative StorageBackend (L3 Pageserver)
 // with an L1 in-memory LRU cache and an L2 checksummed local NVMe disk cache.
 type TieredCacheBackend struct {
@@ -93,6 +112,9 @@ type TieredCacheBackend struct {
 	l2Bytes int64
 	l2List  *list.List
 	l2Map   map[PageCacheKey]*list.Element
+
+	metaMu  sync.Mutex
+	metaMap map[relMetaKey]relMetaVal
 
 	l1Hits             atomic.Uint64
 	l1Misses           atomic.Uint64
@@ -131,6 +153,7 @@ func NewTieredCacheBackend(l3 StorageBackend, cfg CacheConfig) (*TieredCacheBack
 		l1Map:      make(map[PageCacheKey]*list.Element),
 		l2List:     list.New(),
 		l2Map:      make(map[PageCacheKey]*list.Element),
+		metaMap:    make(map[relMetaKey]relMetaVal),
 	}, nil
 }
 
@@ -187,11 +210,67 @@ func (c *TieredCacheBackend) GetTenantGeneration(tenantID string) string {
 }
 
 func (c *TieredCacheBackend) GetRelSize(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) (uint32, error) {
-	return c.l3.GetRelSize(ctx, tenantID, spcOID, dbOID, relNumber, forkNum, lsn)
+	if lsn == 0 || lsn == ^uint64(0) {
+		return c.l3.GetRelSize(ctx, tenantID, spcOID, dbOID, relNumber, forkNum, lsn)
+	}
+	gen := c.l3.GetTenantGeneration(tenantID)
+	mk := relMetaKey{
+		TenantID: tenantID, Generation: gen,
+		SpcOID: spcOID, DbOID: dbOID, RelNumber: relNumber, ForkNum: forkNum, LSN: lsn,
+	}
+	c.metaMu.Lock()
+	if v, ok := c.metaMap[mk]; ok && v.sizeKnown {
+		c.metaMu.Unlock()
+		return v.nblocks, nil
+	}
+	c.metaMu.Unlock()
+
+	sz, err := c.l3.GetRelSize(ctx, tenantID, spcOID, dbOID, relNumber, forkNum, lsn)
+	if err != nil {
+		return 0, err
+	}
+	c.metaMu.Lock()
+	if len(c.metaMap) >= maxRelMetaCacheEntries {
+		clear(c.metaMap)
+	}
+	v := c.metaMap[mk]
+	v.sizeKnown = true
+	v.nblocks = sz
+	c.metaMap[mk] = v
+	c.metaMu.Unlock()
+	return sz, nil
 }
 
 func (c *TieredCacheBackend) GetRelExists(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) (bool, error) {
-	return c.l3.GetRelExists(ctx, tenantID, spcOID, dbOID, relNumber, forkNum, lsn)
+	if lsn == 0 || lsn == ^uint64(0) {
+		return c.l3.GetRelExists(ctx, tenantID, spcOID, dbOID, relNumber, forkNum, lsn)
+	}
+	gen := c.l3.GetTenantGeneration(tenantID)
+	mk := relMetaKey{
+		TenantID: tenantID, Generation: gen,
+		SpcOID: spcOID, DbOID: dbOID, RelNumber: relNumber, ForkNum: forkNum, LSN: lsn,
+	}
+	c.metaMu.Lock()
+	if v, ok := c.metaMap[mk]; ok && v.existsKnown {
+		c.metaMu.Unlock()
+		return v.exists, nil
+	}
+	c.metaMu.Unlock()
+
+	ex, err := c.l3.GetRelExists(ctx, tenantID, spcOID, dbOID, relNumber, forkNum, lsn)
+	if err != nil {
+		return false, err
+	}
+	c.metaMu.Lock()
+	if len(c.metaMap) >= maxRelMetaCacheEntries {
+		clear(c.metaMap)
+	}
+	v := c.metaMap[mk]
+	v.existsKnown = true
+	v.exists = ex
+	c.metaMap[mk] = v
+	c.metaMu.Unlock()
+	return ex, nil
 }
 
 func (c *TieredCacheBackend) GetPageAtLSN(ctx context.Context, tenantID string, key pageserver.Key, lsn uint64) ([]byte, error) {
@@ -286,9 +365,8 @@ func (c *TieredCacheBackend) GetPageBatch(ctx context.Context, tenantID string, 
 			BlockNum:   startBlock + i,
 			LSN:        lsn,
 		}
-		if pg, ok := c.getL1(ck); ok {
+		if c.getL1Into(ck, out[int(i)*PGPageSize:int(i+1)*PGPageSize]) {
 			c.l1Hits.Add(1)
-			copy(out[int(i)*PGPageSize:], pg)
 			cached[i] = true
 			continue
 		}
@@ -407,6 +485,22 @@ func (c *TieredCacheBackend) invalidateWhere(pred func(PageCacheKey) bool) {
 		}
 		c.l2Mu.Unlock()
 	}
+
+	c.metaMu.Lock()
+	for mk := range c.metaMap {
+		if pred(PageCacheKey{
+			TenantID:   mk.TenantID,
+			Generation: mk.Generation,
+			SpcOID:     mk.SpcOID,
+			DbOID:      mk.DbOID,
+			RelNumber:  mk.RelNumber,
+			ForkNum:    mk.ForkNum,
+			LSN:        mk.LSN,
+		}) {
+			delete(c.metaMap, mk)
+		}
+	}
+	c.metaMu.Unlock()
 }
 
 // Stats returns a point-in-time snapshot of L1/L2/L3 cache counters.
@@ -450,6 +544,20 @@ func (c *TieredCacheBackend) getL1(k PageCacheKey) ([]byte, bool) {
 	cp := make([]byte, len(src))
 	copy(cp, src)
 	return cp, true
+}
+
+func (c *TieredCacheBackend) getL1Into(k PageCacheKey, dst []byte) bool {
+	c.l1Mu.Lock()
+	defer c.l1Mu.Unlock()
+
+	elem, ok := c.l1Map[k]
+	if !ok {
+		return false
+	}
+	c.l1List.MoveToFront(elem)
+	src := elem.Value.(*l1Entry).data
+	copy(dst, src)
+	return true
 }
 
 func (c *TieredCacheBackend) putL1(k PageCacheKey, pg []byte) {

@@ -9,6 +9,7 @@ import (
 // PostgreSQL 17 WAL constants (access/xlog_internal.h, access/xlogrecord.h).
 const (
 	XLogPageMagic     uint16 = 0xD116
+	XLogPageMagicPG15 uint16 = 0xD110
 	XLogPageSize      int    = 8192
 	SizeOfXLogRecord  int    = 24
 	SizeOfShortPHD    int    = 24
@@ -301,7 +302,7 @@ func ParseWALPages(data []byte) ([]*DecodedWALRecord, error) {
 	for pageOff := 0; pageOff < len(data); pageOff += XLogPageSize {
 		page := data[pageOff : pageOff+XLogPageSize]
 		magic := binary.LittleEndian.Uint16(page[0:2])
-		if magic != XLogPageMagic {
+		if magic != XLogPageMagic && magic != XLogPageMagicPG15 {
 			return out, fmt.Errorf("%w: got 0x%04x at offset %d", ErrInvalidWALMagic, magic, pageOff)
 		}
 		info := binary.LittleEndian.Uint16(page[2:4])
@@ -405,7 +406,7 @@ func (p *WALStreamParser) Push(chunk []byte) ([]*DecodedWALRecord, error) {
 				p.inPage = false
 				continue
 			}
-			if magic != XLogPageMagic {
+			if magic != XLogPageMagic && magic != XLogPageMagicPG15 {
 				return out, fmt.Errorf("%w: got 0x%04x", ErrInvalidWALMagic, magic)
 			}
 			info := binary.LittleEndian.Uint16(p.buf[2:4])

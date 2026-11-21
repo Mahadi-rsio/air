@@ -83,10 +83,15 @@ type ReadServerMetrics struct {
 	GlobalLSN           uint64            `json:"global_lsn"`
 	ActiveTenants       int               `json:"active_tenants"`
 	PerTenantQueries    map[string]uint64 `json:"per_tenant_queries"`
-	VTabPagesRead       uint64            `json:"vtab_pages_read"`
-	VTabTuplesDecoded   uint64            `json:"vtab_tuples_decoded"`
-	VTabColsDecoded     uint64            `json:"vtab_cols_decoded"`
-	VTabRowsMatched     uint64            `json:"vtab_rows_matched"`
+	VTabPagesRead            uint64            `json:"vtab_pages_read"`
+	VTabTuplesDecoded        uint64            `json:"vtab_tuples_decoded"`
+	VTabColsDecoded          uint64            `json:"vtab_cols_decoded"`
+	VTabRowsMatched          uint64            `json:"vtab_rows_matched"`
+	ToastFallbacks           uint64            `json:"toast_fallbacks"`
+	MultiXactFallbacks       uint64            `json:"multixact_fallbacks"`
+	UnsupportedTypeFallbacks uint64            `json:"unsupported_type_fallbacks"`
+	TotalFallbacks           uint64            `json:"total_fallbacks"`
+	FallbackReasons          map[string]uint64 `json:"fallback_reasons,omitempty"`
 }
 
 // SQLiteReadServer is a shared, multi-tenant SQLite read-only execution server
@@ -117,10 +122,15 @@ type SQLiteReadServer struct {
 	queriesFailed       atomic.Uint64
 	queriesCancelled    atomic.Uint64
 	activeQueries       atomic.Int64
-	writesBlocked       atomic.Uint64
-	snapshotAcqFailures atomic.Uint64
-	globalLSN           atomic.Uint64
-	connSeq             atomic.Uint32
+	writesBlocked            atomic.Uint64
+	snapshotAcqFailures      atomic.Uint64
+	toastFallbacks           atomic.Uint64
+	multixactFallbacks       atomic.Uint64
+	unsupportedTypeFallbacks atomic.Uint64
+	otherFallbacks           atomic.Uint64
+	totalFallbacks           atomic.Uint64
+	globalLSN                atomic.Uint64
+	connSeq                  atomic.Uint32
 
 	latMu  sync.Mutex
 	latBuf [1024]float64
@@ -279,27 +289,66 @@ func (s *SQLiteReadServer) DetailedMetrics() ReadServerMetrics {
 	}
 	pagesRead, tuplesDecoded, colsDecoded, rowsMatched := VTabStats()
 
+	toastFB := s.toastFallbacks.Load()
+	mxFB := s.multixactFallbacks.Load()
+	utFB := s.unsupportedTypeFallbacks.Load()
+	otherFB := s.otherFallbacks.Load()
+	totalFB := s.totalFallbacks.Load()
+	var fbReasons map[string]uint64
+	if totalFB > 0 {
+		fbReasons = map[string]uint64{
+			"toast":            toastFB,
+			"multixact":        mxFB,
+			"unsupported_type": utFB,
+			"other":            otherFB,
+		}
+	}
+
 	return ReadServerMetrics{
-		QueriesTotal:        succeeded + failed + cancelled,
-		QueriesSucceeded:    succeeded,
-		QueriesFailed:       failed,
-		QueriesCancelled:    cancelled,
-		WritesBlocked:       s.writesBlocked.Load(),
-		ActiveQueries:       s.activeQueries.Load(),
-		LatencyP50Ms:        p50,
-		LatencyP95Ms:        p95,
-		LatencyP99Ms:        p99,
-		Cache:               cacheStats,
-		Pageserver:          psStats,
-		ActiveSnapshots:     activeSnaps,
-		SnapshotAcqFailures: s.snapshotAcqFailures.Load(),
-		GlobalLSN:           s.globalLSN.Load(),
-		ActiveTenants:       activeTenants,
-		PerTenantQueries:    perTenant,
-		VTabPagesRead:       pagesRead,
-		VTabTuplesDecoded:   tuplesDecoded,
-		VTabColsDecoded:     colsDecoded,
-		VTabRowsMatched:     rowsMatched,
+		QueriesTotal:             succeeded + failed + cancelled,
+		QueriesSucceeded:         succeeded,
+		QueriesFailed:            failed,
+		QueriesCancelled:         cancelled,
+		WritesBlocked:            s.writesBlocked.Load(),
+		ActiveQueries:            s.activeQueries.Load(),
+		LatencyP50Ms:             p50,
+		LatencyP95Ms:             p95,
+		LatencyP99Ms:             p99,
+		Cache:                    cacheStats,
+		Pageserver:               psStats,
+		ActiveSnapshots:          activeSnaps,
+		SnapshotAcqFailures:      s.snapshotAcqFailures.Load(),
+		GlobalLSN:                s.globalLSN.Load(),
+		ActiveTenants:            activeTenants,
+		PerTenantQueries:         perTenant,
+		VTabPagesRead:            pagesRead,
+		VTabTuplesDecoded:        tuplesDecoded,
+		VTabColsDecoded:          colsDecoded,
+		VTabRowsMatched:          rowsMatched,
+		ToastFallbacks:           toastFB,
+		MultiXactFallbacks:       mxFB,
+		UnsupportedTypeFallbacks: utFB,
+		TotalFallbacks:           totalFB,
+		FallbackReasons:          fbReasons,
+	}
+}
+
+func (s *SQLiteReadServer) recordQueryError(err error) {
+	if err == nil {
+		return
+	}
+	if errors.Is(err, ErrTOASTUnsupported) {
+		s.toastFallbacks.Add(1)
+		s.totalFallbacks.Add(1)
+	} else if errors.Is(err, ErrMultiXactUnsupported) {
+		s.multixactFallbacks.Add(1)
+		s.totalFallbacks.Add(1)
+	} else if errors.Is(err, ErrUnsupportedType) {
+		s.unsupportedTypeFallbacks.Add(1)
+		s.totalFallbacks.Add(1)
+	} else if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		s.otherFallbacks.Add(1)
+		s.totalFallbacks.Add(1)
 	}
 }
 
@@ -1219,6 +1268,7 @@ func (s *SQLiteReadServer) refreshNativeCatalogOnSlot(ctx context.Context, ts *S
 		}
 		vid, err := slot.conn.RegisterNativeTable(ts.TenantID, snap.Generation, tbl, s.nativeAdapter, s.nativeCLOG)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "[air-read-engine] RegisterNativeTable(%s) failed: %v\n", tbl.Name, err)
 			continue
 		}
 		slot.vtabIDs[tbl.Name] = vid
@@ -1294,6 +1344,7 @@ func (s *SQLiteReadServer) executeReaderQuery(ctx context.Context, ts *SQLiteTen
 					s.queriesCancelled.Add(1)
 				} else {
 					s.queriesFailed.Add(1)
+					s.recordQueryError(err)
 				}
 				return nil, err
 			}
@@ -1302,6 +1353,7 @@ func (s *SQLiteReadServer) executeReaderQuery(ctx context.Context, ts *SQLiteTen
 
 		if rerr := s.refreshNativeCatalogWithSnap(ctx, ts, snap); rerr != nil {
 			s.queriesFailed.Add(1)
+			s.recordQueryError(rerr)
 			return nil, rerr
 		}
 	}
@@ -1312,6 +1364,7 @@ func (s *SQLiteReadServer) executeReaderQuery(ctx context.Context, ts *SQLiteTen
 			s.queriesCancelled.Add(1)
 		} else {
 			s.queriesFailed.Add(1)
+			s.recordQueryError(err)
 		}
 		return nil, err
 	}
