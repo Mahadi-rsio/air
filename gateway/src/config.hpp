@@ -30,6 +30,9 @@ struct Config {
     int max_tenant_client_conns = 128;
     int max_user_client_conns = 0;
     int discovery_interval_ms = 2000;
+    std::string read_engine_host = "127.0.0.1";
+    std::string read_engine_sock_dir;
+    int read_engine_port = 0;
 
     static std::string env_or(const char* key, const std::string& fallback);
     static bool env_bool(const char* key, bool fallback);

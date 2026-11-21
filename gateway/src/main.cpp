@@ -95,6 +95,7 @@ int main(int argc, char** argv) {
               << ", max_client_conns=" << cfg.max_client_conns
               << ", max_tenant_client_conns=" << cfg.max_tenant_client_conns
               << ", max_user_client_conns=" << cfg.max_user_client_conns
+              << ", read_engine=" << (cfg.read_engine_port > 0 ? (cfg.read_engine_host + ":" + std::to_string(cfg.read_engine_port)) : "disabled")
               << ", require_tls=" << (cfg.require_tls ? "true" : "false") << ")" << std::endl;
 
     std::atomic<int> active_clients{0};

@@ -95,6 +95,7 @@ public:
     void set_wake_fn(WakeFn fn);
     void update_endpoint(const std::string& host, const std::string& sock_dir,
                          int port, const std::string& app_password);
+    void set_read_engine_endpoint(const std::string& host, const std::string& sock_dir, int port);
     void set_max_backends(int max_backends);
 
     PoolTenantSnapshot snapshot();
@@ -129,6 +130,11 @@ private:
     int port_ = 0;
     std::string app_password_;
     std::vector<std::unique_ptr<BackendConn>> idle_pool_;
+    std::string read_host_;
+    std::string read_sock_dir_;
+    int read_port_ = 0;
+    std::vector<std::unique_ptr<BackendConn>> read_idle_pool_;
+    RoutingMetrics routing_metrics_;
     WakeFn wake_fn_;
 
     std::mutex sem_mu_;
@@ -139,11 +145,15 @@ private:
     std::atomic<uint64_t> client_seq_{0};
     std::atomic<int64_t> pinned_clients_{0};
     std::atomic<int64_t> active_tx_count_{0};
+    std::atomic<uint64_t> read_engine_lsn_{0};
+    std::atomic<bool> read_engine_healthy_{true};
 
     bool acquire_slot(std::string& err_out);
     void release_slot();
     std::unique_ptr<BackendConn> acquire_backend(uint64_t client_id, std::string& err_out);
     void release_backend(std::unique_ptr<BackendConn> b, bool dirty);
+    std::unique_ptr<BackendConn> acquire_read_backend(uint64_t client_id, std::string& err_out);
+    void release_read_backend(std::unique_ptr<BackendConn> b, bool dirty);
     std::unique_ptr<BackendConn> dial_and_startup(const std::string& host,
                                                   const std::string& sock_dir,
                                                   int port,
@@ -175,6 +185,12 @@ private:
                                   std::chrono::steady_clock::time_point q_start,
                                   bool& had_err_out,
                                   bool& io_ok_out);
+    bool try_execute_on_read_engine(ClientSessionState& st,
+                                    const std::vector<uint8_t>& wire_msg,
+                                    uint64_t bytes_in,
+                                    std::chrono::steady_clock::time_point q_start,
+                                    bool& executed_out,
+                                    bool& io_ok_out);
     bool handle_simple_query(ClientSessionState& st, const std::vector<uint8_t>& mbody);
     bool handle_extended_batch(ClientSessionState& st,
                                char terminator_type,
@@ -182,6 +198,8 @@ private:
                                std::vector<std::pair<char, std::vector<uint8_t>>>& ext_batch,
                                size_t& ext_batch_bytes);
 
+    static uint64_t parse_pg_lsn(const std::string& s);
+    static bool query_lsn_backend(BackendConn* b, const char* sql, uint64_t& lsn_out);
     static bool exec_simple_backend(BackendConn* b, const std::string& sql);
     static bool drain_until_ready_backend(BackendConn* b);
     static bool relay_copy_in(BackendConn* b, Stream& client);
@@ -199,6 +217,7 @@ class PoolManager {
 public:
     explicit PoolManager(int max_backends, int idle_timeout_sec = 300);
 
+    void set_read_engine_endpoint(const std::string& host, const std::string& sock_dir, int port);
     std::shared_ptr<TenantPool> get_or_create(const TenantRoute& route, TenantPool::WakeFn wake_fn);
     size_t evict_expired_idle();
     void upsert_discovered(const TenantRoute& route);
@@ -212,6 +231,9 @@ private:
     int max_backends_;
     int idle_timeout_sec_;
     mutable std::mutex mu_;
+    std::string read_host_;
+    std::string read_sock_dir_;
+    int read_port_ = 0;
     std::unordered_map<std::string, std::shared_ptr<TenantPool>> pools_;
 };
 

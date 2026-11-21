@@ -102,6 +102,7 @@ struct TenantPool::ClientSessionState {
     bool in_tx_counted = false;
     bool session_pinned = false;
     bool backend_in_flight = false;
+    uint64_t session_write_lsn = 0;
 };
 
 TenantPool::TenantPool(std::string tenant_id, std::string host, std::string sock_dir,
@@ -380,6 +381,45 @@ bool TenantPool::execute_simple_and_relay(ClientSessionState& st,
     return true;
 }
 
+bool TenantPool::try_execute_on_read_engine(ClientSessionState& st,
+                                            const std::vector<uint8_t>& wire_msg,
+                                            uint64_t bytes_in,
+                                            std::chrono::steady_clock::time_point q_start,
+                                            bool& executed_out,
+                                            bool& io_ok_out) {
+    executed_out = false;
+    io_ok_out = true;
+    auto wait_start = std::chrono::steady_clock::now();
+    std::string err;
+    auto rb = acquire_read_backend(st.client_id, err);
+    uint64_t pool_wait_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - wait_start)
+            .count());
+    if (!rb) {
+        return true; // Fall back to WriteEngine.
+    }
+    if (!ensure_session_and_stmts(rb.get(), st)) {
+        release_read_backend(std::move(rb), true);
+        return true; // Fall back to WriteEngine.
+    }
+    if (!rb->stream.write_all(wire_msg)) {
+        release_read_backend(std::move(rb), true);
+        return true; // Fall back to WriteEngine.
+    }
+    bool had_err = false;
+    RelayStats rstats;
+    if (!relay_until_ready(rb.get(), st.client, st.tx_status, had_err, &rstats)) {
+        release_read_backend(std::move(rb), true);
+        io_ok_out = false;
+        return false;
+    }
+    release_read_backend(std::move(rb), had_err || st.tx_status != 'I');
+    record_query_metrics(st, q_start, pool_wait_us, bytes_in, rstats, had_err, 1);
+    executed_out = true;
+    return true;
+}
+
 bool TenantPool::handle_simple_query(ClientSessionState& st, const std::vector<uint8_t>& mbody) {
     auto q_start = std::chrono::steady_clock::now();
     uint64_t bytes_in = 5 + mbody.size();
@@ -461,7 +501,9 @@ bool TenantPool::handle_simple_query(ClientSessionState& st, const std::vector<u
         }
     } else {
         std::vector<uint8_t> out_body = mbody;
+        bool is_exec_stmt = false;
         if (std::regex_match(trimmed, sm, sqlparse::re_execute_stmt())) {
+            is_exec_stmt = true;
             auto it = st.client_stmts.find(sm[2].str());
             if (it != st.client_stmts.end()) {
                 std::string rewritten = sm[1].str() + it->second.global_name + sm[3].str();
@@ -469,8 +511,58 @@ bool TenantPool::handle_simple_query(ClientSessionState& st, const std::vector<u
                 append_cstr(out_body, rewritten);
             }
         }
-        if (!execute_simple_and_relay(st, build_pg_message('Q', out_body), bytes_in, q_start, had_err, io_ok)) {
-            return io_ok;
+        bool routed_to_read = false;
+        int rport = 0;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            rport = read_port_;
+        }
+        if (!is_exec_stmt && !st.session_pinned && st.tx_status == 'I' && !st.current_backend && rport > 0) {
+            uint64_t rlsn = read_engine_lsn_.load(std::memory_order_relaxed);
+            if (st.session_write_lsn > 0 && rlsn < st.session_write_lsn) {
+                std::string lerr;
+                if (auto rb = acquire_read_backend(st.client_id, lerr)) {
+                    uint64_t fresh = 0;
+                    if (query_lsn_backend(rb.get(),
+                            "SELECT COALESCE(pg_last_wal_replay_lsn(), pg_current_wal_lsn())::text", fresh)) {
+                        rlsn = fresh;
+                        read_engine_lsn_.store(fresh, std::memory_order_relaxed);
+                    }
+                    read_engine_healthy_.store(true, std::memory_order_relaxed);
+                    release_read_backend(std::move(rb), false);
+                } else {
+                    read_engine_healthy_.store(false, std::memory_order_relaxed);
+                }
+            }
+            RoutingContext rctx;
+            rctx.session_pinned = st.session_pinned;
+            rctx.in_transaction = (st.tx_status != 'I');
+            rctx.read_engine_healthy = read_engine_healthy_.load(std::memory_order_relaxed);
+            rctx.session_write_lsn = st.session_write_lsn;
+            rctx.read_engine_lsn = rlsn;
+            RouteDecision rdec = route_query(trimmed, rctx, &routing_metrics_);
+            if (rdec.target == RouteTarget::ReadEngine) {
+                if (!try_execute_on_read_engine(st, build_pg_message('Q', out_body),
+                                                bytes_in, q_start, routed_to_read, io_ok)) {
+                    return io_ok;
+                }
+                if (!routed_to_read) {
+                    record_fallback_to_write(&routing_metrics_);
+                }
+            }
+        }
+        if (!routed_to_read) {
+            if (!execute_simple_and_relay(st, build_pg_message('Q', out_body), bytes_in, q_start, had_err, io_ok)) {
+                return io_ok;
+            }
+            if (rport > 0 && !had_err && st.tx_status == 'I' && st.current_backend &&
+                classify_sql_for_routing(trimmed).target == RouteTarget::WriteEngine) {
+                uint64_t wlsn = 0;
+                if (query_lsn_backend(st.current_backend.get(), "SELECT pg_current_wal_lsn()::text", wlsn) &&
+                    wlsn > st.session_write_lsn) {
+                    st.session_write_lsn = wlsn;
+                }
+            }
         }
     }
 
@@ -899,6 +991,45 @@ std::unique_ptr<BackendConn> TenantPool::dial_and_startup(const std::string& hos
     }
 }
 
+uint64_t TenantPool::parse_pg_lsn(const std::string& s) {
+    auto slash = s.find('/');
+    if (slash == std::string::npos || slash == 0 || slash + 1 >= s.size()) return 0;
+    try {
+        uint64_t hi = std::stoull(s.substr(0, slash), nullptr, 16);
+        uint64_t lo = std::stoull(s.substr(slash + 1), nullptr, 16);
+        return (hi << 32) | (lo & 0xffffffffULL);
+    } catch (...) {
+        return 0;
+    }
+}
+
+bool TenantPool::query_lsn_backend(BackendConn* b, const char* sql, uint64_t& lsn_out) {
+    lsn_out = 0;
+    if (!b || !b->stream.write_all(build_simple_query(sql))) return false;
+    bool ok = false;
+    while (true) {
+        char t = 0;
+        std::vector<uint8_t> body;
+        if (!read_pg_packet(b->stream, t, body)) return false;
+        if (t == 'D' && body.size() >= 6) {
+            uint16_t ncols = read_be16(body.data());
+            if (ncols >= 1) {
+                int32_t flen = static_cast<int32_t>(read_be32(body.data() + 2));
+                if (flen > 0 && static_cast<size_t>(6 + flen) <= body.size()) {
+                    std::string val(reinterpret_cast<const char*>(body.data() + 6),
+                                    static_cast<size_t>(flen));
+                    lsn_out = parse_pg_lsn(val);
+                    ok = (lsn_out > 0);
+                }
+            }
+        } else if (t == 'E') {
+            ok = false;
+        } else if (t == 'Z') {
+            return ok;
+        }
+    }
+}
+
 bool TenantPool::exec_simple_backend(BackendConn* b, const std::string& sql) {
     if (!b->stream.write_all(build_simple_query(sql))) return false;
     return drain_until_ready_backend(b);
@@ -1005,6 +1136,16 @@ PoolManager::PoolManager(int max_backends, int idle_timeout_sec)
     : max_backends_(max_backends),
       idle_timeout_sec_(idle_timeout_sec > 0 ? idle_timeout_sec : 300) {}
 
+void PoolManager::set_read_engine_endpoint(const std::string& host, const std::string& sock_dir, int port) {
+    std::lock_guard<std::mutex> lk(mu_);
+    read_host_ = host;
+    read_sock_dir_ = sock_dir;
+    read_port_ = port;
+    for (auto& [_, p] : pools_) {
+        if (p) p->set_read_engine_endpoint(host, sock_dir, port);
+    }
+}
+
 std::shared_ptr<TenantPool> PoolManager::get_or_create(const TenantRoute& route,
                                                        TenantPool::WakeFn wake_fn) {
     std::lock_guard<std::mutex> lk(mu_);
@@ -1016,6 +1157,9 @@ std::shared_ptr<TenantPool> PoolManager::get_or_create(const TenantRoute& route,
     auto p = std::make_shared<TenantPool>(
         route.tenant_id, route.host, route.sock_dir, route.port, route.app_password,
         max_backends_, idle_timeout_sec_);
+    if (read_port_ > 0 || !read_sock_dir_.empty()) {
+        p->set_read_engine_endpoint(read_host_, read_sock_dir_, read_port_);
+    }
     p->set_wake_fn(std::move(wake_fn));
     pools_[route.tenant_id] = p;
     return p;

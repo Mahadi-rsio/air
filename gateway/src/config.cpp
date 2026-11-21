@@ -69,6 +69,9 @@ Config Config::load(int argc, char** argv) {
     c.max_tenant_client_conns = env_int("AIR_MAX_TENANT_CLIENT_CONNS", c.max_tenant_client_conns);
     c.max_user_client_conns = env_int("AIR_MAX_USER_CLIENT_CONNS", c.max_user_client_conns);
     c.discovery_interval_ms = env_int("AIR_DISCOVERY_INTERVAL_MS", c.discovery_interval_ms);
+    c.read_engine_host = env_or("AIR_READ_ENGINE_HOST", c.read_engine_host);
+    c.read_engine_sock_dir = env_or("AIR_READ_ENGINE_SOCK_DIR", "");
+    c.read_engine_port = env_int_min("AIR_READ_ENGINE_PORT", c.read_engine_port, 0);
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -95,6 +98,9 @@ Config Config::load(int argc, char** argv) {
         else if (arg == "--max-client-conns") parse_int_arg(i, argc, argv, c.max_client_conns);
         else if (arg == "--max-tenant-client-conns") parse_int_arg(i, argc, argv, c.max_tenant_client_conns);
         else if (arg == "--max-user-client-conns") parse_int_arg(i, argc, argv, c.max_user_client_conns);
+        else if (arg == "--read-engine-host") next_val(c.read_engine_host);
+        else if (arg == "--read-engine-sock-dir") next_val(c.read_engine_sock_dir);
+        else if (arg == "--read-engine-port") parse_int_arg(i, argc, argv, c.read_engine_port);
     }
 
     if (c.meta_dsn.empty()) {
