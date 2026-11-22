@@ -1,0 +1,307 @@
+syntax = "proto3";
+
+package air.pageserver.v1;
+
+option go_package = "github.com/Mahadi-rsio/air/internal/pb;pb";
+
+service PageserverService {
+  // Health & introspection
+  rpc Health(PageserverEmpty) returns (PageserverHealthResponse);
+  rpc GetTenantInfo(PageserverTenantRequest) returns (PageserverTenantInfoResponse);
+
+  // Data plane (used by air-read-engine and remote air_smgr proxies)
+  rpc GetPageAtLSN(GetPageAtLSNRequest) returns (GetPageResponse);
+  rpc GetPageBatch(GetPageBatchRequest) returns (GetPageBatchResponse);
+  rpc GetRelSize(GetRelRequest) returns (GetRelSizeResponse);
+  rpc GetRelExists(GetRelRequest) returns (GetRelExistsResponse);
+  rpc GetDBSize(GetDBSizeRequest) returns (GetDBSizeResponse);
+  rpc PutPageBatch(PutPageBatchRequest) returns (PageserverStatusResponse);
+  rpc UnlinkRel(UnlinkRelRequest) returns (PageserverStatusResponse);
+  rpc GetSLRUPage(GetSLRUPageRequest) returns (GetPageResponse);
+  rpc GetModifiedBlocksSince(GetModifiedBlocksRequest) returns (GetModifiedBlocksResponse);
+
+  // Control plane lifecycle (used by air-server)
+  rpc SetTenantGeneration(SetTenantGenerationRequest) returns (PageserverStatusResponse);
+  rpc EnsureTenant(EnsureTenantRequest) returns (EnsureTenantResponse);
+  rpc FlushTenant(PageserverTenantRequest) returns (FlushTenantResponse);
+  rpc FlushAll(PageserverEmpty) returns (PageserverStatusResponse);
+  rpc PurgeTenant(PurgeTenantRequest) returns (PageserverStatusResponse);
+  rpc IngestWALRecords(IngestWALRecordsRequest) returns (IngestWALRecordsResponse);
+  rpc BootstrapTenantFromPGData(BootstrapTenantRequest) returns (BootstrapTenantResponse);
+  rpc HasMetadataSkeleton(PageserverTenantRequest) returns (PageserverBoolResponse);
+  rpc SaveMetadataSkeleton(SaveSkeletonRequest) returns (PageserverStatusResponse);
+  rpc RestoreMetadataSkeleton(RestoreSkeletonRequest) returns (PageserverStatusResponse);
+  rpc SetRelSizes(SetRelSizesRequest) returns (PageserverStatusResponse);
+  rpc SeedSLRUPages(SeedSLRUPagesRequest) returns (PageserverStatusResponse);
+}
+
+message PageserverEmpty {}
+
+message PageserverHealthResponse {
+  string status = 1;
+  string service = 2;
+  int32 active_tenants = 3;
+}
+
+message PageserverStatusResponse {
+  string status = 1;
+  string tenant_id = 2;
+}
+
+message PageserverBoolResponse {
+  bool value = 1;
+}
+
+message PageserverTenantRequest {
+  string tenant_id = 1;
+}
+
+message PageserverTenantInfoResponse {
+  string tenant_id = 1;
+  string generation = 2;
+  uint64 last_lsn = 3;
+  bool exists = 4;
+}
+
+message StorageKey {
+  uint32 kind = 1;
+  uint32 fork_num = 2;
+  uint32 reserved = 3;
+  uint32 spc_oid = 4;
+  uint32 db_oid = 5;
+  uint32 rel_number = 6;
+  uint32 block_num = 7;
+  uint32 extra = 8;
+}
+
+message GetPageAtLSNRequest {
+  string tenant_id = 1;
+  StorageKey key = 2;
+  uint64 lsn = 3;
+}
+
+message GetPageResponse {
+  bytes page = 1;
+  bool found = 2;
+}
+
+message GetPageBatchRequest {
+  string tenant_id = 1;
+  uint32 spc_oid = 2;
+  uint32 db_oid = 3;
+  uint32 rel_number = 4;
+  uint32 fork_num = 5;
+  uint32 start_block = 6;
+  uint32 nblocks = 7;
+  uint64 lsn = 8;
+}
+
+message GetPageBatchResponse {
+  bytes pages = 1;
+  uint32 nblocks_returned = 2;
+}
+
+message GetRelRequest {
+  string tenant_id = 1;
+  uint32 spc_oid = 2;
+  uint32 db_oid = 3;
+  uint32 rel_number = 4;
+  uint32 fork_num = 5;
+  uint64 lsn = 6;
+}
+
+message GetRelSizeResponse {
+  uint32 nblocks = 1;
+}
+
+message GetRelExistsResponse {
+  bool exists = 1;
+}
+
+message GetDBSizeRequest {
+  string tenant_id = 1;
+  uint32 spc_oid = 2;
+  uint32 db_oid = 3;
+  uint64 lsn = 4;
+}
+
+message GetDBSizeResponse {
+  uint64 size_bytes = 1;
+}
+
+message PutPageBatchRequest {
+  string tenant_id = 1;
+  uint32 spc_oid = 2;
+  uint32 db_oid = 3;
+  uint32 rel_number = 4;
+  uint32 fork_num = 5;
+  uint32 start_block = 6;
+  uint32 nblocks = 7;
+  uint64 lsn = 8;
+  bytes pages = 9;
+}
+
+message UnlinkRelRequest {
+  string tenant_id = 1;
+  uint32 spc_oid = 2;
+  uint32 db_oid = 3;
+  uint32 rel_number = 4;
+  uint32 fork_num = 5;
+  uint64 lsn = 6;
+}
+
+message GetSLRUPageRequest {
+  string tenant_id = 1;
+  uint32 kind = 2;
+  uint32 block_num = 3;
+  uint64 lsn = 4;
+}
+
+message GetModifiedBlocksRequest {
+  string tenant_id = 1;
+  uint64 since_lsn = 2;
+}
+
+message ModifiedBlockEventMsg {
+  uint32 spc_oid = 1;
+  uint32 db_oid = 2;
+  uint32 rel_number = 3;
+  uint32 fork_num = 4;
+  uint32 block_num = 5;
+  uint64 lsn = 6;
+  bool is_rel_wide = 7;
+}
+
+message GetModifiedBlocksResponse {
+  uint64 current_lsn = 1;
+  uint64 catalog_lsn = 2;
+  bool reset_required = 3;
+  repeated ModifiedBlockEventMsg events = 4;
+}
+
+message SetTenantGenerationRequest {
+  string tenant_id = 1;
+  string generation = 2;
+}
+
+message EnsureTenantRequest {
+  string tenant_id = 1;
+  int64 epoch = 2;
+  string generation = 3;
+  bool load_from_r2 = 4;
+  string wrapped_dek = 5;
+}
+
+message EnsureTenantResponse {
+  string tenant_id = 1;
+  uint64 last_lsn = 2;
+  string generation = 3;
+}
+
+message FlushTenantResponse {
+  string tenant_id = 1;
+  bool flushed = 2;
+  string file_name = 3;
+  uint64 start_lsn = 4;
+  uint64 end_lsn = 5;
+}
+
+message PurgeTenantRequest {
+  string tenant_id = 1;
+  string generation = 2;
+}
+
+message WALRecordBlockMsg {
+  uint32 block_id = 1;
+  uint32 spc_oid = 2;
+  uint32 db_oid = 3;
+  uint32 rel_number = 4;
+  uint32 fork_num = 5;
+  uint32 block_num = 6;
+  bool will_init = 7;
+  bool has_image = 8;
+  bool has_data = 9;
+  bool image_apply = 10;
+  uint32 image_info = 11;
+  uint32 hole_offset = 12;
+  uint32 hole_length = 13;
+  bytes image_payload = 14;
+  bytes block_data = 15;
+}
+
+message WALRecordMsg {
+  uint64 lsn = 1;
+  uint64 end_lsn = 2;
+  uint32 total_len = 3;
+  uint32 xid = 4;
+  uint64 prev_lsn = 5;
+  uint32 info = 6;
+  uint32 rmid = 7;
+  uint32 crc = 8;
+  bytes main_data = 9;
+  repeated WALRecordBlockMsg blocks = 10;
+  bytes raw_record = 11;
+}
+
+message IngestWALRecordsRequest {
+  string tenant_id = 1;
+  int64 epoch = 2;
+  string generation = 3;
+  repeated WALRecordMsg records = 4;
+  bool flush_if_needed = 5;
+}
+
+message IngestWALRecordsResponse {
+  int32 applied = 1;
+  uint64 last_lsn = 2;
+}
+
+message BootstrapTenantRequest {
+  string tenant_id = 1;
+  int64 epoch = 2;
+  string pg_data_dir = 3;
+  uint64 init_lsn = 4;
+}
+
+message BootstrapTenantResponse {
+  string tenant_id = 1;
+  bool bootstrapped = 2;
+  uint64 init_lsn = 3;
+}
+
+message SaveSkeletonRequest {
+  string tenant_id = 1;
+  int64 epoch = 2;
+  string pg_data_dir = 3;
+}
+
+message RestoreSkeletonRequest {
+  string tenant_id = 1;
+  int64 epoch = 2;
+  string pg_data_dir = 3;
+}
+
+message RelSizeEntry {
+  uint32 spc_oid = 1;
+  uint32 db_oid = 2;
+  uint32 rel_number = 3;
+  uint32 fork_num = 4;
+  uint32 nblocks = 5;
+  uint64 lsn = 6;
+}
+
+message SetRelSizesRequest {
+  string tenant_id = 1;
+  repeated RelSizeEntry entries = 2;
+}
+
+message SLRUPageEntry {
+  uint32 kind = 1;
+  uint32 block_num = 2;
+  bytes page = 3;
+}
+
+message SeedSLRUPagesRequest {
+  string tenant_id = 1;
+  repeated SLRUPageEntry entries = 2;
+}

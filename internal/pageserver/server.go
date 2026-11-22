@@ -16,19 +16,20 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-// Config configures the in-process AIR Pageserver.
+// Config configures the AIR Pageserver.
 type Config struct {
-	SocketPath    string
-	LayerDir      string
-	CacheDir      string
-	CacheMaxBytes int64
-	WalRedoBin    string
-	S3Client      *s3.Client
-	R2Bucket      string
-	KMS           *crypto.EnvelopeKMS
+	SocketPath        string
+	DisableUnixSocket bool
+	LayerDir          string
+	CacheDir          string
+	CacheMaxBytes     int64
+	WalRedoBin        string
+	S3Client          *s3.Client
+	R2Bucket          string
+	KMS               *crypto.EnvelopeKMS
 }
 
-// Pageserver manages multi-tenant Timelines and serves air_smgr over a Unix socket.
+// Pageserver manages multi-tenant Timelines and serves air_smgr over a Unix socket and/or gRPC.
 type Pageserver struct {
 	cfg     Config
 	store   *LayerStore
@@ -41,9 +42,9 @@ type Pageserver struct {
 	generations map[string]string
 }
 
-// New creates a Pageserver instance. Call Start(ctx) to bind the Unix socket.
+// New creates a Pageserver instance. Call Start(ctx) to bind the Unix socket if enabled.
 func New(cfg Config) (*Pageserver, error) {
-	if cfg.SocketPath == "" {
+	if !cfg.DisableUnixSocket && cfg.SocketPath == "" {
 		cfg.SocketPath = "/var/lib/air/pageserver.sock"
 	}
 	if cfg.CacheMaxBytes <= 0 {
@@ -68,18 +69,26 @@ func New(cfg Config) (*Pageserver, error) {
 		generations: make(map[string]string),
 	}
 	store.SetGenerationChecker(ps.isGenerationActive)
-	ps.unixSrv = NewUnixServer(cfg.SocketPath, ps)
+	if !cfg.DisableUnixSocket && cfg.SocketPath != "" {
+		ps.unixSrv = NewUnixServer(cfg.SocketPath, ps)
+	}
 	return ps, nil
 }
 
-// Start binds the Unix domain socket and begins serving air_smgr requests.
+// Start binds the Unix domain socket (if enabled) and begins serving air_smgr requests.
 func (p *Pageserver) Start(ctx context.Context) error {
+	if p.unixSrv == nil {
+		return nil
+	}
 	return p.unixSrv.Start(ctx)
 }
 
 // Close shuts down the Unix socket server and WAL redo worker pool.
 func (p *Pageserver) Close() error {
-	err := p.unixSrv.Close()
+	var err error
+	if p.unixSrv != nil {
+		err = p.unixSrv.Close()
+	}
 	if c, ok := p.redoer.(io.Closer); ok {
 		_ = c.Close()
 	}

@@ -693,7 +693,7 @@ func (cp *ControlPlane) activateRestoredTenant(ctx context.Context, accountID, n
 	}
 
 	if ps := cp.getPageserver(); ps != nil {
-		ps.SetTenantGeneration(newTenantID, newGen)
+		ps.SetTenantGeneration(ctx, newTenantID, newGen)
 		initLSN := cp.readPGControlLSN(targetPGData)
 		if initLSN == 0 {
 			initLSN = 1

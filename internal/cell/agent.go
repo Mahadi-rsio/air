@@ -483,7 +483,11 @@ supautils.restrict_extension_versions = 'error'
 `
 	}
 
-	conf := fmt.Sprintf(`listen_addresses = '127.0.0.1'
+	listenAddr := strings.TrimSpace(os.Getenv("AIR_PG_LISTEN_ADDRESSES"))
+	if listenAddr == "" {
+		listenAddr = "127.0.0.1"
+	}
+	conf := fmt.Sprintf(`listen_addresses = '%s'
 port = %d
 unix_socket_directories = '%s'
 max_connections = 100
@@ -500,20 +504,24 @@ archive_command = 'cp %%p %s/%%f'
 ssl = off
 logging_collector = off
 shared_preload_libraries = '%s'
-%s%s`, port, sockDir, summarizeLine, walSpoolDir, sharedLibs, supautilsConf, smgrConf)
+%s%s`, listenAddr, port, sockDir, summarizeLine, walSpoolDir, sharedLibs, supautilsConf, smgrConf)
 	if err := os.WriteFile(filepath.Join(pgData, "postgresql.conf"), []byte(conf), 0o600); err != nil {
 		return err
 	}
 
-	hba := `
+	hbaHost := "127.0.0.1/32"
+	if listenAddr != "127.0.0.1" {
+		hbaHost = "0.0.0.0/0"
+	}
+	hba := fmt.Sprintf(`
 local   all             postgres                                trust
 local   replication     postgres                                trust
 local   all             app_user                                password
-host    all             postgres        127.0.0.1/32            reject
-host    all             all             127.0.0.1/32            scram-sha-256
-host    replication     postgres        127.0.0.1/32            reject
-host    replication     all             127.0.0.1/32            scram-sha-256
-`
+host    all             postgres        %s            reject
+host    all             all             %s            scram-sha-256
+host    replication     postgres        %s            reject
+host    replication     all             %s            scram-sha-256
+`, hbaHost, hbaHost, hbaHost, hbaHost)
 	if err := os.WriteFile(filepath.Join(pgData, "pg_hba.conf"), []byte(strings.TrimSpace(hba)+"\n"), 0o600); err != nil {
 		return err
 	}

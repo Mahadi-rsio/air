@@ -31,8 +31,10 @@ type SQLiteServerConfig struct {
 	PrimaryConnInfo               string
 	CacheKB                       int
 	Adapter                       *Adapter
-	PageserverSocket              string
-	NativeBackend                 StorageBackend
+	PageserverSocket        string
+	PageserverGRPCAddr      string
+	PageserverInternalToken string
+	NativeBackend           StorageBackend
 	NativeSnapProv                SnapshotProvider
 	CacheDir                      string
 	L1CacheBytes                  int64
@@ -132,6 +134,7 @@ type SQLiteReadServer struct {
 	nativeAdapter   *Adapter
 	nativeCLOG      *CLOGResolver
 	nativeSock      *PageserverSocketBackend
+	nativeGRPC      *PageserverGRPCBackend
 	nativeCache     *TieredCacheBackend
 	statsCache      *StatsCache
 	adaptiveTracker *AdaptiveTracker
@@ -220,10 +223,23 @@ func NewSQLiteReadServer(cfg SQLiteServerConfig) (*SQLiteReadServer, error) {
 		sessions: make(map[uint32]context.CancelFunc),
 		stopCh:   make(chan struct{}),
 	}
-	if cfg.NativeBackend != nil || cfg.PageserverSocket != "" {
+	if cfg.NativeBackend != nil || cfg.PageserverGRPCAddr != "" || cfg.PageserverSocket != "" {
 		backend := cfg.NativeBackend
 		snapProv := cfg.NativeSnapProv
-		if backend == nil {
+		if backend == nil && cfg.PageserverGRPCAddr != "" {
+			grpcBackend, gErr := NewPageserverGRPCBackend(PageserverGRPCConfig{
+				Addr:          cfg.PageserverGRPCAddr,
+				InternalToken: cfg.PageserverInternalToken,
+			})
+			if gErr != nil {
+				return nil, fmt.Errorf("init pageserver gRPC backend: %w", gErr)
+			}
+			s.nativeGRPC = grpcBackend
+			backend = grpcBackend
+			if snapProv == nil {
+				snapProv = grpcBackend
+			}
+		} else if backend == nil {
 			sock := NewPageserverSocketBackend(cfg.PageserverSocket)
 			s.nativeSock = sock
 			backend = sock
@@ -340,7 +356,9 @@ func (s *SQLiteReadServer) DetailedMetrics() ReadServerMetrics {
 		cacheStats = s.nativeCache.Stats()
 	}
 	var psStats PageserverSocketStats
-	if s.nativeSock != nil {
+	if s.nativeGRPC != nil {
+		psStats = s.nativeGRPC.Stats()
+	} else if s.nativeSock != nil {
 		psStats = s.nativeSock.Stats()
 	}
 	var activeSnaps int
@@ -604,6 +622,9 @@ func (s *SQLiteReadServer) Stop() error {
 	}
 	if s.nativeSock != nil {
 		_ = s.nativeSock.Close()
+	}
+	if s.nativeGRPC != nil {
+		_ = s.nativeGRPC.Close()
 	}
 	return nil
 }

@@ -34,6 +34,7 @@ type Config struct {
 	ReadEngineHost       string
 	ReadEngineSockDir    string
 	ReadEnginePort       int
+	ReadEngineGRPCAddr   string
 }
 
 // DefaultConfig returns a Config initialized with default values.
@@ -112,6 +113,7 @@ func LoadConfig(args []string) Config {
 	c.ReadEngineHost = envOr("AIR_READ_ENGINE_HOST", c.ReadEngineHost)
 	c.ReadEngineSockDir = envOr("AIR_READ_ENGINE_SOCK_DIR", "")
 	c.ReadEnginePort = envIntMin("AIR_READ_ENGINE_PORT", c.ReadEnginePort, 0)
+	c.ReadEngineGRPCAddr = envOr("AIR_READ_ENGINE_GRPC_ADDR", "")
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -176,6 +178,8 @@ func LoadConfig(args []string) Config {
 			nextStr(&c.ReadEngineSockDir)
 		case "--read-engine-port":
 			nextInt(&c.ReadEnginePort)
+		case "--read-engine-grpc-addr":
+			nextStr(&c.ReadEngineGRPCAddr)
 		}
 	}
 

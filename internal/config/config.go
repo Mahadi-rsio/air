@@ -43,6 +43,7 @@ type Config struct {
 	EvictOnSuspend     bool
 	PageserverEnabled  bool
 	PageserverSocket   string
+	PageserverGRPCAddr string
 	PageserverCacheMB  int
 }
 
@@ -96,6 +97,7 @@ func Load(args []string) (Config, error) {
 	cfg.R2SecretAccessKey = envOr("AIR_R2_SECRET_ACCESS_KEY", cfg.R2SecretAccessKey)
 	cfg.R2Region = envOr("AIR_R2_REGION", cfg.R2Region)
 	cfg.PageserverSocket = envOr("AIR_PAGESERVER_SOCKET", filepath.Join(cfg.DataDir, "pageserver.sock"))
+	cfg.PageserverGRPCAddr = envOr("AIR_PAGESERVER_GRPC_ADDR", cfg.PageserverGRPCAddr)
 	if v := strings.TrimSpace(os.Getenv("AIR_PAGESERVER_ENABLED")); v != "" {
 		cfg.PageserverEnabled = v == "1" || strings.EqualFold(v, "true")
 	}
@@ -165,6 +167,7 @@ func Load(args []string) (Config, error) {
 	fs.BoolVar(&cfg.EvictOnSuspend, "evict-on-suspend", cfg.EvictOnSuspend, "Evict local tenant pgdata cache after cold data is safely uploaded to R2")
 	fs.BoolVar(&cfg.PageserverEnabled, "pageserver", cfg.PageserverEnabled, "Enable in-process AIR Pageserver over Unix socket")
 	fs.StringVar(&cfg.PageserverSocket, "pageserver-socket", cfg.PageserverSocket, "Unix socket path for AIR Pageserver")
+	fs.StringVar(&cfg.PageserverGRPCAddr, "pageserver-grpc-addr", cfg.PageserverGRPCAddr, "Remote standalone AIR Pageserver gRPC address")
 	fs.IntVar(&cfg.PageserverCacheMB, "pageserver-cache-mb", cfg.PageserverCacheMB, "Bounded LRU disk cache size in MB for Pageserver")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err

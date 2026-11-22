@@ -405,7 +405,7 @@ func (cp *ControlPlane) processColdOffloadJob(ctx context.Context, job coldOfflo
 	ps := cp.getPageserver()
 	if ps != nil {
 		if curGen != "" {
-			ps.SetTenantGeneration(job.tenantID, curGen)
+			ps.SetTenantGeneration(offloadCtx, job.tenantID, curGen)
 		}
 		lm, fErr := ps.FlushTenant(offloadCtx, job.tenantID)
 		if fErr != nil {
@@ -422,7 +422,7 @@ func (cp *ControlPlane) processColdOffloadJob(ctx context.Context, job coldOfflo
 		}
 		if pgDataDir, pdErr := cp.agent.TenantPGDataDir(job.tenantID); pdErr == nil {
 			if _, stErr := os.Stat(filepath.Join(pgDataDir, "PG_VERSION")); stErr == nil {
-				if _, sErr := ps.SaveMetadataSkeleton(offloadCtx, job.tenantID, epoch, pgDataDir); sErr != nil {
+				if sErr := ps.SaveMetadataSkeleton(offloadCtx, job.tenantID, epoch, pgDataDir); sErr != nil {
 					if offloadCtx.Err() != nil && ctx.Err() == nil {
 						return false, uploaded, failed, true, nil
 					}

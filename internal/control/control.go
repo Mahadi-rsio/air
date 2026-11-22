@@ -107,7 +107,7 @@ type ControlPlane struct {
 	evictOnSuspend       bool
 	internalToken        string
 	backendHost          string
-	pageserver           *pageserver.Pageserver
+	pageserver           PageserverClient
 	psMu                 sync.RWMutex
 	wakeGroup            singleflight.Group
 	tenantLocksMu        sync.Mutex
@@ -277,11 +277,22 @@ func (cp *ControlPlane) SetBackupStore(s3c *s3.Client, bucket string) {
 // SetPageserver attaches an in-process AIR Pageserver for layer flushing and wake coordination.
 func (cp *ControlPlane) SetPageserver(ps *pageserver.Pageserver) {
 	cp.psMu.Lock()
-	cp.pageserver = ps
+	if ps == nil {
+		cp.pageserver = nil
+	} else {
+		cp.pageserver = NewLocalPageserverClient(ps)
+	}
 	cp.psMu.Unlock()
 }
 
-func (cp *ControlPlane) getPageserver() *pageserver.Pageserver {
+// SetPageserverClient attaches a PageserverClient (local or remote gRPC) to ControlPlane.
+func (cp *ControlPlane) SetPageserverClient(psc PageserverClient) {
+	cp.psMu.Lock()
+	cp.pageserver = psc
+	cp.psMu.Unlock()
+}
+
+func (cp *ControlPlane) getPageserver() PageserverClient {
 	cp.psMu.RLock()
 	defer cp.psMu.RUnlock()
 	return cp.pageserver
@@ -339,13 +350,8 @@ func (cp *ControlPlane) preloadPageserverTenant(ctx context.Context, tenantID st
 	if ps == nil {
 		return
 	}
-	if gen := cp.getTenantGeneration(ctx, tenantID); gen != "" {
-		ps.SetTenantGeneration(tenantID, gen)
-	}
-	tl := ps.EnsureTenant(tenantID, epoch)
-	if tl.LastLSN() == 0 {
-		_ = tl.LoadLayersFromR2(ctx)
-	}
+	gen := cp.getTenantGeneration(ctx, tenantID)
+	_, _ = ps.EnsureTenant(ctx, tenantID, epoch, gen, true, wrappedDEK)
 }
 
 func (cp *ControlPlane) ensurePageserverBootstrapAndWAL(ctx context.Context, tenantID string, rt *cell.TenantRuntime) error {
@@ -354,11 +360,12 @@ func (cp *ControlPlane) ensurePageserverBootstrapAndWAL(ctx context.Context, ten
 		return nil
 	}
 
-	tl := ps.EnsureTenant(tenantID, rt.FencingEpoch)
-	if tl.LastLSN() == 0 {
-		_ = tl.LoadLayersFromR2(ctx)
+	gen := cp.getTenantGeneration(ctx, tenantID)
+	lastLSN, err := ps.EnsureTenant(ctx, tenantID, rt.FencingEpoch, gen, true, "")
+	if err != nil {
+		return err
 	}
-	if tl.LastLSN() == 0 && rt.PGData != "" && rt.SockDir != "" && rt.Port > 0 {
+	if lastLSN == 0 && rt.PGData != "" && rt.SockDir != "" && rt.Port > 0 {
 		connStr := fmt.Sprintf("host=%s port=%d user=postgres dbname=postgres", rt.SockDir, rt.Port)
 		connCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		conn, err := pgx.Connect(connCtx, connStr)
@@ -387,6 +394,7 @@ func (cp *ControlPlane) ensurePageserverBootstrapAndWAL(ctx context.Context, ten
 		if _, err := ps.BootstrapTenantFromPGData(ctx, tenantID, rt.FencingEpoch, rt.PGData, initLSN); err != nil {
 			return fmt.Errorf("bootstrap pageserver from pgdata: %w", err)
 		}
+		lastLSN = initLSN
 	}
 
 	if rt.SockDir == "" || rt.Port <= 0 {
@@ -398,7 +406,7 @@ func (cp *ControlPlane) ensurePageserverBootstrapAndWAL(ctx context.Context, ten
 	rxCtx, rxCancel := context.WithCancel(context.Background())
 	doneCh := make(chan struct{})
 	dsn := fmt.Sprintf("host=%s port=%d user=postgres dbname=postgres replication=database", rt.SockDir, rt.Port)
-	rx := pageserver.NewWALReceiver(dsn, tl, tl.LastLSN())
+	rx := ps.NewWALReceiver(dsn, tenantID, rt.FencingEpoch, gen, lastLSN)
 
 	cp.walMu.Lock()
 	if cp.walReceivers == nil {
@@ -605,7 +613,7 @@ func (cp *ControlPlane) ProvisionDatabase(ctx context.Context, accountID, idempo
 	gen := newGenerationID()
 
 	if ps := cp.getPageserver(); ps != nil {
-		ps.SetTenantGeneration(tenantID, gen)
+		ps.SetTenantGeneration(ctx, tenantID, gen)
 		var pgDataDir string
 		if activeDir, pdErr := cp.agent.TenantPGDataDir(tenantID); pdErr == nil {
 			if _, statErr := os.Stat(filepath.Join(activeDir, "PG_VERSION")); statErr == nil {
@@ -1015,7 +1023,7 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 			tenantID,
 		)
 		if ps := cp.getPageserver(); ps != nil && generation != "" {
-			ps.SetTenantGeneration(tenantID, generation)
+			ps.SetTenantGeneration(ctx, tenantID, generation)
 		}
 		wakeTotalStart := time.Now()
 		hasLocal := cp.agent.HasLocalPGData(tenantID)
@@ -1030,7 +1038,7 @@ func (cp *ControlPlane) WakeTenant(ctx context.Context, tenantID string) (direct
 				if pdErr != nil {
 					return nil, pdErr
 				}
-				if _, rErr := ps.RestoreMetadataSkeleton(ctx, tenantID, epoch, pgDataDir); rErr != nil {
+				if rErr := ps.RestoreMetadataSkeleton(ctx, tenantID, epoch, pgDataDir); rErr != nil {
 					return nil, fmt.Errorf("restore metadata skeleton for %s: %w", tenantID, rErr)
 				}
 			} else {
@@ -1178,7 +1186,7 @@ func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drai
 			uploaded++
 		}
 		if pgDataDir, pdErr := cp.agent.TenantPGDataDir(tenantID); pdErr == nil {
-			if _, sErr := ps.SaveMetadataSkeleton(ctx, tenantID, epoch, pgDataDir); sErr != nil {
+			if sErr := ps.SaveMetadataSkeleton(ctx, tenantID, epoch, pgDataDir); sErr != nil {
 				cp.finishOffloadOpFailed(ctx, opID, uploaded, 1, 0, sErr.Error())
 				return fmt.Errorf("save metadata skeleton for %s: %w", tenantID, sErr)
 			}

@@ -10,10 +10,16 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
-// WALReceiver streams physical WAL from a PostgreSQL 17 primary into a Timeline.
+// WALBatchSink receives decoded PG17 WAL record batches (implemented by remote gRPC pageserver clients).
+type WALBatchSink interface {
+	IngestWALBatch(ctx context.Context, recs []*DecodedWALRecord, sawCheckpoint bool) (uint64, error)
+}
+
+// WALReceiver streams physical WAL from a PostgreSQL 17 primary into a Timeline or remote WALBatchSink.
 type WALReceiver struct {
 	dsn      string
 	timeline *Timeline
+	sink     WALBatchSink
 	startLSN uint64
 }
 
@@ -22,6 +28,15 @@ func NewWALReceiver(dsn string, timeline *Timeline, startLSN uint64) *WALReceive
 	return &WALReceiver{
 		dsn:      dsn,
 		timeline: timeline,
+		startLSN: startLSN,
+	}
+}
+
+// NewRemoteWALReceiver creates a physical replication receiver that forwards decoded WAL batches to sink.
+func NewRemoteWALReceiver(dsn string, sink WALBatchSink, startLSN uint64) *WALReceiver {
+	return &WALReceiver{
+		dsn:      dsn,
+		sink:     sink,
 		startLSN: startLSN,
 	}
 }
@@ -100,6 +115,7 @@ func (r *WALReceiver) Run(ctx context.Context) error {
 	}
 
 	var parser WALStreamParser
+	lastLSN := startLSN
 	for {
 		select {
 		case <-ctx.Done():
@@ -131,10 +147,6 @@ func (r *WALReceiver) Run(ctx context.Context) error {
 			}
 			sawCheckpoint := false
 			for _, rec := range recs {
-				for _, blk := range rec.Blocks {
-					r.timeline.EnsureRelSizeSeeded(ctx, blk.Rel.SpcOID, blk.Rel.DbOID, blk.Rel.RelNumber, blk.ForkNum)
-				}
-				r.timeline.ApplyWALRecord(rec)
 				if rec.Rmid == RmXLogID {
 					op := rec.Info & XLogInfoOpMask
 					if op == 0x00 || op == 0x10 {
@@ -142,17 +154,39 @@ func (r *WALReceiver) Run(ctx context.Context) error {
 					}
 				}
 			}
-			if sawCheckpoint {
-				if _, fErr := r.timeline.FlushInMemory(ctx); fErr != nil {
-					return fmt.Errorf("pageserver: checkpoint flush: %w", fErr)
+			if r.sink != nil {
+				if len(recs) > 0 {
+					lsn, sErr := r.sink.IngestWALBatch(ctx, recs, sawCheckpoint)
+					if sErr != nil {
+						return fmt.Errorf("pageserver: remote wal ingest: %w", sErr)
+					}
+					if lsn > lastLSN {
+						lastLSN = lsn
+					}
 				}
-			} else if err := r.timeline.EnforceInMemBudget(ctx); err != nil {
-				return fmt.Errorf("pageserver: walreceiver budget flush: %w", err)
+			} else if r.timeline != nil {
+				for _, rec := range recs {
+					for _, blk := range rec.Blocks {
+						r.timeline.EnsureRelSizeSeeded(ctx, blk.Rel.SpcOID, blk.Rel.DbOID, blk.Rel.RelNumber, blk.ForkNum)
+					}
+					r.timeline.ApplyWALRecord(rec)
+				}
+				if sawCheckpoint {
+					if _, fErr := r.timeline.FlushInMemory(ctx); fErr != nil {
+						return fmt.Errorf("pageserver: checkpoint flush: %w", fErr)
+					}
+				} else if err := r.timeline.EnforceInMemBudget(ctx); err != nil {
+					return fmt.Errorf("pageserver: walreceiver budget flush: %w", err)
+				}
+				lastLSN = r.timeline.LastLSN()
 			}
 			_ = walEnd
 		case 'k':
 			if len(cd.Data) >= 18 && cd.Data[17] != 0 {
-				_ = r.sendStandbyStatus(conn, r.timeline.LastLSN())
+				if r.timeline != nil {
+					lastLSN = r.timeline.LastLSN()
+				}
+				_ = r.sendStandbyStatus(conn, lastLSN)
 			}
 		}
 	}

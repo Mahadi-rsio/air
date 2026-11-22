@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1.7
+
+# Stage 1: Build standalone Go air-pageserver + air-walredo binaries
+FROM golang:1.26-bookworm AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/air-pageserver ./cmd/air-pageserver \
+    && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/air-walredo ./cmd/air-walredo
+
+# Stage 2: Minimal runtime image for air-pageserver
+FROM debian:bookworm-slim
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --no-create-home --uid 10003 airps \
+    && mkdir -p /var/lib/air-pageserver/ps_layers /var/lib/air-pageserver/ps_cache \
+    && chown -R airps:airps /var/lib/air-pageserver
+
+COPY --from=builder /out/air-pageserver /usr/local/bin/air-pageserver
+COPY --from=builder /out/air-walredo /usr/local/bin/air-walredo
+
+USER airps
+ENV AIR_DATA_DIR=/var/lib/air-pageserver \
+    AIR_PAGESERVER_GRPC_ADDR=0.0.0.0:9091 \
+    AIR_PAGESERVER_HTTP_ADDR=0.0.0.0:8083 \
+    AIR_WALREDO_BIN=/usr/local/bin/air-walredo
+
+EXPOSE 9091 8083
+ENTRYPOINT ["/usr/local/bin/air-pageserver"]

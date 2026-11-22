@@ -66,7 +66,18 @@ func main() {
 	}
 
 	var ps *pageserver.Pageserver
-	if cfg.PageserverEnabled {
+	var psClient control.PageserverClient
+	if cfg.PageserverGRPCAddr != "" {
+		var psErr error
+		psClient, psErr = control.NewGRPCPageserverClient(cfg.PageserverGRPCAddr, cfg.InternalToken)
+		if psErr != nil {
+			cp.Close()
+			ag.Close()
+			log.Fatalf("init remote pageserver gRPC client: %v", psErr)
+		}
+		cp.SetPageserverClient(psClient)
+		log.Printf("[air-server] connected to standalone pageserver via gRPC (%s)", cfg.PageserverGRPCAddr)
+	} else if cfg.PageserverEnabled {
 		var psErr error
 		ps, psErr = pageserver.New(pageserver.Config{
 			SocketPath:    cfg.PageserverSocket,
@@ -175,6 +186,13 @@ func main() {
 		}
 		if err := ps.Close(); err != nil {
 			log.Printf("[air-server] pageserver close error: %v", err)
+		}
+	} else if psClient != nil {
+		if err := psClient.FlushAll(shutCtx); err != nil {
+			log.Printf("[air-server] remote pageserver flush all error: %v", err)
+		}
+		if err := psClient.Close(); err != nil {
+			log.Printf("[air-server] remote pageserver close error: %v", err)
 		}
 	}
 	cp.Close()

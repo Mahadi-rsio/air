@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -27,6 +28,20 @@ func main() {
 	if cfg.ReadEnginePort > 0 || cfg.ReadEngineSockDir != "" {
 		pools.SetReadEngineEndpoint(cfg.ReadEngineHost, cfg.ReadEngineSockDir, cfg.ReadEnginePort)
 	}
+	var reGRPC *gateway.ReadEngineGRPCClient
+	if cfg.ReadEngineGRPCAddr != "" {
+		var reErr error
+		reGRPC, reErr = gateway.NewReadEngineGRPCClient(cfg.ReadEngineGRPCAddr)
+		if reErr != nil {
+			log.Printf("[air-gateway] read-engine gRPC dial warning (%s): %v", cfg.ReadEngineGRPCAddr, reErr)
+		} else {
+			if h, hErr := reGRPC.Health(context.Background()); hErr == nil && h.GetPgPort() > 0 && cfg.ReadEnginePort == 0 {
+				cfg.ReadEnginePort = int(h.GetPgPort())
+				pools.SetReadEngineEndpoint(cfg.ReadEngineHost, cfg.ReadEngineSockDir, cfg.ReadEnginePort)
+			}
+			log.Printf("[air-gateway] connected to air-read-engine via gRPC (%s)", cfg.ReadEngineGRPCAddr)
+		}
+	}
 	cancelReg := gateway.NewCancelRegistry()
 
 	discovery, err := gateway.NewTenantDiscovery(cfg)
@@ -35,7 +50,14 @@ func main() {
 	}
 	discovery.SetMetrics(metrics)
 	discovery.SetCallbacks(
-		func(r gateway.TenantRoute) { pools.UpsertDiscovered(r) },
+		func(r gateway.TenantRoute) {
+			pools.UpsertDiscovered(r)
+			if reGRPC != nil && r.State == "ACTIVE" {
+				go func(tid string) {
+					_, _ = reGRPC.EnsureTenant(context.Background(), tid)
+				}(r.TenantID)
+			}
+		},
 		func(tid string) { pools.RemoveTenant(tid) },
 	)
 	discovery.Start()
@@ -136,6 +158,9 @@ func main() {
 	adminGRPCSrv.Stop()
 	adminSrv.Stop()
 	discovery.Stop()
+	if reGRPC != nil {
+		_ = reGRPC.Close()
+	}
 	pools.CloseAll()
 
 	done := make(chan struct{})

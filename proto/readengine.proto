@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package air.readengine.v1;
+
+option go_package = "github.com/Mahadi-rsio/air/internal/pb;pb";
+
+service ReadEngineService {
+  rpc Health(ReadEngineEmpty) returns (ReadEngineHealthResponse);
+  rpc EnsureTenant(ReadEngineTenantRequest) returns (ReadEngineTenantRouteResponse);
+  rpc GetTenantRoute(ReadEngineTenantRequest) returns (ReadEngineTenantRouteResponse);
+  rpc SyncTenant(SyncTenantRequest) returns (ReadEngineStatusResponse);
+}
+
+message ReadEngineEmpty {}
+
+message ReadEngineHealthResponse {
+  string status = 1;
+  string service = 2;
+  string state = 3;
+  string host = 4;
+  int32 pg_port = 5;
+  string sock_dir = 6;
+  uint64 queries_allowed = 7;
+  uint64 writes_blocked = 8;
+}
+
+message ReadEngineTenantRequest {
+  string tenant_id = 1;
+}
+
+message ReadEngineTenantRouteResponse {
+  string tenant_id = 1;
+  string engine = 2;
+  string host = 3;
+  int32 pg_port = 4;
+  string sock_dir = 5;
+  string state = 6;
+}
+
+message SyncTenantRequest {
+  string tenant_id = 1;
+  string sql = 2;
+  string lsn = 3;
+  string primary_conninfo = 4;
+}
+
+message ReadEngineStatusResponse {
+  string tenant_id = 1;
+  string status = 2;
+}
