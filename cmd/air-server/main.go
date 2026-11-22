@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -16,7 +15,6 @@ import (
 	"github.com/Mahadi-rsio/air/internal/config"
 	"github.com/Mahadi-rsio/air/internal/control"
 	"github.com/Mahadi-rsio/air/internal/crypto"
-	"github.com/Mahadi-rsio/air/internal/pageserver"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -58,14 +56,13 @@ func main() {
 		log.Fatalf("init control plane: %v", err)
 	}
 
-	s3c, err := configureBackupStore(cp, cfg)
+	_, err = configureBackupStore(cp, cfg)
 	if err != nil {
 		cp.Close()
 		ag.Close()
 		log.Fatalf("init backup store: %v", err)
 	}
 
-	var ps *pageserver.Pageserver
 	var psClient control.PageserverClient
 	if cfg.PageserverGRPCAddr != "" {
 		var psErr error
@@ -77,35 +74,6 @@ func main() {
 		}
 		cp.SetPageserverClient(psClient)
 		log.Printf("[air-server] connected to standalone pageserver via gRPC (%s)", cfg.PageserverGRPCAddr)
-	} else if cfg.PageserverEnabled {
-		var psErr error
-		ps, psErr = pageserver.New(pageserver.Config{
-			SocketPath:    cfg.PageserverSocket,
-			LayerDir:      filepath.Join(cfg.DataDir, "ps_layers"),
-			CacheDir:      filepath.Join(cfg.DataDir, "ps_cache"),
-			CacheMaxBytes: int64(cfg.PageserverCacheMB) * 1024 * 1024,
-			S3Client:      s3c,
-			R2Bucket:      cfg.R2Bucket,
-			KMS:           kms,
-		})
-		if psErr != nil {
-			cp.Close()
-			ag.Close()
-			log.Fatalf("init pageserver: %v", psErr)
-		}
-		if psErr := ps.Start(ctx); psErr != nil {
-			_ = ps.Close()
-			cp.Close()
-			ag.Close()
-			log.Fatalf("start pageserver: %v", psErr)
-		}
-		ag.SetPageserverConfig(true, cfg.PageserverSocket, cfg.PageserverCacheMB)
-		if !ag.HasAirSmgr() {
-			ag.SetPageserverConfig(false, "", 0)
-			log.Printf("[air-server] air_smgr.so not found; Pageserver running in WAL-receiver mode on %s", cfg.PageserverSocket)
-		}
-		cp.SetPageserver(ps)
-		log.Printf("[air-server] pageserver listening on %s (cache_mb=%d)", cfg.PageserverSocket, cfg.PageserverCacheMB)
 	}
 
 	if cfg.BootstrapAPIKey != "" {
@@ -180,14 +148,7 @@ func main() {
 	if err := cp.ShutdownActiveTenants(shutCtx); err != nil {
 		log.Printf("[air-server] shutdown active tenants error: %v", err)
 	}
-	if ps != nil {
-		if err := ps.FlushAll(shutCtx); err != nil {
-			log.Printf("[air-server] pageserver flush all error: %v", err)
-		}
-		if err := ps.Close(); err != nil {
-			log.Printf("[air-server] pageserver close error: %v", err)
-		}
-	} else if psClient != nil {
+	if psClient != nil {
 		if err := psClient.FlushAll(shutCtx); err != nil {
 			log.Printf("[air-server] remote pageserver flush all error: %v", err)
 		}

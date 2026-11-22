@@ -213,9 +213,9 @@ func TestPhase18_TypesDifferential_LivePG17(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping live PostgreSQL 17 differential test in -short mode")
 	}
-	initdbMatches, _ := filepath.Glob("/usr/lib/postgresql/*/bin/initdb")
+	initdbMatches, _ := filepath.Glob("/usr/lib/postgresql/17/bin/initdb")
 	if len(initdbMatches) == 0 {
-		t.Skip("PostgreSQL server binaries not installed")
+		t.Skip("PostgreSQL 17 server binaries not installed")
 	}
 	initdbBin := initdbMatches[len(initdbMatches)-1]
 	pgBin := filepath.Join(filepath.Dir(initdbBin), "postgres")
