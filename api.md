@@ -247,6 +247,19 @@ Response:
 | `POST` | `/internal/v1/tenants/:id/limits` | Update `{"max_client_conns":N,"max_backends":M}` |
 | `POST` | `/internal/v1/tenants/:id/drain` | Cooperatively drain tenant connections (`?timeout=2s`) |
 
+### Query Metering (`query_metering`)
+`air-gateway` records every executed tenant query (both Simple and Extended Query Protocol) to a local tab-separated buffer (`<AIR_METERING_LOG_DIR>/query_metering.log`, default `/tmp/air-gateway-metering/query_metering.log`):
+
+```text
+<RFC3339Nano UTC>	<db_id>	<bandwidth_bytes>	<query_time_us>	<query_type>
+```
+
+- **Flush triggers**: Automatically rotates and persists to `AIR_META_DSN` via PostgreSQL `COPY` when the log reaches `AIR_METERING_MAX_FILE_BYTES` (default `10485760` / 10 MB), every `AIR_METERING_FLUSH_INTERVAL_SEC` (default `120`s), and on graceful shutdown. Rotated log files are deleted immediately after successful DB persistence.
+- **Query types**: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `DDL`, `TX`, `PREPARE`, `EXECUTE`, `DEALLOCATE`, `COPY`, `EXPLAIN`, `SHOW`, `SET`, `RESET`, `LISTEN`, `UNLISTEN`, `NOTIFY`, `EXTENDED`, `OTHER`.
+- **Database table (`query_metering` in `AIR_META_DSN`)**:
+  - Columns: `id BIGSERIAL PRIMARY KEY`, `recorded_at TIMESTAMPTZ`, `db_id TEXT`, `bandwidth_bytes BIGINT`, `query_time_us BIGINT`, `query_type TEXT`, `created_at TIMESTAMPTZ`
+  - Indexes: `idx_query_metering_db_recorded (db_id, recorded_at DESC)`, `idx_query_metering_recorded (recorded_at DESC)`
+
 ---
 
 ## 5. gRPC Services

@@ -25,7 +25,7 @@ Client (psql/SDK) ->|   air-gateway (:5432)  |<- Admin HTTP (:8081) / gRPC (:909
                         +-----------------------------------+
 ```
 
-- **External Metadata PostgreSQL (`air-meta-postgres`)**: Stores control-plane metadata (`clusters`, `tenant_events`, `api_keys`, `provisioning_ops`, `idempotency_records`, `backup_ops`, `offload_ops`, `restore_ops`, `schema_migrations`) via `AIR_META_DSN`.
+- **External Metadata PostgreSQL (`air-meta-postgres`)**: Stores control-plane metadata and query metering (`clusters`, `tenant_events`, `api_keys`, `provisioning_ops`, `idempotency_records`, `backup_ops`, `offload_ops`, `restore_ops`, `query_metering`, `schema_migrations`) via `AIR_META_DSN`.
 - **Shared Master KEK (`AIR_MASTER_KEY_HEX`)**: 32-byte (64 hex chars) key shared between `air-server` and `air-pageserver` so envelope-encrypted tenant DEKs can be unwrapped across separate containers/hosts.
 - **Internal Mesh Auth (`AIR_INTERNAL_TOKEN`)**: Shared secret authenticating all inter-service gRPC and Admin HTTP calls.
 
@@ -91,7 +91,7 @@ Prebuilt images are published to GitHub Container Registry:
 - `ghcr.io/mahadi-rsio/air:latest` (or `:v2.0.27`)
 - `ghcr.io/mahadi-rsio/air-pageserver:latest` (or `:v2.0.27`)
 - `ghcr.io/mahadi-rsio/air-read-engine:latest` (or `:v2.0.27`)
-- `ghcr.io/mahadi-rsio/air-gateway:latest` (or `:v2.0.27`)
+- `ghcr.io/mahadi-rsio/air-gateway:latest` (or `:v2.0.28`)
 
 Create a `compose.ghcr.yml` override file:
 ```yaml
@@ -122,7 +122,7 @@ Instead of the bundled `air-meta-postgres` container, point `AIR_META_DSN` to an
 export AIR_META_DSN="postgres://<user>:<password>@<pg-host>:5432/<db>?sslmode=require"
 ```
 
-Pass `AIR_META_DSN` to both `air-server` and `air-gateway`. On startup, `air-server` automatically runs schema migrations and creates the 9 control-plane tables.
+Pass `AIR_META_DSN` to both `air-server` and `air-gateway`. On startup, `air-server` automatically runs schema migrations and creates the 10 control-plane tables (including `query_metering`), and `air-gateway` uses `AIR_META_DSN` to flush buffered query metering batches.
 
 ---
 
@@ -158,6 +158,13 @@ Pass `AIR_META_DSN` to both `air-server` and `air-gateway`. On startup, `air-ser
    INSERT INTO items (label) VALUES ('hello-air');
    SELECT * FROM items;
    SQL
+   ```
+
+4. **Inspect Query Metering (`query_metering` in `air-meta-postgres`)**:
+   `air-gateway` buffers each query (`timestamp`, `db_id`, `bandwidth_bytes`, `query_time_us`, `query_type`) into `query_metering.log` and flushes to PostgreSQL via `COPY` whenever the log reaches 10 MB or every 2 minutes (deleting the rotated log file after persistence):
+   ```bash
+   PGPASSWORD=air_meta_pass psql -h 127.0.0.1 -p 5435 -U air_meta -d air_meta \
+     -c "SELECT id, recorded_at, db_id, bandwidth_bytes, query_time_us, query_type FROM query_metering ORDER BY id DESC LIMIT 20;"
    ```
 
 ---
@@ -215,6 +222,9 @@ Pass `AIR_META_DSN` to both `air-server` and `air-gateway`. On startup, `air-ser
 | `AIR_READ_ENGINE_GRPC_ADDR` | `air-read-engine:9092` | `ReadEngineService` gRPC endpoint |
 | `AIR_READ_ENGINE_HOST` / `PORT` | `air-read-engine` / `5433` | Read engine PG wire endpoint |
 | `AIR_POOL_MODE` | `true` | Enable transaction-mode connection pooling |
+| `AIR_METERING_LOG_DIR` | `/tmp/air-gateway-metering` | Directory for buffered `query_metering.log` files |
+| `AIR_METERING_MAX_FILE_BYTES` | `10485760` (10 MB) | Rotate & flush log file to `query_metering` when size threshold is reached |
+| `AIR_METERING_FLUSH_INTERVAL_SEC` | `120` (2 min) | Periodic flush interval (in seconds) to persist metering logs to `AIR_META_DSN` |
 
 ### Optional S3 / Cloudflare R2 Cold Storage
 Set on `air-server` and `air-pageserver`: `AIR_R2_ENDPOINT`, `AIR_R2_BUCKET`, `AIR_R2_ACCESS_KEY_ID`, `AIR_R2_SECRET_ACCESS_KEY`, `AIR_R2_REGION` (default `auto`).
