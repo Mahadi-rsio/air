@@ -2,9 +2,9 @@
 
 AIR is a production-oriented, multi-tenant PostgreSQL 17 platform featuring a Go database engine and control plane (`air-server`), a standalone **Go PG gateway & transaction pooler** (`air-gateway`) communicating over **gRPC**, a **default SQLite read engine** (`air-read-engine`) that reads PostgreSQL 17 pages natively from AIR's Pageserver via the Cgo `air_pg` virtual table (zero `/sync` required), cooperative scale-to-zero, generation-fenced cold offload, encrypted Cloudflare R2 backups/PITR, and a custom Neon-style Pageserver (`air_smgr`) with Content-Addressed Upload (CAU).
 
-> **Architecture & Developer Guides:** [Overview](file:///workspaces/air/docs/architecture/overview.md) · [Codebase Map](file:///workspaces/air/docs/architecture/codebase-map.md) · [Developer Guide](file:///workspaces/air/docs/development/DEVELOPMENT.md) · [Contributing](file:///workspaces/air/CONTRIBUTING.md) · [Known Issues](file:///workspaces/air/docs/known-issues.md)
+> **Quick Docs:** [Setup Guide](setup.md) · [API Reference](api.md) · [Docs Index](docs/README.md) · [Contributing](CONTRIBUTING.md) · [Known Issues](docs/development/known-issues.md)
 >
-> **Subsystem Docs:** [Pageserver](file:///workspaces/air/docs/architecture/pageserver.md) · [Read Engine](file:///workspaces/air/docs/architecture/read-engine.md) · [Storage](file:///workspaces/air/docs/architecture/storage.md) · [Tenant Lifecycle](file:///workspaces/air/docs/architecture/tenant-lifecycle.md) · [WAL & Recovery](file:///workspaces/air/docs/architecture/wal-and-recovery.md) · [Backup & Restore](file:///workspaces/air/docs/architecture/backup-and-restore.md)
+> **Architecture & Subsystem Docs:** [Overview](docs/architecture/overview.md) · [Codebase Map](docs/architecture/codebase-map.md) · [Pageserver](docs/architecture/pageserver.md) · [Read Engine](docs/architecture/read-engine.md) · [Storage](docs/architecture/storage.md) · [Tenant Lifecycle](docs/architecture/tenant-lifecycle.md) · [WAL & Recovery](docs/architecture/wal-and-recovery.md) · [Backup & Restore](docs/architecture/backup-and-restore.md) · [Developer Guide](docs/development/DEVELOPMENT.md)
 
 ## How AIR Differs from Standard PostgreSQL
 
@@ -68,7 +68,7 @@ AIR is a production-oriented, multi-tenant PostgreSQL 17 platform featuring a Go
 3. **Cooperative Scale-to-Zero & Warm `initdb` Pool ([agent.go](file:///workspaces/air/internal/cell/agent.go), [control.go](file:///workspaces/air/internal/control/control.go))**:
    - Suspends idle `ACTIVE` tenants after `--idle-timeout` (`AIR_IDLE_TIMEOUT`) only after cooperative drain guards pass (`ErrDrainVetoed` on active txns, prepared xacts, `LISTEN`, temp tables, or advisory locks).
    - Coalesces concurrent wake-on-connect requests via `singleflight` and accelerates provisioning with a pre-warmed `initdb` pool.
-4. **AIR Pageserver, `air_smgr` & Content-Addressed Upload (CAU) ([pageserver.md](file:///workspaces/air/pageserver.md), [smgr.md](file:///workspaces/air/smgr.md))**:
+4. **AIR Pageserver, `air_smgr` & Content-Addressed Upload (CAU) ([pageserver.md](docs/architecture/pageserver.md), [pageserver-plan.md](docs/reports/plans/pageserver-plan.md), [smgr-plan.md](docs/reports/plans/smgr-plan.md))**:
    - Enabled via `--pageserver` / `AIR_PAGESERVER_ENABLED=true` (serves `GetPage@LSN` over `--pageserver-socket` with a bounded `--pageserver-cache-mb` LRU disk cache).
    - Immutable layer files are uploaded to R2 using Content-Addressed Upload (`tenants/{tenant_id}/layers/sha256/{prefix}/{sha256}`) with `If-None-Match: *` deduplication, followed by ETag CAS publication of `tenants/{tenant_id}/timeline_{epoch}/layer_manifest.json`.
    - Both `WakeTenant` and startup `Reconcile` preload tenant layers into the Pageserver before starting/adopting PostgreSQL so `air_smgr` can serve catalog blocks (e.g., `global/1260` / `pg_authid`) immediately.
@@ -150,7 +150,7 @@ All `/v1/*` endpoints require `Authorization: Bearer <token>`:
 ## Current Limitations & Known Issues
 
 - **Non-Destructive Restore**: `POST /v1/databases/{id}/restore` never overwrites an active tenant in place; pass `new_tenant_id` to materialize a restored tenant alongside the original.
-- See [known-issues.md](file:///workspaces/air/docs/known-issues.md) for full details.
+- See [known-issues.md](docs/development/known-issues.md) for full details.
 
 Example with `curl` and `psql`:
 

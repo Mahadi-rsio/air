@@ -4,8 +4,10 @@
 extensions/air_smgr/*.o
 extensions/air_smgr/*.so
 extensions/air_smgr/*.bc
-air-server
+/air-server
+/bin/
 gateway/air-gateway
 gateway/gateway_test
 gateway/build/
-
+__pycache__/
+*.pyc
