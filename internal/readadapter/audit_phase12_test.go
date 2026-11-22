@@ -31,6 +31,15 @@ type slowBlockBackend struct {
 	once        sync.Once
 }
 
+func (b *slowBlockBackend) GetPageAtLSN(ctx context.Context, tenantID string, key pageserver.Key, lsn uint64) ([]byte, error) {
+	if key.RelNumber == b.blockRelNum {
+		b.once.Do(func() { close(b.entered) })
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return b.Pageserver.GetPageAtLSN(ctx, tenantID, key, lsn)
+}
+
 func (b *slowBlockBackend) GetPageBatch(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, startBlock, nblocks uint32, lsn uint64) ([]byte, uint32, error) {
 	if relNumber == b.blockRelNum {
 		b.once.Do(func() { close(b.entered) })
@@ -192,7 +201,11 @@ func TestAudit_SQLiteCancellationIsolation(t *testing.T) {
 		errChA <- qerr
 	}()
 
-	<-sb.entered // Query A is actively executing inside SQLite + ReadPages
+	select {
+	case <-sb.entered: // Query A is actively executing inside SQLite + ReadPages
+	case qerr := <-errChA:
+		t.Fatalf("Query A exited before entering slowBlockBackend: %v", qerr)
+	}
 
 	// Execute Query B concurrently on the SAME tenant while Query A is blocked, then cancel Query A.
 	ctxB, cancelB := context.WithTimeout(context.Background(), 5*time.Second)
