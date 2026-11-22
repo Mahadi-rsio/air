@@ -31,7 +31,7 @@ service PageserverService {
   rpc BootstrapTenantFromPGData(BootstrapTenantRequest) returns (BootstrapTenantResponse);
   rpc HasMetadataSkeleton(PageserverTenantRequest) returns (PageserverBoolResponse);
   rpc SaveMetadataSkeleton(SaveSkeletonRequest) returns (PageserverStatusResponse);
-  rpc RestoreMetadataSkeleton(RestoreSkeletonRequest) returns (PageserverStatusResponse);
+  rpc RestoreMetadataSkeleton(RestoreSkeletonRequest) returns (RestoreSkeletonResponse);
   rpc SetRelSizes(SetRelSizesRequest) returns (PageserverStatusResponse);
   rpc SeedSLRUPages(SeedSLRUPagesRequest) returns (PageserverStatusResponse);
 }
@@ -278,12 +278,20 @@ message SaveSkeletonRequest {
   string tenant_id = 1;
   int64 epoch = 2;
   string pg_data_dir = 3;
+  bytes archive = 4;
 }
 
 message RestoreSkeletonRequest {
   string tenant_id = 1;
   int64 epoch = 2;
   string pg_data_dir = 3;
+  bool return_archive = 4;
+}
+
+message RestoreSkeletonResponse {
+  string status = 1;
+  string tenant_id = 2;
+  bytes archive = 3;
 }
 
 message RelSizeEntry {

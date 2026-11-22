@@ -90,31 +90,19 @@ func isEphemeralPGFile(relSlash string) bool {
 	return false
 }
 
-// SaveMetadataSkeleton captures only non-relation PGDATA compute state (pg_control,
-// pg_filenode.map, pg_xact, pg_multixact, PG_VERSION, configs, and WAL tail) into a
-// zstd-compressed (and KMS-encrypted when configured) snapshot, skipping all base/ and
-// global/ relation fork files stored in the Pageserver.
-func (p *Pageserver) SaveMetadataSkeleton(ctx context.Context, tenantID string, epoch int64, pgDataDir string) (*SkeletonMeta, error) {
-	start := time.Now()
-	if err := tenant.ValidateID(tenantID); err != nil {
-		return nil, err
-	}
-	if epoch <= 0 {
-		epoch = 1
-	}
-	debugf("skeleton", "SaveMetadataSkeleton start tenant=%s epoch=%d pgdata=%q", tenantID, epoch, pgDataDir)
-
+// PackMetadataSkeleton walks pgDataDir and packs only non-relation PGDATA compute state
+// (pg_control, pg_filenode.map, pg_xact, pg_multixact, PG_VERSION, configs, and WAL tail)
+// into a zstd-compressed tar archive, skipping all base/ and global/ relation fork files
+// stored in the Pageserver.
+func PackMetadataSkeleton(pgDataDir string) ([]byte, *SkeletonMeta, error) {
 	var buf bytes.Buffer
 	zw, err := zstd.NewWriter(&buf)
 	if err != nil {
-		return nil, fmt.Errorf("skeleton zstd writer: %w", err)
+		return nil, nil, fmt.Errorf("skeleton zstd writer: %w", err)
 	}
 	tw := tar.NewWriter(zw)
 
-	meta := &SkeletonMeta{
-		TenantID: tenantID,
-		Epoch:    epoch,
-	}
+	meta := &SkeletonMeta{}
 
 	walkErr := filepath.WalkDir(pgDataDir, func(path string, entry os.DirEntry, wErr error) error {
 		if wErr != nil {
@@ -188,127 +176,25 @@ func (p *Pageserver) SaveMetadataSkeleton(ctx context.Context, tenantID string, 
 	if walkErr != nil {
 		_ = tw.Close()
 		_ = zw.Close()
-		return nil, fmt.Errorf("walk pgdata for skeleton: %w", walkErr)
+		return nil, nil, fmt.Errorf("walk pgdata for skeleton: %w", walkErr)
 	}
 	if err := tw.Close(); err != nil {
 		_ = zw.Close()
-		return nil, err
+		return nil, nil, err
 	}
 	if err := zw.Close(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	payload := buf.Bytes()
-	localPath, r2Key, encrypted := p.skeletonPaths(tenantID)
-	if encrypted {
-		enc, err := p.cfg.KMS.EncryptObject(tenantID, epoch, skeletonAADKey, payload)
-		if err != nil {
-			return nil, fmt.Errorf("encrypt skeleton: %w", err)
-		}
-		payload = enc
-	}
-	meta.CompressedBytes = int64(len(payload))
-
-	if localPath != "" {
-		if err := os.MkdirAll(filepath.Dir(localPath), 0o700); err != nil {
-			return nil, err
-		}
-		tmp := localPath + ".tmp"
-		if err := os.WriteFile(tmp, payload, 0o600); err != nil {
-			return nil, err
-		}
-		if err := os.Rename(tmp, localPath); err != nil {
-			_ = os.Remove(tmp)
-			return nil, err
-		}
-		meta.LocalPath = localPath
-	}
-
-	if p.cfg.S3Client != nil && p.cfg.R2Bucket != "" {
-		if _, err := p.cfg.S3Client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket: aws.String(p.cfg.R2Bucket),
-			Key:    aws.String(r2Key),
-			Body:   bytes.NewReader(payload),
-		}); err != nil {
-			return nil, fmt.Errorf("upload skeleton to R2: %w", err)
-		}
-		meta.R2Key = r2Key
-	}
-
-	debugf("skeleton", "SaveMetadataSkeleton done tenant=%s files=%d raw_bytes=%d compressed_bytes=%d skipped_rels=%d skipped_bytes=%d encrypted=%v local=%q r2=%q dur=%s",
-		tenantID, meta.FileCount, meta.RawBytes, meta.CompressedBytes, meta.SkippedRelFiles, meta.SkippedRelBytes, encrypted, meta.LocalPath, meta.R2Key, time.Since(start))
-	return meta, nil
+	return buf.Bytes(), meta, nil
 }
 
-// HasMetadataSkeleton reports whether a metadata skeleton exists locally or in R2.
-func (p *Pageserver) HasMetadataSkeleton(ctx context.Context, tenantID string) bool {
-	if err := tenant.ValidateID(tenantID); err != nil {
-		return false
+// UnpackMetadataSkeleton extracts a zstd-compressed tar skeleton archive into pgDataDir.
+func UnpackMetadataSkeleton(archive []byte, pgDataDir string) (*SkeletonMeta, error) {
+	if len(archive) == 0 {
+		return nil, fmt.Errorf("empty metadata skeleton archive")
 	}
-	localPath, r2Key, _ := p.skeletonPaths(tenantID)
-	if localPath != "" {
-		if _, err := os.Stat(localPath); err == nil {
-			return true
-		}
-	}
-	if p.cfg.S3Client != nil && p.cfg.R2Bucket != "" {
-		_, err := p.cfg.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
-			Bucket: aws.String(p.cfg.R2Bucket),
-			Key:    aws.String(r2Key),
-		})
-		return err == nil
-	}
-	return false
-}
-
-// RestoreMetadataSkeleton reconstructs the minimal PGDATA directory skeleton
-// from the saved snapshot without downloading or restoring relation fork files.
-func (p *Pageserver) RestoreMetadataSkeleton(ctx context.Context, tenantID string, epoch int64, pgDataDir string) (*SkeletonMeta, error) {
-	start := time.Now()
-	if err := tenant.ValidateID(tenantID); err != nil {
-		return nil, err
-	}
-	if epoch <= 0 {
-		epoch = 1
-	}
-	debugf("skeleton", "RestoreMetadataSkeleton start tenant=%s epoch=%d pgdata=%q", tenantID, epoch, pgDataDir)
-
-	localPath, r2Key, encrypted := p.skeletonPaths(tenantID)
-	var payload []byte
-	if localPath != "" {
-		if b, err := os.ReadFile(localPath); err == nil {
-			payload = b
-		}
-	}
-	if len(payload) == 0 && p.cfg.S3Client != nil && p.cfg.R2Bucket != "" {
-		out, err := p.cfg.S3Client.GetObject(ctx, &s3.GetObjectInput{
-			Bucket: aws.String(p.cfg.R2Bucket),
-			Key:    aws.String(r2Key),
-		})
-		if err != nil {
-			return nil, fmt.Errorf("download skeleton from R2: %w", err)
-		}
-		b, err := io.ReadAll(io.LimitReader(out.Body, maxSkeletonTotalSize))
-		_ = out.Body.Close()
-		if err != nil {
-			return nil, err
-		}
-		payload = b
-	}
-	if len(payload) == 0 {
-		return nil, fmt.Errorf("%w: metadata skeleton for %s", ErrNotFound, tenantID)
-	}
-
-	compressedBytes := int64(len(payload))
-	if encrypted {
-		dec, err := p.cfg.KMS.DecryptObject(tenantID, epoch, skeletonAADKey, payload)
-		if err != nil {
-			return nil, fmt.Errorf("decrypt skeleton: %w", err)
-		}
-		payload = dec
-	}
-
-	zr, err := zstd.NewReader(bytes.NewReader(payload))
+	zr, err := zstd.NewReader(bytes.NewReader(archive))
 	if err != nil {
 		return nil, fmt.Errorf("skeleton zstd reader: %w", err)
 	}
@@ -320,10 +206,7 @@ func (p *Pageserver) RestoreMetadataSkeleton(ctx context.Context, tenantID strin
 
 	tr := tar.NewReader(zr)
 	meta := &SkeletonMeta{
-		TenantID:        tenantID,
-		Epoch:           epoch,
-		CompressedBytes: compressedBytes,
-		LocalPath:       localPath,
+		CompressedBytes: int64(len(archive)),
 	}
 
 	var totalExtracted int64
@@ -377,12 +260,195 @@ func (p *Pageserver) RestoreMetadataSkeleton(ctx context.Context, tenantID strin
 			return nil, fmt.Errorf("unsupported skeleton tar entry type %v for %q", hdr.Typeflag, hdr.Name)
 		}
 	}
+	return meta, nil
+}
+
+// SaveMetadataSkeletonArchive persists a pre-packed zstd-compressed tar metadata skeleton
+// (encrypting via KMS when configured) to local storage and R2.
+func (p *Pageserver) SaveMetadataSkeletonArchive(ctx context.Context, tenantID string, epoch int64, archive []byte, meta *SkeletonMeta) (*SkeletonMeta, error) {
+	start := time.Now()
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return nil, err
+	}
+	if epoch <= 0 {
+		epoch = 1
+	}
+	if len(archive) == 0 {
+		return nil, fmt.Errorf("empty metadata skeleton archive")
+	}
+	if meta == nil {
+		meta = &SkeletonMeta{}
+	}
+	meta.TenantID = tenantID
+	meta.Epoch = epoch
+
+	payload := archive
+	localPath, r2Key, encrypted := p.skeletonPaths(tenantID)
+	if encrypted {
+		enc, err := p.cfg.KMS.EncryptObject(tenantID, epoch, skeletonAADKey, payload)
+		if err != nil {
+			return nil, fmt.Errorf("encrypt skeleton: %w", err)
+		}
+		payload = enc
+	}
+	meta.CompressedBytes = int64(len(payload))
+
+	if localPath != "" {
+		if err := os.MkdirAll(filepath.Dir(localPath), 0o700); err != nil {
+			return nil, err
+		}
+		tmp := localPath + ".tmp"
+		if err := os.WriteFile(tmp, payload, 0o600); err != nil {
+			return nil, err
+		}
+		if err := os.Rename(tmp, localPath); err != nil {
+			_ = os.Remove(tmp)
+			return nil, err
+		}
+		meta.LocalPath = localPath
+	}
+
+	if p.cfg.S3Client != nil && p.cfg.R2Bucket != "" {
+		if _, err := p.cfg.S3Client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(p.cfg.R2Bucket),
+			Key:    aws.String(r2Key),
+			Body:   bytes.NewReader(payload),
+		}); err != nil {
+			return nil, fmt.Errorf("upload skeleton to R2: %w", err)
+		}
+		meta.R2Key = r2Key
+	}
+
+	debugf("skeleton", "SaveMetadataSkeleton done tenant=%s files=%d raw_bytes=%d compressed_bytes=%d skipped_rels=%d skipped_bytes=%d encrypted=%v local=%q r2=%q dur=%s",
+		tenantID, meta.FileCount, meta.RawBytes, meta.CompressedBytes, meta.SkippedRelFiles, meta.SkippedRelBytes, encrypted, meta.LocalPath, meta.R2Key, time.Since(start))
+	return meta, nil
+}
+
+// SaveMetadataSkeleton captures only non-relation PGDATA compute state (pg_control,
+// pg_filenode.map, pg_xact, pg_multixact, PG_VERSION, configs, and WAL tail) into a
+// zstd-compressed (and KMS-encrypted when configured) snapshot, skipping all base/ and
+// global/ relation fork files stored in the Pageserver.
+func (p *Pageserver) SaveMetadataSkeleton(ctx context.Context, tenantID string, epoch int64, pgDataDir string) (*SkeletonMeta, error) {
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return nil, err
+	}
+	if epoch <= 0 {
+		epoch = 1
+	}
+	debugf("skeleton", "SaveMetadataSkeleton start tenant=%s epoch=%d pgdata=%q", tenantID, epoch, pgDataDir)
+
+	archive, meta, err := PackMetadataSkeleton(pgDataDir)
+	if err != nil {
+		return nil, err
+	}
+	return p.SaveMetadataSkeletonArchive(ctx, tenantID, epoch, archive, meta)
+}
+
+// HasMetadataSkeleton reports whether a metadata skeleton exists locally or in R2.
+func (p *Pageserver) HasMetadataSkeleton(ctx context.Context, tenantID string) bool {
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return false
+	}
+	localPath, r2Key, _ := p.skeletonPaths(tenantID)
+	if localPath != "" {
+		if _, err := os.Stat(localPath); err == nil {
+			return true
+		}
+	}
+	if p.cfg.S3Client != nil && p.cfg.R2Bucket != "" {
+		_, err := p.cfg.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(p.cfg.R2Bucket),
+			Key:    aws.String(r2Key),
+		})
+		return err == nil
+	}
+	return false
+}
+
+// LoadMetadataSkeletonArchive fetches and decrypts the saved zstd-compressed tar skeleton
+// archive and ensures the tenant's pageserver layers are loaded from R2.
+func (p *Pageserver) LoadMetadataSkeletonArchive(ctx context.Context, tenantID string, epoch int64) ([]byte, *SkeletonMeta, error) {
+	start := time.Now()
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return nil, nil, err
+	}
+	if epoch <= 0 {
+		epoch = 1
+	}
+
+	localPath, r2Key, encrypted := p.skeletonPaths(tenantID)
+	var payload []byte
+	if localPath != "" {
+		if b, err := os.ReadFile(localPath); err == nil {
+			payload = b
+		}
+	}
+	if len(payload) == 0 && p.cfg.S3Client != nil && p.cfg.R2Bucket != "" {
+		out, err := p.cfg.S3Client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(p.cfg.R2Bucket),
+			Key:    aws.String(r2Key),
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("download skeleton from R2: %w", err)
+		}
+		b, err := io.ReadAll(io.LimitReader(out.Body, maxSkeletonTotalSize))
+		_ = out.Body.Close()
+		if err != nil {
+			return nil, nil, err
+		}
+		payload = b
+	}
+	if len(payload) == 0 {
+		return nil, nil, fmt.Errorf("%w: metadata skeleton for %s", ErrNotFound, tenantID)
+	}
+
+	compressedBytes := int64(len(payload))
+	if encrypted {
+		dec, err := p.cfg.KMS.DecryptObject(tenantID, epoch, skeletonAADKey, payload)
+		if err != nil {
+			return nil, nil, fmt.Errorf("decrypt skeleton: %w", err)
+		}
+		payload = dec
+	}
 
 	tl := p.EnsureTenant(tenantID, epoch)
 	if err := tl.LoadLayersFromR2(ctx); err != nil {
-		return nil, fmt.Errorf("load pageserver layers from R2 for %s: %w", tenantID, err)
+		return nil, nil, fmt.Errorf("load pageserver layers from R2 for %s: %w", tenantID, err)
 	}
-	debugf("skeleton", "RestoreMetadataSkeleton done tenant=%s files=%d raw_bytes=%d compressed_bytes=%d layers=%d dur=%s",
-		tenantID, meta.FileCount, meta.RawBytes, meta.CompressedBytes, tl.LayerCount(), time.Since(start))
+
+	meta := &SkeletonMeta{
+		TenantID:        tenantID,
+		Epoch:           epoch,
+		CompressedBytes: compressedBytes,
+		LocalPath:       localPath,
+		R2Key:           r2Key,
+	}
+	debugf("skeleton", "LoadMetadataSkeletonArchive done tenant=%s archive_bytes=%d compressed_bytes=%d layers=%d dur=%s",
+		tenantID, len(payload), compressedBytes, tl.LayerCount(), time.Since(start))
+	return payload, meta, nil
+}
+
+// RestoreMetadataSkeleton reconstructs the minimal PGDATA directory skeleton
+// from the saved snapshot without downloading or restoring relation fork files.
+func (p *Pageserver) RestoreMetadataSkeleton(ctx context.Context, tenantID string, epoch int64, pgDataDir string) (*SkeletonMeta, error) {
+	start := time.Now()
+	debugf("skeleton", "RestoreMetadataSkeleton start tenant=%s epoch=%d pgdata=%q", tenantID, epoch, pgDataDir)
+
+	archive, loadMeta, err := p.LoadMetadataSkeletonArchive(ctx, tenantID, epoch)
+	if err != nil {
+		return nil, err
+	}
+	meta, err := UnpackMetadataSkeleton(archive, pgDataDir)
+	if err != nil {
+		return nil, err
+	}
+	meta.TenantID = loadMeta.TenantID
+	meta.Epoch = loadMeta.Epoch
+	meta.CompressedBytes = loadMeta.CompressedBytes
+	meta.LocalPath = loadMeta.LocalPath
+	meta.R2Key = loadMeta.R2Key
+
+	debugf("skeleton", "RestoreMetadataSkeleton done tenant=%s files=%d raw_bytes=%d compressed_bytes=%d dur=%s",
+		tenantID, meta.FileCount, meta.RawBytes, meta.CompressedBytes, time.Since(start))
 	return meta, nil
 }

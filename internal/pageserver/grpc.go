@@ -596,17 +596,34 @@ func (s *grpcServer) HasMetadataSkeleton(ctx context.Context, req *pb.Pageserver
 }
 
 func (s *grpcServer) SaveMetadataSkeleton(ctx context.Context, req *pb.SaveSkeletonRequest) (*pb.PageserverStatusResponse, error) {
+	if len(req.GetArchive()) > 0 {
+		if _, err := s.ps.SaveMetadataSkeletonArchive(ctx, req.GetTenantId(), req.GetEpoch(), req.GetArchive(), nil); err != nil {
+			return nil, mapPageserverGRPCError(err)
+		}
+		return &pb.PageserverStatusResponse{Status: "saved", TenantId: req.GetTenantId()}, nil
+	}
 	if _, err := s.ps.SaveMetadataSkeleton(ctx, req.GetTenantId(), req.GetEpoch(), req.GetPgDataDir()); err != nil {
 		return nil, mapPageserverGRPCError(err)
 	}
 	return &pb.PageserverStatusResponse{Status: "saved", TenantId: req.GetTenantId()}, nil
 }
 
-func (s *grpcServer) RestoreMetadataSkeleton(ctx context.Context, req *pb.RestoreSkeletonRequest) (*pb.PageserverStatusResponse, error) {
+func (s *grpcServer) RestoreMetadataSkeleton(ctx context.Context, req *pb.RestoreSkeletonRequest) (*pb.RestoreSkeletonResponse, error) {
+	if req.GetReturnArchive() {
+		archive, _, err := s.ps.LoadMetadataSkeletonArchive(ctx, req.GetTenantId(), req.GetEpoch())
+		if err != nil {
+			return nil, mapPageserverGRPCError(err)
+		}
+		return &pb.RestoreSkeletonResponse{
+			Status:   "restored",
+			TenantId: req.GetTenantId(),
+			Archive:  archive,
+		}, nil
+	}
 	if _, err := s.ps.RestoreMetadataSkeleton(ctx, req.GetTenantId(), req.GetEpoch(), req.GetPgDataDir()); err != nil {
 		return nil, mapPageserverGRPCError(err)
 	}
-	return &pb.PageserverStatusResponse{Status: "restored", TenantId: req.GetTenantId()}, nil
+	return &pb.RestoreSkeletonResponse{Status: "restored", TenantId: req.GetTenantId()}, nil
 }
 
 func (s *grpcServer) SetRelSizes(_ context.Context, req *pb.SetRelSizesRequest) (*pb.PageserverStatusResponse, error) {

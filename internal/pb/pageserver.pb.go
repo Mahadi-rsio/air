@@ -2346,6 +2346,7 @@ type SaveSkeletonRequest struct {
 	TenantId      string                 `protobuf:"bytes,1,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
 	Epoch         int64                  `protobuf:"varint,2,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	PgDataDir     string                 `protobuf:"bytes,3,opt,name=pg_data_dir,json=pgDataDir,proto3" json:"pg_data_dir,omitempty"`
+	Archive       []byte                 `protobuf:"bytes,4,opt,name=archive,proto3" json:"archive,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2401,11 +2402,19 @@ func (x *SaveSkeletonRequest) GetPgDataDir() string {
 	return ""
 }
 
+func (x *SaveSkeletonRequest) GetArchive() []byte {
+	if x != nil {
+		return x.Archive
+	}
+	return nil
+}
+
 type RestoreSkeletonRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TenantId      string                 `protobuf:"bytes,1,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
 	Epoch         int64                  `protobuf:"varint,2,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	PgDataDir     string                 `protobuf:"bytes,3,opt,name=pg_data_dir,json=pgDataDir,proto3" json:"pg_data_dir,omitempty"`
+	ReturnArchive bool                   `protobuf:"varint,4,opt,name=return_archive,json=returnArchive,proto3" json:"return_archive,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2461,6 +2470,73 @@ func (x *RestoreSkeletonRequest) GetPgDataDir() string {
 	return ""
 }
 
+func (x *RestoreSkeletonRequest) GetReturnArchive() bool {
+	if x != nil {
+		return x.ReturnArchive
+	}
+	return false
+}
+
+type RestoreSkeletonResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	TenantId      string                 `protobuf:"bytes,2,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
+	Archive       []byte                 `protobuf:"bytes,3,opt,name=archive,proto3" json:"archive,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RestoreSkeletonResponse) Reset() {
+	*x = RestoreSkeletonResponse{}
+	mi := &file_pageserver_proto_msgTypes[36]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RestoreSkeletonResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RestoreSkeletonResponse) ProtoMessage() {}
+
+func (x *RestoreSkeletonResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pageserver_proto_msgTypes[36]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RestoreSkeletonResponse.ProtoReflect.Descriptor instead.
+func (*RestoreSkeletonResponse) Descriptor() ([]byte, []int) {
+	return file_pageserver_proto_rawDescGZIP(), []int{36}
+}
+
+func (x *RestoreSkeletonResponse) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *RestoreSkeletonResponse) GetTenantId() string {
+	if x != nil {
+		return x.TenantId
+	}
+	return ""
+}
+
+func (x *RestoreSkeletonResponse) GetArchive() []byte {
+	if x != nil {
+		return x.Archive
+	}
+	return nil
+}
+
 type RelSizeEntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SpcOid        uint32                 `protobuf:"varint,1,opt,name=spc_oid,json=spcOid,proto3" json:"spc_oid,omitempty"`
@@ -2475,7 +2551,7 @@ type RelSizeEntry struct {
 
 func (x *RelSizeEntry) Reset() {
 	*x = RelSizeEntry{}
-	mi := &file_pageserver_proto_msgTypes[36]
+	mi := &file_pageserver_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2487,7 +2563,7 @@ func (x *RelSizeEntry) String() string {
 func (*RelSizeEntry) ProtoMessage() {}
 
 func (x *RelSizeEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_pageserver_proto_msgTypes[36]
+	mi := &file_pageserver_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2500,7 +2576,7 @@ func (x *RelSizeEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RelSizeEntry.ProtoReflect.Descriptor instead.
 func (*RelSizeEntry) Descriptor() ([]byte, []int) {
-	return file_pageserver_proto_rawDescGZIP(), []int{36}
+	return file_pageserver_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *RelSizeEntry) GetSpcOid() uint32 {
@@ -2555,7 +2631,7 @@ type SetRelSizesRequest struct {
 
 func (x *SetRelSizesRequest) Reset() {
 	*x = SetRelSizesRequest{}
-	mi := &file_pageserver_proto_msgTypes[37]
+	mi := &file_pageserver_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2567,7 +2643,7 @@ func (x *SetRelSizesRequest) String() string {
 func (*SetRelSizesRequest) ProtoMessage() {}
 
 func (x *SetRelSizesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pageserver_proto_msgTypes[37]
+	mi := &file_pageserver_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2580,7 +2656,7 @@ func (x *SetRelSizesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetRelSizesRequest.ProtoReflect.Descriptor instead.
 func (*SetRelSizesRequest) Descriptor() ([]byte, []int) {
-	return file_pageserver_proto_rawDescGZIP(), []int{37}
+	return file_pageserver_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *SetRelSizesRequest) GetTenantId() string {
@@ -2608,7 +2684,7 @@ type SLRUPageEntry struct {
 
 func (x *SLRUPageEntry) Reset() {
 	*x = SLRUPageEntry{}
-	mi := &file_pageserver_proto_msgTypes[38]
+	mi := &file_pageserver_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2620,7 +2696,7 @@ func (x *SLRUPageEntry) String() string {
 func (*SLRUPageEntry) ProtoMessage() {}
 
 func (x *SLRUPageEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_pageserver_proto_msgTypes[38]
+	mi := &file_pageserver_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2633,7 +2709,7 @@ func (x *SLRUPageEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SLRUPageEntry.ProtoReflect.Descriptor instead.
 func (*SLRUPageEntry) Descriptor() ([]byte, []int) {
-	return file_pageserver_proto_rawDescGZIP(), []int{38}
+	return file_pageserver_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *SLRUPageEntry) GetKind() uint32 {
@@ -2667,7 +2743,7 @@ type SeedSLRUPagesRequest struct {
 
 func (x *SeedSLRUPagesRequest) Reset() {
 	*x = SeedSLRUPagesRequest{}
-	mi := &file_pageserver_proto_msgTypes[39]
+	mi := &file_pageserver_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2679,7 +2755,7 @@ func (x *SeedSLRUPagesRequest) String() string {
 func (*SeedSLRUPagesRequest) ProtoMessage() {}
 
 func (x *SeedSLRUPagesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pageserver_proto_msgTypes[39]
+	mi := &file_pageserver_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2692,7 +2768,7 @@ func (x *SeedSLRUPagesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SeedSLRUPagesRequest.ProtoReflect.Descriptor instead.
 func (*SeedSLRUPagesRequest) Descriptor() ([]byte, []int) {
-	return file_pageserver_proto_rawDescGZIP(), []int{39}
+	return file_pageserver_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *SeedSLRUPagesRequest) GetTenantId() string {
@@ -2919,15 +2995,21 @@ const file_pageserver_proto_rawDesc = "" +
 	"\x17BootstrapTenantResponse\x12\x1b\n" +
 	"\ttenant_id\x18\x01 \x01(\tR\btenantId\x12\"\n" +
 	"\fbootstrapped\x18\x02 \x01(\bR\fbootstrapped\x12\x19\n" +
-	"\binit_lsn\x18\x03 \x01(\x04R\ainitLsn\"h\n" +
+	"\binit_lsn\x18\x03 \x01(\x04R\ainitLsn\"\x82\x01\n" +
 	"\x13SaveSkeletonRequest\x12\x1b\n" +
 	"\ttenant_id\x18\x01 \x01(\tR\btenantId\x12\x14\n" +
 	"\x05epoch\x18\x02 \x01(\x03R\x05epoch\x12\x1e\n" +
-	"\vpg_data_dir\x18\x03 \x01(\tR\tpgDataDir\"k\n" +
+	"\vpg_data_dir\x18\x03 \x01(\tR\tpgDataDir\x12\x18\n" +
+	"\aarchive\x18\x04 \x01(\fR\aarchive\"\x92\x01\n" +
 	"\x16RestoreSkeletonRequest\x12\x1b\n" +
 	"\ttenant_id\x18\x01 \x01(\tR\btenantId\x12\x14\n" +
 	"\x05epoch\x18\x02 \x01(\x03R\x05epoch\x12\x1e\n" +
-	"\vpg_data_dir\x18\x03 \x01(\tR\tpgDataDir\"\xa4\x01\n" +
+	"\vpg_data_dir\x18\x03 \x01(\tR\tpgDataDir\x12%\n" +
+	"\x0ereturn_archive\x18\x04 \x01(\bR\rreturnArchive\"h\n" +
+	"\x17RestoreSkeletonResponse\x12\x16\n" +
+	"\x06status\x18\x01 \x01(\tR\x06status\x12\x1b\n" +
+	"\ttenant_id\x18\x02 \x01(\tR\btenantId\x12\x18\n" +
+	"\aarchive\x18\x03 \x01(\fR\aarchive\"\xa4\x01\n" +
 	"\fRelSizeEntry\x12\x17\n" +
 	"\aspc_oid\x18\x01 \x01(\rR\x06spcOid\x12\x15\n" +
 	"\x06db_oid\x18\x02 \x01(\rR\x05dbOid\x12\x1d\n" +
@@ -2945,7 +3027,7 @@ const file_pageserver_proto_rawDesc = "" +
 	"\x04page\x18\x03 \x01(\fR\x04page\"o\n" +
 	"\x14SeedSLRUPagesRequest\x12\x1b\n" +
 	"\ttenant_id\x18\x01 \x01(\tR\btenantId\x12:\n" +
-	"\aentries\x18\x02 \x03(\v2 .air.pageserver.v1.SLRUPageEntryR\aentries2\x8b\x13\n" +
+	"\aentries\x18\x02 \x03(\v2 .air.pageserver.v1.SLRUPageEntryR\aentries2\x8a\x13\n" +
 	"\x11PageserverService\x12Y\n" +
 	"\x06Health\x12\".air.pageserver.v1.PageserverEmpty\x1a+.air.pageserver.v1.PageserverHealthResponse\x12l\n" +
 	"\rGetTenantInfo\x12*.air.pageserver.v1.PageserverTenantRequest\x1a/.air.pageserver.v1.PageserverTenantInfoResponse\x12c\n" +
@@ -2968,8 +3050,8 @@ const file_pageserver_proto_rawDesc = "" +
 	"\x10IngestWALRecords\x12*.air.pageserver.v1.IngestWALRecordsRequest\x1a+.air.pageserver.v1.IngestWALRecordsResponse\x12r\n" +
 	"\x19BootstrapTenantFromPGData\x12).air.pageserver.v1.BootstrapTenantRequest\x1a*.air.pageserver.v1.BootstrapTenantResponse\x12l\n" +
 	"\x13HasMetadataSkeleton\x12*.air.pageserver.v1.PageserverTenantRequest\x1a).air.pageserver.v1.PageserverBoolResponse\x12k\n" +
-	"\x14SaveMetadataSkeleton\x12&.air.pageserver.v1.SaveSkeletonRequest\x1a+.air.pageserver.v1.PageserverStatusResponse\x12q\n" +
-	"\x17RestoreMetadataSkeleton\x12).air.pageserver.v1.RestoreSkeletonRequest\x1a+.air.pageserver.v1.PageserverStatusResponse\x12a\n" +
+	"\x14SaveMetadataSkeleton\x12&.air.pageserver.v1.SaveSkeletonRequest\x1a+.air.pageserver.v1.PageserverStatusResponse\x12p\n" +
+	"\x17RestoreMetadataSkeleton\x12).air.pageserver.v1.RestoreSkeletonRequest\x1a*.air.pageserver.v1.RestoreSkeletonResponse\x12a\n" +
 	"\vSetRelSizes\x12%.air.pageserver.v1.SetRelSizesRequest\x1a+.air.pageserver.v1.PageserverStatusResponse\x12e\n" +
 	"\rSeedSLRUPages\x12'.air.pageserver.v1.SeedSLRUPagesRequest\x1a+.air.pageserver.v1.PageserverStatusResponseB+Z)github.com/Mahadi-rsio/air/internal/pb;pbb\x06proto3"
 
@@ -2985,7 +3067,7 @@ func file_pageserver_proto_rawDescGZIP() []byte {
 	return file_pageserver_proto_rawDescData
 }
 
-var file_pageserver_proto_msgTypes = make([]protoimpl.MessageInfo, 40)
+var file_pageserver_proto_msgTypes = make([]protoimpl.MessageInfo, 41)
 var file_pageserver_proto_goTypes = []any{
 	(*PageserverEmpty)(nil),               // 0: air.pageserver.v1.PageserverEmpty
 	(*PageserverHealthResponse)(nil),      // 1: air.pageserver.v1.PageserverHealthResponse
@@ -3023,10 +3105,11 @@ var file_pageserver_proto_goTypes = []any{
 	(*BootstrapTenantResponse)(nil),       // 33: air.pageserver.v1.BootstrapTenantResponse
 	(*SaveSkeletonRequest)(nil),           // 34: air.pageserver.v1.SaveSkeletonRequest
 	(*RestoreSkeletonRequest)(nil),        // 35: air.pageserver.v1.RestoreSkeletonRequest
-	(*RelSizeEntry)(nil),                  // 36: air.pageserver.v1.RelSizeEntry
-	(*SetRelSizesRequest)(nil),            // 37: air.pageserver.v1.SetRelSizesRequest
-	(*SLRUPageEntry)(nil),                 // 38: air.pageserver.v1.SLRUPageEntry
-	(*SeedSLRUPagesRequest)(nil),          // 39: air.pageserver.v1.SeedSLRUPagesRequest
+	(*RestoreSkeletonResponse)(nil),       // 36: air.pageserver.v1.RestoreSkeletonResponse
+	(*RelSizeEntry)(nil),                  // 37: air.pageserver.v1.RelSizeEntry
+	(*SetRelSizesRequest)(nil),            // 38: air.pageserver.v1.SetRelSizesRequest
+	(*SLRUPageEntry)(nil),                 // 39: air.pageserver.v1.SLRUPageEntry
+	(*SeedSLRUPagesRequest)(nil),          // 40: air.pageserver.v1.SeedSLRUPagesRequest
 }
 var file_pageserver_proto_depIdxs = []int32{
 	5,  // 0: air.pageserver.v1.PageserverListTenantsResponse.tenants:type_name -> air.pageserver.v1.PageserverTenantInfoResponse
@@ -3034,8 +3117,8 @@ var file_pageserver_proto_depIdxs = []int32{
 	21, // 2: air.pageserver.v1.GetModifiedBlocksResponse.events:type_name -> air.pageserver.v1.ModifiedBlockEventMsg
 	28, // 3: air.pageserver.v1.WALRecordMsg.blocks:type_name -> air.pageserver.v1.WALRecordBlockMsg
 	29, // 4: air.pageserver.v1.IngestWALRecordsRequest.records:type_name -> air.pageserver.v1.WALRecordMsg
-	36, // 5: air.pageserver.v1.SetRelSizesRequest.entries:type_name -> air.pageserver.v1.RelSizeEntry
-	38, // 6: air.pageserver.v1.SeedSLRUPagesRequest.entries:type_name -> air.pageserver.v1.SLRUPageEntry
+	37, // 5: air.pageserver.v1.SetRelSizesRequest.entries:type_name -> air.pageserver.v1.RelSizeEntry
+	39, // 6: air.pageserver.v1.SeedSLRUPagesRequest.entries:type_name -> air.pageserver.v1.SLRUPageEntry
 	0,  // 7: air.pageserver.v1.PageserverService.Health:input_type -> air.pageserver.v1.PageserverEmpty
 	4,  // 8: air.pageserver.v1.PageserverService.GetTenantInfo:input_type -> air.pageserver.v1.PageserverTenantRequest
 	0,  // 9: air.pageserver.v1.PageserverService.ListTenants:input_type -> air.pageserver.v1.PageserverEmpty
@@ -3058,8 +3141,8 @@ var file_pageserver_proto_depIdxs = []int32{
 	4,  // 26: air.pageserver.v1.PageserverService.HasMetadataSkeleton:input_type -> air.pageserver.v1.PageserverTenantRequest
 	34, // 27: air.pageserver.v1.PageserverService.SaveMetadataSkeleton:input_type -> air.pageserver.v1.SaveSkeletonRequest
 	35, // 28: air.pageserver.v1.PageserverService.RestoreMetadataSkeleton:input_type -> air.pageserver.v1.RestoreSkeletonRequest
-	37, // 29: air.pageserver.v1.PageserverService.SetRelSizes:input_type -> air.pageserver.v1.SetRelSizesRequest
-	39, // 30: air.pageserver.v1.PageserverService.SeedSLRUPages:input_type -> air.pageserver.v1.SeedSLRUPagesRequest
+	38, // 29: air.pageserver.v1.PageserverService.SetRelSizes:input_type -> air.pageserver.v1.SetRelSizesRequest
+	40, // 30: air.pageserver.v1.PageserverService.SeedSLRUPages:input_type -> air.pageserver.v1.SeedSLRUPagesRequest
 	1,  // 31: air.pageserver.v1.PageserverService.Health:output_type -> air.pageserver.v1.PageserverHealthResponse
 	5,  // 32: air.pageserver.v1.PageserverService.GetTenantInfo:output_type -> air.pageserver.v1.PageserverTenantInfoResponse
 	6,  // 33: air.pageserver.v1.PageserverService.ListTenants:output_type -> air.pageserver.v1.PageserverListTenantsResponse
@@ -3081,7 +3164,7 @@ var file_pageserver_proto_depIdxs = []int32{
 	33, // 49: air.pageserver.v1.PageserverService.BootstrapTenantFromPGData:output_type -> air.pageserver.v1.BootstrapTenantResponse
 	3,  // 50: air.pageserver.v1.PageserverService.HasMetadataSkeleton:output_type -> air.pageserver.v1.PageserverBoolResponse
 	2,  // 51: air.pageserver.v1.PageserverService.SaveMetadataSkeleton:output_type -> air.pageserver.v1.PageserverStatusResponse
-	2,  // 52: air.pageserver.v1.PageserverService.RestoreMetadataSkeleton:output_type -> air.pageserver.v1.PageserverStatusResponse
+	36, // 52: air.pageserver.v1.PageserverService.RestoreMetadataSkeleton:output_type -> air.pageserver.v1.RestoreSkeletonResponse
 	2,  // 53: air.pageserver.v1.PageserverService.SetRelSizes:output_type -> air.pageserver.v1.PageserverStatusResponse
 	2,  // 54: air.pageserver.v1.PageserverService.SeedSLRUPages:output_type -> air.pageserver.v1.PageserverStatusResponse
 	31, // [31:55] is the sub-list for method output_type
@@ -3102,7 +3185,7 @@ func file_pageserver_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pageserver_proto_rawDesc), len(file_pageserver_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   40,
+			NumMessages:   41,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -231,12 +231,17 @@ func (c *GRPCPageserverClient) HasMetadataSkeleton(ctx context.Context, tenantID
 }
 
 func (c *GRPCPageserverClient) SaveMetadataSkeleton(ctx context.Context, tenantID string, epoch int64, pgDataDir string) error {
+	archive, _, err := pageserver.PackMetadataSkeleton(pgDataDir)
+	if err != nil {
+		return err
+	}
 	rctx, cancel := context.WithTimeout(c.withAuth(ctx), 30*time.Second)
 	defer cancel()
-	_, err := c.client.SaveMetadataSkeleton(rctx, &pb.SaveSkeletonRequest{
+	_, err = c.client.SaveMetadataSkeleton(rctx, &pb.SaveSkeletonRequest{
 		TenantId:  tenantID,
 		Epoch:     epoch,
 		PgDataDir: pgDataDir,
+		Archive:   archive,
 	})
 	return mapRemotePSErr(err)
 }
@@ -244,12 +249,19 @@ func (c *GRPCPageserverClient) SaveMetadataSkeleton(ctx context.Context, tenantI
 func (c *GRPCPageserverClient) RestoreMetadataSkeleton(ctx context.Context, tenantID string, epoch int64, pgDataDir string) error {
 	rctx, cancel := context.WithTimeout(c.withAuth(ctx), 30*time.Second)
 	defer cancel()
-	_, err := c.client.RestoreMetadataSkeleton(rctx, &pb.RestoreSkeletonRequest{
-		TenantId:  tenantID,
-		Epoch:     epoch,
-		PgDataDir: pgDataDir,
+	resp, err := c.client.RestoreMetadataSkeleton(rctx, &pb.RestoreSkeletonRequest{
+		TenantId:      tenantID,
+		Epoch:         epoch,
+		PgDataDir:     pgDataDir,
+		ReturnArchive: true,
 	})
-	return mapRemotePSErr(err)
+	if err != nil {
+		return mapRemotePSErr(err)
+	}
+	if _, err := pageserver.UnpackMetadataSkeleton(resp.GetArchive(), pgDataDir); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (c *GRPCPageserverClient) BootstrapTenantFromPGData(ctx context.Context, tenantID string, epoch int64, pgDataDir string, initLSN uint64) (*pageserver.LayerMeta, error) {

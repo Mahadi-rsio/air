@@ -73,7 +73,7 @@ type PageserverServiceClient interface {
 	BootstrapTenantFromPGData(ctx context.Context, in *BootstrapTenantRequest, opts ...grpc.CallOption) (*BootstrapTenantResponse, error)
 	HasMetadataSkeleton(ctx context.Context, in *PageserverTenantRequest, opts ...grpc.CallOption) (*PageserverBoolResponse, error)
 	SaveMetadataSkeleton(ctx context.Context, in *SaveSkeletonRequest, opts ...grpc.CallOption) (*PageserverStatusResponse, error)
-	RestoreMetadataSkeleton(ctx context.Context, in *RestoreSkeletonRequest, opts ...grpc.CallOption) (*PageserverStatusResponse, error)
+	RestoreMetadataSkeleton(ctx context.Context, in *RestoreSkeletonRequest, opts ...grpc.CallOption) (*RestoreSkeletonResponse, error)
 	SetRelSizes(ctx context.Context, in *SetRelSizesRequest, opts ...grpc.CallOption) (*PageserverStatusResponse, error)
 	SeedSLRUPages(ctx context.Context, in *SeedSLRUPagesRequest, opts ...grpc.CallOption) (*PageserverStatusResponse, error)
 }
@@ -296,9 +296,9 @@ func (c *pageserverServiceClient) SaveMetadataSkeleton(ctx context.Context, in *
 	return out, nil
 }
 
-func (c *pageserverServiceClient) RestoreMetadataSkeleton(ctx context.Context, in *RestoreSkeletonRequest, opts ...grpc.CallOption) (*PageserverStatusResponse, error) {
+func (c *pageserverServiceClient) RestoreMetadataSkeleton(ctx context.Context, in *RestoreSkeletonRequest, opts ...grpc.CallOption) (*RestoreSkeletonResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(PageserverStatusResponse)
+	out := new(RestoreSkeletonResponse)
 	err := c.cc.Invoke(ctx, PageserverService_RestoreMetadataSkeleton_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -354,7 +354,7 @@ type PageserverServiceServer interface {
 	BootstrapTenantFromPGData(context.Context, *BootstrapTenantRequest) (*BootstrapTenantResponse, error)
 	HasMetadataSkeleton(context.Context, *PageserverTenantRequest) (*PageserverBoolResponse, error)
 	SaveMetadataSkeleton(context.Context, *SaveSkeletonRequest) (*PageserverStatusResponse, error)
-	RestoreMetadataSkeleton(context.Context, *RestoreSkeletonRequest) (*PageserverStatusResponse, error)
+	RestoreMetadataSkeleton(context.Context, *RestoreSkeletonRequest) (*RestoreSkeletonResponse, error)
 	SetRelSizes(context.Context, *SetRelSizesRequest) (*PageserverStatusResponse, error)
 	SeedSLRUPages(context.Context, *SeedSLRUPagesRequest) (*PageserverStatusResponse, error)
 	mustEmbedUnimplementedPageserverServiceServer()
@@ -430,7 +430,7 @@ func (UnimplementedPageserverServiceServer) HasMetadataSkeleton(context.Context,
 func (UnimplementedPageserverServiceServer) SaveMetadataSkeleton(context.Context, *SaveSkeletonRequest) (*PageserverStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SaveMetadataSkeleton not implemented")
 }
-func (UnimplementedPageserverServiceServer) RestoreMetadataSkeleton(context.Context, *RestoreSkeletonRequest) (*PageserverStatusResponse, error) {
+func (UnimplementedPageserverServiceServer) RestoreMetadataSkeleton(context.Context, *RestoreSkeletonRequest) (*RestoreSkeletonResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RestoreMetadataSkeleton not implemented")
 }
 func (UnimplementedPageserverServiceServer) SetRelSizes(context.Context, *SetRelSizesRequest) (*PageserverStatusResponse, error) {
