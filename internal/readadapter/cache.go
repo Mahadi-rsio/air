@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,6 +43,7 @@ type CacheConfig struct {
 	L2BypassUnderPressure bool
 	L2DropPageCache       bool
 	L2DirectIO            bool
+	L2AdaptiveDirectIO    bool
 	MemPressureFn         func() bool
 }
 
@@ -57,6 +59,7 @@ func LowMemory512MBProfile(l2Dir string) CacheConfig {
 		L2MaxConcurrentIO:     4,
 		L2BypassUnderPressure: true,
 		L2DropPageCache:       true,
+		L2AdaptiveDirectIO:    true,
 	}
 }
 
@@ -181,6 +184,7 @@ type TieredCacheBackend struct {
 	l2BypassUnderPressure bool
 	l2DropPageCache       bool
 	l2DirectIO            bool
+	l2AdaptiveDirectIO    bool
 	memPressureFn         func() bool
 	l2IOSem               chan struct{}
 	alignedPool           sync.Pool
@@ -259,6 +263,11 @@ func NewTieredCacheBackend(l3 StorageBackend, cfg CacheConfig) (*TieredCacheBack
 	if l2Dir != "" && cfg.L2MaxConcurrentIO > 0 {
 		ioSem = make(chan struct{}, cfg.L2MaxConcurrentIO)
 	}
+	memFn := cfg.MemPressureFn
+	if cfg.L2BypassUnderPressure && memFn == nil {
+		memFn = DefaultCgroupMemoryPressureFn()
+	}
+	adaptiveDirect := cfg.L2AdaptiveDirectIO || (cfg.L2BypassUnderPressure && !cfg.L2DirectIO)
 	return &TieredCacheBackend{
 		l3:                    l3,
 		l1MaxBytes:            cfg.L1MaxBytes,
@@ -269,7 +278,8 @@ func NewTieredCacheBackend(l3 StorageBackend, cfg CacheConfig) (*TieredCacheBack
 		l2BypassUnderPressure: cfg.L2BypassUnderPressure,
 		l2DropPageCache:       cfg.L2DropPageCache,
 		l2DirectIO:            cfg.L2DirectIO,
-		memPressureFn:         cfg.MemPressureFn,
+		l2AdaptiveDirectIO:    adaptiveDirect,
+		memPressureFn:         memFn,
 		l2IOSem:               ioSem,
 		alignedPool: sync.Pool{
 			New: func() any {
@@ -1017,7 +1027,7 @@ func (c *TieredCacheBackend) releaseL2IO() {
 }
 
 func (c *TieredCacheBackend) readL2File(path string) ([]byte, error) {
-	if c.l2DirectIO {
+	if c.shouldUseDirectIO() {
 		rawPool := c.alignedPool.Get().([]byte)
 		aligned := alignedSlice(rawPool, directIOL2FileSize)
 		f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECT, 0)
@@ -1063,7 +1073,7 @@ func (c *TieredCacheBackend) readL2File(path string) ([]byte, error) {
 }
 
 func (c *TieredCacheBackend) writeL2File(tmpPath string, pg []byte, crc uint32) (int64, error) {
-	if c.l2DirectIO {
+	if c.shouldUseDirectIO() {
 		rawPool := c.alignedPool.Get().([]byte)
 		aligned := alignedSlice(rawPool, directIOL2FileSize)
 		copy(aligned[:PGPageSize], pg)
@@ -1223,7 +1233,7 @@ func (c *TieredCacheBackend) putL2(k PageCacheKey, pg []byte) {
 		return
 	}
 	fileSize := int64(PGPageSize + 4)
-	if c.l2DirectIO {
+	if c.shouldUseDirectIO() {
 		fileSize = directIOL2FileSize
 	}
 	if fileSize > c.l2MaxBytes || (c.l2MaxEntryBytes > 0 && int64(len(pg)) > c.l2MaxEntryBytes) {
@@ -1253,4 +1263,88 @@ func (c *TieredCacheBackend) putL2(k PageCacheKey, pg []byte) {
 	}
 
 	c.registerL2Entry(k, path, actualSize)
+}
+
+func (c *TieredCacheBackend) shouldUseDirectIO() bool {
+	if c.l2DirectIO {
+		return true
+	}
+	if c.l2AdaptiveDirectIO && c.memPressureFn != nil {
+		return c.memPressureFn()
+	}
+	return false
+}
+
+// ParseCgroupMemoryPressure parses Linux cgroup v2 memory.pressure PSI content
+// (returning true if "some avg10" >= 10.0 or "full avg10" >= 2.0).
+func ParseCgroupMemoryPressure(raw string) bool {
+	for _, line := range strings.Split(raw, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		kind := fields[0]
+		for _, f := range fields[1:] {
+			if strings.HasPrefix(f, "avg10=") {
+				v, err := strconv.ParseFloat(strings.TrimPrefix(f, "avg10="), 64)
+				if err == nil {
+					if (kind == "some" && v >= 10.0) || (kind == "full" && v >= 2.0) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// DefaultCgroupMemoryPressureFn returns a low-overhead (250ms cached) detector wired
+// to cgroup v2 memory.pressure and memory.high / memory.current.
+func DefaultCgroupMemoryPressureFn() func() bool {
+	var lastCheckNs atomic.Int64
+	var lastVal atomic.Bool
+	return func() bool {
+		now := time.Now().UnixNano()
+		prev := lastCheckNs.Load()
+		if now-prev < int64(250*time.Millisecond) {
+			return lastVal.Load()
+		}
+		if !lastCheckNs.CompareAndSwap(prev, now) {
+			return lastVal.Load()
+		}
+		under := false
+		if raw, err := os.ReadFile("/sys/fs/cgroup/memory.pressure"); err == nil {
+			if ParseCgroupMemoryPressure(string(raw)) {
+				under = true
+			}
+		}
+		if !under {
+			curBytes := readCgroupInt64File("/sys/fs/cgroup/memory.current")
+			highBytes := readCgroupInt64File("/sys/fs/cgroup/memory.high")
+			if highBytes <= 0 {
+				highBytes = readCgroupInt64File("/sys/fs/cgroup/memory.max")
+			}
+			if curBytes > 0 && highBytes > 0 && float64(curBytes) >= 0.85*float64(highBytes) {
+				under = true
+			}
+		}
+		lastVal.Store(under)
+		return under
+	}
+}
+
+func readCgroupInt64File(path string) int64 {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "max" {
+		return 0
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
 }
