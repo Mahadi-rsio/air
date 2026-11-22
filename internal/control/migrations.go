@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-const currentSchemaVersion = 5
+const currentSchemaVersion = 6
 
 func (cp *ControlPlane) runMigrations(ctx context.Context) error {
 	if _, err := cp.db.Exec(ctx, `
@@ -206,6 +206,35 @@ func (cp *ControlPlane) runMigrations(ctx context.Context) error {
 		for _, s := range stmts {
 			if _, err := tx.Exec(ctx, s); err != nil {
 				return fmt.Errorf("migration v5 failed: %w", err)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+	}
+	if current < 6 {
+		tx, err := cp.db.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		stmts := []string{
+			`CREATE TABLE IF NOT EXISTS query_metering (
+				id BIGSERIAL PRIMARY KEY,
+				recorded_at TIMESTAMPTZ NOT NULL,
+				db_id TEXT NOT NULL,
+				bandwidth_bytes BIGINT NOT NULL,
+				query_time_us BIGINT NOT NULL,
+				query_type TEXT NOT NULL,
+				created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_query_metering_db_recorded ON query_metering(db_id, recorded_at DESC)`,
+			`CREATE INDEX IF NOT EXISTS idx_query_metering_recorded ON query_metering(recorded_at DESC)`,
+			`INSERT INTO schema_migrations(version) VALUES (6) ON CONFLICT DO NOTHING`,
+		}
+		for _, s := range stmts {
+			if _, err := tx.Exec(ctx, s); err != nil {
+				return fmt.Errorf("migration v6 failed: %w", err)
 			}
 		}
 		if err := tx.Commit(ctx); err != nil {

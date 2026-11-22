@@ -108,6 +108,7 @@ type TenantPool struct {
 	readIdlePool   []*BackendConn
 	routingMetrics RoutingMetrics
 	wakeFn         WakeFn
+	metering       *MeteringLogger
 
 	semMu          sync.Mutex
 	semCond        *sync.Cond
@@ -187,6 +188,12 @@ func (p *TenantPool) SetWakeFn(fn WakeFn) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.wakeFn = fn
+}
+
+func (p *TenantPool) SetMeteringLogger(m *MeteringLogger) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.metering = m
 }
 
 func (p *TenantPool) UpdateEndpoint(host, sockDir string, port int, appPassword string) {
@@ -361,12 +368,23 @@ func (p *TenantPool) updateTxCount(st *clientSessionState) {
 	}
 }
 
-func (p *TenantPool) recordQueryMetrics(st *clientSessionState, qStart time.Time, poolWaitUs, bytesIn uint64, rstats relayStats, hadErr bool, count uint64) {
-	if st.metrics == nil {
-		return
-	}
+func (p *TenantPool) recordQueryMetrics(st *clientSessionState, qStart time.Time, poolWaitUs, bytesIn uint64, rstats relayStats, hadErr bool, count uint64, queryType string) {
 	durUs := uint64(time.Since(qStart).Microseconds())
-	st.metrics.RecordQuery(p.tenantID, st.startupUser, durUs, poolWaitUs, bytesIn, rstats.bytesOut, rstats.rowsReturned, rstats.dataRowBytes, hadErr, count)
+	if st.metrics != nil {
+		st.metrics.RecordQuery(p.tenantID, st.startupUser, durUs, poolWaitUs, bytesIn, rstats.bytesOut, rstats.rowsReturned, rstats.dataRowBytes, hadErr, count)
+	}
+	p.mu.Lock()
+	m := p.metering
+	p.mu.Unlock()
+	if m != nil {
+		m.LogQuery(MeteringEntry{
+			Date:           qStart.UTC(),
+			DBID:           p.tenantID,
+			BandwidthBytes: bytesIn + rstats.bytesOut,
+			QueryTimeUs:    durUs,
+			QueryType:      queryType,
+		})
+	}
 }
 
 func (p *TenantPool) ensureSessionAndStmts(b *BackendConn, st *clientSessionState) bool {
@@ -441,11 +459,11 @@ func (p *TenantPool) ensureBackend(st *clientSessionState) (uint64, bool) {
 	return poolWaitUs, true
 }
 
-func (p *TenantPool) executeSimpleAndRelay(st *clientSessionState, wireMsg []byte, bytesIn uint64, qStart time.Time) (hadErr bool, ioOK bool, ok bool) {
+func (p *TenantPool) executeSimpleAndRelay(st *clientSessionState, wireMsg []byte, bytesIn uint64, qStart time.Time, queryType string) (hadErr bool, ioOK bool, ok bool) {
 	ioOK = true
 	poolWaitUs, acquired := p.ensureBackend(st)
 	if !acquired {
-		p.recordQueryMetrics(st, qStart, poolWaitUs, bytesIn, relayStats{}, true, 1)
+		p.recordQueryMetrics(st, qStart, poolWaitUs, bytesIn, relayStats{}, true, 1, queryType)
 		return true, true, false
 	}
 	st.backendInFlight = true
@@ -460,12 +478,12 @@ func (p *TenantPool) executeSimpleAndRelay(st *clientSessionState, wireMsg []byt
 	}
 	st.txStatus = txStatus
 	st.backendInFlight = false
-	p.recordQueryMetrics(st, qStart, poolWaitUs, bytesIn, rstats, hadErr, 1)
+	p.recordQueryMetrics(st, qStart, poolWaitUs, bytesIn, rstats, hadErr, 1, queryType)
 	p.updateTxCount(st)
 	return hadErr, true, true
 }
 
-func (p *TenantPool) tryExecuteOnReadEngine(st *clientSessionState, wireMsg []byte, bytesIn uint64, qStart time.Time) (executed bool, ioOK bool) {
+func (p *TenantPool) tryExecuteOnReadEngine(st *clientSessionState, wireMsg []byte, bytesIn uint64, qStart time.Time, queryType string) (executed bool, ioOK bool) {
 	ioOK = true
 	waitStart := time.Now()
 	rb, err := p.acquireReadBackend(st.clientID)
@@ -545,7 +563,7 @@ func (p *TenantPool) tryExecuteOnReadEngine(st *clientSessionState, wireMsg []by
 	}
 	st.txStatus = txStatus
 	p.releaseReadBackend(rb, hadErr || st.txStatus != 'I')
-	p.recordQueryMetrics(st, qStart, poolWaitUs, bytesIn, rstats, hadErr, 1)
+	p.recordQueryMetrics(st, qStart, poolWaitUs, bytesIn, rstats, hadErr, 1, queryType)
 	return true, true
 }
 
@@ -556,6 +574,7 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 	off := 0
 	q := ReadCStr(mbody, &off)
 	trimmed := strings.TrimSpace(q)
+	queryType := ClassifyQueryType(trimmed)
 
 	if IsSessionPinningSQL(trimmed) && !st.sessionPinned {
 		st.sessionPinned = true
@@ -564,7 +583,7 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 
 	if sm := reSetStmt.FindStringSubmatch(trimmed); sm != nil {
 		key, val := sm[1], sm[2]
-		hadErr, ioOK, ok := p.executeSimpleAndRelay(st, BuildPGMessage('Q', mbody), bytesIn, qStart)
+		hadErr, ioOK, ok := p.executeSimpleAndRelay(st, BuildPGMessage('Q', mbody), bytesIn, qStart, queryType)
 		if !ok {
 			return ioOK
 		}
@@ -573,7 +592,7 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 		}
 	} else if sm := reResetStmt.FindStringSubmatch(trimmed); sm != nil {
 		key := sm[1]
-		hadErr, ioOK, ok := p.executeSimpleAndRelay(st, BuildPGMessage('Q', mbody), bytesIn, qStart)
+		hadErr, ioOK, ok := p.executeSimpleAndRelay(st, BuildPGMessage('Q', mbody), bytesIn, qStart, queryType)
 		if !ok {
 			return ioOK
 		}
@@ -588,7 +607,7 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 		clientName, typeList, innerQ := sm[1], sm[2], sm[3]
 		globalName := fmt.Sprintf("_air_s_%d_%d", st.clientID, p.stmtSeq.Add(1))
 		rewritten := fmt.Sprintf("PREPARE %s%s AS %s", globalName, typeList, innerQ)
-		hadErr, ioOK, ok := p.executeSimpleAndRelay(st, BuildSimpleQuery(rewritten), bytesIn, qStart)
+		hadErr, ioOK, ok := p.executeSimpleAndRelay(st, BuildSimpleQuery(rewritten), bytesIn, qStart, queryType)
 		if !ok {
 			return ioOK
 		}
@@ -616,7 +635,7 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 		} else {
 			deallocSQL = "DEALLOCATE " + cname
 		}
-		hadErr, ioOK, ok := p.executeSimpleAndRelay(st, BuildSimpleQuery(deallocSQL), bytesIn, qStart)
+		hadErr, ioOK, ok := p.executeSimpleAndRelay(st, BuildSimpleQuery(deallocSQL), bytesIn, qStart, queryType)
 		if !ok {
 			return ioOK
 		}
@@ -672,7 +691,7 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 			}
 			rdec := RouteQuery(trimmed, rctx, &p.routingMetrics)
 			if rdec.Target == RouteTargetReadEngine {
-				execOK, ioOK := p.tryExecuteOnReadEngine(st, BuildPGMessage('Q', outBody), bytesIn, qStart)
+				execOK, ioOK := p.tryExecuteOnReadEngine(st, BuildPGMessage('Q', outBody), bytesIn, qStart, queryType)
 				if !ioOK {
 					return false
 				}
@@ -683,7 +702,7 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 			}
 		}
 		if !routedToRead {
-			hadErr, ioOK, ok := p.executeSimpleAndRelay(st, BuildPGMessage('Q', outBody), bytesIn, qStart)
+			hadErr, ioOK, ok := p.executeSimpleAndRelay(st, BuildPGMessage('Q', outBody), bytesIn, qStart, queryType)
 			if !ok {
 				return ioOK
 			}
@@ -711,14 +730,33 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 	qStart := time.Now()
 	*extBatch = append(*extBatch, extMsg{msgType: terminatorType, body: terminatorBody})
 	var bytesIn, execCount uint64
+	var batchSQLs []string
 	for _, m := range *extBatch {
 		bytesIn += uint64(5 + len(m.body))
-		if m.msgType == 'E' {
+		switch m.msgType {
+		case 'E':
 			execCount++
+		case 'P':
+			off := 0
+			_ = ReadCStr(m.body, &off)
+			if pq := ReadCStr(m.body, &off); pq != "" {
+				batchSQLs = append(batchSQLs, pq)
+			}
+		case 'B':
+			off := 0
+			_ = ReadCStr(m.body, &off)
+			sname := ReadCStr(m.body, &off)
+			if def, ok := st.clientStmts[sname]; ok && def.Query != "" {
+				batchSQLs = append(batchSQLs, def.Query)
+			}
 		}
 	}
 	if execCount == 0 {
 		execCount = 1
+	}
+	batchQueryType := "EXTENDED"
+	if len(batchSQLs) > 0 {
+		batchQueryType = ClassifyQueryType(strings.Join(batchSQLs, "; "))
 	}
 
 	p.mu.Lock()
@@ -906,7 +944,7 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 			if hadErr {
 				rollbackParses()
 			}
-			p.recordQueryMetrics(st, qStart, waitUs, bytesIn, rstats, hadErr, execCount)
+			p.recordQueryMetrics(st, qStart, waitUs, bytesIn, rstats, hadErr, execCount, batchQueryType)
 			if !isReadBackend && rport > 0 && !hadErr && st.txStatus == 'I' && batchHasWrite {
 				if wlsn, ok := queryLSNBackend(targetB, "SELECT pg_current_wal_lsn()::text"); ok && wlsn > st.sessionWriteLSN {
 					st.sessionWriteLSN = wlsn
@@ -922,7 +960,7 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 		if hadErr {
 			rollbackParses()
 		}
-		p.recordQueryMetrics(st, qStart, waitUs, bytesIn, rstats, hadErr, execCount)
+		p.recordQueryMetrics(st, qStart, waitUs, bytesIn, rstats, hadErr, execCount, batchQueryType)
 		return 1
 	}
 
@@ -957,7 +995,7 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 	if !acquired {
 		*extBatch = (*extBatch)[:0]
 		*extBatchBytes = 0
-		p.recordQueryMetrics(st, qStart, poolWaitUs, bytesIn, relayStats{}, true, execCount)
+		p.recordQueryMetrics(st, qStart, poolWaitUs, bytesIn, relayStats{}, true, execCount, batchQueryType)
 		return true
 	}
 
@@ -1506,6 +1544,7 @@ type PoolManager struct {
 	readHost    string
 	readSockDir string
 	readPort    int
+	metering    *MeteringLogger
 	pools       map[string]*TenantPool
 }
 
@@ -1517,6 +1556,17 @@ func NewPoolManager(maxBackends, idleTimeoutSec int) *PoolManager {
 		maxBackends:    maxBackends,
 		idleTimeoutSec: idleTimeoutSec,
 		pools:          make(map[string]*TenantPool),
+	}
+}
+
+func (pm *PoolManager) SetMeteringLogger(m *MeteringLogger) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.metering = m
+	for _, p := range pm.pools {
+		if p != nil {
+			p.SetMeteringLogger(m)
+		}
 	}
 }
 
@@ -1543,6 +1593,9 @@ func (pm *PoolManager) GetOrCreate(route TenantRoute, wakeFn WakeFn) *TenantPool
 	p := NewTenantPool(route.TenantID, route.Host, route.SockDir, route.Port, route.AppPassword, pm.maxBackends, pm.idleTimeoutSec)
 	if pm.readPort > 0 || pm.readSockDir != "" {
 		p.SetReadEngineEndpoint(pm.readHost, pm.readSockDir, pm.readPort)
+	}
+	if pm.metering != nil {
+		p.SetMeteringLogger(pm.metering)
 	}
 	p.SetWakeFn(wakeFn)
 	pm.pools[route.TenantID] = p

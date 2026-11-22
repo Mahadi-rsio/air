@@ -25,6 +25,19 @@ func main() {
 
 	metrics := gateway.NewMetricsRegistry(cfg.MaxClientConns, cfg.MaxTenantClientConns, cfg.MaxUserClientConns)
 	pools := gateway.NewPoolManager(cfg.PoolMaxBackends, cfg.PoolIdleTimeoutSec)
+	var meteringSaver gateway.MeteringSaver
+	if cfg.MetaDSN != "" {
+		meteringSaver = gateway.NewPGMeteringSaver(cfg.MetaDSN)
+	}
+	meteringLogger, err := gateway.NewMeteringLogger(cfg.MeteringLogDir, cfg.MeteringMaxFileBytes, cfg.MeteringFlushInterval, meteringSaver)
+	if err != nil {
+		log.Printf("[air-gateway] metering logger disabled: %v", err)
+	} else {
+		meteringLogger.Start()
+		pools.SetMeteringLogger(meteringLogger)
+		log.Printf("[air-gateway] query metering enabled (dir=%s, max_file_bytes=%d, flush_interval=%s)",
+			cfg.MeteringLogDir, cfg.MeteringMaxFileBytes, cfg.MeteringFlushInterval)
+	}
 	if cfg.ReadEnginePort > 0 || cfg.ReadEngineSockDir != "" {
 		pools.SetReadEngineEndpoint(cfg.ReadEngineHost, cfg.ReadEngineSockDir, cfg.ReadEnginePort)
 	}
@@ -177,6 +190,9 @@ func main() {
 		_ = psGRPC.Close()
 	}
 	pools.CloseAll()
+	if meteringLogger != nil {
+		meteringLogger.Stop()
+	}
 
 	done := make(chan struct{})
 	go func() {

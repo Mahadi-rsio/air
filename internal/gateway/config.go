@@ -3,60 +3,68 @@ package gateway
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds runtime configuration for air-gateway, loaded from environment
 // variables and overridden by CLI flags.
 type Config struct {
-	GatewayAddr          string
-	AdminAddr            string
-	AdminGRPCAddr        string
-	MetaDSN              string
-	MetaPort             int
-	ControlPlaneURL      string
-	GRPCAddr             string
-	InternalToken        string
-	BackendHost          string
-	RequireTLS           bool
-	TLSCertPath          string
-	TLSKeyPath           string
-	PoolMode             bool
-	PoolMaxBackends      int
-	PoolIdleTimeoutSec   int
-	AuthTimeoutMS        int
-	ClientIdleTimeoutMS  int
-	MaxClientConns       int
-	MaxTenantClientConns int
-	MaxUserClientConns   int
-	DiscoveryIntervalMS  int
-	ReadEngineHost       string
-	ReadEngineSockDir    string
-	ReadEnginePort       int
-	ReadEngineGRPCAddr   string
-	PageserverGRPCAddr   string
+	GatewayAddr           string
+	AdminAddr             string
+	AdminGRPCAddr         string
+	MetaDSN               string
+	MetaPort              int
+	ControlPlaneURL       string
+	GRPCAddr              string
+	InternalToken         string
+	BackendHost           string
+	RequireTLS            bool
+	TLSCertPath           string
+	TLSKeyPath            string
+	PoolMode              bool
+	PoolMaxBackends       int
+	PoolIdleTimeoutSec    int
+	AuthTimeoutMS         int
+	ClientIdleTimeoutMS   int
+	MaxClientConns        int
+	MaxTenantClientConns  int
+	MaxUserClientConns    int
+	DiscoveryIntervalMS   int
+	ReadEngineHost        string
+	ReadEngineSockDir     string
+	ReadEnginePort        int
+	ReadEngineGRPCAddr    string
+	PageserverGRPCAddr    string
+	MeteringLogDir        string
+	MeteringMaxFileBytes  int64
+	MeteringFlushInterval time.Duration
 }
 
 // DefaultConfig returns a Config initialized with default values.
 func DefaultConfig() Config {
 	return Config{
-		GatewayAddr:          "127.0.0.1:5432",
-		AdminAddr:            "127.0.0.1:8081",
-		MetaPort:             15432,
-		ControlPlaneURL:      "http://127.0.0.1:8080",
-		GRPCAddr:             "127.0.0.1:9090",
-		PoolMode:             true,
-		PoolMaxBackends:      16,
-		PoolIdleTimeoutSec:   300,
-		AuthTimeoutMS:        5000,
-		ClientIdleTimeoutMS:  0,
-		MaxClientConns:       1024,
-		MaxTenantClientConns: 128,
-		MaxUserClientConns:   0,
-		DiscoveryIntervalMS:  2000,
-		ReadEngineHost:       "127.0.0.1",
-		ReadEnginePort:       5433,
+		GatewayAddr:           "127.0.0.1:5432",
+		AdminAddr:             "127.0.0.1:8081",
+		MetaPort:              15432,
+		ControlPlaneURL:       "http://127.0.0.1:8080",
+		GRPCAddr:              "127.0.0.1:9090",
+		PoolMode:              true,
+		PoolMaxBackends:       16,
+		PoolIdleTimeoutSec:    300,
+		AuthTimeoutMS:         5000,
+		ClientIdleTimeoutMS:   0,
+		MaxClientConns:        1024,
+		MaxTenantClientConns:  128,
+		MaxUserClientConns:    0,
+		DiscoveryIntervalMS:   2000,
+		ReadEngineHost:        "127.0.0.1",
+		ReadEnginePort:        5433,
+		MeteringLogDir:        filepath.Join(os.TempDir(), "air-gateway-metering"),
+		MeteringMaxFileBytes:  10 * 1024 * 1024,
+		MeteringFlushInterval: 2 * time.Minute,
 	}
 }
 
@@ -116,6 +124,15 @@ func LoadConfig(args []string) Config {
 	c.ReadEnginePort = envIntMin("AIR_READ_ENGINE_PORT", c.ReadEnginePort, 0)
 	c.ReadEngineGRPCAddr = envOr("AIR_READ_ENGINE_GRPC_ADDR", "")
 	c.PageserverGRPCAddr = envOr("AIR_PAGESERVER_GRPC_ADDR", "")
+	c.MeteringLogDir = envOr("AIR_METERING_LOG_DIR", c.MeteringLogDir)
+	if v := os.Getenv("AIR_METERING_MAX_FILE_BYTES"); v != "" {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
+			c.MeteringMaxFileBytes = parsed
+		}
+	}
+	if sec := envInt("AIR_METERING_FLUSH_INTERVAL_SEC", int(c.MeteringFlushInterval.Seconds())); sec > 0 {
+		c.MeteringFlushInterval = time.Duration(sec) * time.Second
+	}
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -184,6 +201,22 @@ func LoadConfig(args []string) Config {
 			nextStr(&c.ReadEngineGRPCAddr)
 		case "--pageserver-grpc-addr":
 			nextStr(&c.PageserverGRPCAddr)
+		case "--metering-log-dir":
+			nextStr(&c.MeteringLogDir)
+		case "--metering-max-file-bytes":
+			if i+1 < len(args) {
+				i++
+				if v, err := strconv.ParseInt(args[i], 10, 64); err == nil && v > 0 {
+					c.MeteringMaxFileBytes = v
+				}
+			}
+		case "--metering-flush-interval-sec":
+			if i+1 < len(args) {
+				i++
+				if v, err := strconv.Atoi(args[i]); err == nil && v > 0 {
+					c.MeteringFlushInterval = time.Duration(v) * time.Second
+				}
+			}
 		}
 	}
 
