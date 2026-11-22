@@ -1,4 +1,24 @@
 services:
+  air-meta-postgres:
+    image: postgres:17-alpine
+    container_name: air-meta-postgres
+    environment:
+      POSTGRES_USER: ${AIR_META_PG_USER:-air_meta}
+      POSTGRES_PASSWORD: ${AIR_META_PG_PASSWORD:-air_meta_pass}
+      POSTGRES_DB: ${AIR_META_PG_DB:-air_meta}
+    ports:
+      - "${AIR_META_PG_PORT:-5435}:5432"
+    volumes:
+      - air_meta_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIR_META_PG_USER:-air_meta} -d ${AIR_META_PG_DB:-air_meta}"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    networks:
+      - air-net
+
   air-pageserver:
     build:
       context: .
@@ -36,10 +56,13 @@ services:
       dockerfile: Dockerfile
     container_name: air-server
     depends_on:
+      air-meta-postgres:
+        condition: service_healthy
       air-pageserver:
         condition: service_healthy
     environment:
       AIR_DATA_DIR: /var/lib/air
+      AIR_META_DSN: ${AIR_META_DSN:-postgres://air_meta:air_meta_pass@air-meta-postgres:5432/air_meta?sslmode=disable}
       AIR_PG_BIN_DIR: /usr/lib/postgresql/17/bin
       AIR_HTTP_ADDR: 0.0.0.0:8080
       AIR_GRPC_ADDR: 0.0.0.0:9090
@@ -118,6 +141,7 @@ services:
       AIR_GATEWAY_ADMIN_ADDR: 0.0.0.0:8081
       AIR_GATEWAY_ADMIN_GRPC_ADDR: 0.0.0.0:9093
       AIR_CONTROL_PLANE_URL: http://air-server:8080
+      AIR_META_DSN: ${AIR_META_DSN:-postgres://air_meta:air_meta_pass@air-meta-postgres:5432/air_meta?sslmode=disable}
       AIR_DB_GRPC_ADDR: air-server:9090
       AIR_PAGESERVER_GRPC_ADDR: air-pageserver:9091
       AIR_READ_ENGINE_HOST: air-read-engine
@@ -140,6 +164,7 @@ services:
       - air-net
 
 volumes:
+  air_meta_pg_data:
   air_pageserver_data:
   air_server_data:
   air_read_engine_data:
