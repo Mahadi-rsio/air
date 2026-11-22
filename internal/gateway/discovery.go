@@ -48,6 +48,7 @@ type TenantDiscovery struct {
 
 	cacheMu          sync.RWMutex
 	cache            map[string]TenantRoute
+	aliases          map[string]BlueGreenAlias
 	lastEventVersion atomic.Int64
 
 	cbMu     sync.Mutex
@@ -179,13 +180,14 @@ func (d *TenantDiscovery) fromProtoRoute(resp *pb.TenantRouteResponse) TenantRou
 // ResolveTenant resolves a tenant route from cache or Control Plane gRPC, waking SUSPENDED tenants if needed.
 func (d *TenantDiscovery) ResolveTenant(tenantID string) (TenantRoute, codes.Code, error) {
 	d.cacheMu.RLock()
-	if r, ok := d.cache[tenantID]; ok && r.State == "ACTIVE" && r.Port > 0 && r.AppPassword != "" {
+	targetID := d.resolveAliasLocked(tenantID)
+	if r, ok := d.cache[targetID]; ok && r.State == "ACTIVE" && r.Port > 0 && r.AppPassword != "" {
 		d.cacheMu.RUnlock()
 		return r, codes.OK, nil
 	}
 	d.cacheMu.RUnlock()
 
-	req := &pb.TenantRequest{TenantId: tenantID}
+	req := &pb.TenantRequest{TenantId: targetID}
 	var resp *pb.TenantRouteResponse
 	var err error
 	for attempt := 0; attempt < 2; attempt++ {
