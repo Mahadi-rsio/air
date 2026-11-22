@@ -42,8 +42,9 @@ const (
 	OpGetPageBatch uint16 = 5
 	OpPutPageBatch uint16 = 6
 	OpUnlinkRel    uint16 = 7
-	OpGetSLRUPage  uint16 = 8
-	OpGetTenantInfo uint16 = 9
+	OpGetSLRUPage       uint16 = 8
+	OpGetTenantInfo     uint16 = 9
+	OpGetModifiedBlocks uint16 = 10
 )
 
 // Wire response statuses matching AirPsStatus in protocol.h.
@@ -248,6 +249,12 @@ type Service interface {
 // to query a tenant's active generation and latest ingested WAL LSN over pageserver.sock.
 type TenantInfoProvider interface {
 	GetTenantInfo(tenantID string) (generation string, lastLSN uint64, ok bool)
+}
+
+// ModifiedBlocksProvider is an optional Service extension used by incremental page-level
+// cache invalidation to fetch blocks modified since a given LSN along with catalog LSN.
+type ModifiedBlocksProvider interface {
+	GetModifiedBlocksSince(ctx context.Context, tenantID string, sinceLSN uint64) (ModifiedBlocksResult, error)
 }
 
 // UnixServer serves the binary air_smgr protocol over an AF_UNIX stream socket.
@@ -485,6 +492,38 @@ func (s *UnixServer) handleConn(ctx context.Context, conn net.Conn) {
 				} else {
 					u64Val = lastLSN
 					payload = []byte(gen)
+				}
+			} else {
+				status = StatusNotFound
+			}
+		case OpGetModifiedBlocks:
+			if mbp, ok := s.svc.(ModifiedBlocksProvider); ok {
+				res, err := mbp.GetModifiedBlocksSince(ctx, req.TenantID, req.LSN)
+				if errors.Is(err, ErrNotFound) {
+					status = StatusNotFound
+				} else if err != nil {
+					status = StatusError
+				} else {
+					u64Val = res.CurrentLSN
+					nblocksOrVal = uint32(len(res.Events))
+					// Payload: [CatalogLSN uint64][ResetRequired uint8][7B pad] + N * 28B events.
+					payload = make([]byte, 16+len(res.Events)*28)
+					binary.LittleEndian.PutUint64(payload[0:8], res.CatalogLSN)
+					if res.ResetRequired {
+						payload[8] = 1
+					}
+					for i, ev := range res.Events {
+						off := 16 + i*28
+						binary.LittleEndian.PutUint32(payload[off:off+4], ev.SpcOID)
+						binary.LittleEndian.PutUint32(payload[off+4:off+8], ev.DbOID)
+						binary.LittleEndian.PutUint32(payload[off+8:off+12], ev.RelNumber)
+						binary.LittleEndian.PutUint32(payload[off+12:off+16], ev.BlockNum)
+						binary.LittleEndian.PutUint64(payload[off+16:off+24], ev.LSN)
+						payload[off+24] = ev.ForkNum
+						if ev.IsRelWide {
+							payload[off+25] = 1
+						}
+					}
 				}
 			} else {
 				status = StatusNotFound

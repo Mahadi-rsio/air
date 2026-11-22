@@ -31,6 +31,15 @@ const (
 	RouteReasonReadErrorFallback
 )
 
+// QueryPlanHint carries lightweight, zero-RPC query-shape hints extracted
+// during SQL classification for read-engine routing and observability.
+type QueryPlanHint struct {
+	ExplainQuery     bool
+	ComplexJoinOrAgg bool
+	HasOrderLimit    bool
+	SimpleRead       bool
+}
+
 type RouteDecision struct {
 	Target RouteTarget
 	Reason RouteReason
@@ -48,8 +57,23 @@ type SessionRouteContext struct {
 type RoutingMetrics struct {
 	ReadRouted        atomic.Uint64
 	WriteRouted       atomic.Uint64
+	ExplainRouted     atomic.Uint64
 	FallbacksToWrite  atomic.Uint64
 	ReadErrorsRetried atomic.Uint64
+}
+
+// ReadFallbackRate returns the fraction of read-eligible queries that fell back to WriteEngine.
+func (m *RoutingMetrics) ReadFallbackRate() float64 {
+	if m == nil {
+		return 0
+	}
+	read := m.ReadRouted.Load()
+	fb := m.FallbacksToWrite.Load()
+	total := read + fb
+	if total == 0 {
+		return 0
+	}
+	return float64(fb) / float64(total)
 }
 
 type tokKind int
@@ -262,18 +286,18 @@ func isMutatingFunction(w string) bool {
 	return false
 }
 
-func classifySingleStatement(toks []sqlToken) RouteDecision {
+func classifySingleStatement(toks []sqlToken) (RouteDecision, QueryPlanHint) {
 	if len(toks) == 0 {
-		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}
+		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}, QueryPlanHint{}
 	}
 
 	head := toks[0].upper
 
 	if isWriteKeyword(head) {
-		return RouteDecision{RouteTargetWriteEngine, RouteReasonWriteDML}
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonWriteDML}, QueryPlanHint{}
 	}
 	if isDDLOrWriteHead(head) {
-		return RouteDecision{RouteTargetWriteEngine, RouteReasonWriteDDL}
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonWriteDDL}, QueryPlanHint{}
 	}
 
 	// COPY ... FROM -> WriteEngine; COPY (...) TO -> ReadEngine
@@ -293,88 +317,106 @@ func classifySingleStatement(toks []sqlToken) RouteDecision {
 			}
 			if parenDepth == 0 {
 				if w == "FROM" {
-					return RouteDecision{RouteTargetWriteEngine, RouteReasonWriteDML}
+					return RouteDecision{RouteTargetWriteEngine, RouteReasonWriteDML}, QueryPlanHint{}
 				}
 				if w == "TO" {
-					return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}
+					return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}, QueryPlanHint{}
 				}
 			} else {
 				if isWriteKeyword(w) {
-					return RouteDecision{RouteTargetWriteEngine, RouteReasonModifyingCTE}
+					return RouteDecision{RouteTargetWriteEngine, RouteReasonModifyingCTE}, QueryPlanHint{}
 				}
 				if isMutatingFunction(w) && i+1 < len(toks) && toks[i+1].upper == "(" {
-					return RouteDecision{RouteTargetWriteEngine, RouteReasonMutatingFunction}
+					return RouteDecision{RouteTargetWriteEngine, RouteReasonMutatingFunction}, QueryPlanHint{}
 				}
 			}
 		}
-		return RouteDecision{RouteTargetWriteEngine, RouteReasonWriteDML}
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonWriteDML}, QueryPlanHint{}
 	}
 
 	// Transaction boundaries must execute on WriteEngine so multi-statement
 	// transactions remain atomic and post-commit LSNs are captured accurately.
 	if head == "BEGIN" || head == "START" || head == "COMMIT" || head == "END" || head == "ROLLBACK" {
-		return RouteDecision{RouteTargetWriteEngine, RouteReasonTransactionWriteState}
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonTransactionWriteState}, QueryPlanHint{}
 	}
 
 	switch head {
 	case "SHOW", "DISCARD", "DEALLOCATE":
-		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}
+		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}, QueryPlanHint{}
 	case "SET", "RESET":
 		for i := 1; i < len(toks); i++ {
 			if toks[i].upper == "TRANSACTION_READ_ONLY" || toks[i].upper == "DEFAULT_TRANSACTION_READ_ONLY" {
-				return RouteDecision{RouteTargetWriteEngine, RouteReasonSessionPinned}
+				return RouteDecision{RouteTargetWriteEngine, RouteReasonSessionPinned}, QueryPlanHint{}
 			}
 		}
-		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}
+		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}, QueryPlanHint{}
 	}
+
+	var hint QueryPlanHint
+	hint.ExplainQuery = head == "EXPLAIN"
 
 	for i := 0; i < len(toks); i++ {
 		w := toks[i].upper
 		if i > 0 && isWriteKeyword(w) {
-			return RouteDecision{RouteTargetWriteEngine, RouteReasonModifyingCTE}
+			return RouteDecision{RouteTargetWriteEngine, RouteReasonModifyingCTE}, QueryPlanHint{}
 		}
 		if w == "INTO" && head == "SELECT" {
-			return RouteDecision{RouteTargetWriteEngine, RouteReasonSelectInto}
+			return RouteDecision{RouteTargetWriteEngine, RouteReasonSelectInto}, QueryPlanHint{}
 		}
 		if w == "FOR" && i+1 < len(toks) {
 			next := toks[i+1].upper
 			if next == "UPDATE" || next == "SHARE" || next == "NO" || next == "KEY" {
-				return RouteDecision{RouteTargetWriteEngine, RouteReasonRowLocking}
+				return RouteDecision{RouteTargetWriteEngine, RouteReasonRowLocking}, QueryPlanHint{}
 			}
 		}
 		if isMutatingFunction(w) && i+1 < len(toks) && toks[i+1].upper == "(" {
-			return RouteDecision{RouteTargetWriteEngine, RouteReasonMutatingFunction}
+			return RouteDecision{RouteTargetWriteEngine, RouteReasonMutatingFunction}, QueryPlanHint{}
+		}
+		switch w {
+		case "JOIN", "GROUP", "HAVING", "UNION", "INTERSECT", "EXCEPT":
+			hint.ComplexJoinOrAgg = true
+		case "ORDER", "LIMIT":
+			hint.HasOrderLimit = true
 		}
 	}
 
 	switch head {
 	case "SELECT", "WITH", "VALUES", "TABLE", "EXPLAIN":
-		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlySelect}
+		hint.SimpleRead = !hint.ComplexJoinOrAgg && !hint.ExplainQuery
+		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlySelect}, hint
 	}
 
-	return RouteDecision{RouteTargetWriteEngine, RouteReasonWriteDDL}
+	return RouteDecision{RouteTargetWriteEngine, RouteReasonWriteDDL}, QueryPlanHint{}
 }
 
-// ClassifySQLForRouting classifies a SQL string (single or multi-statement) for ReadEngine vs WriteEngine routing.
-func ClassifySQLForRouting(sql string) RouteDecision {
+// ClassifySQLWithHint classifies a SQL string and returns lightweight query-shape hints.
+func ClassifySQLWithHint(sql string) (RouteDecision, QueryPlanHint) {
 	stmts := tokenizeStatements(sql)
 	overall := RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlySelect}
+	var overallHint QueryPlanHint
 	for _, toks := range stmts {
 		if len(toks) == 0 {
 			continue
 		}
-		d := classifySingleStatement(toks)
+		d, h := classifySingleStatement(toks)
 		if d.Target == RouteTargetWriteEngine {
-			return d
+			return d, h
 		}
 		overall = d
+		overallHint = h
 	}
-	return overall
+	return overall, overallHint
+}
+
+// ClassifySQLForRouting classifies a SQL string (single or multi-statement) for ReadEngine vs WriteEngine routing.
+func ClassifySQLForRouting(sql string) RouteDecision {
+	d, _ := ClassifySQLWithHint(sql)
+	return d
 }
 
 // RouteQuery decides the final route for a query given session transaction/pinning/LSN state.
 func RouteQuery(sql string, ctx SessionRouteContext, metrics *RoutingMetrics) RouteDecision {
-	d := ClassifySQLForRouting(sql)
+	d, hint := ClassifySQLWithHint(sql)
 	if d.Target == RouteTargetReadEngine {
 		if ctx.SessionPinned {
 			d = RouteDecision{RouteTargetWriteEngine, RouteReasonSessionPinned}
@@ -396,6 +438,9 @@ func RouteQuery(sql string, ctx SessionRouteContext, metrics *RoutingMetrics) Ro
 	if metrics != nil {
 		if d.Target == RouteTargetReadEngine {
 			metrics.ReadRouted.Add(1)
+			if hint.ExplainQuery {
+				metrics.ExplainRouted.Add(1)
+			}
 		} else {
 			metrics.WriteRouted.Add(1)
 		}

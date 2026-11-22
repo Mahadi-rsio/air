@@ -16,6 +16,7 @@ const (
 	PGAttributeRelID uint32 = 1249
 	PGIndexRelID     uint32 = 2610
 	PGNamespaceRelID uint32 = 2615
+	PGStatisticRelID uint32 = 2619
 
 	PGBtreeAMOID uint32 = 403
 )
@@ -39,6 +40,8 @@ type DiscoveredIndex struct {
 	SpcOID      uint32
 	DbOID       uint32
 	RelNumber   uint32
+	RelPages    int32
+	RelTuples   float32
 	IndNAtts    int16
 	IndNKeyAtts int16
 	IsUnique    bool
@@ -55,11 +58,15 @@ type DiscoveredTable struct {
 	SpcOID         uint32
 	DbOID          uint32
 	RelNumber      uint32
+	RelPages       int32
+	RelTuples      float32
+	RelAllVisible  int32
 	ToastRelOID    uint32
 	ToastRelNumber uint32
 	ToastIndexRel  uint32
 	Columns        []DiscoveredColumn
 	Indexes        []DiscoveredIndex
+	ColumnStats    map[int16]ColumnStats
 }
 
 var (
@@ -119,6 +126,15 @@ var (
 	pgNamespaceCols = []ColumnType{
 		ColOID,  // 1: oid
 		ColName, // 2: nspname
+	}
+
+	pgStatisticCols = []ColumnType{
+		ColOID,    // 1: starelid
+		ColInt2,   // 2: staattnum
+		ColBool,   // 3: stainherit
+		ColFloat4, // 4: stanullfrac
+		ColInt4,   // 5: stawidth
+		ColFloat4, // 6: stadistinct
 	}
 
 	pgClassCols = []ColumnType{
@@ -256,8 +272,6 @@ func scanCatalogRelation(
 				decodeCols := cols
 				if relNumber == PGDatabaseRelID && (thdr.Infomask2&HeapNattsMask) == 16 {
 					decodeCols = pgDatabaseColsPG15
-				} else if relNumber == PGAttributeRelID && (thdr.Infomask2&HeapNattsMask) == 26 {
-					decodeCols = pgAttributeColsPG15
 				}
 				vals, err := DecodeHeapColumns(tup, thdr, decodeCols)
 				if err != nil {
@@ -294,6 +308,7 @@ func DiscoverCatalog(
 	var dbSpcOID uint32 = PGDefaultTablespaceOID
 	var fallbackOID uint32
 	var fallbackSpc uint32 = PGDefaultTablespaceOID
+	isPG15 := false
 	for _, r := range dbRows {
 		name, _ := r[1].(string)
 		oid, _ := r[0].(uint32)
@@ -301,6 +316,7 @@ func DiscoverCatalog(
 		spcIdx := 11
 		if len(r) == len(pgDatabaseColsPG15) {
 			spcIdx = 10
+			isPG15 = true
 		}
 		if spcIdx < len(r) {
 			if s, ok := r[spcIdx].(uint32); ok && s != 0 {
@@ -349,15 +365,18 @@ func DiscoverCatalog(
 		return nil, fmt.Errorf("readadapter: scan pg_class: %w", err)
 	}
 	type classMeta struct {
-		oid       uint32
-		name      string
-		nspOID    uint32
-		relAM     uint32
-		relNode   uint32
-		relSpc    uint32
-		toastOID  uint32
-		hasIndex  bool
-		relKind   byte
+		oid        uint32
+		name       string
+		nspOID     uint32
+		relAM      uint32
+		relNode    uint32
+		relSpc     uint32
+		relPages   int32
+		relTuples  float32
+		relAllVis  int32
+		toastOID   uint32
+		hasIndex   bool
+		relKind    byte
 	}
 	classesByOID := make(map[uint32]classMeta, len(classRows))
 	tablesByOID := make(map[uint32]*DiscoveredTable)
@@ -368,6 +387,9 @@ func DiscoverCatalog(
 		relAM, _ := r[6].(uint32)
 		relFileNode, _ := r[7].(uint32)
 		relSpc, _ := r[8].(uint32)
+		relPages, _ := r[9].(int32)
+		relTuples, _ := r[10].(float32)
+		relAllVis, _ := r[11].(int32)
 		toastOID, _ := r[12].(uint32)
 		hasIndex, _ := r[13].(bool)
 		relkind, _ := r[16].(byte)
@@ -378,27 +400,33 @@ func DiscoverCatalog(
 			relSpc = dbSpcOID
 		}
 		classesByOID[relOID] = classMeta{
-			oid:      relOID,
-			name:     relName,
-			nspOID:   nspOID,
-			relAM:    relAM,
-			relNode:  relFileNode,
-			relSpc:   relSpc,
-			toastOID: toastOID,
-			hasIndex: hasIndex,
-			relKind:  relkind,
+			oid:       relOID,
+			name:      relName,
+			nspOID:    nspOID,
+			relAM:     relAM,
+			relNode:   relFileNode,
+			relSpc:    relSpc,
+			relPages:  relPages,
+			relTuples: relTuples,
+			relAllVis: relAllVis,
+			toastOID:  toastOID,
+			hasIndex:  hasIndex,
+			relKind:   relkind,
 		}
 		if nspOID != publicNspOID || relkind != 'r' {
 			continue
 		}
 		tablesByOID[relOID] = &DiscoveredTable{
-			Schema:      "public",
-			Name:        relName,
-			RelOID:      relOID,
-			SpcOID:      relSpc,
-			DbOID:       dbOID,
-			RelNumber:   relFileNode,
-			ToastRelOID: toastOID,
+			Schema:        "public",
+			Name:          relName,
+			RelOID:        relOID,
+			SpcOID:        relSpc,
+			DbOID:         dbOID,
+			RelNumber:     relFileNode,
+			RelPages:      relPages,
+			RelTuples:     relTuples,
+			RelAllVisible: relAllVis,
+			ToastRelOID:   toastOID,
 		}
 	}
 	if len(tablesByOID) == 0 {
@@ -415,7 +443,11 @@ func DiscoverCatalog(
 	}
 
 	// 4. Scan pg_attribute (dbSpcOID/dbOID/1249) for user columns (attnum > 0).
-	attRows, err := scanCatalogRelation(ctx, adapter, clog, snap, dbSpcOID, dbOID, PGAttributeRelID, pgAttributeCols)
+	attCols := pgAttributeCols
+	if isPG15 {
+		attCols = pgAttributeColsPG15
+	}
+	attRows, err := scanCatalogRelation(ctx, adapter, clog, snap, dbSpcOID, dbOID, PGAttributeRelID, attCols)
 	if err != nil {
 		return nil, fmt.Errorf("readadapter: scan pg_attribute: %w", err)
 	}
@@ -517,6 +549,8 @@ func DiscoverCatalog(
 				SpcOID:      icls.relSpc,
 				DbOID:       dbOID,
 				RelNumber:   icls.relNode,
+				RelPages:    icls.relPages,
+				RelTuples:   icls.relTuples,
 				IndNAtts:    indNAtts,
 				IndNKeyAtts: indNKeyAtts,
 				IsUnique:    isUnique,
@@ -524,6 +558,43 @@ func DiscoverCatalog(
 				KeyAttNums:  keyAtts,
 				KeyOptions:  keyOpts,
 			})
+		}
+	}
+
+	// 6. Scan pg_statistic (dbSpcOID/dbOID/2619) when available to populate column statistics.
+	// Missing or empty pg_statistic (e.g. before ANALYZE or in synthetic tests) is handled gracefully.
+	if statRows, err := scanCatalogRelation(ctx, adapter, clog, snap, dbSpcOID, dbOID, PGStatisticRelID, pgStatisticCols); err == nil {
+		for _, r := range statRows {
+			if len(r) < 6 {
+				continue
+			}
+			relID, _ := r[0].(uint32)
+			tbl, ok := tablesByOID[relID]
+			if !ok {
+				continue
+			}
+			attNum, _ := r[1].(int16)
+			if attNum <= 0 {
+				continue
+			}
+			staInherit, _ := r[2].(bool)
+			if staInherit && tbl.ColumnStats != nil {
+				if _, exists := tbl.ColumnStats[attNum]; exists {
+					continue
+				}
+			}
+			nullFrac, _ := r[3].(float32)
+			avgWidth, _ := r[4].(int32)
+			distinct, _ := r[5].(float32)
+			if tbl.ColumnStats == nil {
+				tbl.ColumnStats = make(map[int16]ColumnStats)
+			}
+			tbl.ColumnStats[attNum] = ColumnStats{
+				AttNum:   attNum,
+				NullFrac: nullFrac,
+				AvgWidth: avgWidth,
+				Distinct: distinct,
+			}
 		}
 	}
 

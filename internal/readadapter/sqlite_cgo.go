@@ -274,20 +274,31 @@ func (c *SQLiteConn) Query(sql string, args []string) (*SQLiteResult, error) {
 
 // QueryWithContext executes a SQL statement under ctx and an optional shared ReadSnapshot.
 func (c *SQLiteConn) QueryWithContext(ctx context.Context, snap *ReadSnapshot, sql string, args []string) (*SQLiteResult, error) {
+	res, _, err := c.queryWithContextInternal(ctx, snap, sql, args)
+	return res, err
+}
+
+// QueryWithContextPlan executes a SQL statement under ctx and an optional shared ReadSnapshot,
+// also returning the last AIR virtual-table PlanDecision recorded during execution (if any).
+func (c *SQLiteConn) QueryWithContextPlan(ctx context.Context, snap *ReadSnapshot, sql string, args []string) (*SQLiteResult, *PlanDecision, error) {
+	return c.queryWithContextInternal(ctx, snap, sql, args)
+}
+
+func (c *SQLiteConn) queryWithContextInternal(ctx context.Context, snap *ReadSnapshot, sql string, args []string) (*SQLiteResult, *PlanDecision, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.db == nil {
-		return nil, fmt.Errorf("sqlite connection closed")
+		return nil, nil, fmt.Errorf("sqlite connection closed")
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if ctx.Done() != nil {
@@ -328,18 +339,18 @@ func (c *SQLiteConn) QueryWithContext(ctx context.Context, snap *ReadSnapshot, s
 	if rc != C.SQLITE_OK {
 		msg := C.GoString(C.sqlite3_errmsg(c.db))
 		if rc == C.SQLITE_AUTH {
-			return nil, &SQLiteReadOnlyError{Message: msg}
+			return nil, nil, &SQLiteReadOnlyError{Message: msg}
 		}
-		return nil, fmt.Errorf("%s", msg)
+		return nil, nil, fmt.Errorf("%s", msg)
 	}
 	if stmt == nil {
 		// Empty statement or comment-only query.
-		return &SQLiteResult{}, nil
+		return &SQLiteResult{}, nil, nil
 	}
 	defer C.sqlite3_finalize(stmt)
 
 	if C.sqlite3_stmt_readonly(stmt) == 0 && c.readOnly {
-		return nil, &SQLiteReadOnlyError{Message: "statement is not read-only"}
+		return nil, nil, &SQLiteReadOnlyError{Message: "statement is not read-only"}
 	}
 
 	for i, arg := range args {
@@ -352,7 +363,7 @@ func (c *SQLiteConn) QueryWithContext(ctx context.Context, snap *ReadSnapshot, s
 		brc := C.air_bind_text(stmt, idx, carg, C.int(len(arg)))
 		C.free(unsafe.Pointer(carg))
 		if brc != C.SQLITE_OK {
-			return nil, fmt.Errorf("bind param %d: %s", i+1, C.GoString(C.sqlite3_errmsg(c.db)))
+			return nil, nil, fmt.Errorf("bind param %d: %s", i+1, C.GoString(C.sqlite3_errmsg(c.db)))
 		}
 	}
 
@@ -443,19 +454,19 @@ func (c *SQLiteConn) QueryWithContext(ctx context.Context, snap *ReadSnapshot, s
 			res.RowsChanged = int64(C.sqlite3_changes(c.db))
 			break
 		} else if stepRC == C.SQLITE_AUTH {
-			return nil, &SQLiteReadOnlyError{Message: C.GoString(C.sqlite3_errmsg(c.db))}
+			return nil, nil, &SQLiteReadOnlyError{Message: C.GoString(C.sqlite3_errmsg(c.db))}
 		} else {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
+				return nil, nil, ctxErr
 			}
 			if qctx.lastErr != nil {
-				return nil, qctx.lastErr
+				return nil, nil, qctx.lastErr
 			}
-			return nil, fmt.Errorf("%s", C.GoString(C.sqlite3_errmsg(c.db)))
+			return nil, nil, fmt.Errorf("%s", C.GoString(C.sqlite3_errmsg(c.db)))
 		}
 	}
 
-	return res, nil
+	return res, qctx.lastPlan, nil
 }
 
 // DescribeColumns prepares a SQL statement without stepping it and returns its result column metadata.

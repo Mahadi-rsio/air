@@ -301,6 +301,13 @@ func (p *Pageserver) GetRelExists(ctx context.Context, tenantID string, spcOID, 
 }
 
 // GetDBSize implements Service.
+func (p *Pageserver) GetModifiedBlocksSince(_ context.Context, tenantID string, sinceLSN uint64) (ModifiedBlocksResult, error) {
+	tl, err := p.getTimeline(tenantID)
+	if err != nil {
+		return ModifiedBlocksResult{}, err
+	}
+	return tl.GetModifiedBlocksSince(sinceLSN), nil
+}
 func (p *Pageserver) GetDBSize(ctx context.Context, tenantID string, spcOID, dbOID uint32, lsn uint64) (uint64, error) {
 	tl, err := p.getTimeline(tenantID)
 	if err != nil {

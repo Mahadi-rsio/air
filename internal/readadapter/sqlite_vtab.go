@@ -17,10 +17,10 @@ typedef struct {
 } air_pg_cursor;
 
 extern int goAirPGConnect(sqlite3 *db, int argc, char **argv, unsigned long long *out_id, char **out_ddl);
-extern void goAirPGBestIndexCost(unsigned long long vtab_id, char *idx_str, double *out_cost, sqlite3_int64 *out_rows);
+extern void goAirPGBestIndexCost(unsigned long long vtab_id, char *idx_str, double *out_cost, sqlite3_int64 *out_rows, int *out_order_consumed, int *out_idx_num);
 extern int goAirPGOpen(unsigned long long vtab_id, unsigned long long *out_cursor_id);
 extern int goAirPGClose(unsigned long long cursor_id);
-extern int goAirPGFilter(unsigned long long cursor_id, char *idx_str, int argc, sqlite3_value **argv);
+extern int goAirPGFilter(unsigned long long cursor_id, int idx_num, char *idx_str, int argc, sqlite3_value **argv);
 extern int goAirPGNext(unsigned long long cursor_id);
 extern int goAirPGEof(unsigned long long cursor_id);
 extern int goAirPGColumn(unsigned long long cursor_id, sqlite3_context *ctx, int col_idx);
@@ -75,6 +75,7 @@ static int air_pg_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *pIdxInfo) 
 		int needs_arg = 0;
 		switch (op) {
 			case SQLITE_INDEX_CONSTRAINT_EQ:
+			case SQLITE_INDEX_CONSTRAINT_NE:
 			case SQLITE_INDEX_CONSTRAINT_GT:
 			case SQLITE_INDEX_CONSTRAINT_LE:
 			case SQLITE_INDEX_CONSTRAINT_LT:
@@ -95,6 +96,14 @@ static int air_pg_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *pIdxInfo) 
 		sqlite3_str_appendf(str, "%d:%d,", pIdxInfo->aConstraint[i].iColumn, (int)op);
 	}
 
+	sqlite3_str_appendall(str, "|");
+	for (int i = 0; i < pIdxInfo->nOrderBy; i++) {
+		if (pIdxInfo->aOrderBy[i].iColumn < 0) {
+			continue;
+		}
+		sqlite3_str_appendf(str, "%d:%d,", pIdxInfo->aOrderBy[i].iColumn, (int)pIdxInfo->aOrderBy[i].desc);
+	}
+
 	char *encoded = sqlite3_str_finish(str);
 	if (encoded == NULL) {
 		return SQLITE_NOMEM;
@@ -104,9 +113,13 @@ static int air_pg_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *pIdxInfo) 
 
 	double cost = 10000.0;
 	sqlite3_int64 rows = 10000;
-	goAirPGBestIndexCost(v != NULL ? v->go_id : 0, encoded, &cost, &rows);
+	int order_consumed = 0;
+	int idx_num = 0;
+	goAirPGBestIndexCost(v != NULL ? v->go_id : 0, encoded, &cost, &rows, &order_consumed, &idx_num);
 	pIdxInfo->estimatedCost = cost;
 	pIdxInfo->estimatedRows = rows;
+	pIdxInfo->orderByConsumed = order_consumed;
+	pIdxInfo->idxNum = idx_num;
 	return SQLITE_OK;
 }
 
@@ -147,9 +160,8 @@ static int air_pg_filter(
 	int argc,
 	sqlite3_value **argv
 ) {
-	(void)idxNum;
 	air_pg_cursor *c = (air_pg_cursor *)pCur;
-	return goAirPGFilter(c->go_id, (char *)idxStr, argc, argv);
+	return goAirPGFilter(c->go_id, idxNum, (char *)idxStr, argc, argv);
 }
 
 static int air_pg_next(sqlite3_vtab_cursor *pCur) {
@@ -217,15 +229,18 @@ import "C"
 import (
 	"context"
 	"fmt"
+	"math/bits"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
 const (
 	sqliteConstraintEQ        = int(C.SQLITE_INDEX_CONSTRAINT_EQ)
+	sqliteConstraintNE        = int(C.SQLITE_INDEX_CONSTRAINT_NE)
 	sqliteConstraintGT        = int(C.SQLITE_INDEX_CONSTRAINT_GT)
 	sqliteConstraintLE        = int(C.SQLITE_INDEX_CONSTRAINT_LE)
 	sqliteConstraintLT        = int(C.SQLITE_INDEX_CONSTRAINT_LT)
@@ -251,6 +266,8 @@ type pgVTabSpec struct {
 	IndexPlans []btreeIndexPlan
 	Adapter    *Adapter
 	CLOG       *CLOGResolver
+	Optimizer  *QueryOptimizer
+	Adaptive   *AdaptiveTracker
 }
 
 type vtabFilter struct {
@@ -274,6 +291,7 @@ type pgVTabCursor struct {
 	nextBlock     uint32
 	indexScanDone bool
 	neededCols    []bool
+	filterCols    []bool
 	filters       []vtabFilter
 	rowStride     int
 	rows          []HeapVal
@@ -283,12 +301,17 @@ type pgVTabCursor struct {
 	pageRowIdx    int
 	rowid         int64
 	eof           bool
+	estRows       int64
+	actualRows    uint64
+	startPages    uint64
+	startTime     time.Time
 }
 
 type queryExecContext struct {
-	ctx     context.Context
-	snap    *ReadSnapshot
-	lastErr error
+	ctx      context.Context
+	snap     *ReadSnapshot
+	lastErr  error
+	lastPlan *PlanDecision
 }
 
 var (
@@ -362,6 +385,19 @@ func (c *SQLiteConn) RegisterAirPGModule() error {
 // SQLite virtual table backed by AIR's Pageserver via adapter and clog.
 // Returns the registered vtab spec ID (call UnregisterNativeTable on cleanup).
 func (c *SQLiteConn) RegisterNativeTable(tenantID, generation string, tbl DiscoveredTable, adapter *Adapter, clog *CLOGResolver) (uint64, error) {
+	return c.RegisterNativeTableWithOptimizer(tenantID, generation, tbl, adapter, clog, nil, nil)
+}
+
+// RegisterNativeTableWithOptimizer registers a discovered PostgreSQL table as a
+// read-only SQLite virtual table wired to AIR's cost-based QueryOptimizer and AdaptiveTracker.
+func (c *SQLiteConn) RegisterNativeTableWithOptimizer(
+	tenantID, generation string,
+	tbl DiscoveredTable,
+	adapter *Adapter,
+	clog *CLOGResolver,
+	optimizer *QueryOptimizer,
+	adaptive *AdaptiveTracker,
+) (uint64, error) {
 	allCols := make([]ColumnType, len(tbl.Columns))
 	var visibleIdx []int
 	for i, col := range tbl.Columns {
@@ -372,6 +408,9 @@ func (c *SQLiteConn) RegisterNativeTable(tenantID, generation string, tbl Discov
 	}
 	if len(visibleIdx) == 0 {
 		return 0, fmt.Errorf("readadapter: table %q has no visible columns", tbl.Name)
+	}
+	if optimizer == nil {
+		optimizer = NewQueryOptimizer(DefaultCostModelConfig(), nil, adaptive, nil)
 	}
 
 	id := vtabNextID.Add(1)
@@ -386,6 +425,8 @@ func (c *SQLiteConn) RegisterNativeTable(tenantID, generation string, tbl Discov
 		IndexPlans: buildTableIndexPlans(tbl, allCols, visibleIdx),
 		Adapter:    adapter,
 		CLOG:       clog,
+		Optimizer:  optimizer,
+		Adaptive:   adaptive,
 	}
 	vtabMu.Lock()
 	vtabMap[id] = spec
@@ -445,95 +486,127 @@ func goAirPGConnect(_ *C.sqlite3, argc C.int, argv **C.char, outID *C.ulonglong,
 }
 
 //export goAirPGBestIndexCost
-func goAirPGBestIndexCost(vtabID C.ulonglong, idxStr *C.char, outCost *C.double, outRows *C.sqlite3_int64) {
+func goAirPGBestIndexCost(
+	vtabID C.ulonglong,
+	idxStr *C.char,
+	outCost *C.double,
+	outRows *C.sqlite3_int64,
+	outOrderConsumed *C.int,
+	outIdxNum *C.int,
+) {
 	*outCost = 10000.0
 	*outRows = 10000
+	*outOrderConsumed = 0
+	*outIdxNum = 0
 	if idxStr == nil {
 		return
 	}
 	encoded := C.GoString(idxStr)
-	barIdx := strings.IndexByte(encoded, '|')
-	if barIdx < 0 {
-		return
-	}
-	condPart := encoded[barIdx+1:]
-	if condPart == "" {
-		return
-	}
+	parts := strings.SplitN(encoded, "|", 3)
 
 	vtabMu.RLock()
 	spec := vtabMap[uint64(vtabID)]
 	vtabMu.RUnlock()
+	if spec == nil {
+		return
+	}
 
-	hasEQ := false
-	hasRange := false
-	hasIndexedEQ := false
-	hasUniqueIndexedEQ := false
-	hasIndexedRange := false
-
-	for len(condPart) > 0 {
-		commaIdx := strings.IndexByte(condPart, ',')
-		var token string
-		if commaIdx >= 0 {
-			token = condPart[:commaIdx]
-			condPart = condPart[commaIdx+1:]
-		} else {
-			token = condPart
-			condPart = ""
-		}
-		if token == "" {
-			continue
-		}
-		colonIdx := strings.IndexByte(token, ':')
-		if colonIdx < 0 {
-			continue
-		}
-		vIdx, err1 := strconv.Atoi(token[:colonIdx])
-		op, err2 := strconv.Atoi(token[colonIdx+1:])
-		if err1 != nil || err2 != nil {
-			continue
-		}
-		if op == sqliteConstraintEQ || op == sqliteConstraintISNULL {
-			hasEQ = true
-		} else {
-			hasRange = true
-		}
-		if spec != nil && vIdx >= 0 && vIdx < len(spec.VisibleIdx) {
-			allIdx := spec.VisibleIdx[vIdx]
-			for _, plan := range spec.IndexPlans {
-				if len(plan.KeyAllCols) > 0 && plan.KeyAllCols[0] == allIdx {
-					if op == sqliteConstraintEQ || op == sqliteConstraintISNULL {
-						hasIndexedEQ = true
-						if plan.Index.IsUnique && plan.Index.IndNKeyAtts == 1 {
-							hasUniqueIndexedEQ = true
-						}
-					} else if op == sqliteConstraintGT || op == sqliteConstraintGE || op == sqliteConstraintLT || op == sqliteConstraintLE {
-						hasIndexedRange = true
-					}
+	neededCols := len(spec.AllCols)
+	if len(parts) >= 1 && parts[0] != "" {
+		if colUsed, err := strconv.ParseUint(parts[0], 16, 64); err == nil {
+			if (colUsed >> 63) == 0 {
+				cnt := bits.OnesCount64(colUsed)
+				if cnt > 0 && cnt < neededCols {
+					neededCols = cnt
 				}
 			}
 		}
 	}
 
-	switch {
-	case hasUniqueIndexedEQ:
-		*outCost = 2.0
-		*outRows = 1
-	case hasIndexedEQ:
-		*outCost = 10.0
-		*outRows = 5
-	case hasIndexedRange:
-		*outCost = 40.0
-		*outRows = 50
-	case hasEQ:
-		*outCost = 100.0
-		*outRows = 10
-	case hasRange:
-		*outCost = 500.0
-		*outRows = 100
-	default:
-		*outCost = 10000.0
-		*outRows = 10000
+	var constraints []FilterConstraint
+	if len(parts) >= 2 && parts[1] != "" {
+		for _, token := range strings.Split(parts[1], ",") {
+			if token == "" {
+				continue
+			}
+			colonIdx := strings.IndexByte(token, ':')
+			if colonIdx < 0 {
+				continue
+			}
+			vIdx, err1 := strconv.Atoi(token[:colonIdx])
+			op, err2 := strconv.Atoi(token[colonIdx+1:])
+			if err1 != nil || err2 != nil || vIdx < 0 || vIdx >= len(spec.VisibleIdx) {
+				continue
+			}
+			allIdx := spec.VisibleIdx[vIdx]
+			var attNum int16
+			if allIdx < len(spec.Table.Columns) {
+				attNum = spec.Table.Columns[allIdx].AttNum
+			}
+			constraints = append(constraints, FilterConstraint{
+				AllColIdx: allIdx,
+				AttNum:    attNum,
+				Op:        op,
+			})
+		}
+	}
+
+	var orderBy []OrderBySpec
+	if len(parts) >= 3 && parts[2] != "" {
+		for _, token := range strings.Split(parts[2], ",") {
+			if token == "" {
+				continue
+			}
+			colonIdx := strings.IndexByte(token, ':')
+			if colonIdx < 0 {
+				continue
+			}
+			vIdx, err1 := strconv.Atoi(token[:colonIdx])
+			descInt, err2 := strconv.Atoi(token[colonIdx+1:])
+			if err1 != nil || err2 != nil || vIdx < 0 || vIdx >= len(spec.VisibleIdx) {
+				continue
+			}
+			orderBy = append(orderBy, OrderBySpec{
+				AllColIdx: spec.VisibleIdx[vIdx],
+				Desc:      descInt != 0,
+			})
+		}
+	}
+
+	opt := spec.Optimizer
+	if opt == nil {
+		opt = NewQueryOptimizer(DefaultCostModelConfig(), nil, spec.Adaptive, nil)
+	}
+	dec := opt.ChooseBestPlan(
+		spec.Table,
+		spec.IndexPlans,
+		spec.AllCols,
+		constraints,
+		orderBy,
+		neededCols,
+		0,
+		spec.TenantID,
+		spec.Generation,
+	)
+
+	if qctx := getActiveQueryContext(spec.db); qctx != nil {
+		decCopy := dec
+		qctx.lastPlan = &decCopy
+	}
+
+	*outCost = C.double(dec.Selected.EstimatedCost)
+	estRows := dec.Selected.EstimatedRows
+	if estRows < 1 {
+		estRows = 1
+	}
+	*outRows = C.sqlite3_int64(estRows)
+	if dec.Selected.OrderByConsumed {
+		*outOrderConsumed = 1
+	}
+	if dec.Selected.IndexPlanIdx >= 0 {
+		*outIdxNum = C.int(dec.Selected.IndexPlanIdx + 1)
+	} else {
+		*outIdxNum = 0
 	}
 }
 
@@ -590,6 +663,25 @@ func goAirPGClose(cursorID C.ulonglong) C.int {
 	delete(cursorMap, uint64(cursorID))
 	cursorMu.Unlock()
 	if ok && cur != nil {
+		if cur.spec != nil && cur.spec.Adaptive != nil && !cur.startTime.IsZero() {
+			pagesDelta := vtabPagesRead.Load() - cur.startPages
+			execNs := uint64(time.Since(cur.startTime).Nanoseconds())
+			var l1Hits, l2Hits uint64
+			if cur.spec.Optimizer != nil && cur.spec.Optimizer.cache != nil {
+				cs := cur.spec.Optimizer.cache.Stats()
+				if cs.L1Hits+cs.L1Misses > 0 {
+					l1Hits = (pagesDelta * cs.L1Hits) / (cs.L1Hits + cs.L1Misses)
+				}
+				if cs.L2Hits+cs.L2Misses > 0 {
+					l2Hits = (pagesDelta * cs.L2Hits) / (cs.L2Hits + cs.L2Misses)
+				}
+			}
+			est := cur.estRows
+			if est < 1 {
+				est = 1
+			}
+			cur.spec.Adaptive.Record(cur.spec.TenantID, cur.spec.Table.RelOID, uint64(est), cur.actualRows, pagesDelta, l1Hits, l2Hits, execNs)
+		}
 		cur.resetResources()
 	}
 	return C.SQLITE_OK
@@ -681,6 +773,8 @@ func evalFilterVal(f vtabFilter, val HeapVal) bool {
 	switch f.op {
 	case int(C.SQLITE_INDEX_CONSTRAINT_EQ):
 		return cmp == 0
+	case int(C.SQLITE_INDEX_CONSTRAINT_NE):
+		return cmp != 0
 	case int(C.SQLITE_INDEX_CONSTRAINT_LT):
 		return cmp < 0
 	case int(C.SQLITE_INDEX_CONSTRAINT_LE):
@@ -739,7 +833,13 @@ func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 
 	var filterCols []bool
 	if len(cur.filters) > 0 {
-		filterCols = make([]bool, ncols)
+		if cap(cur.filterCols) < ncols {
+			cur.filterCols = make([]bool, ncols)
+		} else {
+			cur.filterCols = cur.filterCols[:ncols]
+			clear(cur.filterCols)
+		}
+		filterCols = cur.filterCols
 		for _, f := range cur.filters {
 			if f.allColIdx >= 0 && f.allColIdx < ncols {
 				filterCols[f.allColIdx] = true
@@ -813,6 +913,7 @@ func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 					cur.rowBuf[j].Materialize()
 				}
 				vtabRowsMatched.Add(1)
+				cur.actualRows++
 				cur.rows = append(cur.rows, cur.rowBuf...)
 				cur.numRows++
 			}
@@ -830,7 +931,7 @@ func (cur *pgVTabCursor) parseFilterPlan(idxStr string, argc int, argv **C.sqlit
 	hasColMask := false
 
 	if idxStr != "" {
-		parts := strings.SplitN(idxStr, "|", 2)
+		parts := strings.SplitN(idxStr, "|", 3)
 		if len(parts) >= 1 && parts[0] != "" {
 			if colUsed, err := strconv.ParseUint(parts[0], 16, 64); err == nil {
 				hasColMask = true
@@ -848,7 +949,7 @@ func (cur *pgVTabCursor) parseFilterPlan(idxStr string, argc int, argv **C.sqlit
 			}
 		}
 
-		if len(parts) == 2 && parts[1] != "" {
+		if len(parts) >= 2 && parts[1] != "" {
 			var argVals []*C.sqlite3_value
 			if argc > 0 && argv != nil {
 				argVals = unsafe.Slice(argv, argc)
@@ -907,7 +1008,7 @@ func (cur *pgVTabCursor) parseFilterPlan(idxStr string, argc int, argv **C.sqlit
 }
 
 //export goAirPGFilter
-func goAirPGFilter(cursorID C.ulonglong, idxStr *C.char, argc C.int, argv **C.sqlite3_value) C.int {
+func goAirPGFilter(cursorID C.ulonglong, idxNum C.int, idxStr *C.char, argc C.int, argv **C.sqlite3_value) C.int {
 	cursorMu.RLock()
 	cur, ok := cursorMap[uint64(cursorID)]
 	cursorMu.RUnlock()
@@ -919,6 +1020,9 @@ func goAirPGFilter(cursorID C.ulonglong, idxStr *C.char, argc C.int, argv **C.sq
 	cur.eof = false
 	cur.rowid = 0
 	cur.nextBlock = 0
+	cur.actualRows = 0
+	cur.startTime = time.Now()
+	cur.startPages = vtabPagesRead.Load()
 	if idxStr != nil {
 		cur.parseFilterPlan(C.GoString(idxStr), int(argc), argv)
 	}
@@ -989,9 +1093,11 @@ func goAirPGFilter(cursorID C.ulonglong, idxStr *C.char, argc C.int, argv **C.sq
 	}
 	cur.nblocks = meta.NBlocks
 
-	// Try B-tree index scan pushdown if an eligible index exists for the pushed-down filters.
-	if planIdx, _, _ := selectBestBTreeIndex(cur.spec.IndexPlans, cur.filters); planIdx >= 0 {
-		tids, idxErr := scanBTreeIndexForTIDs(ctx, cur.spec.Adapter, cur.snap, cur.spec.IndexPlans[planIdx], cur.filters)
+	// Use the cost-based optimizer's selected index (idxNum > 0 => planIdx = idxNum - 1).
+	// idxNum == 0 indicates the optimizer chose Sequential Scan (or no xBestIndex plan).
+	chosenPlanIdx := int(idxNum) - 1
+	if chosenPlanIdx >= 0 && chosenPlanIdx < len(cur.spec.IndexPlans) {
+		tids, idxErr := scanBTreeIndexForTIDs(ctx, cur.spec.Adapter, cur.snap, cur.spec.IndexPlans[chosenPlanIdx], cur.filters)
 		if idxErr == nil {
 			cur.indexScanDone = true
 			if err := cur.fetchVisibleTuplesByTIDs(ctx, tids); err != nil {
@@ -1002,6 +1108,7 @@ func goAirPGFilter(cursorID C.ulonglong, idxStr *C.char, argc C.int, argv **C.sq
 				cur.eof = true
 				return C.SQLITE_ERROR
 			}
+			cur.actualRows += uint64(cur.numRows)
 			if !cur.eof {
 				cur.rowid = 1
 			}

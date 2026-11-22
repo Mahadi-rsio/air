@@ -12,7 +12,7 @@ const (
 	SLRUMultiXactOffsetsKind uint32 = 2
 	SLRUMultiXactMembersKind uint32 = 3
 
-	RmMultiXactID uint8 = 13
+	RmMultiXactID uint8 = 6 // RM_MULTIXACT_ID in PostgreSQL access/rmgrlist.h
 
 	// xl_info opcodes for RM_MULTIXACT_ID.
 	XLogMultiXactZeroOffPage uint8 = 0x00
@@ -116,29 +116,53 @@ func (t *Timeline) applyMultiXactWALLocked(rec *DecodedWALRecord) {
 		if n < 0 || 12+n*8 > len(d) {
 			return
 		}
-		setOffset := func(id, val uint32) {
-			pg, bo := MultiXactOffsetPos(id)
-			t.slruModifyLocked(Key{Kind: KeyKindSLRU, SpcOID: SLRUMultiXactOffsetsKind, BlockNum: pg}, rec.EndLSN, false, func(p []byte) {
-				binary.LittleEndian.PutUint32(p[bo:bo+4], val)
-			})
-		}
-		setOffset(mid, moff)
-		// Record the next multixact's start offset so member counts are derivable for the newest id
-		// (overwritten by its own CREATE_ID later). Skip InvalidMultiXactId (0) on wraparound.
 		next := mid + 1
 		if next == 0 {
 			next = 1
 		}
-		setOffset(next, moff+uint32(n))
+		pg1, bo1 := MultiXactOffsetPos(mid)
+		pg2, bo2 := MultiXactOffsetPos(next)
+		if pg1 == pg2 {
+			t.slruModifyLocked(Key{Kind: KeyKindSLRU, SpcOID: SLRUMultiXactOffsetsKind, BlockNum: pg1}, rec.EndLSN, false, func(p []byte) {
+				binary.LittleEndian.PutUint32(p[bo1:bo1+4], moff)
+				binary.LittleEndian.PutUint32(p[bo2:bo2+4], moff+uint32(n))
+			})
+		} else {
+			t.slruModifyLocked(Key{Kind: KeyKindSLRU, SpcOID: SLRUMultiXactOffsetsKind, BlockNum: pg1}, rec.EndLSN, false, func(p []byte) {
+				binary.LittleEndian.PutUint32(p[bo1:bo1+4], moff)
+			})
+			// Record the next multixact's start offset so member counts are derivable for the newest id
+			// (overwritten by its own CREATE_ID later). Skip InvalidMultiXactId (0) on wraparound.
+			t.slruModifyLocked(Key{Kind: KeyKindSLRU, SpcOID: SLRUMultiXactOffsetsKind, BlockNum: pg2}, rec.EndLSN, false, func(p []byte) {
+				binary.LittleEndian.PutUint32(p[bo2:bo2+4], moff+uint32(n))
+			})
+		}
+		// Group member writes by page so each SLRU page receives a single WALDelta at rec.EndLSN.
+		type memberWrite struct {
+			xid, status uint32
+			xo, fo      int
+			sh          uint
+		}
+		var pageOrder []uint32
+		byPage := make(map[uint32][]memberWrite)
 		for i := 0; i < n; i++ {
 			xid := binary.LittleEndian.Uint32(d[12+i*8 : 16+i*8])
 			status := binary.LittleEndian.Uint32(d[16+i*8 : 20+i*8])
 			pg, xo, fo, sh := MultiXactMemberPos(moff + uint32(i))
+			if _, seen := byPage[pg]; !seen {
+				pageOrder = append(pageOrder, pg)
+			}
+			byPage[pg] = append(byPage[pg], memberWrite{xid: xid, status: status, xo: xo, fo: fo, sh: sh})
+		}
+		for _, pg := range pageOrder {
+			writes := byPage[pg]
 			t.slruModifyLocked(Key{Kind: KeyKindSLRU, SpcOID: SLRUMultiXactMembersKind, BlockNum: pg}, rec.EndLSN, false, func(p []byte) {
-				binary.LittleEndian.PutUint32(p[xo:xo+4], xid)
-				fl := binary.LittleEndian.Uint32(p[fo : fo+4])
-				fl = (fl &^ (uint32(0xFF) << sh)) | ((status & 0xFF) << sh)
-				binary.LittleEndian.PutUint32(p[fo:fo+4], fl)
+				for _, w := range writes {
+					binary.LittleEndian.PutUint32(p[w.xo:w.xo+4], w.xid)
+					fl := binary.LittleEndian.Uint32(p[w.fo : w.fo+4])
+					fl = (fl &^ (uint32(0xFF) << w.sh)) | ((w.status & 0xFF) << w.sh)
+					binary.LittleEndian.PutUint32(p[w.fo:w.fo+4], fl)
+				}
 			})
 		}
 

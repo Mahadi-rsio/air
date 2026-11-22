@@ -43,6 +43,10 @@ func (b *PageserverBackend) GetRelExists(ctx context.Context, tenantID string, s
 	return b.ps.GetRelExists(ctx, tenantID, spcOID, dbOID, relNumber, forkNum, lsn)
 }
 
+func (b *PageserverBackend) GetModifiedBlocksSince(ctx context.Context, tenantID string, sinceLSN uint64) (pageserver.ModifiedBlocksResult, error) {
+	return b.ps.GetModifiedBlocksSince(ctx, tenantID, sinceLSN)
+}
+
 type publishedSnapshot struct {
 	generation string
 	info       SnapshotInfo

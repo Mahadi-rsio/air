@@ -437,6 +437,43 @@ func (b *PageserverSocketBackend) GetTenantInfo(ctx context.Context, tenantID st
 	return gen, resp.U64Val, nil
 }
 
+// GetModifiedBlocksSince implements pageserver.ModifiedBlocksProvider over the Unix socket.
+func (b *PageserverSocketBackend) GetModifiedBlocksSince(ctx context.Context, tenantID string, sinceLSN uint64) (pageserver.ModifiedBlocksResult, error) {
+	resp, payload, err := b.roundTrip(ctx, pageserver.ReqHeader{
+		Op:       pageserver.OpGetModifiedBlocks,
+		TenantID: tenantID,
+		LSN:      sinceLSN,
+	})
+	if err != nil {
+		return pageserver.ModifiedBlocksResult{}, err
+	}
+	res := pageserver.ModifiedBlocksResult{
+		CurrentLSN: resp.U64Val,
+	}
+	if len(payload) < 16 {
+		return res, fmt.Errorf("readadapter: malformed OpGetModifiedBlocks payload (%d bytes)", len(payload))
+	}
+	res.CatalogLSN = binary.LittleEndian.Uint64(payload[0:8])
+	res.ResetRequired = payload[8] != 0
+	count := int(resp.NBlocksOrVal)
+	if count > 0 && len(payload) >= 16+count*28 {
+		res.Events = make([]pageserver.ModifiedBlockEvent, count)
+		for i := 0; i < count; i++ {
+			off := 16 + i*28
+			res.Events[i] = pageserver.ModifiedBlockEvent{
+				SpcOID:    binary.LittleEndian.Uint32(payload[off : off+4]),
+				DbOID:     binary.LittleEndian.Uint32(payload[off+4 : off+8]),
+				RelNumber: binary.LittleEndian.Uint32(payload[off+8 : off+12]),
+				BlockNum:  binary.LittleEndian.Uint32(payload[off+12 : off+16]),
+				LSN:       binary.LittleEndian.Uint64(payload[off+16 : off+24]),
+				ForkNum:   payload[off+24],
+				IsRelWide: payload[off+25] != 0,
+			}
+		}
+	}
+	return res, nil
+}
+
 // GetTenantGeneration implements StorageBackend.
 func (b *PageserverSocketBackend) GetTenantGeneration(tenantID string) string {
 	b.genMu.RLock()

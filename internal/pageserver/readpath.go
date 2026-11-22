@@ -10,6 +10,26 @@ import (
 )
 
 const defaultMaxInMemBytes int64 = 16 * 1024 * 1024
+const maxTimelineModLogEntries = 65536
+
+// ModifiedBlockEvent records a block or relation-wide modification at LSN.
+type ModifiedBlockEvent struct {
+	SpcOID    uint32
+	DbOID     uint32
+	RelNumber uint32
+	ForkNum   uint8
+	BlockNum  uint32
+	LSN       uint64
+	IsRelWide bool
+}
+
+// ModifiedBlocksResult is returned by GetModifiedBlocksSince.
+type ModifiedBlocksResult struct {
+	CurrentLSN    uint64
+	CatalogLSN    uint64
+	ResetRequired bool
+	Events        []ModifiedBlockEvent
+}
 
 // Timeline manages the 2D (Key, LSN) storage state for a single tenant.
 type Timeline struct {
@@ -25,6 +45,9 @@ type Timeline struct {
 	generation    string
 	epoch         int64
 	lastLSN       uint64
+	catalogLSN    uint64
+	modLog        []ModifiedBlockEvent
+	modLogBaseLSN uint64
 	inMem         *InMemoryLayer
 	frozenMems    []*InMemoryLayer // ordered oldest -> newest, currently flushing
 	layers        []LayerMeta      // ordered oldest -> newest
@@ -348,6 +371,14 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 			}
 		}
 		t.inMem.Put(key, delta)
+		t.recordModifiedLocked(ModifiedBlockEvent{
+			SpcOID:    blk.Rel.SpcOID,
+			DbOID:     blk.Rel.DbOID,
+			RelNumber: blk.Rel.RelNumber,
+			ForkNum:   blk.ForkNum,
+			BlockNum:  blk.BlockNum,
+			LSN:       rec.EndLSN,
+		})
 
 		sizeKey := RelSizeKey(blk.Rel.SpcOID, blk.Rel.DbOID, blk.Rel.RelNumber, blk.ForkNum)
 		if cur := t.relSizes[sizeKey]; blk.BlockNum+1 > cur {
@@ -454,6 +485,14 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 				Flags:   EntryFlagRelSize,
 				RelSize: t.relSizes[sizeKey],
 			})
+			t.recordModifiedLocked(ModifiedBlockEvent{
+				SpcOID:    rel.SpcOID,
+				DbOID:     rel.DbOID,
+				RelNumber: rel.RelNumber,
+				ForkNum:   fork,
+				LSN:       rec.EndLSN,
+				IsRelWide: true,
+			})
 		} else if op == XLogSmgrTruncate && len(rec.MainData) >= 20 {
 			blkno := binary.LittleEndian.Uint32(rec.MainData[0:4])
 			rel := RelFileLocator{
@@ -471,6 +510,15 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 						LSN:     rec.EndLSN,
 						Flags:   EntryFlagRelSize,
 						RelSize: blkno,
+					})
+					t.recordModifiedLocked(ModifiedBlockEvent{
+						SpcOID:    rel.SpcOID,
+						DbOID:     rel.DbOID,
+						RelNumber: rel.RelNumber,
+						ForkNum:   fork,
+						BlockNum:  blkno,
+						LSN:       rec.EndLSN,
+						IsRelWide: true,
 					})
 				}
 			}
@@ -865,6 +913,14 @@ func (t *Timeline) PutPageBatch(ctx context.Context, spcOID, dbOID, relNumber ui
 			Flags:     EntryFlagPageImage,
 			PageImage: cp,
 		})
+		t.recordModifiedLocked(ModifiedBlockEvent{
+			SpcOID:    spcOID,
+			DbOID:     dbOID,
+			RelNumber: relNumber,
+			ForkNum:   forkNum,
+			BlockNum:  blk,
+			LSN:       useLSN,
+		})
 	}
 	sizeKey := RelSizeKey(spcOID, dbOID, relNumber, forkNum)
 	endBlk := startBlock + nblocks
@@ -875,6 +931,9 @@ func (t *Timeline) PutPageBatch(ctx context.Context, spcOID, dbOID, relNumber ui
 			Flags:   EntryFlagRelSize,
 			RelSize: endBlk,
 		})
+	}
+	if useLSN > t.lastLSN {
+		t.lastLSN = useLSN
 	}
 	approx := t.inMem.ApproxBytes
 	t.mu.Unlock()
@@ -1052,6 +1111,14 @@ func (t *Timeline) UnlinkRel(spcOID, dbOID, relNumber uint32, forkNum uint8, lsn
 		Flags:   EntryFlagRelSize | EntryFlagRelUnlinked,
 		RelSize: 0,
 	})
+	t.recordModifiedLocked(ModifiedBlockEvent{
+		SpcOID:    spcOID,
+		DbOID:     dbOID,
+		RelNumber: relNumber,
+		ForkNum:   forkNum,
+		LSN:       lsn,
+		IsRelWide: true,
+	})
 }
 
 func (t *Timeline) seedAllRelSizes(ctx context.Context) {
@@ -1115,4 +1182,55 @@ func (t *Timeline) GetDBSize(ctx context.Context, spcOID, dbOID uint32, _ uint64
 		}
 	}
 	return total, nil
+}
+
+// recordModifiedLocked appends ev to the bounded modification log and updates catalogLSN
+// when a system catalog relation (< 16384) or relation-wide DDL/truncate/unlink occurs.
+// Caller must hold t.mu.
+func (t *Timeline) recordModifiedLocked(ev ModifiedBlockEvent) {
+	if ev.LSN == 0 {
+		return
+	}
+	if ev.RelNumber < 16384 || ev.IsRelWide {
+		if ev.LSN > t.catalogLSN {
+			t.catalogLSN = ev.LSN
+		}
+	}
+	if len(t.modLog) >= maxTimelineModLogEntries {
+		drop := maxTimelineModLogEntries / 2
+		var maxDropped uint64
+		for i := 0; i < drop; i++ {
+			if t.modLog[i].LSN > maxDropped {
+				maxDropped = t.modLog[i].LSN
+			}
+		}
+		if maxDropped > t.modLogBaseLSN {
+			t.modLogBaseLSN = maxDropped
+		}
+		copy(t.modLog, t.modLog[drop:])
+		t.modLog = t.modLog[:len(t.modLog)-drop]
+	}
+	t.modLog = append(t.modLog, ev)
+}
+
+// GetModifiedBlocksSince returns all block/relation modifications recorded after sinceLSN,
+// along with the timeline's current LSN and latest catalog modification LSN.
+func (t *Timeline) GetModifiedBlocksSince(sinceLSN uint64) ModifiedBlocksResult {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	res := ModifiedBlocksResult{
+		CurrentLSN: t.lastLSN,
+		CatalogLSN: t.catalogLSN,
+	}
+	if sinceLSN < t.modLogBaseLSN {
+		res.ResetRequired = true
+		return res
+	}
+	for _, ev := range t.modLog {
+		if ev.LSN > sinceLSN {
+			res.Events = append(res.Events, ev)
+		}
+	}
+	return res
 }

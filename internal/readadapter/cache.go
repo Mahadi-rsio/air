@@ -42,6 +42,29 @@ type PageCacheKey struct {
 	LSN        uint64
 }
 
+// BlockCacheKey identifies a cached 8 KiB page independent of snapshot LSN.
+type BlockCacheKey struct {
+	TenantID   string
+	Generation string
+	SpcOID     uint32
+	DbOID      uint32
+	RelNumber  uint32
+	ForkNum    uint8
+	BlockNum   uint32
+}
+
+func (k PageCacheKey) blockKey() BlockCacheKey {
+	return BlockCacheKey{
+		TenantID:   k.TenantID,
+		Generation: k.Generation,
+		SpcOID:     k.SpcOID,
+		DbOID:      k.DbOID,
+		RelNumber:  k.RelNumber,
+		ForkNum:    k.ForkNum,
+		BlockNum:   k.BlockNum,
+	}
+}
+
 func (k PageCacheKey) sfKey() string {
 	return fmt.Sprintf("%s|%s|%d|%d|%d|%d|%d|%d",
 		k.TenantID, k.Generation, k.SpcOID, k.DbOID, k.RelNumber, k.ForkNum, k.BlockNum, k.LSN)
@@ -90,6 +113,25 @@ type relMetaVal struct {
 	nblocks     uint32
 }
 
+type relMetaLatestKey struct {
+	TenantID   string
+	Generation string
+	SpcOID     uint32
+	DbOID      uint32
+	RelNumber  uint32
+	ForkNum    uint8
+}
+
+type relMetaLatestVal struct {
+	fetchedLSN uint64
+	val        relMetaVal
+}
+
+type tenantSyncState struct {
+	syncedLSN  uint64
+	catalogLSN uint64
+}
+
 const maxRelMetaCacheEntries = 4096
 
 // TieredCacheBackend wraps an authoritative StorageBackend (L3 Pageserver)
@@ -101,20 +143,27 @@ type TieredCacheBackend struct {
 	l2MaxBytes int64
 
 	sfGroup singleflight.Group
+	syncSF  singleflight.Group
 	tmpSeq  atomic.Uint64
 
-	l1Mu    sync.Mutex
-	l1Bytes int64
-	l1List  *list.List
-	l1Map   map[PageCacheKey]*list.Element
+	syncMu    sync.Mutex
+	syncState map[string]*tenantSyncState
 
-	l2Mu    sync.Mutex
-	l2Bytes int64
-	l2List  *list.List
-	l2Map   map[PageCacheKey]*list.Element
+	l1Mu     sync.Mutex
+	l1Bytes  int64
+	l1List   *list.List
+	l1Map    map[PageCacheKey]*list.Element
+	l1Latest map[BlockCacheKey]*list.Element
 
-	metaMu  sync.Mutex
-	metaMap map[relMetaKey]relMetaVal
+	l2Mu     sync.Mutex
+	l2Bytes  int64
+	l2List   *list.List
+	l2Map    map[PageCacheKey]*list.Element
+	l2Latest map[BlockCacheKey]*list.Element
+
+	metaMu     sync.Mutex
+	metaMap    map[relMetaKey]relMetaVal
+	metaLatest map[relMetaLatestKey]relMetaLatestVal
 
 	l1Hits             atomic.Uint64
 	l1Misses           atomic.Uint64
@@ -149,11 +198,15 @@ func NewTieredCacheBackend(l3 StorageBackend, cfg CacheConfig) (*TieredCacheBack
 		l1MaxBytes: cfg.L1MaxBytes,
 		l2Dir:      cfg.L2Dir,
 		l2MaxBytes: cfg.L2MaxBytes,
+		syncState:  make(map[string]*tenantSyncState),
 		l1List:     list.New(),
 		l1Map:      make(map[PageCacheKey]*list.Element),
+		l1Latest:   make(map[BlockCacheKey]*list.Element),
 		l2List:     list.New(),
 		l2Map:      make(map[PageCacheKey]*list.Element),
+		l2Latest:   make(map[BlockCacheKey]*list.Element),
 		metaMap:    make(map[relMetaKey]relMetaVal),
+		metaLatest: make(map[relMetaLatestKey]relMetaLatestVal),
 	}, nil
 }
 
@@ -209,19 +262,123 @@ func (c *TieredCacheBackend) GetTenantGeneration(tenantID string) string {
 	return c.l3.GetTenantGeneration(tenantID)
 }
 
+// ensureSynced pulls incremental modified-block events from L3 (coalesced via singleflight)
+// whenever targetLSN exceeds the highest LSN already synced for (tenantID, generation).
+func (c *TieredCacheBackend) ensureSynced(ctx context.Context, tenantID, generation string, targetLSN uint64) (syncedLSN, catalogLSN uint64, supported bool) {
+	mbp, ok := c.l3.(pageserver.ModifiedBlocksProvider)
+	if !ok {
+		return 0, 0, false
+	}
+	stateKey := tenantID + "|" + generation
+	c.syncMu.Lock()
+	st := c.syncState[stateKey]
+	if st != nil && targetLSN <= st.syncedLSN {
+		s, cat := st.syncedLSN, st.catalogLSN
+		c.syncMu.Unlock()
+		return s, cat, true
+	}
+	c.syncMu.Unlock()
+
+	val, err, _ := c.syncSF.Do(stateKey, func() (any, error) {
+		c.syncMu.Lock()
+		cur := c.syncState[stateKey]
+		var since uint64
+		if cur != nil {
+			if targetLSN <= cur.syncedLSN {
+				out := *cur
+				c.syncMu.Unlock()
+				return out, nil
+			}
+			since = cur.syncedLSN
+		}
+		c.syncMu.Unlock()
+
+		syncCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		res, gerr := mbp.GetModifiedBlocksSince(syncCtx, tenantID, since)
+		if gerr != nil {
+			return tenantSyncState{}, gerr
+		}
+
+		if res.ResetRequired {
+			c.InvalidateTenant(tenantID)
+		} else {
+			for _, ev := range res.Events {
+				if ev.IsRelWide {
+					c.InvalidateRelation(tenantID, generation, ev.SpcOID, ev.DbOID, ev.RelNumber, ev.ForkNum)
+				} else {
+					c.InvalidateBlock(tenantID, generation, ev.SpcOID, ev.DbOID, ev.RelNumber, ev.ForkNum, ev.BlockNum, ev.LSN)
+					c.invalidateRelMetaIfExtended(tenantID, generation, ev.SpcOID, ev.DbOID, ev.RelNumber, ev.ForkNum, ev.BlockNum)
+				}
+			}
+		}
+
+		c.syncMu.Lock()
+		cur = c.syncState[stateKey]
+		if cur == nil {
+			cur = &tenantSyncState{}
+			c.syncState[stateKey] = cur
+		}
+		if res.CurrentLSN > cur.syncedLSN {
+			cur.syncedLSN = res.CurrentLSN
+		}
+		if res.CatalogLSN > cur.catalogLSN {
+			cur.catalogLSN = res.CatalogLSN
+		}
+		out := *cur
+		c.syncMu.Unlock()
+		return out, nil
+	})
+	if err != nil {
+		return 0, 0, false
+	}
+	out := val.(tenantSyncState)
+	return out.syncedLSN, out.catalogLSN, true
+}
+
+// CatalogLSN returns the latest catalog modification LSN known for (tenantID, generation)
+// after syncing up to targetLSN.
+func (c *TieredCacheBackend) CatalogLSN(ctx context.Context, tenantID, generation string, targetLSN uint64) (uint64, bool) {
+	_, catLSN, ok := c.ensureSynced(ctx, tenantID, generation, targetLSN)
+	return catLSN, ok
+}
+
+func (c *TieredCacheBackend) invalidateRelMetaIfExtended(tenantID, generation string, spcOID, dbOID, relNumber uint32, forkNum uint8, blockNum uint32) {
+	mlk := relMetaLatestKey{
+		TenantID: tenantID, Generation: generation,
+		SpcOID: spcOID, DbOID: dbOID, RelNumber: relNumber, ForkNum: forkNum,
+	}
+	c.metaMu.Lock()
+	if cur, ok := c.metaLatest[mlk]; ok && cur.val.sizeKnown && blockNum >= cur.val.nblocks {
+		delete(c.metaLatest, mlk)
+	}
+	c.metaMu.Unlock()
+}
+
 func (c *TieredCacheBackend) GetRelSize(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) (uint32, error) {
 	if lsn == 0 || lsn == ^uint64(0) {
 		return c.l3.GetRelSize(ctx, tenantID, spcOID, dbOID, relNumber, forkNum, lsn)
 	}
 	gen := c.l3.GetTenantGeneration(tenantID)
+	syncedLSN, _, syncOK := c.ensureSynced(ctx, tenantID, gen, lsn)
 	mk := relMetaKey{
 		TenantID: tenantID, Generation: gen,
 		SpcOID: spcOID, DbOID: dbOID, RelNumber: relNumber, ForkNum: forkNum, LSN: lsn,
+	}
+	mlk := relMetaLatestKey{
+		TenantID: tenantID, Generation: gen,
+		SpcOID: spcOID, DbOID: dbOID, RelNumber: relNumber, ForkNum: forkNum,
 	}
 	c.metaMu.Lock()
 	if v, ok := c.metaMap[mk]; ok && v.sizeKnown {
 		c.metaMu.Unlock()
 		return v.nblocks, nil
+	}
+	if syncOK && lsn <= syncedLSN {
+		if lv, ok := c.metaLatest[mlk]; ok && lv.val.sizeKnown && lv.fetchedLSN <= lsn {
+			c.metaMu.Unlock()
+			return lv.val.nblocks, nil
+		}
 	}
 	c.metaMu.Unlock()
 
@@ -233,10 +390,19 @@ func (c *TieredCacheBackend) GetRelSize(ctx context.Context, tenantID string, sp
 	if len(c.metaMap) >= maxRelMetaCacheEntries {
 		clear(c.metaMap)
 	}
+	if len(c.metaLatest) >= maxRelMetaCacheEntries {
+		clear(c.metaLatest)
+	}
 	v := c.metaMap[mk]
 	v.sizeKnown = true
 	v.nblocks = sz
 	c.metaMap[mk] = v
+	if cur, ok := c.metaLatest[mlk]; !ok || lsn >= cur.fetchedLSN {
+		nv := cur.val
+		nv.sizeKnown = true
+		nv.nblocks = sz
+		c.metaLatest[mlk] = relMetaLatestVal{fetchedLSN: lsn, val: nv}
+	}
 	c.metaMu.Unlock()
 	return sz, nil
 }
@@ -246,14 +412,25 @@ func (c *TieredCacheBackend) GetRelExists(ctx context.Context, tenantID string, 
 		return c.l3.GetRelExists(ctx, tenantID, spcOID, dbOID, relNumber, forkNum, lsn)
 	}
 	gen := c.l3.GetTenantGeneration(tenantID)
+	syncedLSN, _, syncOK := c.ensureSynced(ctx, tenantID, gen, lsn)
 	mk := relMetaKey{
 		TenantID: tenantID, Generation: gen,
 		SpcOID: spcOID, DbOID: dbOID, RelNumber: relNumber, ForkNum: forkNum, LSN: lsn,
+	}
+	mlk := relMetaLatestKey{
+		TenantID: tenantID, Generation: gen,
+		SpcOID: spcOID, DbOID: dbOID, RelNumber: relNumber, ForkNum: forkNum,
 	}
 	c.metaMu.Lock()
 	if v, ok := c.metaMap[mk]; ok && v.existsKnown {
 		c.metaMu.Unlock()
 		return v.exists, nil
+	}
+	if syncOK && lsn <= syncedLSN {
+		if lv, ok := c.metaLatest[mlk]; ok && lv.val.existsKnown && lv.fetchedLSN <= lsn {
+			c.metaMu.Unlock()
+			return lv.val.exists, nil
+		}
 	}
 	c.metaMu.Unlock()
 
@@ -265,10 +442,19 @@ func (c *TieredCacheBackend) GetRelExists(ctx context.Context, tenantID string, 
 	if len(c.metaMap) >= maxRelMetaCacheEntries {
 		clear(c.metaMap)
 	}
+	if len(c.metaLatest) >= maxRelMetaCacheEntries {
+		clear(c.metaLatest)
+	}
 	v := c.metaMap[mk]
 	v.existsKnown = true
 	v.exists = ex
 	c.metaMap[mk] = v
+	if cur, ok := c.metaLatest[mlk]; !ok || lsn >= cur.fetchedLSN {
+		nv := cur.val
+		nv.existsKnown = true
+		nv.exists = ex
+		c.metaLatest[mlk] = relMetaLatestVal{fetchedLSN: lsn, val: nv}
+	}
 	c.metaMu.Unlock()
 	return ex, nil
 }
@@ -280,6 +466,10 @@ func (c *TieredCacheBackend) GetPageAtLSN(ctx context.Context, tenantID string, 
 	}
 
 	gen := c.l3.GetTenantGeneration(tenantID)
+	syncedLSN, _, syncOK := c.ensureSynced(ctx, tenantID, gen, lsn)
+	if !syncOK {
+		syncedLSN = 0
+	}
 	ck := PageCacheKey{
 		TenantID:   tenantID,
 		Generation: gen,
@@ -291,14 +481,14 @@ func (c *TieredCacheBackend) GetPageAtLSN(ctx context.Context, tenantID string, 
 		LSN:        lsn,
 	}
 
-	if pg, ok := c.getL1(ck); ok {
+	if pg, ok := c.getL1(ck, syncedLSN); ok {
 		c.l1Hits.Add(1)
 		return pg, nil
 	}
 	c.l1Misses.Add(1)
 
 	if c.l2Dir != "" {
-		if pg, ok := c.getL2(ck); ok {
+		if pg, ok := c.getL2(ck, syncedLSN); ok {
 			c.l2Hits.Add(1)
 			c.putL1(ck, pg)
 			return pg, nil
@@ -350,6 +540,10 @@ func (c *TieredCacheBackend) GetPageBatch(ctx context.Context, tenantID string, 
 		return c.l3.GetPageBatch(ctx, tenantID, spcOID, dbOID, relNumber, forkNum, startBlock, nblocks, lsn)
 	}
 	gen := c.l3.GetTenantGeneration(tenantID)
+	syncedLSN, _, syncOK := c.ensureSynced(ctx, tenantID, gen, lsn)
+	if !syncOK {
+		syncedLSN = 0
+	}
 	out := make([]byte, int(nblocks)*PGPageSize)
 	cached := make([]bool, nblocks)
 	allHit := true
@@ -365,14 +559,14 @@ func (c *TieredCacheBackend) GetPageBatch(ctx context.Context, tenantID string, 
 			BlockNum:   startBlock + i,
 			LSN:        lsn,
 		}
-		if c.getL1Into(ck, out[int(i)*PGPageSize:int(i+1)*PGPageSize]) {
+		if c.getL1Into(ck, out[int(i)*PGPageSize:int(i+1)*PGPageSize], syncedLSN) {
 			c.l1Hits.Add(1)
 			cached[i] = true
 			continue
 		}
 		c.l1Misses.Add(1)
 		if c.l2Dir != "" {
-			if pg, ok := c.getL2(ck); ok {
+			if pg, ok := c.getL2(ck, syncedLSN); ok {
 				c.l2Hits.Add(1)
 				c.putL1(ck, pg)
 				copy(out[int(i)*PGPageSize:], pg)
@@ -388,21 +582,36 @@ func (c *TieredCacheBackend) GetPageBatch(ctx context.Context, tenantID string, 
 		return out, nblocks, nil
 	}
 
+	firstMiss := int(nblocks)
+	lastMiss := -1
+	for i := 0; i < int(nblocks); i++ {
+		if !cached[i] {
+			if firstMiss == int(nblocks) {
+				firstMiss = i
+			}
+			lastMiss = i
+		}
+	}
+	fetchStart := startBlock + uint32(firstMiss)
+	fetchCount := uint32(lastMiss - firstMiss + 1)
+
 	c.l3Fetches.Add(1)
-	raw, gotCount, err := c.l3.GetPageBatch(ctx, tenantID, spcOID, dbOID, relNumber, forkNum, startBlock, nblocks, lsn)
+	raw, gotCount, err := c.l3.GetPageBatch(ctx, tenantID, spcOID, dbOID, relNumber, forkNum, fetchStart, fetchCount, lsn)
 	if err != nil {
 		return nil, 0, err
 	}
-	for i := uint32(0); i < gotCount; i++ {
+	for j := uint32(0); j < gotCount; j++ {
+		i := uint32(firstMiss) + j
 		if cached[i] {
 			continue
 		}
-		off := int(i) * PGPageSize
-		if off+PGPageSize > len(raw) {
+		srcOff := int(j) * PGPageSize
+		dstOff := int(i) * PGPageSize
+		if srcOff+PGPageSize > len(raw) {
 			break
 		}
-		pg := raw[off : off+PGPageSize]
-		copy(out[off:off+PGPageSize], pg)
+		pg := raw[srcOff : srcOff+PGPageSize]
+		copy(out[dstOff:dstOff+PGPageSize], pg)
 		ck := PageCacheKey{
 			TenantID:   tenantID,
 			Generation: gen,
@@ -418,7 +627,11 @@ func (c *TieredCacheBackend) GetPageBatch(ctx context.Context, tenantID string, 
 		}
 		c.putL1(ck, pg)
 	}
-	return out[:int(gotCount)*PGPageSize], gotCount, nil
+	totalCount := uint32(firstMiss) + gotCount
+	if totalCount > nblocks {
+		totalCount = nblocks
+	}
+	return out[:int(totalCount)*PGPageSize], totalCount, nil
 }
 
 // InvalidateTenant removes all L1 and L2 cached pages belonging to tenantID.
@@ -467,6 +680,10 @@ func (c *TieredCacheBackend) invalidateWhere(pred func(PageCacheKey) bool) {
 		if pred(k) {
 			c.l1List.Remove(elem)
 			delete(c.l1Map, k)
+			bk := k.blockKey()
+			if c.l1Latest[bk] == elem {
+				delete(c.l1Latest, bk)
+			}
 			c.l1Bytes -= int64(len(elem.Value.(*l1Entry).data))
 		}
 	}
@@ -479,6 +696,10 @@ func (c *TieredCacheBackend) invalidateWhere(pred func(PageCacheKey) bool) {
 				ent := elem.Value.(*l2Entry)
 				c.l2List.Remove(elem)
 				delete(c.l2Map, k)
+				bk := k.blockKey()
+				if c.l2Latest[bk] == elem {
+					delete(c.l2Latest, bk)
+				}
 				c.l2Bytes -= ent.size
 				_ = os.Remove(ent.path)
 			}
@@ -498,6 +719,19 @@ func (c *TieredCacheBackend) invalidateWhere(pred func(PageCacheKey) bool) {
 			LSN:        mk.LSN,
 		}) {
 			delete(c.metaMap, mk)
+		}
+	}
+	for mlk, lv := range c.metaLatest {
+		if pred(PageCacheKey{
+			TenantID:   mlk.TenantID,
+			Generation: mlk.Generation,
+			SpcOID:     mlk.SpcOID,
+			DbOID:      mlk.DbOID,
+			RelNumber:  mlk.RelNumber,
+			ForkNum:    mlk.ForkNum,
+			LSN:        lv.fetchedLSN,
+		}) {
+			delete(c.metaLatest, mlk)
 		}
 	}
 	c.metaMu.Unlock()
@@ -531,11 +765,17 @@ func (c *TieredCacheBackend) Stats() CacheStats {
 	}
 }
 
-func (c *TieredCacheBackend) getL1(k PageCacheKey) ([]byte, bool) {
+func (c *TieredCacheBackend) getL1(k PageCacheKey, syncedLSN uint64) ([]byte, bool) {
 	c.l1Mu.Lock()
 	defer c.l1Mu.Unlock()
 
 	elem, ok := c.l1Map[k]
+	if !ok && syncedLSN > 0 && k.LSN <= syncedLSN {
+		if le, lok := c.l1Latest[k.blockKey()]; lok && le.Value.(*l1Entry).key.LSN <= k.LSN {
+			elem = le
+			ok = true
+		}
+	}
 	if !ok {
 		return nil, false
 	}
@@ -546,11 +786,17 @@ func (c *TieredCacheBackend) getL1(k PageCacheKey) ([]byte, bool) {
 	return cp, true
 }
 
-func (c *TieredCacheBackend) getL1Into(k PageCacheKey, dst []byte) bool {
+func (c *TieredCacheBackend) getL1Into(k PageCacheKey, dst []byte, syncedLSN uint64) bool {
 	c.l1Mu.Lock()
 	defer c.l1Mu.Unlock()
 
 	elem, ok := c.l1Map[k]
+	if !ok && syncedLSN > 0 && k.LSN <= syncedLSN {
+		if le, lok := c.l1Latest[k.blockKey()]; lok && le.Value.(*l1Entry).key.LSN <= k.LSN {
+			elem = le
+			ok = true
+		}
+	}
 	if !ok {
 		return false
 	}
@@ -570,9 +816,13 @@ func (c *TieredCacheBackend) putL1(k PageCacheKey, pg []byte) {
 	c.l1Mu.Lock()
 	defer c.l1Mu.Unlock()
 
+	bk := k.blockKey()
 	if elem, ok := c.l1Map[k]; ok {
 		c.l1List.MoveToFront(elem)
 		elem.Value.(*l1Entry).data = cp
+		if cur, lok := c.l1Latest[bk]; !lok || cur.Value.(*l1Entry).key.LSN <= k.LSN {
+			c.l1Latest[bk] = elem
+		}
 		return
 	}
 	for c.l1Bytes+int64(len(cp)) > c.l1MaxBytes && c.l1List.Len() > 0 {
@@ -580,11 +830,18 @@ func (c *TieredCacheBackend) putL1(k PageCacheKey, pg []byte) {
 		ent := back.Value.(*l1Entry)
 		c.l1List.Remove(back)
 		delete(c.l1Map, ent.key)
+		ebk := ent.key.blockKey()
+		if c.l1Latest[ebk] == back {
+			delete(c.l1Latest, ebk)
+		}
 		c.l1Bytes -= int64(len(ent.data))
 		c.l1Evictions.Add(1)
 	}
 	elem := c.l1List.PushFront(&l1Entry{key: k, data: cp})
 	c.l1Map[k] = elem
+	if cur, lok := c.l1Latest[bk]; !lok || cur.Value.(*l1Entry).key.LSN <= k.LSN {
+		c.l1Latest[bk] = elem
+	}
 	c.l1Bytes += int64(len(cp))
 }
 
@@ -596,13 +853,21 @@ func (c *TieredCacheBackend) l2PathFor(k PageCacheKey) string {
 	return filepath.Join(c.l2Dir, sum[:2], sum+".pg")
 }
 
-func (c *TieredCacheBackend) getL2(k PageCacheKey) ([]byte, bool) {
+func (c *TieredCacheBackend) getL2(k PageCacheKey, syncedLSN uint64) ([]byte, bool) {
 	c.l2Mu.Lock()
 	elem, ok := c.l2Map[k]
+	if !ok && syncedLSN > 0 && k.LSN <= syncedLSN {
+		if le, lok := c.l2Latest[k.blockKey()]; lok && le.Value.(*l2Entry).key.LSN <= k.LSN {
+			elem = le
+			ok = true
+		}
+	}
 	var path string
+	actualKey := k
 	if ok {
 		ent := elem.Value.(*l2Entry)
 		path = ent.path
+		actualKey = ent.key
 		c.l2List.MoveToFront(elem)
 		c.l2Mu.Unlock()
 	} else {
@@ -613,22 +878,22 @@ func (c *TieredCacheBackend) getL2(k PageCacheKey) ([]byte, bool) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if ok {
-			c.evictCorruptL2(k, path, false)
+			c.evictCorruptL2(actualKey, path, false)
 		}
 		return nil, false
 	}
 	if len(raw) != PGPageSize+4 {
-		c.evictCorruptL2(k, path, true)
+		c.evictCorruptL2(actualKey, path, true)
 		return nil, false
 	}
 	gotCRC := binary.LittleEndian.Uint32(raw[PGPageSize:])
 	wantCRC := crc32.Checksum(raw[:PGPageSize], crc32cTable)
 	if gotCRC != wantCRC {
-		c.evictCorruptL2(k, path, true)
+		c.evictCorruptL2(actualKey, path, true)
 		return nil, false
 	}
 	if !ok {
-		c.registerL2Entry(k, path, int64(PGPageSize+4))
+		c.registerL2Entry(actualKey, path, int64(PGPageSize+4))
 	}
 	return raw[:PGPageSize], true
 }
@@ -637,8 +902,12 @@ func (c *TieredCacheBackend) registerL2Entry(k PageCacheKey, path string, fileSi
 	c.l2Mu.Lock()
 	defer c.l2Mu.Unlock()
 
+	bk := k.blockKey()
 	if elem, ok := c.l2Map[k]; ok {
 		c.l2List.MoveToFront(elem)
+		if cur, lok := c.l2Latest[bk]; !lok || cur.Value.(*l2Entry).key.LSN <= k.LSN {
+			c.l2Latest[bk] = elem
+		}
 		return
 	}
 	for c.l2Bytes+fileSize > c.l2MaxBytes && c.l2List.Len() > 0 {
@@ -646,12 +915,19 @@ func (c *TieredCacheBackend) registerL2Entry(k PageCacheKey, path string, fileSi
 		ent := back.Value.(*l2Entry)
 		c.l2List.Remove(back)
 		delete(c.l2Map, ent.key)
+		ebk := ent.key.blockKey()
+		if c.l2Latest[ebk] == back {
+			delete(c.l2Latest, ebk)
+		}
 		c.l2Bytes -= ent.size
 		_ = os.Remove(ent.path)
 		c.l2Evictions.Add(1)
 	}
 	elem := c.l2List.PushFront(&l2Entry{key: k, path: path, size: fileSize})
 	c.l2Map[k] = elem
+	if cur, lok := c.l2Latest[bk]; !lok || cur.Value.(*l2Entry).key.LSN <= k.LSN {
+		c.l2Latest[bk] = elem
+	}
 	c.l2Bytes += fileSize
 }
 
@@ -664,6 +940,10 @@ func (c *TieredCacheBackend) evictCorruptL2(k PageCacheKey, path string, countCo
 		ent := elem.Value.(*l2Entry)
 		c.l2List.Remove(elem)
 		delete(c.l2Map, k)
+		bk := k.blockKey()
+		if c.l2Latest[bk] == elem {
+			delete(c.l2Latest, bk)
+		}
 		c.l2Bytes -= ent.size
 	}
 	c.l2Mu.Unlock()
