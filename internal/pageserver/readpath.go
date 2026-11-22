@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 )
 
 const defaultMaxInMemBytes int64 = 16 * 1024 * 1024
@@ -168,6 +169,8 @@ func (t *Timeline) LoadLayersFromR2(ctx context.Context) error {
 			t.lastLSN = lm.EndLSN
 		}
 	}
+	debugf("timeline", "LoadLayersFromR2 tenant=%s gen=%q epoch=%d loaded=%d max_seq=%d last_lsn=%s",
+		t.tenantID, gen, t.epoch, len(layers), maxSeq, formatLSNHex(t.lastLSN))
 	return nil
 }
 
@@ -284,6 +287,7 @@ func (t *Timeline) MaybeFlushAsync() {
 	t.flushDoneCh = done
 	t.bgFlushMu.Unlock()
 
+	debugf("flush", "MaybeFlushAsync scheduled tenant=%s inmem_bytes=%d max_inmem_bytes=%d", t.tenantID, t.InMemBytes(), t.maxInMemBytes)
 	go func() {
 		_, err := t.FlushInMemory(context.Background())
 		t.bgFlushMu.Lock()
@@ -598,6 +602,7 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 	if t.store == nil {
 		return nil, nil
 	}
+	start := time.Now()
 	t.flushMu.Lock()
 	defer t.flushMu.Unlock()
 
@@ -605,8 +610,10 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 	recs, startLSN, endLSN := t.inMem.SnapshotAll()
 	if len(recs) == 0 {
 		t.mu.Unlock()
+		debugf("flush", "FlushInMemory skipped (empty) tenant=%s", t.tenantID)
 		return nil, nil
 	}
+	approxBytes := t.inMem.ApproxBytes
 	oldMem := t.inMem
 	t.frozenMems = append(t.frozenMems, oldMem)
 	t.inMem = NewInMemoryLayer(endLSN)
@@ -616,6 +623,9 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 	tenantID := t.tenantID
 	gen := t.generation
 	t.mu.Unlock()
+
+	debugf("flush", "FlushInMemory start tenant=%s gen=%q seq=%d recs=%d approx_bytes=%d lsn=%s..%s",
+		tenantID, gen, seq, len(recs), approxBytes, formatLSNHex(startLSN), formatLSNHex(endLSN))
 
 	fileName := fmt.Sprintf("l0_%06d_%016x_%016x.layer", seq, startLSN, endLSN)
 	logicalKey := fmt.Sprintf("%s/timeline_%d/layers/%s", TenantR2Prefix(tenantID, gen), epoch, fileName)
@@ -668,17 +678,21 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 	}
 	t.mu.Lock()
 	t.layers = append(t.layers, written)
+	totalLayers := len(t.layers)
 	if written.EndLSN > t.lastLSN {
 		t.lastLSN = written.EndLSN
 	}
 	t.removeFrozenMemLocked(oldMem)
 	t.mu.Unlock()
 	t.manifestMu.Unlock()
+	debugf("flush", "FlushInMemory done tenant=%s file=%s size=%d sha256=%s encrypted=%v remote=%v total_layers=%d lsn=%s..%s dur=%s",
+		tenantID, written.FileName, written.FileSize, shortHash(written.SHA256), written.Encrypted, written.RemotelyAvailable, totalLayers, formatLSNHex(written.StartLSN), formatLSNHex(written.EndLSN), time.Since(start))
 	return &written, nil
 }
 
 // GetPageAtLSN reconstructs the 8192-byte page for key as of lsn (0 = latest).
 func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byte, error) {
+	start := time.Now()
 	if t.store != nil && t.store.readLimiter != nil {
 		release, err := t.store.readLimiter.Acquire(ctx, t.tenantID)
 		if err != nil {
@@ -699,6 +713,7 @@ func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byt
 	collected = append(collected, inMemDeltas...)
 
 	// Walk layers from newest to oldest; stop once we hit an Image layer or FPI.
+	layersScanned := 0
 	for i := len(layersCopy) - 1; i >= 0; i-- {
 		lm := layersCopy[i]
 		if lsn != 0 && lm.StartLSN > lsn {
@@ -707,8 +722,10 @@ func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byt
 		if lm.EndKey != (Key{}) && (key.Compare(lm.StartKey) < 0 || key.Compare(lm.EndKey) > 0) {
 			continue
 		}
+		layersScanned++
 		deltas, err := t.store.LookupKeyInLayer(ctx, lm, key, lsn)
 		if err != nil {
+			debugf("readpath", "GetPageAtLSN tenant=%s key=%s lsn=%s layer=%s err=%v dur=%s", t.tenantID, key, formatLSNHex(lsn), lm.FileName, err, time.Since(start))
 			return nil, err
 		}
 		if len(deltas) == 0 {
@@ -727,9 +744,14 @@ func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byt
 	}
 
 	if len(collected) == 0 && !foundBase {
+		debugf("readpath", "GetPageAtLSN tenant=%s key=%s lsn=%s inmem=%d layers_scanned=%d/%d result=NOT_FOUND dur=%s",
+			t.tenantID, key, formatLSNHex(lsn), len(inMemDeltas), layersScanned, len(layersCopy), time.Since(start))
 		return nil, ErrNotFound
 	}
-	return reconstructPage(ctx, t.redoer, key, collected)
+	page, err := reconstructPage(ctx, t.redoer, key, collected)
+	debugf("readpath", "GetPageAtLSN tenant=%s key=%s lsn=%s inmem=%d layers_scanned=%d/%d total_deltas=%d base_fpi=%v err=%v dur=%s",
+		t.tenantID, key, formatLSNHex(lsn), len(inMemDeltas), layersScanned, len(layersCopy), len(collected), foundBase, err, time.Since(start))
+	return page, err
 }
 
 func prepareCollectedForRedo(collected []WALDelta) ([]byte, []WALDelta) {

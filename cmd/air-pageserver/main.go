@@ -38,6 +38,22 @@ type Config struct {
 	R2AccessKeyID     string
 	R2SecretAccessKey string
 	R2Region          string
+	Debug             bool
+}
+
+func envBoolOr(key string, fallback bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if v == "" {
+		return fallback
+	}
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func envOr(key, fallback string) string {
@@ -72,6 +88,7 @@ func loadConfig(args []string) Config {
 		R2AccessKeyID:     envOr("AIR_R2_ACCESS_KEY_ID", ""),
 		R2SecretAccessKey: envOr("AIR_R2_SECRET_ACCESS_KEY", ""),
 		R2Region:          envOr("AIR_R2_REGION", "auto"),
+		Debug:             envBoolOr("AIR_PAGESERVER_DEBUG", true),
 	}
 
 	fs := flag.NewFlagSet("air-pageserver", flag.ContinueOnError)
@@ -88,6 +105,7 @@ func loadConfig(args []string) Config {
 	fs.StringVar(&cfg.R2AccessKeyID, "r2-access-key-id", cfg.R2AccessKeyID, "S3/R2 access key ID")
 	fs.StringVar(&cfg.R2SecretAccessKey, "r2-secret-access-key", cfg.R2SecretAccessKey, "S3/R2 secret access key")
 	fs.StringVar(&cfg.R2Region, "r2-region", cfg.R2Region, "S3/R2 region")
+	fs.BoolVar(&cfg.Debug, "debug", cfg.Debug, "Enable verbose debug logging")
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("parse flags: %v", err)
 	}
@@ -137,6 +155,10 @@ func main() {
 		log.Fatalf("init s3 client: %v", err)
 	}
 
+	pageserver.SetDebugLogging(cfg.Debug)
+	log.Printf("[air-pageserver] starting (debug=%v, data_dir=%s, cache_mb=%d, walredo_bin=%q, r2_enabled=%v, r2_bucket=%q, auth_enabled=%v)",
+		cfg.Debug, cfg.DataDir, cfg.CacheMB, cfg.WalRedoBin, s3c != nil, cfg.R2Bucket, cfg.InternalToken != "")
+
 	ps, err := pageserver.New(pageserver.Config{
 		SocketPath:        cfg.SocketPath,
 		DisableUnixSocket: cfg.SocketPath == "",
@@ -147,6 +169,7 @@ func main() {
 		S3Client:          s3c,
 		R2Bucket:          cfg.R2Bucket,
 		KMS:               kms,
+		Debug:             cfg.Debug,
 	})
 	if err != nil {
 		log.Fatalf("init pageserver: %v", err)
@@ -200,13 +223,25 @@ func main() {
 	})
 
 	handleNamespace := func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		w.Header().Set("Content-Type", "application/json")
 		if !isAuthorized(r) {
+			if cfg.Debug {
+				log.Printf("[air-pageserver][DEBUG][http] unauthorized %s %s from=%s", r.Method, r.URL.Path, r.RemoteAddr)
+			}
 			w.WriteHeader(http.StatusUnauthorized)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
 			return
 		}
 		suffix := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/namespaces"), "/")
+		if cfg.Debug {
+			log.Printf("[air-pageserver][DEBUG][http] %s %s suffix=%q remote=%s", r.Method, r.URL.Path, suffix, r.RemoteAddr)
+		}
+		defer func() {
+			if cfg.Debug {
+				log.Printf("[air-pageserver][DEBUG][http] done %s %s suffix=%q dur=%s", r.Method, r.URL.Path, suffix, time.Since(start))
+			}
+		}()
 		switch {
 		case suffix == "" && r.Method == http.MethodGet:
 			_ = json.NewEncoder(w).Encode(map[string]any{

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Mahadi-rsio/air/internal/tenant"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -94,12 +95,14 @@ func isEphemeralPGFile(relSlash string) bool {
 // zstd-compressed (and KMS-encrypted when configured) snapshot, skipping all base/ and
 // global/ relation fork files stored in the Pageserver.
 func (p *Pageserver) SaveMetadataSkeleton(ctx context.Context, tenantID string, epoch int64, pgDataDir string) (*SkeletonMeta, error) {
+	start := time.Now()
 	if err := tenant.ValidateID(tenantID); err != nil {
 		return nil, err
 	}
 	if epoch <= 0 {
 		epoch = 1
 	}
+	debugf("skeleton", "SaveMetadataSkeleton start tenant=%s epoch=%d pgdata=%q", tenantID, epoch, pgDataDir)
 
 	var buf bytes.Buffer
 	zw, err := zstd.NewWriter(&buf)
@@ -232,6 +235,8 @@ func (p *Pageserver) SaveMetadataSkeleton(ctx context.Context, tenantID string, 
 		meta.R2Key = r2Key
 	}
 
+	debugf("skeleton", "SaveMetadataSkeleton done tenant=%s files=%d raw_bytes=%d compressed_bytes=%d skipped_rels=%d skipped_bytes=%d encrypted=%v local=%q r2=%q dur=%s",
+		tenantID, meta.FileCount, meta.RawBytes, meta.CompressedBytes, meta.SkippedRelFiles, meta.SkippedRelBytes, encrypted, meta.LocalPath, meta.R2Key, time.Since(start))
 	return meta, nil
 }
 
@@ -259,12 +264,14 @@ func (p *Pageserver) HasMetadataSkeleton(ctx context.Context, tenantID string) b
 // RestoreMetadataSkeleton reconstructs the minimal PGDATA directory skeleton
 // from the saved snapshot without downloading or restoring relation fork files.
 func (p *Pageserver) RestoreMetadataSkeleton(ctx context.Context, tenantID string, epoch int64, pgDataDir string) (*SkeletonMeta, error) {
+	start := time.Now()
 	if err := tenant.ValidateID(tenantID); err != nil {
 		return nil, err
 	}
 	if epoch <= 0 {
 		epoch = 1
 	}
+	debugf("skeleton", "RestoreMetadataSkeleton start tenant=%s epoch=%d pgdata=%q", tenantID, epoch, pgDataDir)
 
 	localPath, r2Key, encrypted := p.skeletonPaths(tenantID)
 	var payload []byte
@@ -375,5 +382,7 @@ func (p *Pageserver) RestoreMetadataSkeleton(ctx context.Context, tenantID strin
 	if err := tl.LoadLayersFromR2(ctx); err != nil {
 		return nil, fmt.Errorf("load pageserver layers from R2 for %s: %w", tenantID, err)
 	}
+	debugf("skeleton", "RestoreMetadataSkeleton done tenant=%s files=%d raw_bytes=%d compressed_bytes=%d layers=%d dur=%s",
+		tenantID, meta.FileCount, meta.RawBytes, meta.CompressedBytes, tl.LayerCount(), time.Since(start))
 	return meta, nil
 }

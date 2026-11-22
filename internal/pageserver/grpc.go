@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Mahadi-rsio/air/internal/pb"
 	"google.golang.org/grpc"
@@ -116,13 +117,24 @@ func (p *Pageserver) IngestWALRecords(
 	recs []*DecodedWALRecord,
 	flushIfNeeded bool,
 ) (int, uint64, error) {
+	start := time.Now()
 	if generation != "" {
 		p.SetTenantGeneration(tenantID, generation)
 	}
 	tl := p.EnsureTenant(tenantID, epoch)
 	sawCheckpoint := false
-	for _, rec := range recs {
+	var firstLSN, lastRecLSN uint64
+	var totalBlocks, fpiBlocks int
+	for i, rec := range recs {
+		if i == 0 {
+			firstLSN = rec.LSN
+		}
+		lastRecLSN = rec.EndLSN
+		totalBlocks += len(rec.Blocks)
 		for _, blk := range rec.Blocks {
+			if blk.HasImage {
+				fpiBlocks++
+			}
 			tl.EnsureRelSizeSeeded(ctx, blk.Rel.SpcOID, blk.Rel.DbOID, blk.Rel.RelNumber, blk.ForkNum)
 		}
 		tl.ApplyWALRecord(rec)
@@ -133,12 +145,17 @@ func (p *Pageserver) IngestWALRecords(
 			}
 		}
 	}
+	debugf("wal-ingest", "tenant=%s epoch=%d gen=%q recs=%d blocks=%d fpi=%d lsn=%s..%s rmids=[%s] checkpoint=%v flush_if_needed=%v inmem_bytes=%d dur=%s",
+		tenantID, epoch, generation, len(recs), totalBlocks, fpiBlocks, formatLSNHex(firstLSN), formatLSNHex(lastRecLSN), summarizeRMIDs(recs), sawCheckpoint, flushIfNeeded, tl.InMemBytes(), time.Since(start))
 	if sawCheckpoint {
+		debugf("wal-ingest", "tenant=%s checkpoint detected, triggering FlushInMemory", tenantID)
 		if _, err := tl.FlushInMemory(ctx); err != nil {
+			debugf("wal-ingest", "tenant=%s checkpoint FlushInMemory error=%v", tenantID, err)
 			return len(recs), tl.LastLSN(), err
 		}
 	} else if flushIfNeeded {
 		if err := tl.EnforceInMemBudget(ctx); err != nil {
+			debugf("wal-ingest", "tenant=%s EnforceInMemBudget error=%v", tenantID, err)
 			return len(recs), tl.LastLSN(), err
 		}
 	}
@@ -187,13 +204,21 @@ func (s *grpcServer) authorize(ctx context.Context) error {
 func (s *grpcServer) authUnaryInterceptor(
 	ctx context.Context,
 	req any,
-	_ *grpc.UnaryServerInfo,
+	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (any, error) {
+	start := time.Now()
 	if err := s.authorize(ctx); err != nil {
+		debugf("grpc", "method=%s auth=DENIED err=%v dur=%s", info.FullMethod, err, time.Since(start))
 		return nil, err
 	}
-	return handler(ctx, req)
+	resp, err := handler(ctx, req)
+	if err != nil {
+		debugf("grpc", "method=%s status=ERR err=%v dur=%s", info.FullMethod, err, time.Since(start))
+	} else if info.FullMethod != "/air.v1.PageserverService/Health" {
+		debugf("grpc", "method=%s status=OK dur=%s", info.FullMethod, time.Since(start))
+	}
+	return resp, err
 }
 
 func mapPageserverGRPCError(err error) error {
@@ -260,11 +285,13 @@ func (s *grpcServer) GetPageAtLSN(ctx context.Context, req *pb.GetPageAtLSNReque
 	}
 	page, err := s.ps.GetPageAtLSN(ctx, req.GetTenantId(), key, req.GetLsn())
 	if errors.Is(err, ErrNotFound) {
+		debugf("grpc-read", "GetPageAtLSN tenant=%s key=%s req_lsn=%s found=false", req.GetTenantId(), key, formatLSNHex(req.GetLsn()))
 		return &pb.GetPageResponse{Found: false}, nil
 	}
 	if err != nil {
 		return nil, mapPageserverGRPCError(err)
 	}
+	debugf("grpc-read", "GetPageAtLSN tenant=%s key=%s req_lsn=%s found=true bytes=%d", req.GetTenantId(), key, formatLSNHex(req.GetLsn()), len(page))
 	return &pb.GetPageResponse{Page: page, Found: true}, nil
 }
 
@@ -283,6 +310,8 @@ func (s *grpcServer) GetPageBatch(ctx context.Context, req *pb.GetPageBatchReque
 	if err != nil {
 		return nil, mapPageserverGRPCError(err)
 	}
+	debugf("grpc-read", "GetPageBatch tenant=%s rel=%d/%d/%d.%d blk=%d+%d req_lsn=%s returned=%d bytes=%d",
+		req.GetTenantId(), req.GetSpcOid(), req.GetDbOid(), req.GetRelNumber(), req.GetForkNum(), req.GetStartBlock(), req.GetNblocks(), formatLSNHex(req.GetLsn()), nblocks, len(pages))
 	return &pb.GetPageBatchResponse{
 		Pages:           pages,
 		NblocksReturned: nblocks,
@@ -302,6 +331,8 @@ func (s *grpcServer) GetRelSize(ctx context.Context, req *pb.GetRelRequest) (*pb
 	if err != nil {
 		return nil, mapPageserverGRPCError(err)
 	}
+	debugf("grpc-read", "GetRelSize tenant=%s rel=%d/%d/%d.%d req_lsn=%s nblocks=%d",
+		req.GetTenantId(), req.GetSpcOid(), req.GetDbOid(), req.GetRelNumber(), req.GetForkNum(), formatLSNHex(req.GetLsn()), nb)
 	return &pb.GetRelSizeResponse{Nblocks: nb}, nil
 }
 
@@ -318,6 +349,8 @@ func (s *grpcServer) GetRelExists(ctx context.Context, req *pb.GetRelRequest) (*
 	if err != nil {
 		return nil, mapPageserverGRPCError(err)
 	}
+	debugf("grpc-read", "GetRelExists tenant=%s rel=%d/%d/%d.%d req_lsn=%s exists=%v",
+		req.GetTenantId(), req.GetSpcOid(), req.GetDbOid(), req.GetRelNumber(), req.GetForkNum(), formatLSNHex(req.GetLsn()), exists)
 	return &pb.GetRelExistsResponse{Exists: exists}, nil
 }
 
@@ -326,6 +359,8 @@ func (s *grpcServer) GetDBSize(ctx context.Context, req *pb.GetDBSizeRequest) (*
 	if err != nil {
 		return nil, mapPageserverGRPCError(err)
 	}
+	debugf("grpc-read", "GetDBSize tenant=%s db=%d/%d req_lsn=%s size_bytes=%d",
+		req.GetTenantId(), req.GetSpcOid(), req.GetDbOid(), formatLSNHex(req.GetLsn()), sz)
 	return &pb.GetDBSizeResponse{SizeBytes: sz}, nil
 }
 
@@ -345,6 +380,8 @@ func (s *grpcServer) PutPageBatch(ctx context.Context, req *pb.PutPageBatchReque
 	if err != nil {
 		return nil, mapPageserverGRPCError(err)
 	}
+	debugf("grpc-write", "PutPageBatch tenant=%s rel=%d/%d/%d.%d blk=%d+%d lsn=%s bytes=%d",
+		req.GetTenantId(), req.GetSpcOid(), req.GetDbOid(), req.GetRelNumber(), req.GetForkNum(), req.GetStartBlock(), req.GetNblocks(), formatLSNHex(req.GetLsn()), len(req.GetPages()))
 	return &pb.PageserverStatusResponse{Status: "ok", TenantId: req.GetTenantId()}, nil
 }
 
@@ -361,6 +398,8 @@ func (s *grpcServer) UnlinkRel(ctx context.Context, req *pb.UnlinkRelRequest) (*
 	if err != nil {
 		return nil, mapPageserverGRPCError(err)
 	}
+	debugf("grpc-write", "UnlinkRel tenant=%s rel=%d/%d/%d.%d lsn=%s",
+		req.GetTenantId(), req.GetSpcOid(), req.GetDbOid(), req.GetRelNumber(), req.GetForkNum(), formatLSNHex(req.GetLsn()))
 	return &pb.PageserverStatusResponse{Status: "ok", TenantId: req.GetTenantId()}, nil
 }
 
@@ -372,11 +411,13 @@ func (s *grpcServer) GetSLRUPage(ctx context.Context, req *pb.GetSLRUPageRequest
 	}
 	page, err := s.ps.GetPageAtLSN(ctx, req.GetTenantId(), key, req.GetLsn())
 	if errors.Is(err, ErrNotFound) {
+		debugf("grpc-read", "GetSLRUPage tenant=%s kind=%d blk=%d req_lsn=%s found=false", req.GetTenantId(), req.GetKind(), req.GetBlockNum(), formatLSNHex(req.GetLsn()))
 		return &pb.GetPageResponse{Found: false}, nil
 	}
 	if err != nil {
 		return nil, mapPageserverGRPCError(err)
 	}
+	debugf("grpc-read", "GetSLRUPage tenant=%s kind=%d blk=%d req_lsn=%s found=true", req.GetTenantId(), req.GetKind(), req.GetBlockNum(), formatLSNHex(req.GetLsn()))
 	return &pb.GetPageResponse{Page: page, Found: true}, nil
 }
 
@@ -397,6 +438,8 @@ func (s *grpcServer) GetModifiedBlocksSince(ctx context.Context, req *pb.GetModi
 			IsRelWide: ev.IsRelWide,
 		})
 	}
+	debugf("grpc-read", "GetModifiedBlocksSince tenant=%s since_lsn=%s current_lsn=%s catalog_lsn=%s reset=%v events=%d",
+		req.GetTenantId(), formatLSNHex(req.GetSinceLsn()), formatLSNHex(res.CurrentLSN), formatLSNHex(res.CatalogLSN), res.ResetRequired, len(events))
 	return &pb.GetModifiedBlocksResponse{
 		CurrentLsn:    res.CurrentLSN,
 		CatalogLsn:    res.CatalogLSN,
@@ -581,6 +624,7 @@ func (s *grpcServer) SetRelSizes(_ context.Context, req *pb.SetRelSizesRequest) 
 	if err := s.ps.SetRelSizes(req.GetTenantId(), entries); err != nil {
 		return nil, mapPageserverGRPCError(err)
 	}
+	debugf("grpc-write", "SetRelSizes tenant=%s entries=%d", req.GetTenantId(), len(entries))
 	return &pb.PageserverStatusResponse{Status: "ok", TenantId: req.GetTenantId()}, nil
 }
 
@@ -596,5 +640,6 @@ func (s *grpcServer) SeedSLRUPages(_ context.Context, req *pb.SeedSLRUPagesReque
 	if err := s.ps.SeedSLRUPages(req.GetTenantId(), entries); err != nil {
 		return nil, mapPageserverGRPCError(err)
 	}
+	debugf("grpc-write", "SeedSLRUPages tenant=%s entries=%d", req.GetTenantId(), len(entries))
 	return &pb.PageserverStatusResponse{Status: "ok", TenantId: req.GetTenantId()}, nil
 }

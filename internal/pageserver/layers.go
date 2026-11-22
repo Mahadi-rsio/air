@@ -578,6 +578,7 @@ func (s *LayerStore) recordMetrics(m UploadMetrics) {
 // WriteLayer encodes recs into an immutable layer file, finalizes it atomically on disk,
 // and uploads it to R2 using content-addressed storage if configured.
 func (s *LayerStore) WriteLayer(ctx context.Context, meta LayerMeta, recs []LayerRecord) (LayerMeta, error) {
+	start := time.Now()
 	if err := s.checkGeneration(meta.TenantID, meta.Generation); err != nil {
 		return meta, err
 	}
@@ -740,6 +741,8 @@ func (s *LayerStore) WriteLayer(ctx context.Context, meta LayerMeta, recs []Laye
 			}
 		}
 	}
+	debugf("layer-store", "WriteLayer tenant=%s file=%s kind=%s ver=V%d recs=%d size=%d sha256=%s encrypted=%v r2_uploaded=%v dur=%s",
+		meta.TenantID, meta.FileName, meta.Kind, s.layerVersion(), len(recs), meta.FileSize, shortHash(meta.SHA256), meta.Encrypted, meta.RemotelyAvailable, time.Since(start))
 	return meta, nil
 }
 
@@ -1350,6 +1353,7 @@ func (s *LayerStore) ReadRange(ctx context.Context, meta LayerMeta, offset, leng
 	}
 	if s.cache != nil {
 		if b, ok := s.cache.GetRange(meta.R2Key, offset, length); ok {
+			debugf("layer-io", "ReadRange source=disk_cache tenant=%s file=%s off=%d len=%d", meta.TenantID, meta.FileName, offset, length)
 			return b, nil
 		}
 	}
@@ -1360,6 +1364,7 @@ func (s *LayerStore) ReadRange(ctx context.Context, meta LayerMeta, offset, leng
 			buf := make([]byte, length)
 			n, err := f.ReadAt(buf, offset)
 			if err == nil || (errors.Is(err, io.EOF) && int64(n) == length) {
+				debugf("layer-io", "ReadRange source=local_disk tenant=%s file=%s off=%d len=%d", meta.TenantID, meta.FileName, offset, n)
 				return buf[:n], nil
 			}
 		}
@@ -1858,6 +1863,8 @@ func (s *LayerStore) PublishLayerManifestGen(ctx context.Context, tenantID, gene
 			return err
 		}
 	}
+	debugf("manifest", "PublishLayerManifestGen tenant=%s gen=%q epoch=%d layers=%d max_seq=%d r2=%v local=%v",
+		tenantID, generation, epoch, len(layers), maxSeq, s.s3c != nil && s.bucket != "", s.localDir != "")
 	return nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const (
@@ -34,6 +35,8 @@ func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materiali
 	if len(l0s) < threshold {
 		return nil, nil
 	}
+	start := time.Now()
+	debugf("compactor", "CompactIfNeeded start tenant=%s l0_count=%d threshold=%d materialize_image=%v", t.tenantID, len(l0s), threshold, materializeImage)
 
 	var minLSN, maxLSN uint64
 	iters := make([]*layerRecordIterator, 0, len(l0s))
@@ -174,6 +177,8 @@ func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materiali
 	t.layers = updated
 	t.mu.Unlock()
 
+	debugf("compactor", "CompactIfNeeded done tenant=%s compacted_l0=%d out_file=%s kind=%s size=%d lsn=%s..%s total_layers=%d dur=%s",
+		tenantID, len(l0s), written.FileName, written.Kind, written.FileSize, formatLSNHex(minLSN), formatLSNHex(maxLSN), len(updated), time.Since(start))
 	return &written, nil
 }
 

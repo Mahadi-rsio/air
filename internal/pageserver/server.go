@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Mahadi-rsio/air/internal/crypto"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -27,6 +28,7 @@ type Config struct {
 	S3Client          *s3.Client
 	R2Bucket          string
 	KMS               *crypto.EnvelopeKMS
+	Debug             bool
 }
 
 // Pageserver manages multi-tenant Timelines and serves air_smgr over a Unix socket and/or gRPC.
@@ -44,6 +46,9 @@ type Pageserver struct {
 
 // New creates a Pageserver instance. Call Start(ctx) to bind the Unix socket if enabled.
 func New(cfg Config) (*Pageserver, error) {
+	if cfg.Debug {
+		SetDebugLogging(true)
+	}
 	if !cfg.DisableUnixSocket && cfg.SocketPath == "" {
 		cfg.SocketPath = "/var/lib/air/pageserver.sock"
 	}
@@ -72,6 +77,8 @@ func New(cfg Config) (*Pageserver, error) {
 	if !cfg.DisableUnixSocket && cfg.SocketPath != "" {
 		ps.unixSrv = NewUnixServer(cfg.SocketPath, ps)
 	}
+	debugf("server", "initialized pageserver layer_dir=%q cache_dir=%q cache_max_bytes=%d walredo_bin=%q r2_bucket=%q kms=%v unix_socket=%q",
+		cfg.LayerDir, cfg.CacheDir, cfg.CacheMaxBytes, cfg.WalRedoBin, cfg.R2Bucket, cfg.KMS != nil, cfg.SocketPath)
 	return ps, nil
 }
 
@@ -109,7 +116,10 @@ func (p *Pageserver) SetTenantGeneration(tenantID, generation string) {
 		return
 	}
 	if prev, ok := p.generations[tenantID]; ok && prev != generation {
+		debugf("tenant", "SetTenantGeneration tenant=%s prev=%q new=%q (detaching old timeline)", tenantID, prev, generation)
 		delete(p.tenants, tenantID)
+	} else {
+		debugf("tenant", "SetTenantGeneration tenant=%s gen=%q", tenantID, generation)
 	}
 	p.generations[tenantID] = generation
 	if tl, ok := p.tenants[tenantID]; ok && tl.Generation() != generation {
@@ -158,6 +168,8 @@ func (p *Pageserver) isGenerationActive(tenantID, generation string) bool {
 // PurgeTenant removes in-memory timelines, local layer/cache files, decoded/index/disk cache entries,
 // and best-effort R2 objects for (tenantID, generation).
 func (p *Pageserver) PurgeTenant(ctx context.Context, tenantID, generation string) error {
+	start := time.Now()
+	debugf("tenant", "PurgeTenant start tenant=%s gen=%q", tenantID, generation)
 	p.mu.Lock()
 	curGen := p.generations[tenantID]
 	if generation == "" || curGen == generation {
@@ -168,6 +180,7 @@ func (p *Pageserver) PurgeTenant(ctx context.Context, tenantID, generation strin
 	}
 	p.mu.Unlock()
 
+	var deletedR2 int
 	if p.store != nil {
 		if p.store.decodedChunks != nil {
 			p.store.decodedChunks.InvalidateTenantGeneration(tenantID, generation)
@@ -188,6 +201,7 @@ func (p *Pageserver) PurgeTenant(ctx context.Context, tenantID, generation strin
 					ContinuationToken: token,
 				})
 				if err != nil {
+					debugf("tenant", "PurgeTenant R2 list error tenant=%s prefix=%q err=%v", tenantID, prefix, err)
 					break
 				}
 				for _, obj := range out.Contents {
@@ -196,6 +210,7 @@ func (p *Pageserver) PurgeTenant(ctx context.Context, tenantID, generation strin
 							Bucket: aws.String(p.store.bucket),
 							Key:    obj.Key,
 						})
+						deletedR2++
 					}
 				}
 				if !aws.ToBool(out.IsTruncated) || out.NextContinuationToken == nil {
@@ -213,6 +228,7 @@ func (p *Pageserver) PurgeTenant(ctx context.Context, tenantID, generation strin
 			_ = os.RemoveAll(filepath.Join(p.cfg.LayerDir, tenantID))
 		}
 	}
+	debugf("tenant", "PurgeTenant done tenant=%s gen=%q cur_gen=%q deleted_r2=%d dur=%s", tenantID, generation, curGen, deletedR2, time.Since(start))
 	return nil
 }
 
@@ -223,6 +239,7 @@ func (p *Pageserver) EnsureTenant(tenantID string, epoch int64) *Timeline {
 	gen := p.generations[tenantID]
 	if tl, ok := p.tenants[tenantID]; ok {
 		if gen == "" || tl.Generation() == gen {
+			debugf("tenant", "EnsureTenant reuse tenant=%s epoch=%d gen=%q last_lsn=%s layers=%d", tenantID, epoch, tl.Generation(), formatLSNHex(tl.LastLSN()), tl.LayerCount())
 			return tl
 		}
 	}
@@ -231,6 +248,7 @@ func (p *Pageserver) EnsureTenant(tenantID string, epoch int64) *Timeline {
 		tl.SetGeneration(gen)
 	}
 	p.tenants[tenantID] = tl
+	debugf("tenant", "EnsureTenant created timeline tenant=%s epoch=%d gen=%q active_tenants=%d", tenantID, epoch, gen, len(p.tenants))
 	return tl
 }
 
@@ -347,9 +365,11 @@ func (p *Pageserver) UnlinkRel(_ context.Context, tenantID string, spcOID, dbOID
 // BootstrapTenantFromPGData imports an existing PGDATA base/ and global/ directory into an Image layer at initLSN
 // using bounded-memory streaming file traversal and V2 encoding.
 func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID string, epoch int64, pgDataDir string, initLSN uint64) (*LayerMeta, error) {
+	start := time.Now()
 	if initLSN == 0 {
 		initLSN = 1
 	}
+	debugf("bootstrap", "BootstrapTenantFromPGData start tenant=%s epoch=%d pgdata=%q init_lsn=%s", tenantID, epoch, pgDataDir, formatLSNHex(initLSN))
 	tl := p.EnsureTenant(tenantID, epoch)
 
 	type pgDataFile struct {
@@ -600,9 +620,11 @@ func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID str
 		return nil, err
 	}
 	if !wroteAny {
+		debugf("bootstrap", "BootstrapTenantFromPGData tenant=%s no pages written dur=%s", tenantID, time.Since(start))
 		return nil, nil
 	}
 	if err := tl.PublishNewLayer(ctx, written); err != nil {
+		debugf("bootstrap", "BootstrapTenantFromPGData publish error tenant=%s err=%v dur=%s", tenantID, err, time.Since(start))
 		return nil, err
 	}
 	tl.mu.Lock()
@@ -610,6 +632,8 @@ func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID str
 		tl.relSizes[sizeKey] = nb
 	}
 	tl.mu.Unlock()
+	debugf("bootstrap", "BootstrapTenantFromPGData done tenant=%s files=%d rels=%d layer=%s size=%d sha256=%s end_lsn=%s dur=%s",
+		tenantID, len(files), len(relSizes), written.FileName, written.FileSize, shortHash(written.SHA256), formatLSNHex(written.EndLSN), time.Since(start))
 	return &written, nil
 }
 

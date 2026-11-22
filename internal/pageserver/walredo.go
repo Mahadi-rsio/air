@@ -167,12 +167,15 @@ func prepareRedo(key Key, basePage []byte, deltas []WALDelta) (cur []byte, pendi
 
 // Redo applies deltas onto basePage in LSN order and returns the materialized 8192-byte page.
 func (r *DefaultWALRedoer) Redo(ctx context.Context, key Key, basePage []byte, deltas []WALDelta) ([]byte, error) {
+	start := time.Now()
 	cur, pendingWAL, done, err := prepareRedo(key, basePage, deltas)
 	if done {
+		debugf("walredo", "Redo fast_path key=%s deltas=%d has_base=%v err=%v dur=%s", key, len(deltas), len(basePage) == PageSize, err, time.Since(start))
 		return cur, err
 	}
 	if r.cfg.WorkerBin == "" {
 		if applied, ok := ApplyWALRecordsInGo(key, cur, pendingWAL); ok && len(applied) == PageSize {
+			debugf("walredo", "Redo in_go key=%s pending_wal=%d dur=%s", key, len(pendingWAL), time.Since(start))
 			return applied, nil
 		}
 		var rmid uint8
@@ -185,7 +188,9 @@ func (r *DefaultWALRedoer) Redo(ctx context.Context, key Key, basePage []byte, d
 		}
 		return nil, fmt.Errorf("pageserver: %d non-FPI WAL records (rmid=%d info=0x%02x) for %s require walredo worker", len(pendingWAL), rmid, rinfo, key)
 	}
-	return r.submitJob(ctx, key, cur, pendingWAL)
+	page, err := r.submitJob(ctx, key, cur, pendingWAL)
+	debugf("walredo", "Redo external_worker key=%s pending_wal=%d err=%v dur=%s", key, len(pendingWAL), err, time.Since(start))
+	return page, err
 }
 
 // RedoBatch executes multiple WAL redo requests concurrently across the bounded worker pool.
