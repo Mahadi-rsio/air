@@ -163,6 +163,7 @@ type SQLiteReadServer struct {
 	unsupportedTypeFallbacks atomic.Uint64
 	otherFallbacks           atomic.Uint64
 	totalFallbacks           atomic.Uint64
+	fallbackTelemetry        FallbackTelemetry
 	globalLSN                atomic.Uint64
 	connSeq                  atomic.Uint32
 
@@ -349,16 +350,10 @@ func (s *SQLiteReadServer) DetailedMetrics() ReadServerMetrics {
 	toastFB := s.toastFallbacks.Load()
 	mxFB := s.multixactFallbacks.Load()
 	utFB := s.unsupportedTypeFallbacks.Load()
-	otherFB := s.otherFallbacks.Load()
 	totalFB := s.totalFallbacks.Load()
 	var fbReasons map[string]uint64
 	if totalFB > 0 {
-		fbReasons = map[string]uint64{
-			"toast":            toastFB,
-			"multixact":        mxFB,
-			"unsupported_type": utFB,
-			"other":            otherFB,
-		}
+		fbReasons = s.fallbackTelemetry.ReasonCounts()
 	}
 
 	var planCacheStats PlanCacheStats
@@ -444,9 +439,7 @@ func (s *SQLiteReadServer) PrometheusMetrics() string {
 	fmt.Fprintf(&b, "air_read_fallbacks_total %d\n", m.TotalFallbacks)
 	fmt.Fprintf(&b, "air_native_read_queries_total %d\n", m.QueriesSucceeded)
 	fmt.Fprintf(&b, "air_postgres_fallback_queries_total %d\n", m.TotalFallbacks)
-	for _, reason := range []string{"toast", "multixact", "unsupported_type", "unsupported_operator", "unsupported_function", "unsupported_syntax", "other"} {
-		fmt.Fprintf(&b, "air_postgres_fallback_total{reason=%q} %d\n", reason, m.FallbackReasons[reason])
-	}
+	s.fallbackTelemetry.WritePrometheus(&b)
 	var cs CacheStats
 	if s.nativeCache != nil {
 		cs = s.nativeCache.Stats()
@@ -474,8 +467,20 @@ func readCgroupMemoryCurrent() int64 {
 	return v
 }
 
+// RankedFallbacks returns observed PostgreSQL fallbacks ranked by descending frequency.
+func (s *SQLiteReadServer) RankedFallbacks() []FallbackRankEntry {
+	return s.fallbackTelemetry.RankedFallbacks()
+}
+
 func (s *SQLiteReadServer) recordQueryError(err error) {
+	s.recordQueryErrorWithSQL("", err)
+}
+
+func (s *SQLiteReadServer) recordQueryErrorWithSQL(sql string, err error) {
 	if err == nil {
+		return
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return
 	}
 	if errors.Is(err, ErrTOASTUnsupported) {
@@ -487,10 +492,13 @@ func (s *SQLiteReadServer) recordQueryError(err error) {
 	} else if errors.Is(err, ErrUnsupportedType) {
 		s.unsupportedTypeFallbacks.Add(1)
 		s.totalFallbacks.Add(1)
-	} else if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+	} else {
 		s.otherFallbacks.Add(1)
 		s.totalFallbacks.Add(1)
 	}
+	shape := ClassifyQueryShape(sql)
+	reason := ClassifyFallbackReason(sql, err)
+	s.fallbackTelemetry.RecordFallback(shape, reason)
 }
 
 // Tenants returns the list of registered tenant IDs.
@@ -1556,7 +1564,9 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 	}
 	defer func() {
 		s.activeQueries.Add(-1)
-		s.recordLatency(time.Since(start))
+		dur := time.Since(start)
+		s.recordLatency(dur)
+		s.fallbackTelemetry.RecordQuery(ClassifyQueryShape(sqliteSQL), dur)
 	}()
 
 	var snap *ReadSnapshot
@@ -1587,7 +1597,7 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 			if extMap, _ := ts.extCols.Load().(map[string]ColumnType); true {
 				if opErr := CheckUnsupportedExtOps(sqliteSQL, extMap); opErr != nil {
 					s.queriesFailed.Add(1)
-					s.recordQueryError(opErr)
+					s.recordQueryErrorWithSQL(sqliteSQL, opErr)
 					return nil, nil, opErr
 				}
 			}
@@ -1601,7 +1611,7 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 					s.queriesCancelled.Add(1)
 				} else {
 					s.queriesFailed.Add(1)
-					s.recordQueryError(err)
+					s.recordQueryErrorWithSQL(sqliteSQL, err)
 				}
 				return nil, nil, err
 			}
@@ -1610,14 +1620,14 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 
 		if rerr := s.refreshNativeCatalogWithSnap(ctx, ts, snap); rerr != nil {
 			s.queriesFailed.Add(1)
-			s.recordQueryError(rerr)
+			s.recordQueryErrorWithSQL(sqliteSQL, rerr)
 			return nil, nil, rerr
 		}
 	}
 	if extMap, _ := ts.extCols.Load().(map[string]ColumnType); true {
 		if opErr := CheckUnsupportedExtOps(sqliteSQL, extMap); opErr != nil {
 			s.queriesFailed.Add(1)
-			s.recordQueryError(opErr)
+			s.recordQueryErrorWithSQL(sqliteSQL, opErr)
 			return nil, nil, opErr
 		}
 	}
@@ -1632,7 +1642,7 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 			s.queriesCancelled.Add(1)
 		} else {
 			s.queriesFailed.Add(1)
-			s.recordQueryError(err)
+			s.recordQueryErrorWithSQL(sqliteSQL, err)
 		}
 		return nil, nil, err
 	}
