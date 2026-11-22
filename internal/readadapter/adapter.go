@@ -136,7 +136,9 @@ func (a *Adapter) validateGeneration(tenantID, generation string) error {
 
 // GetSnapshot acquires and pins a consistent read snapshot for (tenantID, generation).
 func (a *Adapter) GetSnapshot(ctx context.Context, tenantID, generation string) (*ReadSnapshot, error) {
+	start := time.Now()
 	if err := a.validateGeneration(tenantID, generation); err != nil {
+		debugf("adapter", "GetSnapshot tenant=%s gen=%s validate_err=%v", tenantID, generation, err)
 		return nil, err
 	}
 	var info SnapshotInfo
@@ -144,6 +146,7 @@ func (a *Adapter) GetSnapshot(ctx context.Context, tenantID, generation string) 
 		var err error
 		info, err = a.snapProv.CurrentSnapshot(ctx, tenantID, generation)
 		if err != nil {
+			debugf("adapter", "GetSnapshot tenant=%s gen=%s snap_prov_err=%v dur=%s", tenantID, generation, err, time.Since(start))
 			return nil, err
 		}
 	}
@@ -163,7 +166,10 @@ func (a *Adapter) GetSnapshot(ctx context.Context, tenantID, generation string) 
 	}
 	a.mu.Lock()
 	a.snapshots[snap.ID] = snap
+	active := len(a.snapshots)
 	a.mu.Unlock()
+	debugf("adapter", "GetSnapshot id=%d tenant=%s gen=%s lsn=%s xmin=%d xmax=%d active_snaps=%d dur=%s",
+		snap.ID, tenantID, generation, formatLSNHex(snap.LSN), snap.Xmin, snap.Xmax, active, time.Since(start))
 	return snap, nil
 }
 
@@ -177,7 +183,10 @@ func (a *Adapter) ReleaseSnapshot(snap *ReadSnapshot) error {
 	}
 	a.mu.Lock()
 	delete(a.snapshots, snap.ID)
+	active := len(a.snapshots)
 	a.mu.Unlock()
+	debugf("adapter", "ReleaseSnapshot id=%d tenant=%s lsn=%s held=%s active_snaps=%d",
+		snap.ID, snap.TenantID, formatLSNHex(snap.LSN), time.Since(snap.AcquiredAt), active)
 	return nil
 }
 

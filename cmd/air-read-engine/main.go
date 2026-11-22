@@ -37,6 +37,19 @@ type Config struct {
 	PageserverGRPCAddr      string
 	PageserverInternalToken string
 	CacheDir                string
+	Debug                   bool
+}
+
+func envBoolOr(key string, fallback bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func envOr(key, fallback string) string {
@@ -90,6 +103,7 @@ func loadConfig(args []string) Config {
 	fs.StringVar(&cfg.PageserverGRPCAddr, "pageserver-grpc-addr", envOr("AIR_PAGESERVER_GRPC_ADDR", ""), "Standalone AIR Pageserver gRPC address")
 	fs.StringVar(&cfg.PageserverInternalToken, "internal-token", envOr("AIR_INTERNAL_TOKEN", ""), "Shared internal token for Pageserver gRPC auth")
 	fs.StringVar(&cfg.CacheDir, "cache-dir", envOr("AIR_READ_ENGINE_CACHE_DIR", ""), "Optional local NVMe L2 page cache directory")
+	fs.BoolVar(&cfg.Debug, "debug", envBoolOr("AIR_READ_ENGINE_DEBUG", true), "Enable verbose debug logging")
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("parse flags: %v", err)
 	}
@@ -105,6 +119,7 @@ type SharedReadEngine struct {
 }
 
 func NewSharedReadEngine(cfg Config) (*SharedReadEngine, error) {
+	readadapter.SetDebugLogging(cfg.Debug)
 	sq, err := readadapter.NewSQLiteReadServer(readadapter.SQLiteServerConfig{
 		ListenHost:              cfg.ListenHost,
 		PGPort:                  cfg.PGPort,
@@ -115,6 +130,7 @@ func NewSharedReadEngine(cfg Config) (*SharedReadEngine, error) {
 		PageserverInternalToken: cfg.PageserverInternalToken,
 		CacheDir:                cfg.CacheDir,
 		CacheKB:                 parseMemoryToKB(cfg.SharedBuffers, 32768),
+		Debug:                   cfg.Debug,
 	})
 	if err != nil {
 		return nil, err
@@ -236,6 +252,7 @@ func (re *SharedReadEngine) HTTPHandler() http.Handler {
 		_ = json.NewEncoder(w).Encode(re.sqliteRe.DetailedMetrics())
 	})
 	mux.HandleFunc("/v1/tenants/", func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		path := strings.TrimPrefix(r.URL.Path, "/v1/tenants/")
 		parts := strings.Split(strings.Trim(path, "/"), "/")
 		if len(parts) < 2 {
@@ -243,12 +260,24 @@ func (re *SharedReadEngine) HTTPHandler() http.Handler {
 			return
 		}
 		tenantID, action := parts[0], parts[1]
+		if re.cfg.Debug {
+			log.Printf("[air-read-engine][DEBUG][http] %s %s tenant=%s action=%s remote=%s",
+				r.Method, r.URL.Path, tenantID, action, r.RemoteAddr)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodPost && (action == "start" || action == "register"):
 			if err := re.EnsureTenantDB(tenantID); err != nil {
+				if re.cfg.Debug {
+					log.Printf("[air-read-engine][DEBUG][http] %s %s tenant=%s err=%v dur=%s",
+						r.Method, r.URL.Path, tenantID, err, time.Since(start))
+				}
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
+			}
+			if re.cfg.Debug {
+				log.Printf("[air-read-engine][DEBUG][http] %s %s tenant=%s -> ACTIVE dur=%s",
+					r.Method, r.URL.Path, tenantID, time.Since(start))
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"tenant_id": tenantID,
@@ -298,13 +327,22 @@ func (re *SharedReadEngine) HTTPHandler() http.Handler {
 		}
 	})
 	handleNamespaces := func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		w.Header().Set("Content-Type", "application/json")
 		if !re.isAuthorizedHTTP(r) {
+			if re.cfg.Debug {
+				log.Printf("[air-read-engine][DEBUG][http] %s %s remote=%s status=401 unauthorized dur=%s",
+					r.Method, r.URL.Path, r.RemoteAddr, time.Since(start))
+			}
 			w.WriteHeader(http.StatusUnauthorized)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
 			return
 		}
 		suffix := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/namespaces"), "/")
+		if re.cfg.Debug {
+			log.Printf("[air-read-engine][DEBUG][http] %s %s suffix=%q remote=%s",
+				r.Method, r.URL.Path, suffix, r.RemoteAddr)
+		}
 		switch {
 		case suffix == "" && r.Method == http.MethodGet:
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -414,13 +452,28 @@ func (s *readEngineGRPCServer) authorize(ctx context.Context) error {
 func (s *readEngineGRPCServer) authUnaryInterceptor(
 	ctx context.Context,
 	req any,
-	_ *grpc.UnaryServerInfo,
+	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (any, error) {
+	start := time.Now()
 	if err := s.authorize(ctx); err != nil {
+		if s.re.cfg.Debug {
+			log.Printf("[air-read-engine][DEBUG][grpc] method=%s auth=DENIED code=%s err=%v dur=%s",
+				info.FullMethod, status.Code(err), err, time.Since(start))
+		}
 		return nil, err
 	}
-	return handler(ctx, req)
+	resp, err := handler(ctx, req)
+	if s.re.cfg.Debug {
+		if err != nil {
+			log.Printf("[air-read-engine][DEBUG][grpc] method=%s status=%s err=%v dur=%s",
+				info.FullMethod, status.Code(err), err, time.Since(start))
+		} else {
+			log.Printf("[air-read-engine][DEBUG][grpc] method=%s status=OK dur=%s",
+				info.FullMethod, time.Since(start))
+		}
+	}
+	return resp, err
 }
 
 func (s *readEngineGRPCServer) Health(_ context.Context, _ *pb.ReadEngineEmpty) (*pb.ReadEngineHealthResponse, error) {
@@ -521,8 +574,13 @@ func main() {
 	if err := re.Start(); err != nil {
 		log.Fatalf("start shared read engine: %v", err)
 	}
-	log.Printf("[air-read-engine] shared read-only SQLite %s engine listening on %s:%d (sock=%s, cache=%s, pageserver_grpc=%q)",
-		readadapter.SQLiteVersion(), cfg.ListenHost, re.cfg.PGPort, re.sockDir, cfg.SharedBuffers, cfg.PageserverGRPCAddr)
+	log.Printf("[air-read-engine] shared read-only SQLite %s engine listening on %s:%d (sock=%s, cache=%s, pageserver_grpc=%q, debug=%v)",
+		readadapter.SQLiteVersion(), cfg.ListenHost, re.cfg.PGPort, re.sockDir, cfg.SharedBuffers, cfg.PageserverGRPCAddr, cfg.Debug)
+	if cfg.Debug {
+		log.Printf("[air-read-engine][DEBUG][startup] http=%s grpc=%s data_dir=%s cache_dir=%q pageserver_socket=%q pageserver_grpc=%q primary_conninfo_set=%v internal_token_set=%v",
+			cfg.HTTPAddr, cfg.GRPCAddr, cfg.DataDir, cfg.CacheDir, cfg.PageserverSocket, cfg.PageserverGRPCAddr,
+			cfg.PrimaryConnInfo != "", cfg.PageserverInternalToken != "")
+	}
 
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {

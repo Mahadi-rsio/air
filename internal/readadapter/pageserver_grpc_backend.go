@@ -119,6 +119,7 @@ func (b *PageserverGRPCBackend) mapErr(err error) error {
 
 // GetTenantInfo queries the active generation and latest ingested WAL LSN for tenantID.
 func (b *PageserverGRPCBackend) GetTenantInfo(ctx context.Context, tenantID string) (string, uint64, error) {
+	start := time.Now()
 	b.requestsTotal.Add(1)
 	b.inFlight.Add(1)
 	defer b.inFlight.Add(-1)
@@ -127,9 +128,12 @@ func (b *PageserverGRPCBackend) GetTenantInfo(ctx context.Context, tenantID stri
 	defer cancel()
 	resp, err := b.client.GetTenantInfo(rctx, &pb.PageserverTenantRequest{TenantId: tenantID})
 	if err != nil {
-		return "", 0, b.mapErr(err)
+		mapped := b.mapErr(err)
+		debugf("ps-grpc", "GetTenantInfo tenant=%s err=%v dur=%s", tenantID, mapped, time.Since(start))
+		return "", 0, mapped
 	}
 	if !resp.GetExists() {
+		debugf("ps-grpc", "GetTenantInfo tenant=%s exists=false dur=%s", tenantID, time.Since(start))
 		return "", 0, ErrNotFound
 	}
 	b.genMu.Lock()
@@ -139,11 +143,14 @@ func (b *PageserverGRPCBackend) GetTenantInfo(ctx context.Context, tenantID stri
 		fetchedAt:  time.Now(),
 	}
 	b.genMu.Unlock()
+	debugf("ps-grpc", "GetTenantInfo tenant=%s gen=%s last_lsn=%s dur=%s",
+		tenantID, resp.GetGeneration(), formatLSNHex(resp.GetLastLsn()), time.Since(start))
 	return resp.GetGeneration(), resp.GetLastLsn(), nil
 }
 
 // GetModifiedBlocksSince implements pageserver.ModifiedBlocksProvider over gRPC.
 func (b *PageserverGRPCBackend) GetModifiedBlocksSince(ctx context.Context, tenantID string, sinceLSN uint64) (pageserver.ModifiedBlocksResult, error) {
+	start := time.Now()
 	b.requestsTotal.Add(1)
 	b.inFlight.Add(1)
 	defer b.inFlight.Add(-1)
@@ -155,7 +162,10 @@ func (b *PageserverGRPCBackend) GetModifiedBlocksSince(ctx context.Context, tena
 		SinceLsn: sinceLSN,
 	})
 	if err != nil {
-		return pageserver.ModifiedBlocksResult{}, b.mapErr(err)
+		mapped := b.mapErr(err)
+		debugf("ps-grpc", "GetModifiedBlocksSince tenant=%s since=%s err=%v dur=%s",
+			tenantID, formatLSNHex(sinceLSN), mapped, time.Since(start))
+		return pageserver.ModifiedBlocksResult{}, mapped
 	}
 	events := make([]pageserver.ModifiedBlockEvent, 0, len(resp.GetEvents()))
 	for _, ev := range resp.GetEvents() {
@@ -169,6 +179,9 @@ func (b *PageserverGRPCBackend) GetModifiedBlocksSince(ctx context.Context, tena
 			IsRelWide: ev.GetIsRelWide(),
 		})
 	}
+	debugf("ps-grpc", "GetModifiedBlocksSince tenant=%s since=%s -> current=%s catalog=%s reset=%v events=%d dur=%s",
+		tenantID, formatLSNHex(sinceLSN), formatLSNHex(resp.GetCurrentLsn()), formatLSNHex(resp.GetCatalogLsn()),
+		resp.GetResetRequired(), len(events), time.Since(start))
 	return pageserver.ModifiedBlocksResult{
 		CurrentLSN:    resp.GetCurrentLsn(),
 		CatalogLSN:    resp.GetCatalogLsn(),
@@ -217,6 +230,7 @@ func (b *PageserverGRPCBackend) CurrentSnapshot(ctx context.Context, tenantID, g
 
 // GetPageAtLSN implements StorageBackend.
 func (b *PageserverGRPCBackend) GetPageAtLSN(ctx context.Context, tenantID string, key pageserver.Key, lsn uint64) ([]byte, error) {
+	start := time.Now()
 	b.requestsTotal.Add(1)
 	b.inFlight.Add(1)
 	defer b.inFlight.Add(-1)
@@ -232,11 +246,18 @@ func (b *PageserverGRPCBackend) GetPageAtLSN(ctx context.Context, tenantID strin
 			Lsn:      lsn,
 		})
 		if err != nil {
-			return nil, b.mapErr(err)
+			mapped := b.mapErr(err)
+			debugf("ps-grpc", "GetSLRUPage tenant=%s kind=%d blk=%d lsn=%s err=%v dur=%s",
+				tenantID, key.SpcOID, key.BlockNum, formatLSNHex(lsn), mapped, time.Since(start))
+			return nil, mapped
 		}
 		if !resp.GetFound() {
+			debugf("ps-grpc", "GetSLRUPage tenant=%s kind=%d blk=%d lsn=%s found=false dur=%s",
+				tenantID, key.SpcOID, key.BlockNum, formatLSNHex(lsn), time.Since(start))
 			return nil, ErrNotFound
 		}
+		debugf("ps-grpc", "GetSLRUPage tenant=%s kind=%d blk=%d lsn=%s found=true bytes=%d dur=%s",
+			tenantID, key.SpcOID, key.BlockNum, formatLSNHex(lsn), len(resp.GetPage()), time.Since(start))
 		return resp.GetPage(), nil
 	}
 
@@ -255,16 +276,24 @@ func (b *PageserverGRPCBackend) GetPageAtLSN(ctx context.Context, tenantID strin
 		Lsn: lsn,
 	})
 	if err != nil {
-		return nil, b.mapErr(err)
+		mapped := b.mapErr(err)
+		debugf("ps-grpc", "GetPageAtLSN tenant=%s rel=%d/%d/%d.%d blk=%d lsn=%s err=%v dur=%s",
+			tenantID, key.SpcOID, key.DbOID, key.RelNumber, key.ForkNum, key.BlockNum, formatLSNHex(lsn), mapped, time.Since(start))
+		return nil, mapped
 	}
 	if !resp.GetFound() {
+		debugf("ps-grpc", "GetPageAtLSN tenant=%s rel=%d/%d/%d.%d blk=%d lsn=%s found=false dur=%s",
+			tenantID, key.SpcOID, key.DbOID, key.RelNumber, key.ForkNum, key.BlockNum, formatLSNHex(lsn), time.Since(start))
 		return nil, ErrNotFound
 	}
+	debugf("ps-grpc", "GetPageAtLSN tenant=%s rel=%d/%d/%d.%d blk=%d lsn=%s found=true bytes=%d dur=%s",
+		tenantID, key.SpcOID, key.DbOID, key.RelNumber, key.ForkNum, key.BlockNum, formatLSNHex(lsn), len(resp.GetPage()), time.Since(start))
 	return resp.GetPage(), nil
 }
 
 // GetPageBatch implements StorageBackend.
 func (b *PageserverGRPCBackend) GetPageBatch(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, startBlock, nblocks uint32, lsn uint64) ([]byte, uint32, error) {
+	start := time.Now()
 	b.requestsTotal.Add(1)
 	b.inFlight.Add(1)
 	defer b.inFlight.Add(-1)
@@ -282,13 +311,19 @@ func (b *PageserverGRPCBackend) GetPageBatch(ctx context.Context, tenantID strin
 		Lsn:        lsn,
 	})
 	if err != nil {
-		return nil, 0, b.mapErr(err)
+		mapped := b.mapErr(err)
+		debugf("ps-grpc", "GetPageBatch tenant=%s rel=%d/%d/%d.%d start=%d req=%d lsn=%s err=%v dur=%s",
+			tenantID, spcOID, dbOID, relNumber, forkNum, startBlock, nblocks, formatLSNHex(lsn), mapped, time.Since(start))
+		return nil, 0, mapped
 	}
+	debugf("ps-grpc", "GetPageBatch tenant=%s rel=%d/%d/%d.%d start=%d req=%d got=%d lsn=%s dur=%s",
+		tenantID, spcOID, dbOID, relNumber, forkNum, startBlock, nblocks, resp.GetNblocksReturned(), formatLSNHex(lsn), time.Since(start))
 	return resp.GetPages(), resp.GetNblocksReturned(), nil
 }
 
 // GetRelSize implements StorageBackend.
 func (b *PageserverGRPCBackend) GetRelSize(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) (uint32, error) {
+	start := time.Now()
 	b.requestsTotal.Add(1)
 	b.inFlight.Add(1)
 	defer b.inFlight.Add(-1)
@@ -304,13 +339,19 @@ func (b *PageserverGRPCBackend) GetRelSize(ctx context.Context, tenantID string,
 		Lsn:       lsn,
 	})
 	if err != nil {
-		return 0, b.mapErr(err)
+		mapped := b.mapErr(err)
+		debugf("ps-grpc", "GetRelSize tenant=%s rel=%d/%d/%d.%d lsn=%s err=%v dur=%s",
+			tenantID, spcOID, dbOID, relNumber, forkNum, formatLSNHex(lsn), mapped, time.Since(start))
+		return 0, mapped
 	}
+	debugf("ps-grpc", "GetRelSize tenant=%s rel=%d/%d/%d.%d lsn=%s nblocks=%d dur=%s",
+		tenantID, spcOID, dbOID, relNumber, forkNum, formatLSNHex(lsn), resp.GetNblocks(), time.Since(start))
 	return resp.GetNblocks(), nil
 }
 
 // GetRelExists implements StorageBackend.
 func (b *PageserverGRPCBackend) GetRelExists(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) (bool, error) {
+	start := time.Now()
 	b.requestsTotal.Add(1)
 	b.inFlight.Add(1)
 	defer b.inFlight.Add(-1)
@@ -326,7 +367,12 @@ func (b *PageserverGRPCBackend) GetRelExists(ctx context.Context, tenantID strin
 		Lsn:       lsn,
 	})
 	if err != nil {
-		return false, b.mapErr(err)
+		mapped := b.mapErr(err)
+		debugf("ps-grpc", "GetRelExists tenant=%s rel=%d/%d/%d.%d lsn=%s err=%v dur=%s",
+			tenantID, spcOID, dbOID, relNumber, forkNum, formatLSNHex(lsn), mapped, time.Since(start))
+		return false, mapped
 	}
+	debugf("ps-grpc", "GetRelExists tenant=%s rel=%d/%d/%d.%d lsn=%s exists=%v dur=%s",
+		tenantID, spcOID, dbOID, relNumber, forkNum, formatLSNHex(lsn), resp.GetExists(), time.Since(start))
 	return resp.GetExists(), nil
 }

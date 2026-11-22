@@ -54,6 +54,7 @@ type SQLiteServerConfig struct {
 	TenantMemoryLimitBytes        int64
 	QueryMemoryLimitBytes         int64
 	NoisyNeighbor                 NoisyNeighborConfig
+	Debug                         bool
 }
 
 type sqliteReaderSlot struct {
@@ -180,6 +181,9 @@ type SQLiteReadServer struct {
 
 // NewSQLiteReadServer creates a new shared SQLiteReadServer.
 func NewSQLiteReadServer(cfg SQLiteServerConfig) (*SQLiteReadServer, error) {
+	if cfg.Debug {
+		SetDebugLogging(true)
+	}
 	if cfg.ListenHost == "" {
 		cfg.ListenHost = "127.0.0.1"
 	}
@@ -285,6 +289,9 @@ func NewSQLiteReadServer(cfg SQLiteServerConfig) (*SQLiteReadServer, error) {
 	})
 	s.noisyNeighbor = NewNoisyNeighborController(cfg.NoisyNeighbor)
 	s.globalLSN.Store(0x1000000)
+	debugf("init", "SQLiteReadServer initialized listen=%s:%d root=%s sock=%s native_mode=%v pageserver_grpc=%q cache_dir=%q cache_kb=%d readers_per_tenant=%d max_conc_per_tenant=%d query_timeout=%s",
+		cfg.ListenHost, cfg.PGPort, root, sockDir, s.nativeAdapter != nil, cfg.PageserverGRPCAddr, cfg.CacheDir,
+		cfg.CacheKB, cfg.ReadersPerTenant, cfg.MaxConcurrentQueriesPerTenant, cfg.QueryTimeout)
 	return s, nil
 }
 
@@ -520,6 +527,7 @@ func (s *SQLiteReadServer) recordQueryErrorWithSQL(sql string, err error) {
 	shape := ClassifyQueryShape(sql)
 	reason := ClassifyFallbackReason(sql, err)
 	s.fallbackTelemetry.RecordFallback(shape, reason)
+	debugf("fallback", "query_error shape=%s reason=%s err=%v sql=%q", shape, reason, err, truncateSQL(sql, 160))
 }
 
 // Tenants returns the list of registered tenant IDs.
@@ -688,6 +696,7 @@ func (s *SQLiteReadServer) DeleteTenantDB(tenantID string) error {
 		_ = os.Remove(ts.DBPath + "-wal")
 		_ = os.Remove(ts.DBPath + "-shm")
 	}
+	debugf("tenant", "DeleteTenantDB tenant=%s native_mode=%v readers=%d", tenantID, ts.NativeMode, len(ts.readers))
 	return nil
 }
 
@@ -737,6 +746,8 @@ func (s *SQLiteReadServer) ensureTenantLocked(tenantID string) (*SQLiteTenantSto
 			sem:        make(chan struct{}, s.cfg.MaxConcurrentQueriesPerTenant),
 		}
 		s.tenants[tenantID] = ts
+		debugf("tenant", "EnsureTenantDB tenant=%s mode=native_pageserver reader_slots=%d max_conc=%d",
+			tenantID, len(slots), s.cfg.MaxConcurrentQueriesPerTenant)
 		return ts, nil
 	}
 	dbPath := filepath.Join(s.dbDir, tenantID+".sqlite3")
@@ -1192,6 +1203,8 @@ func (s *SQLiteReadServer) serveConn(c net.Conn) {
 	}
 
 	pid := 20000 + s.connSeq.Add(1)
+	connStart := time.Now()
+	debugf("wire", "connect pid=%d remote=%s tenant=%s user=%s", pid, c.RemoteAddr(), dbName, params["user"])
 	s.sessionsMu.Lock()
 	s.sessions[pid] = connCancel
 	s.sessionsMu.Unlock()
@@ -1199,6 +1212,7 @@ func (s *SQLiteReadServer) serveConn(c net.Conn) {
 		s.sessionsMu.Lock()
 		delete(s.sessions, pid)
 		s.sessionsMu.Unlock()
+		debugf("wire", "disconnect pid=%d remote=%s tenant=%s dur=%s", pid, c.RemoteAddr(), dbName, time.Since(connStart))
 	}()
 	var out bytes.Buffer
 	writePGAuthOk(&out)
@@ -1527,8 +1541,11 @@ func (s *SQLiteReadServer) refreshNativeCatalogOnSlot(ctx context.Context, ts *S
 		}
 	}
 
+	catStart := time.Now()
 	tables, err := DiscoverCatalog(ctx, s.nativeAdapter, s.nativeCLOG, snap, ts.TenantID)
 	if err != nil {
+		debugf("catalog", "refreshSlot tenant=%s gen=%s lsn=%s discover_err=%v dur=%s",
+			ts.TenantID, snap.Generation, formatLSNHex(snap.LSN), err, time.Since(catStart))
 		return err
 	}
 	if s.statsCache != nil {
@@ -1542,8 +1559,10 @@ func (s *SQLiteReadServer) refreshNativeCatalogOnSlot(ctx context.Context, ts *S
 	defer slot.conn.SetReadOnlyAuthorizer(true)
 
 	seen := make(map[string]struct{}, len(tables))
+	totalIndexes := 0
 	for _, tbl := range tables {
 		seen[tbl.Name] = struct{}{}
+		totalIndexes += len(tbl.Indexes)
 		if oldID, ok := slot.vtabIDs[tbl.Name]; ok {
 			UnregisterNativeTable(oldID)
 		}
@@ -1571,6 +1590,9 @@ func (s *SQLiteReadServer) refreshNativeCatalogOnSlot(ctx context.Context, ts *S
 	if curCatModLSN > slot.lastCatalogModLSN {
 		slot.lastCatalogModLSN = curCatModLSN
 	}
+	debugf("catalog", "refreshSlot tenant=%s gen=%s lsn=%s cat_mod_lsn=%s tables=%d indexes=%d dur=%s",
+		ts.TenantID, snap.Generation, formatLSNHex(snap.LSN), formatLSNHex(slot.lastCatalogModLSN),
+		len(tables), totalIndexes, time.Since(catStart))
 	return nil
 }
 
@@ -1693,8 +1715,16 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 					s.queriesFailed.Add(1)
 					s.recordQueryErrorWithSQL(sqliteSQL, err)
 				}
+				debugf("query", "exec tenant=%s mode=native_pool gen=%s lsn=%s err=%v dur=%s sql=%q",
+					ts.TenantID, snap.Generation, formatLSNHex(snap.LSN), err, time.Since(start), truncateSQL(sqliteSQL, 160))
 				return nil, nil, err
 			}
+			strategy := "sqlite"
+			if plan != nil && plan.Selected.Strategy != "" {
+				strategy = string(plan.Selected.Strategy)
+			}
+			debugf("query", "exec tenant=%s mode=native_pool gen=%s lsn=%s strategy=%s rows=%d cols=%d dur=%s sql=%q",
+				ts.TenantID, snap.Generation, formatLSNHex(snap.LSN), strategy, len(res.Rows), len(res.Columns), time.Since(start), truncateSQL(sqliteSQL, 160))
 			return res, plan, nil
 		}
 
@@ -1725,8 +1755,12 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 			s.queriesFailed.Add(1)
 			s.recordQueryErrorWithSQL(sqliteSQL, err)
 		}
+		debugf("query", "exec tenant=%s mode=reader err=%v dur=%s sql=%q",
+			ts.TenantID, err, time.Since(start), truncateSQL(sqliteSQL, 160))
 		return nil, nil, err
 	}
+	debugf("query", "exec tenant=%s mode=reader rows=%d cols=%d dur=%s sql=%q",
+		ts.TenantID, len(res.Rows), len(res.Columns), time.Since(start), truncateSQL(sqliteSQL, 160))
 	return res, plan, nil
 }
 
@@ -1755,6 +1789,8 @@ func (sess *sqliteClientSession) currentTenantLSN() uint64 {
 
 func (sess *sqliteClientSession) rejectWrite(reason string) error {
 	sess.srv.writesBlocked.Add(1)
+	debugf("guard", "write_rejected tenant=%s user=%s reason=%q total_blocked=%d",
+		sess.tenantID, sess.user, reason, sess.srv.writesBlocked.Load())
 	return &SQLiteReadOnlyError{Message: reason}
 }
 
@@ -2069,7 +2105,9 @@ func (sess *sqliteClientSession) execSingleStatement(stmt string, args []string,
 		_ = sess.srv.SyncFromPrimary(context.Background(), sess.tenantID, sess.srv.cfg.PrimaryConnInfo)
 	}
 
-	sqliteSQL, _, _ := sess.srv.translateCachedForSession(sess, ts, s, nil)
+	sqliteSQL, _, planHit := sess.srv.translateCachedForSession(sess, ts, s, nil)
+	debugf("sql", "simple tenant=%s plan_cache_hit=%v pg_sql=%q sqlite_sql=%q",
+		sess.tenantID, planHit, truncateSQL(s, 140), truncateSQL(sqliteSQL, 140))
 	res, err := sess.srv.executeReaderQuery(sess.sessionCtx(), ts, sqliteSQL, args)
 	if err != nil {
 		var roErr *SQLiteReadOnlyError
@@ -2686,6 +2724,8 @@ func (sess *sqliteClientSession) handleExecute(body []byte) bool {
 			!strings.Contains(upper, "PG_CURRENT_WAL_LSN()") &&
 			!strings.Contains(upper, "AIR_RO_STATUS()") &&
 			!strings.Contains(upper, "SQLITE_VERSION()") {
+			debugf("sql", "extended_exec tenant=%s portal=%q stmt=%q args=%d sqlite_sql=%q",
+				sess.tenantID, portalName, portal.Stmt.Name, len(portal.Args), truncateSQL(portal.Stmt.SQLiteSQL, 140))
 			res, _, execErr := sess.srv.executeReaderQueryWithPlanTyped(sess.sessionCtx(), ts, portal.Stmt.SQLiteSQL, portal.Args, portal.Stmt.ParamOIDs)
 			if execErr != nil {
 				var roErr *SQLiteReadOnlyError

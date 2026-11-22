@@ -383,14 +383,19 @@ func (c *TieredCacheBackend) ensureSynced(ctx context.Context, tenantID, generat
 		}
 		c.syncMu.Unlock()
 
+		syncStart := time.Now()
 		syncCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
 		res, gerr := mbp.GetModifiedBlocksSince(syncCtx, tenantID, since)
 		if gerr != nil {
+			debugf("cache-sync", "ensureSynced tenant=%s gen=%s since=%s target=%s err=%v dur=%s",
+				tenantID, generation, formatLSNHex(since), formatLSNHex(targetLSN), gerr, time.Since(syncStart))
 			return tenantSyncState{}, gerr
 		}
 
 		if res.ResetRequired {
+			debugf("cache-sync", "ensureSynced tenant=%s gen=%s RESET_REQUIRED -> invalidating tenant cache",
+				tenantID, generation)
 			c.InvalidateTenant(tenantID)
 		} else {
 			for _, ev := range res.Events {
@@ -417,6 +422,9 @@ func (c *TieredCacheBackend) ensureSynced(ctx context.Context, tenantID, generat
 		}
 		out := *cur
 		c.syncMu.Unlock()
+		debugf("cache-sync", "ensureSynced tenant=%s gen=%s since=%s -> synced=%s catalog=%s events=%d reset=%v dur=%s",
+			tenantID, generation, formatLSNHex(since), formatLSNHex(out.syncedLSN), formatLSNHex(out.catalogLSN),
+			len(res.Events), res.ResetRequired, time.Since(syncStart))
 		return out, nil
 	})
 	if err != nil {
@@ -622,6 +630,8 @@ func (c *TieredCacheBackend) GetPageAtLSN(ctx context.Context, tenantID string, 
 
 	if pg, ok := c.getL1(ck, syncedLSN); ok {
 		c.l1Hits.Add(1)
+		debugf("cache", "GetPageAtLSN tier=L1_HIT tenant=%s rel=%d/%d/%d.%d blk=%d lsn=%s",
+			tenantID, key.SpcOID, key.DbOID, key.RelNumber, key.ForkNum, key.BlockNum, formatLSNHex(lsn))
 		return pg, nil
 	}
 	c.l1Misses.Add(1)
@@ -630,11 +640,14 @@ func (c *TieredCacheBackend) GetPageAtLSN(ctx context.Context, tenantID string, 
 		if pg, ok := c.getL2(ck, syncedLSN); ok {
 			c.l2Hits.Add(1)
 			c.putL1(ck, pg)
+			debugf("cache", "GetPageAtLSN tier=L2_HIT tenant=%s rel=%d/%d/%d.%d blk=%d lsn=%s",
+				tenantID, key.SpcOID, key.DbOID, key.RelNumber, key.ForkNum, key.BlockNum, formatLSNHex(lsn))
 			return pg, nil
 		}
 		c.l2Misses.Add(1)
 	}
 
+	l3Start := time.Now()
 	ch := c.sfGroup.DoChan(ck.sfKey(), func() (any, error) {
 		c.l3Fetches.Add(1)
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
@@ -661,8 +674,12 @@ func (c *TieredCacheBackend) GetPageAtLSN(ctx context.Context, tenantID string, 
 			c.stampedesPrevented.Add(1)
 		}
 		if res.Err != nil {
+			debugf("cache", "GetPageAtLSN tier=L3_ERR tenant=%s rel=%d/%d/%d.%d blk=%d lsn=%s shared=%v err=%v dur=%s",
+				tenantID, key.SpcOID, key.DbOID, key.RelNumber, key.ForkNum, key.BlockNum, formatLSNHex(lsn), res.Shared, res.Err, time.Since(l3Start))
 			return nil, res.Err
 		}
+		debugf("cache", "GetPageAtLSN tier=L3_FETCH tenant=%s rel=%d/%d/%d.%d blk=%d lsn=%s shared=%v dur=%s",
+			tenantID, key.SpcOID, key.DbOID, key.RelNumber, key.ForkNum, key.BlockNum, formatLSNHex(lsn), res.Shared, time.Since(l3Start))
 		pg := res.Val.([]byte)
 		out := make([]byte, len(pg))
 		copy(out, pg)
@@ -718,6 +735,8 @@ func (c *TieredCacheBackend) GetPageBatch(ctx context.Context, tenantID string, 
 	}
 
 	if allHit {
+		debugf("cache", "GetPageBatch tier=CACHE_ALL_HIT tenant=%s rel=%d/%d/%d.%d start=%d nblocks=%d lsn=%s",
+			tenantID, spcOID, dbOID, relNumber, forkNum, startBlock, nblocks, formatLSNHex(lsn))
 		return out, nblocks, nil
 	}
 
@@ -734,11 +753,16 @@ func (c *TieredCacheBackend) GetPageBatch(ctx context.Context, tenantID string, 
 	fetchStart := startBlock + uint32(firstMiss)
 	fetchCount := uint32(lastMiss - firstMiss + 1)
 
+	l3Start := time.Now()
 	c.l3Fetches.Add(1)
 	raw, gotCount, err := c.l3.GetPageBatch(ctx, tenantID, spcOID, dbOID, relNumber, forkNum, fetchStart, fetchCount, lsn)
 	if err != nil {
+		debugf("cache", "GetPageBatch tier=L3_ERR tenant=%s rel=%d/%d/%d.%d start=%d req=%d lsn=%s err=%v dur=%s",
+			tenantID, spcOID, dbOID, relNumber, forkNum, fetchStart, fetchCount, formatLSNHex(lsn), err, time.Since(l3Start))
 		return nil, 0, err
 	}
+	debugf("cache", "GetPageBatch tier=L3_FETCH tenant=%s rel=%d/%d/%d.%d total_req=%d l3_start=%d l3_req=%d l3_got=%d lsn=%s dur=%s",
+		tenantID, spcOID, dbOID, relNumber, forkNum, nblocks, fetchStart, fetchCount, gotCount, formatLSNHex(lsn), time.Since(l3Start))
 	for j := uint32(0); j < gotCount; j++ {
 		i := uint32(firstMiss) + j
 		if cached[i] {
