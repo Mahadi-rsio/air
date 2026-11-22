@@ -1347,6 +1347,8 @@ func translatePGToSQLite(sql string) (string, int) {
 		return "?" + m[1:]
 	})
 	s = reTypeCast.ReplaceAllString(s, "")
+	s = rewriteDistinctOn(s)
+	s = rewriteILikeAndRegex(s)
 	return s, maxParam
 }
 
@@ -1595,6 +1597,7 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 				return nil, nil, rerr
 			}
 			if extMap, _ := ts.extCols.Load().(map[string]ColumnType); true {
+				sqliteSQL = rewriteNumericOps(sqliteSQL, extMap)
 				if opErr := CheckUnsupportedExtOps(sqliteSQL, extMap); opErr != nil {
 					s.queriesFailed.Add(1)
 					s.recordQueryErrorWithSQL(sqliteSQL, opErr)
@@ -1625,6 +1628,7 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 		}
 	}
 	if extMap, _ := ts.extCols.Load().(map[string]ColumnType); true {
+		sqliteSQL = rewriteNumericOps(sqliteSQL, extMap)
 		if opErr := CheckUnsupportedExtOps(sqliteSQL, extMap); opErr != nil {
 			s.queriesFailed.Add(1)
 			s.recordQueryErrorWithSQL(sqliteSQL, opErr)

@@ -280,6 +280,7 @@ type pgVTabSpec struct {
 	Table       DiscoveredTable
 	AllCols     []ColumnType         // includes dropped columns for heap offset alignment
 	MissingCols []MissingColumnValue // aligned with AllCols for attmissingval fast defaults
+	EnumCols    []map[uint32]string  // non-nil if table has enum columns
 	VisibleIdx  []int                // maps SQLite column index -> index in AllCols
 	IndexPlans  []btreeIndexPlan
 	Adapter     *Adapter
@@ -464,6 +465,15 @@ func (c *SQLiteConn) RegisterNativeTableWithOptimizer(
 	if len(visibleIdx) == 0 {
 		return 0, fmt.Errorf("readadapter: table %q has no visible columns", tbl.Name)
 	}
+	var enumCols []map[uint32]string
+	for i, col := range tbl.Columns {
+		if len(col.EnumLabels) > 0 {
+			if enumCols == nil {
+				enumCols = make([]map[uint32]string, len(tbl.Columns))
+			}
+			enumCols[i] = col.EnumLabels
+		}
+	}
 	if optimizer == nil {
 		optimizer = NewQueryOptimizer(DefaultCostModelConfig(), nil, adaptive, nil)
 	}
@@ -477,6 +487,7 @@ func (c *SQLiteConn) RegisterNativeTableWithOptimizer(
 		Table:       tbl,
 		AllCols:     allCols,
 		MissingCols: missingCols,
+		EnumCols:    enumCols,
 		VisibleIdx:  visibleIdx,
 		IndexPlans:  buildTableIndexPlans(tbl, allCols, visibleIdx),
 		Adapter:     adapter,
@@ -923,8 +934,27 @@ func (cur *pgVTabCursor) matchesFilters(vals []HeapVal) bool {
 	return true
 }
 
+func resolveEnumCols(enumCols []map[uint32]string, dst []HeapVal) error {
+	if enumCols == nil {
+		return nil
+	}
+	for i, m := range enumCols {
+		if m != nil && i < len(dst) && dst[i].Kind == ValInt64 {
+			label, ok := m[uint32(dst[i].I64)]
+			if !ok {
+				return fmt.Errorf("%w: unknown enum oid %d", ErrUnsupportedType, dst[i].I64)
+			}
+			dst[i] = HeapVal{Kind: ValString, Str: label}
+		}
+	}
+	return nil
+}
+
 func (cur *pgVTabCursor) decodeHeapTupleColumns(_ context.Context, tup []byte, thdr HeapTupleHeader, dst []HeapVal) error {
-	return DecodeHeapColumnsWithTOASTAndMissingInto(tup, thdr, cur.spec.AllCols, cur.neededCols, dst, false, cur.toastFn, cur.spec.MissingCols)
+	if err := DecodeHeapColumnsWithTOASTAndMissingInto(tup, thdr, cur.spec.AllCols, cur.neededCols, dst, false, cur.toastFn, cur.spec.MissingCols); err != nil {
+		return err
+	}
+	return resolveEnumCols(cur.spec.EnumCols, dst)
 }
 
 func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
@@ -1035,6 +1065,9 @@ func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 				vtabColsDecoded.Add(decodedColsPerTuple)
 				if len(filterCols) > 0 {
 					if err := DecodeHeapColumnsWithTOASTAndMissingInto(tup, thdr, cur.spec.AllCols, filterCols, cur.rowBuf, false, cur.toastFn, cur.spec.MissingCols); err != nil {
+						return err
+					}
+					if err := resolveEnumCols(cur.spec.EnumCols, cur.rowBuf); err != nil {
 						return err
 					}
 					if !cur.matchesFilters(cur.rowBuf) {

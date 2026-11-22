@@ -208,6 +208,10 @@ func OpenSQLiteConn(path string, readOnly bool, cacheKB int) (*SQLiteConn, error
 		_ = conn.Close()
 		return nil, err
 	}
+	if err := conn.registerPGFuncs(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 
 	return conn, nil
 }

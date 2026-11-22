@@ -277,6 +277,9 @@ const (
 	ColBoolArray
 	ColFloat4Array
 	ColFloat8Array
+	ColTime
+	ColInterval
+	ColEnum
 	ColUnsupported
 )
 
@@ -312,8 +315,12 @@ func PGTypeOIDToColumnType(oid uint32) (ColumnType, string) {
 		return ColFloat8, "REAL"
 	case 1082: // date
 		return ColDate, "TEXT"
+	case 1083: // time without time zone
+		return ColTime, "TEXT"
 	case 1114, 1184: // timestamp, timestamptz
 		return ColTimestamp, "TEXT"
+	case 1186: // interval
+		return ColInterval, "TEXT"
 	case 2950: // uuid
 		return ColUUID, "TEXT"
 	case 1700: // numeric
@@ -629,6 +636,37 @@ func DecodeHeapColumnsProjected(tup []byte, hdr HeapTupleHeader, cols []ColumnTy
 				vals[i] = t.Format("2006-01-02 15:04:05.999999")
 			}
 			off += 8
+		case ColTime:
+			off = alignUp(off, 8)
+			if off+8 > len(tup) {
+				return nil, fmt.Errorf("%w: time out of bounds", ErrInvalidPage)
+			}
+			if want {
+				usec := int64(binary.LittleEndian.Uint64(tup[off : off+8]))
+				vals[i] = decodePGTime(usec)
+			}
+			off += 8
+		case ColInterval:
+			off = alignUp(off, 8)
+			if off+16 > len(tup) {
+				return nil, fmt.Errorf("%w: interval out of bounds", ErrInvalidPage)
+			}
+			if want {
+				usec := int64(binary.LittleEndian.Uint64(tup[off : off+8]))
+				days := int32(binary.LittleEndian.Uint32(tup[off+8 : off+12]))
+				months := int32(binary.LittleEndian.Uint32(tup[off+12 : off+16]))
+				vals[i] = decodePGInterval(usec, days, months)
+			}
+			off += 16
+		case ColEnum:
+			off = alignUp(off, 4)
+			if off+4 > len(tup) {
+				return nil, fmt.Errorf("%w: enum out of bounds", ErrInvalidPage)
+			}
+			if want {
+				vals[i] = binary.LittleEndian.Uint32(tup[off : off+4])
+			}
+			off += 4
 		case ColUUID:
 			if off+16 > len(tup) {
 				return nil, fmt.Errorf("%w: uuid out of bounds", ErrInvalidPage)
@@ -868,6 +906,25 @@ func DecodeMissingValArray(ct ColumnType, raw []byte) (HeapVal, bool) {
 		usec := int64(binary.LittleEndian.Uint64(raw[elemOff : elemOff+8]))
 		t := pgEpoch.Add(time.Duration(usec) * time.Microsecond)
 		return HeapVal{Kind: ValString, Str: t.Format("2006-01-02 15:04:05.999999")}, true
+	case ColTime:
+		if elemOff+8 > len(raw) {
+			return HeapVal{}, false
+		}
+		usec := int64(binary.LittleEndian.Uint64(raw[elemOff : elemOff+8]))
+		return HeapVal{Kind: ValString, Str: decodePGTime(usec)}, true
+	case ColInterval:
+		if elemOff+16 > len(raw) {
+			return HeapVal{}, false
+		}
+		usec := int64(binary.LittleEndian.Uint64(raw[elemOff : elemOff+8]))
+		days := int32(binary.LittleEndian.Uint32(raw[elemOff+8 : elemOff+12]))
+		months := int32(binary.LittleEndian.Uint32(raw[elemOff+12 : elemOff+16]))
+		return HeapVal{Kind: ValString, Str: decodePGInterval(usec, days, months)}, true
+	case ColEnum:
+		if elemOff+4 > len(raw) {
+			return HeapVal{}, false
+		}
+		return HeapVal{Kind: ValInt64, I64: int64(binary.LittleEndian.Uint32(raw[elemOff : elemOff+4]))}, true
 	case ColUUID:
 		if elemOff+16 > len(raw) {
 			return HeapVal{}, false
@@ -1102,6 +1159,37 @@ func DecodeHeapColumnsWithTOASTAndMissingInto(tup []byte, hdr HeapTupleHeader, c
 				dst[i] = HeapVal{Kind: ValString, Str: t.Format("2006-01-02 15:04:05.999999")}
 			}
 			off += 8
+		case ColTime:
+			off = alignUp(off, 8)
+			if off+8 > len(tup) {
+				return fmt.Errorf("%w: time out of bounds", ErrInvalidPage)
+			}
+			if want {
+				usec := int64(binary.LittleEndian.Uint64(tup[off : off+8]))
+				dst[i] = HeapVal{Kind: ValString, Str: decodePGTime(usec)}
+			}
+			off += 8
+		case ColInterval:
+			off = alignUp(off, 8)
+			if off+16 > len(tup) {
+				return fmt.Errorf("%w: interval out of bounds", ErrInvalidPage)
+			}
+			if want {
+				usec := int64(binary.LittleEndian.Uint64(tup[off : off+8]))
+				days := int32(binary.LittleEndian.Uint32(tup[off+8 : off+12]))
+				months := int32(binary.LittleEndian.Uint32(tup[off+12 : off+16]))
+				dst[i] = HeapVal{Kind: ValString, Str: decodePGInterval(usec, days, months)}
+			}
+			off += 16
+		case ColEnum:
+			off = alignUp(off, 4)
+			if off+4 > len(tup) {
+				return fmt.Errorf("%w: enum out of bounds", ErrInvalidPage)
+			}
+			if want {
+				dst[i] = HeapVal{Kind: ValInt64, I64: int64(binary.LittleEndian.Uint32(tup[off : off+4]))}
+			}
+			off += 4
 		case ColUUID:
 			if off+16 > len(tup) {
 				return fmt.Errorf("%w: uuid out of bounds", ErrInvalidPage)
@@ -1476,6 +1564,31 @@ func DecodeIndexTupleColumnsInto(itup []byte, h IndexTupleHeader, keyColTypes []
 			t := pgEpoch.Add(time.Duration(usec) * time.Microsecond)
 			dst[i] = HeapVal{Kind: ValString, Str: t.Format("2006-01-02 15:04:05.999999")}
 			off += 8
+		case ColTime:
+			off = alignUp(off, 8)
+			if off+8 > len(keyData) {
+				return i, fmt.Errorf("%w: idx time out of bounds", ErrInvalidPage)
+			}
+			usec := int64(binary.LittleEndian.Uint64(keyData[off : off+8]))
+			dst[i] = HeapVal{Kind: ValString, Str: decodePGTime(usec)}
+			off += 8
+		case ColInterval:
+			off = alignUp(off, 8)
+			if off+16 > len(keyData) {
+				return i, fmt.Errorf("%w: idx interval out of bounds", ErrInvalidPage)
+			}
+			usec := int64(binary.LittleEndian.Uint64(keyData[off : off+8]))
+			days := int32(binary.LittleEndian.Uint32(keyData[off+8 : off+12]))
+			months := int32(binary.LittleEndian.Uint32(keyData[off+12 : off+16]))
+			dst[i] = HeapVal{Kind: ValString, Str: decodePGInterval(usec, days, months)}
+			off += 16
+		case ColEnum:
+			off = alignUp(off, 4)
+			if off+4 > len(keyData) {
+				return i, fmt.Errorf("%w: idx enum out of bounds", ErrInvalidPage)
+			}
+			dst[i] = HeapVal{Kind: ValInt64, I64: int64(binary.LittleEndian.Uint32(keyData[off : off+4]))}
+			off += 4
 		case ColUUID:
 			if off+16 > len(keyData) {
 				return i, fmt.Errorf("%w: idx uuid out of bounds", ErrInvalidPage)
@@ -1494,4 +1607,68 @@ func DecodeIndexTupleColumnsInto(itup []byte, h IndexTupleHeader, keyColTypes []
 	}
 	return n, nil
 }
+
+func decodePGTime(usec int64) string {
+	if usec < 0 {
+		usec = 0
+	}
+	totalSec := usec / 1_000_000
+	frac := usec % 1_000_000
+	h := totalSec / 3600
+	m := (totalSec % 3600) / 60
+	s := totalSec % 60
+	if frac == 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+	}
+	fstr := strings.TrimRight(fmt.Sprintf("%06d", frac), "0")
+	return fmt.Sprintf("%02d:%02d:%02d.%s", h, m, s, fstr)
+}
+
+func decodePGInterval(usec int64, days, months int32) string {
+	var parts []string
+	years := months / 12
+	remMonths := months % 12
+	if years != 0 {
+		if years == 1 || years == -1 {
+			parts = append(parts, fmt.Sprintf("%d year", years))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d years", years))
+		}
+	}
+	if remMonths != 0 {
+		if remMonths == 1 || remMonths == -1 {
+			parts = append(parts, fmt.Sprintf("%d mon", remMonths))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d mons", remMonths))
+		}
+	}
+	if days != 0 {
+		if days == 1 || days == -1 {
+			parts = append(parts, fmt.Sprintf("%d day", days))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d days", days))
+		}
+	}
+	if usec != 0 || len(parts) == 0 {
+		sign := ""
+		u := usec
+		if u < 0 {
+			sign = "-"
+			u = -u
+		}
+		totalSec := u / 1_000_000
+		frac := u % 1_000_000
+		h := totalSec / 3600
+		m := (totalSec % 3600) / 60
+		s := totalSec % 60
+		if frac == 0 {
+			parts = append(parts, fmt.Sprintf("%s%02d:%02d:%02d", sign, h, m, s))
+		} else {
+			fstr := strings.TrimRight(fmt.Sprintf("%06d", frac), "0")
+			parts = append(parts, fmt.Sprintf("%s%02d:%02d:%02d.%s", sign, h, m, s, fstr))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
 

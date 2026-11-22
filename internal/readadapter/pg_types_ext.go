@@ -758,7 +758,8 @@ func BuildExtColMap(tables []DiscoveredTable) map[string]ColumnType {
 			switch col.ColType {
 			case ColNumeric, ColInet, ColCIDR,
 				ColInt2Array, ColInt4Array, ColInt8Array,
-				ColTextArray, ColBoolArray, ColFloat4Array, ColFloat8Array:
+				ColTextArray, ColBoolArray, ColFloat4Array, ColFloat8Array,
+				ColInterval, ColEnum:
 				m[strings.ToLower(col.Name)] = col.ColType
 			}
 		}
@@ -885,8 +886,10 @@ func CheckUnsupportedExtOps(sql string, extCols map[string]ColumnType) error {
 
 	if hasNumeric {
 		for _, fn := range []string{"sum(", "avg(", "variance(", "stddev("} {
-			if strings.Contains(cleaned, fn) {
-				return fmt.Errorf("%w: numeric aggregate %q requires primary fallback", ErrUnsupportedType, strings.TrimSuffix(fn, "("))
+			if idx := strings.Index(cleaned, fn); idx >= 0 {
+				if idx == 0 || (!((cleaned[idx-1] >= 'a' && cleaned[idx-1] <= 'z') || (cleaned[idx-1] >= '0' && cleaned[idx-1] <= '9') || cleaned[idx-1] == '_')) {
+					return fmt.Errorf("%w: numeric aggregate %q requires primary fallback", ErrUnsupportedType, strings.TrimSuffix(fn, "("))
+				}
 			}
 		}
 		// Arithmetic operators (+, -, *, /) on numeric columns would coerce TEXT to float64 in SQLite.
@@ -955,5 +958,45 @@ func CheckUnsupportedExtOps(sql string, extCols map[string]ColumnType) error {
 		}
 	}
 
+	// Interval and Enum ordering/range/arithmetic semantics differ from text collation; fall back safely.
+	obClause := ""
+	if obIdx := strings.Index(cleaned, "order by"); obIdx >= 0 {
+		obClause = cleaned[obIdx:]
+	}
+	for col, ct := range extCols {
+		if ct != ColInterval && ct != ColEnum {
+			continue
+		}
+		if !containsSQLIdent(cleaned, col) {
+			continue
+		}
+		if obClause != "" && containsSQLIdent(obClause, col) {
+			return fmt.Errorf("%w: %s ORDER BY requires primary fallback", ErrUnsupportedType, colTypeLabel(ct))
+		}
+		if strings.Contains(cleaned, "min("+col+")") || strings.Contains(cleaned, "max("+col+")") ||
+			strings.Contains(cleaned, col+" between") ||
+			strings.Contains(cleaned, col+" <") || strings.Contains(cleaned, col+"<") ||
+			strings.Contains(cleaned, col+" >") || strings.Contains(cleaned, col+">") {
+			if !strings.Contains(cleaned, col+" <>") && !strings.Contains(cleaned, col+"<>") {
+				return fmt.Errorf("%w: %s ordering comparison requires primary fallback", ErrUnsupportedType, colTypeLabel(ct))
+			}
+		}
+		if ct == ColInterval && (strings.Contains(cleaned, col+" +") || strings.Contains(cleaned, col+"+") ||
+			strings.Contains(cleaned, col+" -") || strings.Contains(cleaned, col+" *") || strings.Contains(cleaned, col+" /")) {
+			return fmt.Errorf("%w: interval arithmetic requires primary fallback", ErrUnsupportedType)
+		}
+	}
+
 	return nil
+}
+
+func colTypeLabel(ct ColumnType) string {
+	switch ct {
+	case ColInterval:
+		return "interval"
+	case ColEnum:
+		return "enum"
+	default:
+		return "ext"
+	}
 }

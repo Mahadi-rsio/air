@@ -430,6 +430,8 @@ func TestPhase18_TypesDifferential_LivePG17(t *testing.T) {
 		"SELECT id, amt_hp FROM num_items WHERE amt_hp = '12345678901234567890123456.123456789012'",
 		"SELECT grp, count(*), min(amt10), max(amt10) FROM num_items GROUP BY grp ORDER BY grp",
 		"SELECT a.id, b.id FROM num_items a JOIN num_items b ON a.amt10 = b.amt10 WHERE a.id < b.id ORDER BY a.id, b.id",
+		"SELECT sum(amt10) FROM num_items",
+		"SELECT amt10 + 1 FROM num_items ORDER BY id",
 	}
 	for i, q := range numQueries {
 		assertSimpleMatch(fmt.Sprintf("18a_num_%d", i), q)
@@ -458,10 +460,8 @@ func TestPhase18_TypesDifferential_LivePG17(t *testing.T) {
 		assertSimpleMatch(fmt.Sprintf("18c_arr_%d", i), q)
 	}
 
-	// Verify unsupported operations safely reject so gateway falls back to PG
+	// Verify remaining unsupported operations safely reject so gateway falls back to PG
 	fallbackQueries := []string{
-		"SELECT sum(amt10) FROM num_items",
-		"SELECT amt10 + 1 FROM num_items",
 		"SELECT id FROM net_items WHERE ip << '10.0.0.0/8'",
 		"SELECT host(ip) FROM net_items",
 		"SELECT i4[1] FROM arr_items",

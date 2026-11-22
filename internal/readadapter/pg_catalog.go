@@ -17,6 +17,8 @@ const (
 	PGIndexRelID     uint32 = 2610
 	PGNamespaceRelID uint32 = 2615
 	PGStatisticRelID uint32 = 2619
+	PGTypeRelID      uint32 = 1247
+	PGEnumRelID      uint32 = 3501
 
 	PGBtreeAMOID uint32 = 403
 )
@@ -33,6 +35,7 @@ type DiscoveredColumn struct {
 	HasMissing         bool
 	MissingVal         HeapVal
 	UnsupportedMissing bool
+	EnumLabels         map[uint32]string
 }
 
 // DiscoveredIndex describes a PostgreSQL B-tree index discovered from pg_class and pg_index.
@@ -129,6 +132,42 @@ var (
 	pgNamespaceCols = []ColumnType{
 		ColOID,  // 1: oid
 		ColName, // 2: nspname
+	}
+
+	pgTypeCols = []ColumnType{
+		ColOID,  // 1: oid
+		ColName, // 2: typname
+		ColOID,  // 3: typnamespace
+		ColOID,  // 4: typowner
+		ColInt2, // 5: typlen
+		ColBool, // 6: typbyval
+		ColChar, // 7: typtype
+		ColChar, // 8: typcategory
+		ColBool, // 9: typispreferred
+		ColBool, // 10: typisdefined
+		ColChar, // 11: typdelim
+		ColOID,  // 12: typrelid
+		ColOID,  // 13: typsubscript
+		ColOID,  // 14: typelem
+		ColOID,  // 15: typarray
+		ColOID,  // 16: typinput
+		ColOID,  // 17: typoutput
+		ColOID,  // 18: typreceive
+		ColOID,  // 19: typsend
+		ColOID,  // 20: typmodin
+		ColOID,  // 21: typmodout
+		ColOID,  // 22: typanalyze
+		ColChar, // 23: typalign
+		ColChar, // 24: typstorage
+		ColBool, // 25: typnotnull
+		ColOID,  // 26: typbasetype
+	}
+
+	pgEnumCols = []ColumnType{
+		ColOID,    // 1: oid
+		ColOID,    // 2: enumtypid
+		ColFloat4, // 3: enumsortorder
+		ColName,   // 4: enumlabel
 	}
 
 	pgStatisticCols = []ColumnType{
@@ -571,6 +610,86 @@ func DiscoverCatalog(
 			MissingVal:         missingVal,
 			UnsupportedMissing: unsupportedMissing,
 		})
+	}
+
+	// 4b. Resolve domain and enum types via pg_type (1247) and pg_enum (3501) if any custom types exist.
+	hasCustomCol := false
+	for _, tbl := range tablesByOID {
+		for i := range tbl.Columns {
+			if !tbl.Columns[i].IsDropped && tbl.Columns[i].ColType == ColUnsupported {
+				hasCustomCol = true
+				break
+			}
+		}
+		if hasCustomCol {
+			break
+		}
+	}
+	if hasCustomCol {
+		type pgTypeInfo struct {
+			typType     byte
+			typBaseType uint32
+		}
+		pgTypes := make(map[uint32]pgTypeInfo)
+		if typeRows, terr := scanCatalogRelation(ctx, adapter, clog, snap, dbSpcOID, dbOID, PGTypeRelID, pgTypeCols); terr == nil {
+			for _, tr := range typeRows {
+				if len(tr) < 26 {
+					continue
+				}
+				oid, _ := tr[0].(uint32)
+				typChar, _ := tr[6].(byte)
+				baseOID, _ := tr[25].(uint32)
+				pgTypes[oid] = pgTypeInfo{typType: typChar, typBaseType: baseOID}
+			}
+		}
+		enumLabelsByType := make(map[uint32]map[uint32]string)
+		if enumRows, eerr := scanCatalogRelation(ctx, adapter, clog, snap, dbSpcOID, dbOID, PGEnumRelID, pgEnumCols); eerr == nil {
+			for _, er := range enumRows {
+				if len(er) < 4 {
+					continue
+				}
+				enumOID, _ := er[0].(uint32)
+				enumTypID, _ := er[1].(uint32)
+				enumLabel, _ := er[3].(string)
+				if enumLabelsByType[enumTypID] == nil {
+					enumLabelsByType[enumTypID] = make(map[uint32]string)
+				}
+				enumLabelsByType[enumTypID][enumOID] = enumLabel
+			}
+		}
+		for _, tbl := range tablesByOID {
+			for i := range tbl.Columns {
+				c := &tbl.Columns[i]
+				if c.IsDropped || c.ColType != ColUnsupported {
+					continue
+				}
+				curOID := c.PGTypeOID
+				for hop := 0; hop < 16; hop++ {
+					ti, ok := pgTypes[curOID]
+					if !ok {
+						break
+					}
+					if ti.typType == 'd' && ti.typBaseType != 0 {
+						curOID = ti.typBaseType
+						ct, st := PGTypeOIDToColumnType(curOID)
+						if ct != ColUnsupported {
+							c.ColType = ct
+							c.SQLiteType = st
+							break
+						}
+						continue
+					}
+					if ti.typType == 'e' {
+						if labels, ok := enumLabelsByType[curOID]; ok {
+							c.ColType = ColEnum
+							c.SQLiteType = "TEXT"
+							c.EnumLabels = labels
+						}
+					}
+					break
+				}
+			}
+		}
 	}
 
 	// 5. Scan pg_index (dbSpcOID/dbOID/2610) to discover valid, live, non-partial, non-expression B-tree indexes.
