@@ -117,8 +117,35 @@ type btreeIndexPlan struct {
 	Index       DiscoveredIndex
 	KeyAllCols  []int        // maps index key position -> index in table AllCols
 	KeyVisCols  []int        // maps index key position -> index in table VisibleIdx
-	KeyColTypes []ColumnType // PostgreSQL ColumnType of each index key attribute
-	Orderings   []btreeKeyOrdering
+	KeyColTypes    []ColumnType // PostgreSQL ColumnType of each index key attribute
+	AllIdxCols     []int        // key + INCLUDE covering columns in AllCols
+	AllIdxColTypes []ColumnType // ColumnType of each key + INCLUDE column
+	Orderings      []btreeKeyOrdering
+}
+
+// IsCoveringFor reports whether all needed/filter columns are covered by this index's key + INCLUDE attributes.
+func (p btreeIndexPlan) IsCoveringFor(neededCols, filterCols []bool, totalCols int) bool {
+	if len(p.AllIdxCols) == 0 {
+		return false
+	}
+	for c := 0; c < totalCols; c++ {
+		need := neededCols == nil || (c < len(neededCols) && neededCols[c])
+		filt := c < len(filterCols) && filterCols[c]
+		if !need && !filt {
+			continue
+		}
+		covered := false
+		for _, ic := range p.AllIdxCols {
+			if ic == c {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return false
+		}
+	}
+	return true
 }
 
 // buildTableIndexPlans matches discovered B-tree indexes against table columns.
@@ -169,8 +196,6 @@ func buildTableIndexPlans(tbl DiscoveredTable, allCols []ColumnType, visibleIdx 
 			if !supported {
 				break
 			}
-			// Text/Name B-tree ordering depends on locale collation; only use B-tree index
-			// for equality on text/name/uuid, or range on numeric/int/oid/date/timestamp/bool.
 			keyAll[k] = allI
 			keyVis[k] = visI
 			keyTypes[k] = ct
@@ -183,12 +208,39 @@ func buildTableIndexPlans(tbl DiscoveredTable, allCols []ColumnType, visibleIdx 
 		if !supported {
 			continue
 		}
+		// Map all index attributes (keys + INCLUDE covering columns).
+		natts := int(idx.IndNAtts)
+		if natts < nkeys || natts > len(idx.KeyAttNums) {
+			natts = nkeys
+		}
+		allIdxCols := make([]int, 0, natts)
+		allIdxTypes := make([]ColumnType, 0, natts)
+		for k := 0; k < natts; k++ {
+			allI, ok := attNumToAllIdx[idx.KeyAttNums[k]]
+			if !ok {
+				allIdxCols = nil
+				break
+			}
+			ct := allCols[allI]
+			switch ct {
+			case ColInt2, ColInt4, ColInt8, ColOID, ColFloat4, ColFloat8, ColBool, ColChar, ColName, ColText, ColDate, ColTimestamp, ColUUID:
+				allIdxCols = append(allIdxCols, allI)
+				allIdxTypes = append(allIdxTypes, ct)
+			default:
+				allIdxCols = nil
+			}
+			if allIdxCols == nil {
+				break
+			}
+		}
 		plans = append(plans, btreeIndexPlan{
-			Index:       idx,
-			KeyAllCols:  keyAll,
-			KeyVisCols:  keyVis,
-			KeyColTypes: keyTypes,
-			Orderings:   ords,
+			Index:          idx,
+			KeyAllCols:     keyAll,
+			KeyVisCols:     keyVis,
+			KeyColTypes:    keyTypes,
+			AllIdxCols:     allIdxCols,
+			AllIdxColTypes: allIdxTypes,
+			Orderings:      ords,
 		})
 	}
 	return plans
@@ -446,15 +498,12 @@ func scanBTreeIndexForTIDs(
 		}
 	}
 
+	var idxPageBuf [PGPageSize]byte
 	readIdxPage := func(blk uint32) ([]byte, PageHeader, BTPageOpaque, error) {
-		pgs, rerr := adapter.ReadPages(ctx, idxRel, snap, blk, 1)
-		if rerr != nil {
+		if rerr := adapter.ReadPageInto(ctx, idxRel, snap, blk, idxPageBuf[:]); rerr != nil {
 			return nil, PageHeader{}, BTPageOpaque{}, rerr
 		}
-		if len(pgs) == 0 {
-			return nil, PageHeader{}, BTPageOpaque{}, fmt.Errorf("%w: empty page read for btree blk %d", ErrInvalidPage, blk)
-		}
-		data := pgs[0].Data
+		data := idxPageBuf[:]
 		vtabIndexPagesRead.Add(1)
 		vtabPagesRead.Add(1)
 		hdr, herr := ParsePageHeader(data)
@@ -696,6 +745,7 @@ func (cur *pgVTabCursor) fetchVisibleTuplesByTIDs(ctx context.Context, tids []It
 	// 8 KiB page can hold at most (8192-24)/4 = 2042 line pointers -> 32 uint64 words = 2048 bits on stack (zero heap allocs).
 	var visitedBits [32]uint64
 
+	var heapPageBuf [PGPageSize]byte
 	i := 0
 	for i < len(tids) {
 		blkNum := tids[i].BlockNum
@@ -713,14 +763,10 @@ func (cur *pgVTabCursor) fetchVisibleTuplesByTIDs(ctx context.Context, tids []It
 			// Stale index entry pointing beyond current relation size at snapshot -> skip safely
 			continue
 		}
-		pgs, err := cur.spec.Adapter.ReadPages(ctx, cur.rel, cur.snap, blkNum, 1)
-		if err != nil {
+		if err := cur.spec.Adapter.ReadPageInto(ctx, cur.rel, cur.snap, blkNum, heapPageBuf[:]); err != nil {
 			return err
 		}
-		if len(pgs) == 0 {
-			continue
-		}
-		pageData := pgs[0].Data
+		pageData := heapPageBuf[:]
 		vtabPagesRead.Add(1)
 		if IsZeroPage(pageData) {
 			continue

@@ -1015,45 +1015,41 @@ func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 		return nil
 	}
 
-	const batchBlocks uint32 = 16
+	var pageBuf [PGPageSize]byte
 	for cur.nextBlock < cur.nblocks {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		n := batchBlocks
-		if cur.nextBlock+n > cur.nblocks {
-			n = cur.nblocks - cur.nextBlock
+		blk := cur.nextBlock
+		cur.nextBlock++
+
+		if err := cur.spec.Adapter.ReadPageInto(ctx, cur.rel, cur.snap, blk, pageBuf[:]); err != nil {
+			return err
 		}
-		pages, err := cur.spec.Adapter.ReadPages(ctx, cur.rel, cur.snap, cur.nextBlock, n)
+		pageData := pageBuf[:]
+		vtabPagesRead.Add(1)
+		if IsZeroPage(pageData) {
+			continue
+		}
+		phdr, err := ParsePageHeader(pageData)
 		if err != nil {
 			return err
 		}
-		cur.nextBlock += n
-
-		for _, pd := range pages {
-			vtabPagesRead.Add(1)
-			if IsZeroPage(pd.Data) {
+		cur.lpBuf = ParseLinePointersInto(pageData, phdr, cur.lpBuf)
+		for _, lp := range cur.lpBuf {
+			if lp.Flags != LPNormal {
 				continue
 			}
-			phdr, err := ParsePageHeader(pd.Data)
+			if err := ValidateLinePointer(lp, phdr); err != nil {
+				return err
+			}
+			start := int(lp.Offset)
+			end := start + int(lp.Length)
+			tup := pageData[start:end]
+			thdr, err := ParseHeapTupleHeader(tup)
 			if err != nil {
 				return err
 			}
-			cur.lpBuf = ParseLinePointersInto(pd.Data, phdr, cur.lpBuf)
-			for _, lp := range cur.lpBuf {
-				if lp.Flags != LPNormal {
-					continue
-				}
-				if err := ValidateLinePointer(lp, phdr); err != nil {
-					return err
-				}
-				start := int(lp.Offset)
-				end := start + int(lp.Length)
-				tup := pd.Data[start:end]
-				thdr, err := ParseHeapTupleHeader(tup)
-				if err != nil {
-					return err
-				}
 				vis, err := IsVisibleWithCLOG(ctx, thdr, cur.snap, cur.spec.CLOG)
 				if err != nil {
 					return err
@@ -1087,7 +1083,6 @@ func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 				cur.actualRows++
 				cur.rows = append(cur.rows, cur.rowBuf...)
 				cur.numRows++
-			}
 		}
 		if cur.numRows > 0 {
 			return nil

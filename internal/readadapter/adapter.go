@@ -272,6 +272,31 @@ func (a *Adapter) GetRelationMetadata(ctx context.Context, h *RelationHandle, sn
 }
 
 // ReadPage reads a single 8192-byte page at blockNum as of snap.
+// ReadPageInto reads an 8192-byte page directly into dst (len >= PGPageSize) with zero per-page allocations on L1 hit.
+func (a *Adapter) ReadPageInto(ctx context.Context, h *RelationHandle, snap *ReadSnapshot, blockNum uint32, dst []byte) error {
+	if len(dst) < pageserver.PageSize {
+		return fmt.Errorf("readadapter: dst buffer too small (%d < %d)", len(dst), pageserver.PageSize)
+	}
+	if err := a.validateAccess(h, snap); err != nil {
+		return err
+	}
+	key := pageserver.RelBlockKey(h.Spec.SpcOID, h.Spec.DbOID, h.Spec.RelNumber, h.Spec.ForkNum, blockNum)
+	if intoBackend, ok := a.backend.(interface {
+		GetPageAtLSNInto(ctx context.Context, tenantID string, key pageserver.Key, lsn uint64, dst []byte) error
+	}); ok {
+		return intoBackend.GetPageAtLSNInto(ctx, h.Spec.TenantID, key, snap.LSN, dst)
+	}
+	raw, err := a.backend.GetPageAtLSN(ctx, h.Spec.TenantID, key, snap.LSN)
+	if err != nil {
+		return err
+	}
+	if len(raw) != pageserver.PageSize {
+		return fmt.Errorf("readadapter: invalid page size %d", len(raw))
+	}
+	copy(dst[:pageserver.PageSize], raw)
+	return nil
+}
+
 func (a *Adapter) ReadPage(ctx context.Context, h *RelationHandle, snap *ReadSnapshot, blockNum uint32) (*PageData, error) {
 	if err := a.validateAccess(h, snap); err != nil {
 		return nil, err

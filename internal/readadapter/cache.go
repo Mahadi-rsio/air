@@ -539,6 +539,55 @@ func (c *TieredCacheBackend) GetRelExists(ctx context.Context, tenantID string, 
 	return ex, nil
 }
 
+// GetPageAtLSNInto copies the 8192-byte page into dst without allocating on L1 hits.
+func (c *TieredCacheBackend) GetPageAtLSNInto(ctx context.Context, tenantID string, key pageserver.Key, lsn uint64, dst []byte) error {
+	if len(dst) < PGPageSize {
+		return fmt.Errorf("readadapter: dst buffer too small (%d < %d)", len(dst), PGPageSize)
+	}
+	if key.Kind != pageserver.KeyKindRelBlock || lsn == 0 || lsn == ^uint64(0) {
+		c.l3Fetches.Add(1)
+		raw, err := c.l3.GetPageAtLSN(ctx, tenantID, key, lsn)
+		if err != nil {
+			return err
+		}
+		if len(raw) != PGPageSize {
+			return fmt.Errorf("readadapter: invalid page size %d", len(raw))
+		}
+		copy(dst[:PGPageSize], raw)
+		return nil
+	}
+
+	gen := c.l3.GetTenantGeneration(tenantID)
+	syncedLSN, _, syncOK := c.ensureSynced(ctx, tenantID, gen, lsn)
+	if !syncOK {
+		syncedLSN = 0
+	}
+	ck := PageCacheKey{
+		TenantID:   tenantID,
+		Generation: gen,
+		SpcOID:     key.SpcOID,
+		DbOID:      key.DbOID,
+		RelNumber:  key.RelNumber,
+		ForkNum:    key.ForkNum,
+		BlockNum:   key.BlockNum,
+		LSN:        lsn,
+	}
+
+	if c.getL1Into(ck, dst[:PGPageSize], syncedLSN) {
+		c.l1Hits.Add(1)
+		return nil
+	}
+	raw, err := c.GetPageAtLSN(ctx, tenantID, key, lsn)
+	if err != nil {
+		return err
+	}
+	if len(raw) != PGPageSize {
+		return fmt.Errorf("readadapter: invalid page size %d", len(raw))
+	}
+	copy(dst[:PGPageSize], raw)
+	return nil
+}
+
 func (c *TieredCacheBackend) GetPageAtLSN(ctx context.Context, tenantID string, key pageserver.Key, lsn uint64) ([]byte, error) {
 	if key.Kind != pageserver.KeyKindRelBlock || lsn == 0 || lsn == ^uint64(0) {
 		c.l3Fetches.Add(1)
