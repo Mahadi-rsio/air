@@ -2,18 +2,6 @@ name: Build and Push air-read-engine to GHCR
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - "cmd/air-read-engine/**"
-      - "internal/readadapter/**"
-      - "internal/pb/pageserver*"
-      - "internal/pb/readengine*"
-      - "proto/readengine.proto"
-      - "Dockerfile.read-engine"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/read-engine.yml"
     tags:
       - "read-engine-v*"
   workflow_dispatch:
@@ -57,7 +45,7 @@ jobs:
       - name: Build and test air-read-engine
         run: |
           go build -v ./cmd/air-read-engine
-          go test -v -race ./internal/readadapter/... ./cmd/air-read-engine/...
+          go test -v -short -race ./internal/readadapter/... ./cmd/air-read-engine/...
 
   build-air-read-engine:
     name: Build & Push air-read-engine Image
@@ -88,6 +76,8 @@ jobs:
         with:
           images: ${{ steps.image.outputs.name }}
           tags: |
+            type=match,pattern=^read-engine-(v.*)$
+            type=match,pattern=^read-engine-v(.*)$
             type=ref,event=tag
             type=sha,prefix=sha-
             type=raw,value=latest

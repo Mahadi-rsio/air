@@ -2,26 +2,6 @@ name: Build and Push air-server to GHCR
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - "cmd/air-server/**"
-      - "internal/control/**"
-      - "internal/cell/**"
-      - "internal/config/**"
-      - "internal/backup/**"
-      - "internal/crypto/**"
-      - "internal/fencing/**"
-      - "internal/tenant/**"
-      - "internal/pb/**"
-      - "Dockerfile"
-      - "patches/**"
-      - "extensions/**"
-      - "migrations/**"
-      - "scripts/**"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/server.yml"
     tags:
       - "server-v*"
   workflow_dispatch:
@@ -91,6 +71,8 @@ jobs:
         with:
           images: ${{ steps.image.outputs.name }}
           tags: |
+            type=match,pattern=^server-(v.*)$
+            type=match,pattern=^server-v(.*)$
             type=ref,event=tag
             type=sha,prefix=sha-
             type=raw,value=latest

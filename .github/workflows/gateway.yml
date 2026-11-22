@@ -2,16 +2,6 @@ name: Build and Push air-gateway to GHCR
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - "cmd/air-gateway/**"
-      - "internal/gateway/**"
-      - "internal/pb/**"
-      - "gateway/Dockerfile"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/gateway.yml"
     tags:
       - "gateway-v*"
   workflow_dispatch:
@@ -81,6 +71,8 @@ jobs:
         with:
           images: ${{ steps.image.outputs.name }}
           tags: |
+            type=match,pattern=^gateway-(v.*)$
+            type=match,pattern=^gateway-v(.*)$
             type=ref,event=tag
             type=sha,prefix=sha-
             type=raw,value=latest
