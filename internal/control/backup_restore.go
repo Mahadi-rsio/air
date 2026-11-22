@@ -587,6 +587,7 @@ func (cp *ControlPlane) RestoreDatabaseWithOptions(ctx context.Context, accountI
 		WALStartLSN:     walRefs[0].StartLSN,
 		WALEndLSN:       walRefs[len(walRefs)-1].EndLSN,
 		ConsistencyLSN:  walRefs[0].StartLSN,
+		TimeIndex:       backup.AggregateTimeIndex(walRefs),
 		WALSegments:     walRefs,
 	}
 	if bm != nil {

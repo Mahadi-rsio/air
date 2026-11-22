@@ -145,6 +145,32 @@ func (t RecoveryTarget) ValidateAgainstManifest(m *BackupManifest) error {
 		if !m.ConsistencyTime.IsZero() && parsed.Before(m.ConsistencyTime) {
 			return fmt.Errorf("%w: target time %s precedes backup minimum recovery time %s", ErrTargetOutOfRange, t.Time, m.ConsistencyTime.UTC().Format(time.RFC3339Nano))
 		}
+		if len(m.TimeIndex) > 0 {
+			convertedLSN, lerr := LookupTargetTimeLSN(m.TimeIndex, parsed)
+			if lerr != nil {
+				return lerr
+			}
+			minLSN, errMin := ParseLSN(m.ConsistencyLSN)
+			startLSN, errStart := ParseLSN(m.WALStartLSN)
+			endLSN, errEnd := ParseLSN(m.WALEndLSN)
+			if errMin != nil || errStart != nil || errEnd != nil || endLSN < minLSN || endLSN < startLSN {
+				return fmt.Errorf("%w: empty or invalid recoverable LSN range", ErrTargetOutOfRange)
+			}
+			if convertedLSN < minLSN {
+				return fmt.Errorf("%w: target time %s maps to LSN %s preceding backup minimum recovery LSN %s",
+					ErrTargetOutOfRange, t.Time, FormatLSN(convertedLSN), m.ConsistencyLSN)
+			}
+			if convertedLSN < startLSN {
+				return fmt.Errorf("%w: target time %s maps to LSN %s preceding retained WAL start %s",
+					ErrTargetOutOfRange, t.Time, FormatLSN(convertedLSN), m.WALStartLSN)
+			}
+			if convertedLSN > endLSN {
+				return fmt.Errorf("%w: target time %s maps to LSN %s exceeding archived WAL end %s",
+					ErrTargetOutOfRange, t.Time, FormatLSN(convertedLSN), m.WALEndLSN)
+			}
+			return nil
+		}
+		// Backward-compatible coarse path for legacy manifests without TimeIndex.
 		if parsed.After(time.Now().Add(5 * time.Minute)) {
 			return fmt.Errorf("%w: target time %s is in the future", ErrTargetOutOfRange, t.Time)
 		}

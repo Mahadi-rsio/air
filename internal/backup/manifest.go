@@ -59,17 +59,24 @@ type ObjectRef struct {
 	ETag   string `json:"etag,omitempty"`
 }
 
+// TimeLSNEntry maps a PostgreSQL commit timestamp to its WAL LSN for PITR pre-validation.
+type TimeLSNEntry struct {
+	CommitTime time.Time `json:"commit_time"`
+	LSN        string    `json:"lsn"`
+}
+
 // WALRef identifies one archived WAL segment used for PITR.
 type WALRef struct {
-	SegmentName  string `json:"segment_name"`
-	TimelineID   string `json:"timeline_id,omitempty"`
-	R2Key        string `json:"r2_key"`
-	Epoch        int64  `json:"epoch"`
-	Size         int64  `json:"size"`
-	CipherSHA256 string `json:"cipher_sha256"`
-	SHA256       string `json:"sha256"`
-	StartLSN     string `json:"start_lsn,omitempty"`
-	EndLSN       string `json:"end_lsn,omitempty"`
+	SegmentName  string         `json:"segment_name"`
+	TimelineID   string         `json:"timeline_id,omitempty"`
+	R2Key        string         `json:"r2_key"`
+	Epoch        int64          `json:"epoch"`
+	Size         int64          `json:"size"`
+	CipherSHA256 string         `json:"cipher_sha256"`
+	SHA256       string         `json:"sha256"`
+	StartLSN     string         `json:"start_lsn,omitempty"`
+	EndLSN       string         `json:"end_lsn,omitempty"`
+	TimeIndex    []TimeLSNEntry `json:"time_index,omitempty"`
 }
 
 // BackupManifest is the immutable, self-describing record for one recoverable backup.
@@ -93,6 +100,7 @@ type BackupManifest struct {
 	WALStartLSN       string                  `json:"wal_start_lsn"`
 	WALEndLSN         string                  `json:"wal_end_lsn"`
 	ConsistencyTime   time.Time               `json:"consistency_time"`
+	TimeIndex         []TimeLSNEntry          `json:"time_index,omitempty"`
 	Objects           []ObjectRef             `json:"objects"`
 	WALSegments       []WALRef                `json:"wal_segments"`
 	State             string                  `json:"state"`
@@ -313,6 +321,7 @@ func WALRefsFromArtifacts(segs []WALSegmentArtifact) []WALRef {
 			SHA256:       s.PlainSHA256,
 			StartLSN:     FormatLSN(start),
 			EndLSN:       FormatLSN(start + WALSegmentSize),
+			TimeIndex:    s.TimeIndex,
 		}
 		if e.TimelineID == "" {
 			e.TimelineID = timelineIDFromSegment(s.SegmentName)
@@ -321,6 +330,16 @@ func WALRefsFromArtifacts(segs []WALSegmentArtifact) []WALRef {
 	}
 	SortWALRefs(out)
 	return out
+}
+
+// AggregateTimeIndex merges per-segment sparse time->LSN indexes into a single
+// monotonic manifest-level time index.
+func AggregateTimeIndex(refs []WALRef) []TimeLSNEntry {
+	var all []TimeLSNEntry
+	for _, r := range refs {
+		all = append(all, r.TimeIndex...)
+	}
+	return BuildSparseTimeIndex(all, time.Second)
 }
 
 func timelineIDFromSegment(name string) string {

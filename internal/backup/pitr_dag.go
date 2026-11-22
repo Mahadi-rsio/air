@@ -47,8 +47,9 @@ type WALSegmentArtifact struct {
 	CipherBytes  int    `json:"cipher_bytes"`
 	CipherSHA256 string `json:"cipher_sha256,omitempty"`
 	PlainSHA256  string `json:"plain_sha256,omitempty"`
-	CipherETag   string `json:"cipher_etag,omitempty"`
-	Status       string `json:"status,omitempty"` // PENDING, VERIFIED_IN_R2, LOCAL_DELETED
+	CipherETag   string         `json:"cipher_etag,omitempty"`
+	Status       string         `json:"status,omitempty"` // PENDING, VERIFIED_IN_R2, LOCAL_DELETED
+	TimeIndex    []TimeLSNEntry `json:"time_index,omitempty"`
 }
 
 type WALUploadManifest struct {
@@ -676,6 +677,10 @@ func drainWALSpoolDirWithFaultGen(
 		if putOut.ETag != nil {
 			etag = *putOut.ETag
 		}
+		var timeIdx []TimeLSNEntry
+		if walSegmentRe.MatchString(segName) {
+			timeIdx, _ = ExtractCommitTimeIndexFromWAL(rawWAL, time.Second)
+		}
 		art := &WALSegmentArtifact{
 			SegmentName:  segName,
 			TimelineID:   timelineIDFromSegment(segName),
@@ -686,6 +691,7 @@ func drainWALSpoolDirWithFaultGen(
 			PlainSHA256:  plainSHA,
 			CipherETag:   etag,
 			Status:       "VERIFIED_IN_R2",
+			TimeIndex:    timeIdx,
 		}
 		manifest.Segments[segName] = art
 		if err := saveWALManifestAtomic(manifestPath, manifest); err != nil {
