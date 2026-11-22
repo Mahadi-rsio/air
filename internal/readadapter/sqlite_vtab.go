@@ -223,6 +223,23 @@ static void air_result_text_copy(sqlite3_context *ctx, const char *s, int n) {
 static void air_result_blob_copy(sqlite3_context *ctx, const void *p, int n) {
 	sqlite3_result_blob(ctx, p, n, SQLITE_TRANSIENT);
 }
+
+extern int goPGNumericCmp(void *arg, int lenA, void *a, int lenB, void *b);
+extern int goPGInetCmp(void *arg, int lenA, void *a, int lenB, void *b);
+
+static int air_pg_numeric_cmp(void *arg, int lenA, const void *a, int lenB, const void *b) {
+	return goPGNumericCmp(arg, lenA, (void *)a, lenB, (void *)b);
+}
+
+static int air_pg_inet_cmp(void *arg, int lenA, const void *a, int lenB, const void *b) {
+	return goPGInetCmp(arg, lenA, (void *)a, lenB, (void *)b);
+}
+
+static int air_register_pg_collations(sqlite3 *db) {
+	int rc = sqlite3_create_collation_v2(db, "PG_NUMERIC", SQLITE_UTF8, NULL, air_pg_numeric_cmp, NULL);
+	if (rc != SQLITE_OK) return rc;
+	return sqlite3_create_collation_v2(db, "PG_INET", SQLITE_UTF8, NULL, air_pg_inet_cmp, NULL);
+}
 */
 import "C"
 
@@ -273,6 +290,7 @@ type pgVTabSpec struct {
 
 type vtabFilter struct {
 	allColIdx int
+	colType   ColumnType
 	op        int
 	valType   int // C.SQLITE_INTEGER, C.SQLITE_FLOAT, C.SQLITE_TEXT, C.SQLITE_BLOB, C.SQLITE_NULL
 	intVal    int64
@@ -381,6 +399,33 @@ func (c *SQLiteConn) RegisterAirPGModule() error {
 		return fmt.Errorf("sqlite3_create_module_v2(air_pg): rc=%d %s", int(rc), C.GoString(C.sqlite3_errmsg(c.db)))
 	}
 	return nil
+}
+
+func (c *SQLiteConn) registerPGCollations() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.db == nil {
+		return fmt.Errorf("sqlite connection closed")
+	}
+	rc := C.air_register_pg_collations(c.db)
+	if rc != C.SQLITE_OK {
+		return fmt.Errorf("air_register_pg_collations: rc=%d %s", int(rc), C.GoString(C.sqlite3_errmsg(c.db)))
+	}
+	return nil
+}
+
+//export goPGNumericCmp
+func goPGNumericCmp(_ unsafe.Pointer, lenA C.int, a unsafe.Pointer, lenB C.int, b unsafe.Pointer) C.int {
+	sa := C.GoStringN((*C.char)(a), lenA)
+	sb := C.GoStringN((*C.char)(b), lenB)
+	return C.int(ComparePGNumeric(sa, sb))
+}
+
+//export goPGInetCmp
+func goPGInetCmp(_ unsafe.Pointer, lenA C.int, a unsafe.Pointer, lenB C.int, b unsafe.Pointer) C.int {
+	sa := C.GoStringN((*C.char)(a), lenA)
+	sb := C.GoStringN((*C.char)(b), lenB)
+	return C.int(ComparePGInet(sa, sb))
 }
 
 // RegisterNativeTable registers a discovered PostgreSQL table as a read-only
@@ -742,6 +787,60 @@ func evalFilterVal(f vtabFilter, val HeapVal) bool {
 		return false
 	}
 
+	if f.colType == ColNumeric && val.Kind == ValString {
+		var rhs string
+		switch f.valType {
+		case int(C.SQLITE_TEXT):
+			rhs = f.strVal
+		case int(C.SQLITE_INTEGER):
+			rhs = strconv.FormatInt(f.intVal, 10)
+		case int(C.SQLITE_FLOAT):
+			rhs = strconv.FormatFloat(f.floatVal, 'f', -1, 64)
+		default:
+			return true
+		}
+		cmp := ComparePGNumeric(val.Str, rhs)
+		switch f.op {
+		case int(C.SQLITE_INDEX_CONSTRAINT_EQ):
+			return cmp == 0
+		case int(C.SQLITE_INDEX_CONSTRAINT_NE):
+			return cmp != 0
+		case int(C.SQLITE_INDEX_CONSTRAINT_LT):
+			return cmp < 0
+		case int(C.SQLITE_INDEX_CONSTRAINT_LE):
+			return cmp <= 0
+		case int(C.SQLITE_INDEX_CONSTRAINT_GT):
+			return cmp > 0
+		case int(C.SQLITE_INDEX_CONSTRAINT_GE):
+			return cmp >= 0
+		default:
+			return true
+		}
+	}
+
+	if (f.colType == ColInet || f.colType == ColCIDR) && val.Kind == ValString {
+		if f.valType != int(C.SQLITE_TEXT) {
+			return true
+		}
+		cmp := ComparePGInet(val.Str, f.strVal)
+		switch f.op {
+		case int(C.SQLITE_INDEX_CONSTRAINT_EQ):
+			return cmp == 0
+		case int(C.SQLITE_INDEX_CONSTRAINT_NE):
+			return cmp != 0
+		case int(C.SQLITE_INDEX_CONSTRAINT_LT):
+			return cmp < 0
+		case int(C.SQLITE_INDEX_CONSTRAINT_LE):
+			return cmp <= 0
+		case int(C.SQLITE_INDEX_CONSTRAINT_GT):
+			return cmp > 0
+		case int(C.SQLITE_INDEX_CONSTRAINT_GE):
+			return cmp >= 0
+		default:
+			return true
+		}
+	}
+
 	var cmp int
 	switch f.valType {
 	case int(C.SQLITE_INTEGER):
@@ -1012,6 +1111,7 @@ func (cur *pgVTabCursor) parseFilterPlan(idxStr string, argc int, argv **C.sqlit
 
 				f := vtabFilter{
 					allColIdx: allCol,
+					colType:   cur.spec.AllCols[allCol],
 					op:        op,
 				}
 				if op != int(C.SQLITE_INDEX_CONSTRAINT_ISNULL) && op != int(C.SQLITE_INDEX_CONSTRAINT_ISNOTNULL) {

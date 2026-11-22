@@ -267,6 +267,16 @@ const (
 	ColUUID
 	ColInt2Vector
 	ColJSONB
+	ColNumeric
+	ColInet
+	ColCIDR
+	ColInt2Array
+	ColInt4Array
+	ColInt8Array
+	ColTextArray
+	ColBoolArray
+	ColFloat4Array
+	ColFloat8Array
 	ColUnsupported
 )
 
@@ -306,6 +316,26 @@ func PGTypeOIDToColumnType(oid uint32) (ColumnType, string) {
 		return ColTimestamp, "TEXT"
 	case 2950: // uuid
 		return ColUUID, "TEXT"
+	case 1700: // numeric
+		return ColNumeric, "TEXT_NUMERIC COLLATE PG_NUMERIC"
+	case 869: // inet
+		return ColInet, "TEXT_INET COLLATE PG_INET"
+	case 650: // cidr
+		return ColCIDR, "TEXT_CIDR COLLATE PG_INET"
+	case 1005: // int2[]
+		return ColInt2Array, "TEXT_INT2ARRAY"
+	case 1007: // int4[]
+		return ColInt4Array, "TEXT_INT4ARRAY"
+	case 1016: // int8[]
+		return ColInt8Array, "TEXT_INT8ARRAY"
+	case 1009: // text[]
+		return ColTextArray, "TEXT_TEXTARRAY"
+	case 1000: // bool[]
+		return ColBoolArray, "TEXT_BOOLARRAY"
+	case 1021: // float4[]
+		return ColFloat4Array, "TEXT_FLOAT4ARRAY"
+	case 1022: // float8[]
+		return ColFloat8Array, "TEXT_FLOAT8ARRAY"
 	default:
 		return ColUnsupported, "TEXT"
 	}
@@ -650,6 +680,20 @@ func DecodeHeapColumnsProjected(tup []byte, hdr HeapTupleHeader, cols []ColumnTy
 				vals[i] = s
 			}
 			off = nextOff
+		case ColNumeric, ColInet, ColCIDR,
+			ColInt2Array, ColInt4Array, ColInt8Array, ColTextArray, ColBoolArray, ColFloat4Array, ColFloat8Array:
+			raw, nextOff, err := decodeVarlena(tup, off, want)
+			if err != nil {
+				return nil, err
+			}
+			if want {
+				s, derr := decodeExtColType(ct, raw)
+				if derr != nil {
+					return nil, derr
+				}
+				vals[i] = s
+			}
+			off = nextOff
 		default:
 			return nil, fmt.Errorf("%w: column %d type %d", ErrUnsupportedType, i, ct)
 		}
@@ -835,6 +879,17 @@ func DecodeMissingValArray(ct ColumnType, raw []byte) (HeapVal, bool) {
 			binary.BigEndian.Uint16(u[6:8]),
 			binary.BigEndian.Uint16(u[8:10]),
 			u[10:16])}, true
+	case ColNumeric, ColInet, ColCIDR,
+		ColInt2Array, ColInt4Array, ColInt8Array, ColTextArray, ColBoolArray, ColFloat4Array, ColFloat8Array:
+		v, _, err := decodeVarlenaWithTOAST(raw, elemOff, true, nil)
+		if err != nil {
+			return HeapVal{}, false
+		}
+		s, derr := decodeExtColType(ct, v)
+		if derr != nil {
+			return HeapVal{}, false
+		}
+		return HeapVal{Kind: ValString, Str: s}, true
 	default:
 		return HeapVal{}, false
 	}
@@ -1074,6 +1129,20 @@ func DecodeHeapColumnsWithTOASTAndMissingInto(tup []byte, hdr HeapTupleHeader, c
 				} else {
 					dst[i] = HeapVal{Kind: ValBytes, Raw: raw}
 				}
+			}
+			off = nextOff
+		case ColNumeric, ColInet, ColCIDR,
+			ColInt2Array, ColInt4Array, ColInt8Array, ColTextArray, ColBoolArray, ColFloat4Array, ColFloat8Array:
+			raw, nextOff, err := decodeVarlenaWithTOAST(tup, off, want, toastFn)
+			if err != nil {
+				return err
+			}
+			if want {
+				s, derr := decodeExtColType(ct, raw)
+				if derr != nil {
+					return derr
+				}
+				dst[i] = HeapVal{Kind: ValString, Str: s}
 			}
 			off = nextOff
 		default:

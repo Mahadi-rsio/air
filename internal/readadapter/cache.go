@@ -14,19 +14,50 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/Mahadi-rsio/air/internal/pageserver"
 	"golang.org/x/sync/singleflight"
+	"golang.org/x/sys/unix"
 )
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
+const (
+	directIOAlign      = 4096
+	directIOL2FileSize = 12288 // 8192 (PGPageSize) + 4 (CRC32C) padded to 4096-byte boundary
+)
+
 // CacheConfig configures the multi-level L1 RAM + L2 Local NVMe + L3 Pageserver cache.
 type CacheConfig struct {
-	L1MaxBytes int64
-	L2Dir      string
-	L2MaxBytes int64
+	L1MaxBytes            int64
+	L2Dir                 string
+	L2Disabled            bool
+	L2MaxBytes            int64
+	L2MaxEntries          int
+	L2MaxEntryBytes       int64
+	L2MaxConcurrentIO     int
+	L2BypassUnderPressure bool
+	L2DropPageCache       bool
+	L2DirectIO            bool
+	MemPressureFn         func() bool
+}
+
+// LowMemory512MBProfile returns a strictly bounded CacheConfig tuned for 512MB cgroup nodes.
+func LowMemory512MBProfile(l2Dir string) CacheConfig {
+	return CacheConfig{
+		L1MaxBytes:            16 * 1024 * 1024,
+		L2Dir:                 l2Dir,
+		L2Disabled:            l2Dir == "",
+		L2MaxBytes:            64 * 1024 * 1024,
+		L2MaxEntries:          4096,
+		L2MaxEntryBytes:       16384,
+		L2MaxConcurrentIO:     4,
+		L2BypassUnderPressure: true,
+		L2DropPageCache:       true,
+	}
 }
 
 // PageCacheKey uniquely identifies a cached 8 KiB page by tenant, generation,
@@ -72,17 +103,21 @@ func (k PageCacheKey) sfKey() string {
 
 // CacheStats reports L1/L2/L3 hit, miss, eviction, corruption, stampede, and usage counters.
 type CacheStats struct {
-	L1Hits             uint64
-	L1Misses           uint64
-	L1Evictions        uint64
-	L1Bytes            int64
-	L2Hits             uint64
-	L2Misses           uint64
-	L2Evictions        uint64
-	L2Corrupt          uint64
-	L2Bytes            int64
-	L3Fetches          uint64
-	StampedesPrevented uint64
+	L1Hits              uint64
+	L1Misses            uint64
+	L1Evictions         uint64
+	L1Bytes             int64
+	L2Hits              uint64
+	L2Misses            uint64
+	L2Evictions         uint64
+	L2Corrupt           uint64
+	L2Bypasses          uint64
+	L2Bytes             int64
+	L2Entries           int64
+	L2DirectIOOps       uint64
+	L2DirectIOFallbacks uint64
+	L3Fetches           uint64
+	StampedesPrevented  uint64
 }
 
 type l1Entry struct {
@@ -135,12 +170,20 @@ type tenantSyncState struct {
 const maxRelMetaCacheEntries = 4096
 
 // TieredCacheBackend wraps an authoritative StorageBackend (L3 Pageserver)
-// with an L1 in-memory LRU cache and an L2 checksummed local NVMe disk cache.
+// with an L1 in-memory LRU cache and a strictly bounded L2 checksummed local disk cache.
 type TieredCacheBackend struct {
-	l3         StorageBackend
-	l1MaxBytes int64
-	l2Dir      string
-	l2MaxBytes int64
+	l3                    StorageBackend
+	l1MaxBytes            int64
+	l2Dir                 string
+	l2MaxBytes            int64
+	l2MaxEntries          int
+	l2MaxEntryBytes       int64
+	l2BypassUnderPressure bool
+	l2DropPageCache       bool
+	l2DirectIO            bool
+	memPressureFn         func() bool
+	l2IOSem               chan struct{}
+	alignedPool           sync.Pool
 
 	sfGroup singleflight.Group
 	syncSF  singleflight.Group
@@ -165,15 +208,18 @@ type TieredCacheBackend struct {
 	metaMap    map[relMetaKey]relMetaVal
 	metaLatest map[relMetaLatestKey]relMetaLatestVal
 
-	l1Hits             atomic.Uint64
-	l1Misses           atomic.Uint64
-	l1Evictions        atomic.Uint64
-	l2Hits             atomic.Uint64
-	l2Misses           atomic.Uint64
-	l2Evictions        atomic.Uint64
-	l2Corrupt          atomic.Uint64
-	l3Fetches          atomic.Uint64
-	stampedesPrevented atomic.Uint64
+	l1Hits              atomic.Uint64
+	l1Misses            atomic.Uint64
+	l1Evictions         atomic.Uint64
+	l2Hits              atomic.Uint64
+	l2Misses            atomic.Uint64
+	l2Evictions         atomic.Uint64
+	l2Corrupt           atomic.Uint64
+	l2Bypasses          atomic.Uint64
+	l2DirectIOOps       atomic.Uint64
+	l2DirectIOFallbacks atomic.Uint64
+	l3Fetches           atomic.Uint64
+	stampedesPrevented  atomic.Uint64
 }
 
 // NewTieredCacheBackend creates a multi-level L1+L2+L3 StorageBackend.
@@ -184,20 +230,52 @@ func NewTieredCacheBackend(l3 StorageBackend, cfg CacheConfig) (*TieredCacheBack
 	if cfg.L1MaxBytes <= 0 {
 		cfg.L1MaxBytes = 64 * 1024 * 1024
 	}
-	if cfg.L2Dir != "" {
-		if err := os.MkdirAll(cfg.L2Dir, 0o750); err != nil {
+	l2Dir := cfg.L2Dir
+	if cfg.L2Disabled {
+		l2Dir = ""
+	}
+	if l2Dir != "" {
+		if err := os.MkdirAll(l2Dir, 0o750); err != nil {
 			return nil, fmt.Errorf("readadapter: create L2 cache dir: %w", err)
 		}
 		if cfg.L2MaxBytes <= 0 {
 			cfg.L2MaxBytes = 256 * 1024 * 1024
 		}
-		reconcileL2DirOnStartup(cfg.L2Dir, cfg.L2MaxBytes)
+		if cfg.L2MaxEntryBytes <= 0 {
+			cfg.L2MaxEntryBytes = 16384
+		}
+		if cfg.L2MaxEntries <= 0 {
+			cfg.L2MaxEntries = int(cfg.L2MaxBytes / int64(PGPageSize+4))
+			if cfg.L2MaxEntries <= 0 {
+				cfg.L2MaxEntries = 1
+			}
+		}
+		if cfg.L2MaxConcurrentIO <= 0 {
+			cfg.L2MaxConcurrentIO = 8
+		}
+		reconcileL2DirOnStartup(l2Dir, cfg.L2MaxBytes, cfg.L2MaxEntries)
+	}
+	var ioSem chan struct{}
+	if l2Dir != "" && cfg.L2MaxConcurrentIO > 0 {
+		ioSem = make(chan struct{}, cfg.L2MaxConcurrentIO)
 	}
 	return &TieredCacheBackend{
-		l3:         l3,
-		l1MaxBytes: cfg.L1MaxBytes,
-		l2Dir:      cfg.L2Dir,
-		l2MaxBytes: cfg.L2MaxBytes,
+		l3:                    l3,
+		l1MaxBytes:            cfg.L1MaxBytes,
+		l2Dir:                 l2Dir,
+		l2MaxBytes:            cfg.L2MaxBytes,
+		l2MaxEntries:          cfg.L2MaxEntries,
+		l2MaxEntryBytes:       cfg.L2MaxEntryBytes,
+		l2BypassUnderPressure: cfg.L2BypassUnderPressure,
+		l2DropPageCache:       cfg.L2DropPageCache,
+		l2DirectIO:            cfg.L2DirectIO,
+		memPressureFn:         cfg.MemPressureFn,
+		l2IOSem:               ioSem,
+		alignedPool: sync.Pool{
+			New: func() any {
+				return make([]byte, directIOL2FileSize+directIOAlign)
+			},
+		},
 		syncState:  make(map[string]*tenantSyncState),
 		l1List:     list.New(),
 		l1Map:      make(map[PageCacheKey]*list.Element),
@@ -210,7 +288,7 @@ func NewTieredCacheBackend(l3 StorageBackend, cfg CacheConfig) (*TieredCacheBack
 	}, nil
 }
 
-func reconcileL2DirOnStartup(l2Dir string, maxBytes int64) {
+func reconcileL2DirOnStartup(l2Dir string, maxBytes int64, maxEntries int) {
 	type diskFile struct {
 		path    string
 		size    int64
@@ -234,7 +312,7 @@ func reconcileL2DirOnStartup(l2Dir string, maxBytes int64) {
 		if ierr != nil {
 			return nil
 		}
-		if info.Size() != PGPageSize+4 {
+		if info.Size() != PGPageSize+4 && info.Size() != directIOL2FileSize {
 			_ = os.Remove(p)
 			return nil
 		}
@@ -242,18 +320,20 @@ func reconcileL2DirOnStartup(l2Dir string, maxBytes int64) {
 		files = append(files, diskFile{path: p, size: info.Size(), modTime: info.ModTime()})
 		return nil
 	})
-	if total <= maxBytes {
+	if total <= maxBytes && (maxEntries <= 0 || len(files) <= maxEntries) {
 		return
 	}
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].modTime.Before(files[j].modTime)
 	})
+	remaining := len(files)
 	for _, f := range files {
-		if total <= maxBytes {
+		if total <= maxBytes && (maxEntries <= 0 || remaining <= maxEntries) {
 			break
 		}
 		if os.Remove(f.path) == nil {
 			total -= f.size
+			remaining--
 		}
 	}
 }
@@ -744,24 +824,30 @@ func (c *TieredCacheBackend) Stats() CacheStats {
 	c.l1Mu.Unlock()
 
 	var l2B int64
+	var l2E int64
 	if c.l2Dir != "" {
 		c.l2Mu.Lock()
 		l2B = c.l2Bytes
+		l2E = int64(c.l2List.Len())
 		c.l2Mu.Unlock()
 	}
 
 	return CacheStats{
-		L1Hits:             c.l1Hits.Load(),
-		L1Misses:           c.l1Misses.Load(),
-		L1Evictions:        c.l1Evictions.Load(),
-		L1Bytes:            l1B,
-		L2Hits:             c.l2Hits.Load(),
-		L2Misses:           c.l2Misses.Load(),
-		L2Evictions:        c.l2Evictions.Load(),
-		L2Corrupt:          c.l2Corrupt.Load(),
-		L2Bytes:            l2B,
-		L3Fetches:          c.l3Fetches.Load(),
-		StampedesPrevented: c.stampedesPrevented.Load(),
+		L1Hits:              c.l1Hits.Load(),
+		L1Misses:            c.l1Misses.Load(),
+		L1Evictions:         c.l1Evictions.Load(),
+		L1Bytes:             l1B,
+		L2Hits:              c.l2Hits.Load(),
+		L2Misses:            c.l2Misses.Load(),
+		L2Evictions:         c.l2Evictions.Load(),
+		L2Corrupt:           c.l2Corrupt.Load(),
+		L2Bypasses:          c.l2Bypasses.Load(),
+		L2Bytes:             l2B,
+		L2Entries:           l2E,
+		L2DirectIOOps:       c.l2DirectIOOps.Load(),
+		L2DirectIOFallbacks: c.l2DirectIOFallbacks.Load(),
+		L3Fetches:           c.l3Fetches.Load(),
+		StampedesPrevented:  c.stampedesPrevented.Load(),
 	}
 }
 
@@ -853,6 +939,127 @@ func (c *TieredCacheBackend) l2PathFor(k PageCacheKey) string {
 	return filepath.Join(c.l2Dir, sum[:2], sum+".pg")
 }
 
+func alignedSlice(buf []byte, n int) []byte {
+	addr := uintptr(unsafe.Pointer(&buf[0]))
+	off := (directIOAlign - int(addr&(directIOAlign-1))) & (directIOAlign - 1)
+	return buf[off : off+n]
+}
+
+func (c *TieredCacheBackend) acquireL2IO(tryOnly bool) bool {
+	if c.l2IOSem == nil {
+		return true
+	}
+	if tryOnly {
+		select {
+		case c.l2IOSem <- struct{}{}:
+			return true
+		default:
+			return false
+		}
+	}
+	c.l2IOSem <- struct{}{}
+	return true
+}
+
+func (c *TieredCacheBackend) releaseL2IO() {
+	if c.l2IOSem != nil {
+		<-c.l2IOSem
+	}
+}
+
+func (c *TieredCacheBackend) readL2File(path string) ([]byte, error) {
+	if c.l2DirectIO {
+		rawPool := c.alignedPool.Get().([]byte)
+		aligned := alignedSlice(rawPool, directIOL2FileSize)
+		f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECT, 0)
+		if err == nil {
+			n, rerr := f.Read(aligned)
+			_ = f.Close()
+			if rerr == nil && (n == PGPageSize+4 || n == directIOL2FileSize) {
+				c.l2DirectIOOps.Add(1)
+				out := make([]byte, n)
+				copy(out, aligned[:n])
+				c.alignedPool.Put(rawPool)
+				return out, nil
+			}
+			if rerr != nil {
+				c.l2DirectIOFallbacks.Add(1)
+			}
+		} else if !os.IsNotExist(err) {
+			c.l2DirectIOFallbacks.Add(1)
+		}
+		c.alignedPool.Put(rawPool)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var buf [directIOL2FileSize]byte
+	n := 0
+	for n < len(buf) {
+		m, rerr := f.Read(buf[n:])
+		n += m
+		if rerr != nil {
+			break
+		}
+	}
+	if c.l2DropPageCache {
+		_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
+	}
+	out := make([]byte, n)
+	copy(out, buf[:n])
+	return out, nil
+}
+
+func (c *TieredCacheBackend) writeL2File(tmpPath string, pg []byte, crc uint32) (int64, error) {
+	if c.l2DirectIO {
+		rawPool := c.alignedPool.Get().([]byte)
+		aligned := alignedSlice(rawPool, directIOL2FileSize)
+		copy(aligned[:PGPageSize], pg)
+		binary.LittleEndian.PutUint32(aligned[PGPageSize:PGPageSize+4], crc)
+		clear(aligned[PGPageSize+4:])
+		f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_DIRECT, 0o640)
+		if err == nil {
+			n, werr := f.Write(aligned)
+			cerr := f.Close()
+			c.alignedPool.Put(rawPool)
+			if werr == nil && cerr == nil && n == directIOL2FileSize {
+				c.l2DirectIOOps.Add(1)
+				return directIOL2FileSize, nil
+			}
+			_ = os.Remove(tmpPath)
+			c.l2DirectIOFallbacks.Add(1)
+		} else {
+			c.alignedPool.Put(rawPool)
+			c.l2DirectIOFallbacks.Add(1)
+		}
+	}
+
+	var buf [PGPageSize + 4]byte
+	copy(buf[:PGPageSize], pg)
+	binary.LittleEndian.PutUint32(buf[PGPageSize:], crc)
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
+	if err != nil {
+		return 0, err
+	}
+	_, werr := f.Write(buf[:])
+	if werr == nil && c.l2DropPageCache {
+		_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
+	}
+	cerr := f.Close()
+	if werr != nil {
+		_ = os.Remove(tmpPath)
+		return 0, werr
+	}
+	if cerr != nil {
+		_ = os.Remove(tmpPath)
+		return 0, cerr
+	}
+	return PGPageSize + 4, nil
+}
+
 func (c *TieredCacheBackend) getL2(k PageCacheKey, syncedLSN uint64) ([]byte, bool) {
 	c.l2Mu.Lock()
 	elem, ok := c.l2Map[k]
@@ -875,25 +1082,27 @@ func (c *TieredCacheBackend) getL2(k PageCacheKey, syncedLSN uint64) ([]byte, bo
 		path = c.l2PathFor(k)
 	}
 
-	raw, err := os.ReadFile(path)
+	c.acquireL2IO(false)
+	raw, err := c.readL2File(path)
+	c.releaseL2IO()
 	if err != nil {
 		if ok {
 			c.evictCorruptL2(actualKey, path, false)
 		}
 		return nil, false
 	}
-	if len(raw) != PGPageSize+4 {
+	if len(raw) != PGPageSize+4 && len(raw) != directIOL2FileSize {
 		c.evictCorruptL2(actualKey, path, true)
 		return nil, false
 	}
-	gotCRC := binary.LittleEndian.Uint32(raw[PGPageSize:])
+	gotCRC := binary.LittleEndian.Uint32(raw[PGPageSize : PGPageSize+4])
 	wantCRC := crc32.Checksum(raw[:PGPageSize], crc32cTable)
 	if gotCRC != wantCRC {
 		c.evictCorruptL2(actualKey, path, true)
 		return nil, false
 	}
 	if !ok {
-		c.registerL2Entry(actualKey, path, int64(PGPageSize+4))
+		c.registerL2Entry(actualKey, path, int64(len(raw)))
 	}
 	return raw[:PGPageSize], true
 }
@@ -910,7 +1119,8 @@ func (c *TieredCacheBackend) registerL2Entry(k PageCacheKey, path string, fileSi
 		}
 		return
 	}
-	for c.l2Bytes+fileSize > c.l2MaxBytes && c.l2List.Len() > 0 {
+	evictCount := 0
+	for (c.l2Bytes+fileSize > c.l2MaxBytes || (c.l2MaxEntries > 0 && c.l2List.Len() >= c.l2MaxEntries)) && c.l2List.Len() > 0 {
 		back := c.l2List.Back()
 		ent := back.Value.(*l2Entry)
 		c.l2List.Remove(back)
@@ -922,6 +1132,10 @@ func (c *TieredCacheBackend) registerL2Entry(k PageCacheKey, path string, fileSi
 		c.l2Bytes -= ent.size
 		_ = os.Remove(ent.path)
 		c.l2Evictions.Add(1)
+		evictCount++
+		if evictCount >= 16 && c.l2Bytes+fileSize <= c.l2MaxBytes && (c.l2MaxEntries <= 0 || c.l2List.Len() < c.l2MaxEntries) {
+			break
+		}
 	}
 	elem := c.l2List.PushFront(&l2Entry{key: k, path: path, size: fileSize})
 	c.l2Map[k] = elem
@@ -952,24 +1166,36 @@ func (c *TieredCacheBackend) evictCorruptL2(k PageCacheKey, path string, countCo
 
 func (c *TieredCacheBackend) putL2(k PageCacheKey, pg []byte) {
 	if len(pg) != PGPageSize {
+		c.l2Bypasses.Add(1)
+		return
+	}
+	if c.l2BypassUnderPressure && c.memPressureFn != nil && c.memPressureFn() {
+		c.l2Bypasses.Add(1)
 		return
 	}
 	fileSize := int64(PGPageSize + 4)
-	if fileSize > c.l2MaxBytes {
+	if c.l2DirectIO {
+		fileSize = directIOL2FileSize
+	}
+	if fileSize > c.l2MaxBytes || (c.l2MaxEntryBytes > 0 && int64(len(pg)) > c.l2MaxEntryBytes) {
+		c.l2Bypasses.Add(1)
 		return
 	}
+	if !c.acquireL2IO(true) {
+		c.l2Bypasses.Add(1)
+		return
+	}
+	defer c.releaseL2IO()
 
 	path := c.l2PathFor(k)
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return
 	}
 
-	buf := make([]byte, PGPageSize+4)
-	copy(buf[:PGPageSize], pg)
-	binary.LittleEndian.PutUint32(buf[PGPageSize:], crc32.Checksum(pg, crc32cTable))
-
+	crc := crc32.Checksum(pg, crc32cTable)
 	tmpPath := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), c.tmpSeq.Add(1))
-	if err := os.WriteFile(tmpPath, buf, 0o640); err != nil {
+	actualSize, err := c.writeL2File(tmpPath, pg, crc)
+	if err != nil {
 		return
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
@@ -977,5 +1203,5 @@ func (c *TieredCacheBackend) putL2(k PageCacheKey, pg []byte) {
 		return
 	}
 
-	c.registerL2Entry(k, path, fileSize)
+	c.registerL2Entry(k, path, actualSize)
 }

@@ -91,6 +91,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -202,6 +203,10 @@ func OpenSQLiteConn(path string, readOnly bool, cacheKB int) (*SQLiteConn, error
 		_ = conn.execRaw("PRAGMA query_only=ON; PRAGMA temp_store=MEMORY;")
 		*roPtr = 1
 		C.air_install_ro_authorizer(db, roPtr)
+	}
+	if err := conn.registerPGCollations(); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
 
 	return conn, nil
@@ -334,6 +339,26 @@ func declTypeToPG(decl string) (uint32, int16) {
 		return PGOIDFloat8, 8
 	case u == "BLOB" || u == "BYTEA":
 		return PGOIDBytea, -1
+	case u == "TEXT_NUMERIC" || strings.Contains(u, "TEXT_NUMERIC"):
+		return PGOIDNumeric, -1
+	case u == "TEXT_INET" || strings.Contains(u, "TEXT_INET"):
+		return PGOIDInet, -1
+	case u == "TEXT_CIDR" || strings.Contains(u, "TEXT_CIDR"):
+		return PGOIDCIDR, -1
+	case u == "TEXT_INT2ARRAY":
+		return PGOIDInt2Array, -1
+	case u == "TEXT_INT4ARRAY":
+		return PGOIDInt4Array, -1
+	case u == "TEXT_INT8ARRAY":
+		return PGOIDInt8Array, -1
+	case u == "TEXT_TEXTARRAY":
+		return PGOIDTextArray, -1
+	case u == "TEXT_BOOLARRAY":
+		return PGOIDBoolArray, -1
+	case u == "TEXT_FLOAT4ARRAY":
+		return PGOIDFloat4Array, -1
+	case u == "TEXT_FLOAT8ARRAY":
+		return PGOIDFloat8Array, -1
 	default:
 		return PGOIDText, -1
 	}

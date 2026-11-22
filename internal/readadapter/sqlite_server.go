@@ -36,6 +36,14 @@ type SQLiteServerConfig struct {
 	NativeSnapProv                SnapshotProvider
 	CacheDir                      string
 	L1CacheBytes                  int64
+	L2Disabled                    bool
+	L2MaxBytes                    int64
+	L2MaxEntries                  int
+	L2MaxEntryBytes               int64
+	L2MaxConcurrentIO             int
+	L2BypassUnderPressure         bool
+	L2DropPageCache               bool
+	L2DirectIO                    bool
 	MaxConcurrentQueriesPerTenant int
 	ReadersPerTenant              int
 	QueryTimeout                  time.Duration
@@ -69,6 +77,7 @@ type SQLiteTenantStore struct {
 	lastCatalogModLSN uint64
 	sem          chan struct{}
 	queriesTotal atomic.Uint64
+	extCols      atomic.Value // map[string]ColumnType
 	mu           sync.Mutex
 }
 
@@ -224,8 +233,16 @@ func NewSQLiteReadServer(cfg SQLiteServerConfig) (*SQLiteReadServer, error) {
 			l1Bytes = 64 * 1024 * 1024
 		}
 		tiered, err := NewTieredCacheBackend(backend, CacheConfig{
-			L1MaxBytes: l1Bytes,
-			L2Dir:      cfg.CacheDir,
+			L1MaxBytes:            l1Bytes,
+			L2Dir:                 cfg.CacheDir,
+			L2Disabled:            cfg.L2Disabled,
+			L2MaxBytes:            cfg.L2MaxBytes,
+			L2MaxEntries:          cfg.L2MaxEntries,
+			L2MaxEntryBytes:       cfg.L2MaxEntryBytes,
+			L2MaxConcurrentIO:     cfg.L2MaxConcurrentIO,
+			L2BypassUnderPressure: cfg.L2BypassUnderPressure,
+			L2DropPageCache:       cfg.L2DropPageCache,
+			L2DirectIO:            cfg.L2DirectIO,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("init native tiered cache: %w", err)
@@ -425,7 +442,36 @@ func (s *SQLiteReadServer) PrometheusMetrics() string {
 	fmt.Fprintf(&b, "air_read_sqlite_memory_used_bytes %d\n", m.Memory.SQLiteUsedBytes)
 	fmt.Fprintf(&b, "air_read_go_heap_alloc_bytes %d\n", m.GoHeapAllocBytes)
 	fmt.Fprintf(&b, "air_read_fallbacks_total %d\n", m.TotalFallbacks)
+	fmt.Fprintf(&b, "air_native_read_queries_total %d\n", m.QueriesSucceeded)
+	fmt.Fprintf(&b, "air_postgres_fallback_queries_total %d\n", m.TotalFallbacks)
+	for _, reason := range []string{"toast", "multixact", "unsupported_type", "unsupported_operator", "unsupported_function", "unsupported_syntax", "other"} {
+		fmt.Fprintf(&b, "air_postgres_fallback_total{reason=%q} %d\n", reason, m.FallbackReasons[reason])
+	}
+	var cs CacheStats
+	if s.nativeCache != nil {
+		cs = s.nativeCache.Stats()
+	}
+	fmt.Fprintf(&b, "air_cache_l1_hits_total %d\n", cs.L1Hits)
+	fmt.Fprintf(&b, "air_cache_l2_hits_total %d\n", cs.L2Hits)
+	fmt.Fprintf(&b, "air_cache_misses_total %d\n", cs.L1Misses)
+	fmt.Fprintf(&b, "air_cache_evictions_total %d\n", cs.L1Evictions+cs.L2Evictions)
+	fmt.Fprintf(&b, "air_l2_cache_bytes %d\n", cs.L2Bytes)
+	fmt.Fprintf(&b, "air_l2_cache_entries %d\n", cs.L2Entries)
+	fmt.Fprintf(&b, "air_tenant_memory_bytes %d\n", m.Memory.GlobalUsedBytes)
+	fmt.Fprintf(&b, "air_cgroup_memory_bytes %d\n", readCgroupMemoryCurrent())
 	return b.String()
+}
+
+func readCgroupMemoryCurrent() int64 {
+	raw, err := os.ReadFile("/sys/fs/cgroup/memory.current")
+	if err != nil {
+		return 0
+	}
+	v, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
 }
 
 func (s *SQLiteReadServer) recordQueryError(err error) {
@@ -1348,6 +1394,7 @@ func (s *SQLiteReadServer) refreshNativeCatalogWithSnap(ctx context.Context, ts 
 	if s.statsCache != nil {
 		s.statsCache.PutDiscoveredTables(ts.TenantID, snap.Generation, tables, snap.LSN)
 	}
+	ts.extCols.Store(BuildExtColMap(tables))
 	s.reconcileAndInvalidatePlans(ts.TenantID, snap.Generation, tables)
 
 	ts.Reader.InvalidatePreparedStmts()
@@ -1414,6 +1461,7 @@ func (s *SQLiteReadServer) refreshNativeCatalogOnSlot(ctx context.Context, ts *S
 	if s.statsCache != nil {
 		s.statsCache.PutDiscoveredTables(ts.TenantID, snap.Generation, tables, snap.LSN)
 	}
+	ts.extCols.Store(BuildExtColMap(tables))
 	s.reconcileAndInvalidatePlans(ts.TenantID, snap.Generation, tables)
 
 	slot.conn.InvalidatePreparedStmts()
@@ -1536,6 +1584,13 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 				s.queriesFailed.Add(1)
 				return nil, nil, rerr
 			}
+			if extMap, _ := ts.extCols.Load().(map[string]ColumnType); true {
+				if opErr := CheckUnsupportedExtOps(sqliteSQL, extMap); opErr != nil {
+					s.queriesFailed.Add(1)
+					s.recordQueryError(opErr)
+					return nil, nil, opErr
+				}
+			}
 			var schemaVer uint64
 			if s.schemaVersions != nil {
 				schemaVer = s.schemaVersions.SchemaVersion(ts.TenantID, 0)
@@ -1557,6 +1612,13 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 			s.queriesFailed.Add(1)
 			s.recordQueryError(rerr)
 			return nil, nil, rerr
+		}
+	}
+	if extMap, _ := ts.extCols.Load().(map[string]ColumnType); true {
+		if opErr := CheckUnsupportedExtOps(sqliteSQL, extMap); opErr != nil {
+			s.queriesFailed.Add(1)
+			s.recordQueryError(opErr)
+			return nil, nil, opErr
 		}
 	}
 

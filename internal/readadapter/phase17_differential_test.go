@@ -309,18 +309,18 @@ func TestPhase17B_DifferentialCorrectness_LivePG17(t *testing.T) {
 		assertDifferentialMatch(t, ctx, pgConn, airConn, fmt.Sprintf("rand17_%d", i), q)
 	}
 
-	// 5. Unsupported Column Type Safe Rejection (numeric -> ErrUnsupportedType for PG fallback)
+	// 5. Unsupported Column Type Safe Rejection (point -> ErrUnsupportedType for PG fallback)
 	if _, err := pgConn.Exec(ctx, `
-		CREATE TABLE num_tbl (id int4 PRIMARY KEY, amount numeric(10,2));
-		INSERT INTO num_tbl VALUES (1, 123.45);
+		CREATE TABLE unsup_tbl (id int4 PRIMARY KEY, pt point);
+		INSERT INTO unsup_tbl VALUES (1, '(1,2)');
 		CHECKPOINT;
 	`); err != nil {
 		t.Fatal(err)
 	}
 	waitForWALSync(ctx, pgConn, tl, 10*time.Second)
 
-	if _, err := queryRowsNormalized(ctx, airConn, "SELECT id, amount FROM num_tbl"); err == nil {
-		t.Fatalf("expected error for unsupported numeric column so gateway falls back to PG, got nil")
+	if _, err := queryRowsNormalized(ctx, airConn, "SELECT id, pt FROM unsup_tbl"); err == nil {
+		t.Fatalf("expected error for unsupported point column so gateway falls back to PG, got nil")
 	}
 
 	// 6. Restart Pageserver + SQLiteReadServer & Verify Recovery
