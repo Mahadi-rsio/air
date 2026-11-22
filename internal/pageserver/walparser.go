@@ -45,6 +45,7 @@ const (
 	XLogXactAbort          uint8 = 0x20
 	XLogXactCommitPrepared uint8 = 0x30
 	XLogXactAbortPrepared  uint8 = 0x40
+	XLogXactAssignment     uint8 = 0x60
 	XLogXactOpMask         uint8 = 0x70
 
 	XLogSmgrCreate   uint8 = 0x10
@@ -261,31 +262,40 @@ payloads:
 	return rec, nil
 }
 
-// RestoreBkpImage reconstructs an 8192-byte page from an uncompressed WALBlockRef FPI.
+// RestoreBkpImage reconstructs an 8192-byte page from a WALBlockRef FPI (uncompressed or PGLZ/LZ4/ZSTD compressed).
 func RestoreBkpImage(ref WALBlockRef) ([]byte, error) {
 	if !ref.HasImage {
 		return nil, errors.New("pageserver: block ref has no full-page image")
 	}
+	payload := ref.ImagePayload
 	compressed := (ref.ImageInfo & (BkpImageCompressPGLZ | BkpImageCompressLZ4 | BkpImageCompressZSTD)) != 0
 	if compressed {
-		return nil, ErrCompressedFPI
+		rawSize := PageSize
+		if (ref.ImageInfo & BkpImageHasHole) != 0 {
+			rawSize = PageSize - int(ref.HoleLength)
+		}
+		var err error
+		payload, err = decompressFPIPayload(ref.ImageInfo, ref.ImagePayload, rawSize)
+		if err != nil {
+			return nil, err
+		}
 	}
 	page := make([]byte, PageSize)
 	if (ref.ImageInfo & BkpImageHasHole) == 0 {
-		if len(ref.ImagePayload) != PageSize {
-			return nil, fmt.Errorf("pageserver: invalid FPI size %d", len(ref.ImagePayload))
+		if len(payload) != PageSize {
+			return nil, fmt.Errorf("pageserver: invalid FPI size %d", len(payload))
 		}
-		copy(page, ref.ImagePayload)
+		copy(page, payload)
 		return page, nil
 	}
 	holeOff := int(ref.HoleOffset)
 	holeLen := int(ref.HoleLength)
-	if holeOff+holeLen > PageSize || len(ref.ImagePayload) != PageSize-holeLen {
-		return nil, fmt.Errorf("pageserver: invalid FPI hole offset=%d len=%d payload=%d", holeOff, holeLen, len(ref.ImagePayload))
+	if holeOff+holeLen > PageSize || len(payload) != PageSize-holeLen {
+		return nil, fmt.Errorf("pageserver: invalid FPI hole offset=%d len=%d payload=%d", holeOff, holeLen, len(payload))
 	}
-	copy(page[:holeOff], ref.ImagePayload[:holeOff])
+	copy(page[:holeOff], payload[:holeOff])
 	// page[holeOff : holeOff+holeLen] remains zeroed.
-	copy(page[holeOff+holeLen:], ref.ImagePayload[holeOff:])
+	copy(page[holeOff+holeLen:], payload[holeOff:])
 	return page, nil
 }
 

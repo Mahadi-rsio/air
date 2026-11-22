@@ -580,7 +580,7 @@ func (p *Pageserver) BootstrapTenantFromPGData(ctx context.Context, tenantID str
 		for _, d := range []struct {
 			dir  string
 			kind uint32
-		}{{"pg_xact", 0}, {"pg_multixact/offsets", SLRUMultiXactOffsetsKind}, {"pg_multixact/members", SLRUMultiXactMembersKind}} {
+		}{{"pg_xact", 0}, {"pg_subtrans", 1}, {"pg_multixact/offsets", SLRUMultiXactOffsetsKind}, {"pg_multixact/members", SLRUMultiXactMembersKind}} {
 			if err := seedSLRU(d.dir, d.kind); err != nil {
 				return err
 			}

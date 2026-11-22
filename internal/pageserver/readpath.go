@@ -455,9 +455,39 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 						subXID := binary.LittleEndian.Uint32(rec.MainData[off : off+4])
 						off += 4
 						markCLOG(subXID)
+						if subXID >= 3 {
+							const subtransPerPage = uint32(PageSize) / 4
+							pgNum := subXID / subtransPerPage
+							slotOff := int(subXID%subtransPerPage) * 4
+							t.slruModifyLocked(Key{Kind: KeyKindSLRU, SpcOID: 1, BlockNum: pgNum}, rec.EndLSN, false, func(p []byte) {
+								if binary.LittleEndian.Uint32(p[slotOff:slotOff+4]) == 0 {
+									binary.LittleEndian.PutUint32(p[slotOff:slotOff+4], rec.XID)
+								}
+							})
+						}
 					}
 				}
 			}
+		}
+	}
+
+	// Track subtransaction -> top-level XID mapping in pg_subtrans SLRU (KeyKindSLRU, SpcOID=1).
+	if rec.Rmid == RmXactID && (rec.Info&XLogXactOpMask) == XLogXactAssignment && len(rec.MainData) >= 8 {
+		xtop := binary.LittleEndian.Uint32(rec.MainData[0:4])
+		nsub := int(binary.LittleEndian.Uint32(rec.MainData[4:8]))
+		off := 8
+		const subtransPerPage = uint32(PageSize) / 4
+		for i := 0; i < nsub && off+4 <= len(rec.MainData); i++ {
+			subXID := binary.LittleEndian.Uint32(rec.MainData[off : off+4])
+			off += 4
+			if subXID < 3 {
+				continue
+			}
+			pgNum := subXID / subtransPerPage
+			slotOff := int(subXID%subtransPerPage) * 4
+			t.slruModifyLocked(Key{Kind: KeyKindSLRU, SpcOID: 1, BlockNum: pgNum}, rec.EndLSN, false, func(p []byte) {
+				binary.LittleEndian.PutUint32(p[slotOff:slotOff+4], xtop)
+			})
 		}
 	}
 

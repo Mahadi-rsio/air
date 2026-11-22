@@ -149,6 +149,9 @@ func prepareRedo(key Key, basePage []byte, deltas []WALDelta) (cur []byte, pendi
 		if (d.Flags & EntryFlagWillInit) != 0 {
 			cur = make([]byte, PageSize)
 		}
+		if (d.Flags&EntryFlagWALRecord) != 0 && len(d.WALRecord) == 0 {
+			return nil, nil, true, ErrTruncatedWAL
+		}
 		if len(d.WALRecord) > 0 {
 			pendingWAL = append(pendingWAL, d.WALRecord)
 		}
@@ -169,7 +172,7 @@ func (r *DefaultWALRedoer) Redo(ctx context.Context, key Key, basePage []byte, d
 		return cur, err
 	}
 	if r.cfg.WorkerBin == "" {
-		if applied, ok := applyHeapWALRecords(key, cur, pendingWAL); ok && len(applied) == PageSize {
+		if applied, ok := ApplyWALRecordsInGo(key, cur, pendingWAL); ok && len(applied) == PageSize {
 			return applied, nil
 		}
 		var rmid uint8
@@ -207,7 +210,7 @@ func (r *DefaultWALRedoer) RedoBatch(ctx context.Context, reqs []WALRedoRequest)
 			continue
 		}
 		if r.cfg.WorkerBin == "" {
-			if applied, ok := applyHeapWALRecords(req.Key, cur, pendingWAL); ok && len(applied) == PageSize {
+			if applied, ok := ApplyWALRecordsInGo(req.Key, cur, pendingWAL); ok && len(applied) == PageSize {
 				pages[i] = applied
 			} else {
 				var rmid uint8
