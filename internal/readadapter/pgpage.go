@@ -698,13 +698,178 @@ func DecodeHeapColumnsInto(tup []byte, hdr HeapTupleHeader, cols []ColumnType, n
 	return DecodeHeapColumnsWithTOASTInto(tup, hdr, cols, needed, dst, copyStrings, nil)
 }
 
+// MissingColumnValue holds the pre-decoded PostgreSQL attmissingval default for a column
+// added via ALTER TABLE ... ADD COLUMN ... DEFAULT without a table rewrite.
+type MissingColumnValue struct {
+	HasMissing  bool
+	Unsupported bool
+	Val         HeapVal
+}
+
+// DecodeMissingValArray decodes a PostgreSQL 17 pg_attribute.attmissingval (1-element ArrayType payload)
+// into a HeapVal for the given ColumnType. Returns (val, true) on success, or (_, false) if the
+// array is malformed, TOASTed, or of an unsupported type.
+func DecodeMissingValArray(ct ColumnType, raw []byte) (HeapVal, bool) {
+	if len(raw) < 20 {
+		return HeapVal{}, false
+	}
+	ndim := int32(binary.LittleEndian.Uint32(raw[0:4]))
+	dataOffset := int32(binary.LittleEndian.Uint32(raw[4:8]))
+	dim1 := int32(binary.LittleEndian.Uint32(raw[12:16]))
+	if ndim != 1 || dim1 != 1 {
+		return HeapVal{}, false
+	}
+	elemOff := 20
+	if dataOffset != 0 {
+		if len(raw) < 21 || int(dataOffset) < 21 || int(dataOffset) > len(raw) {
+			return HeapVal{}, false
+		}
+		if (raw[20] & 0x01) == 0 {
+			return HeapVal{Kind: ValNull}, true
+		}
+		elemOff = int(dataOffset)
+	}
+	if elemOff > len(raw) {
+		return HeapVal{}, false
+	}
+	switch ct {
+	case ColBool:
+		if elemOff+1 > len(raw) {
+			return HeapVal{}, false
+		}
+		var b int64
+		if raw[elemOff] != 0 {
+			b = 1
+		}
+		return HeapVal{Kind: ValBool, I64: b}, true
+	case ColChar:
+		if elemOff+1 > len(raw) {
+			return HeapVal{}, false
+		}
+		return HeapVal{Kind: ValByte, I64: int64(raw[elemOff])}, true
+	case ColInt2:
+		if elemOff+2 > len(raw) {
+			return HeapVal{}, false
+		}
+		return HeapVal{Kind: ValInt64, I64: int64(int16(binary.LittleEndian.Uint16(raw[elemOff : elemOff+2])))}, true
+	case ColInt4:
+		if elemOff+4 > len(raw) {
+			return HeapVal{}, false
+		}
+		return HeapVal{Kind: ValInt64, I64: int64(int32(binary.LittleEndian.Uint32(raw[elemOff : elemOff+4])))}, true
+	case ColOID:
+		if elemOff+4 > len(raw) {
+			return HeapVal{}, false
+		}
+		return HeapVal{Kind: ValInt64, I64: int64(binary.LittleEndian.Uint32(raw[elemOff : elemOff+4]))}, true
+	case ColInt8:
+		if elemOff+8 > len(raw) {
+			return HeapVal{}, false
+		}
+		return HeapVal{Kind: ValInt64, I64: int64(binary.LittleEndian.Uint64(raw[elemOff : elemOff+8]))}, true
+	case ColFloat4:
+		if elemOff+4 > len(raw) {
+			return HeapVal{}, false
+		}
+		return HeapVal{Kind: ValFloat64, F64: float64(math.Float32frombits(binary.LittleEndian.Uint32(raw[elemOff : elemOff+4])))}, true
+	case ColFloat8:
+		if elemOff+8 > len(raw) {
+			return HeapVal{}, false
+		}
+		return HeapVal{Kind: ValFloat64, F64: math.Float64frombits(binary.LittleEndian.Uint64(raw[elemOff : elemOff+8]))}, true
+	case ColName:
+		if elemOff+64 > len(raw) {
+			return HeapVal{}, false
+		}
+		nameRaw := raw[elemOff : elemOff+64]
+		end := 0
+		for end < 64 && nameRaw[end] != 0 {
+			end++
+		}
+		return HeapVal{Kind: ValString, Str: string(nameRaw[:end])}, true
+	case ColText:
+		v, _, err := decodeVarlenaWithTOAST(raw, elemOff, true, nil)
+		if err != nil {
+			return HeapVal{}, false
+		}
+		return HeapVal{Kind: ValString, Str: string(v)}, true
+	case ColBytea:
+		v, _, err := decodeVarlenaWithTOAST(raw, elemOff, true, nil)
+		if err != nil {
+			return HeapVal{}, false
+		}
+		cp := make([]byte, len(v))
+		copy(cp, v)
+		return HeapVal{Kind: ValBytes, Raw: cp}, true
+	case ColJSONB:
+		v, _, err := decodeVarlenaWithTOAST(raw, elemOff, true, nil)
+		if err != nil {
+			return HeapVal{}, false
+		}
+		s, err := decodePGJSONBToText(v)
+		if err != nil {
+			return HeapVal{}, false
+		}
+		return HeapVal{Kind: ValString, Str: s}, true
+	case ColDate:
+		if elemOff+4 > len(raw) {
+			return HeapVal{}, false
+		}
+		days := int32(binary.LittleEndian.Uint32(raw[elemOff : elemOff+4]))
+		return HeapVal{Kind: ValString, Str: pgEpoch.AddDate(0, 0, int(days)).Format("2006-01-02")}, true
+	case ColTimestamp:
+		if elemOff+8 > len(raw) {
+			return HeapVal{}, false
+		}
+		usec := int64(binary.LittleEndian.Uint64(raw[elemOff : elemOff+8]))
+		t := pgEpoch.Add(time.Duration(usec) * time.Microsecond)
+		return HeapVal{Kind: ValString, Str: t.Format("2006-01-02 15:04:05.999999")}, true
+	case ColUUID:
+		if elemOff+16 > len(raw) {
+			return HeapVal{}, false
+		}
+		u := raw[elemOff : elemOff+16]
+		return HeapVal{Kind: ValString, Str: fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+			binary.BigEndian.Uint32(u[0:4]),
+			binary.BigEndian.Uint16(u[4:6]),
+			binary.BigEndian.Uint16(u[6:8]),
+			binary.BigEndian.Uint16(u[8:10]),
+			u[10:16])}, true
+	default:
+		return HeapVal{}, false
+	}
+}
+
 // DecodeHeapColumnsWithTOASTInto decodes projected columns directly into dst, resolving external TOAST pointers via toastFn when non-nil.
 func DecodeHeapColumnsWithTOASTInto(tup []byte, hdr HeapTupleHeader, cols []ColumnType, needed []bool, dst []HeapVal, copyStrings bool, toastFn TOASTResolverFunc) error {
+	return DecodeHeapColumnsWithTOASTAndMissingInto(tup, hdr, cols, needed, dst, copyStrings, toastFn, nil)
+}
+
+// DecodeHeapColumnsWithTOASTAndMissingInto decodes projected columns directly into dst,
+// substituting attmissingval defaults for trailing attributes omitted from older tuples,
+// and resolving external TOAST pointers via toastFn when non-nil.
+func DecodeHeapColumnsWithTOASTAndMissingInto(tup []byte, hdr HeapTupleHeader, cols []ColumnType, needed []bool, dst []HeapVal, copyStrings bool, toastFn TOASTResolverFunc, missing []MissingColumnValue) error {
 	off := int(hdr.Hoff)
 	natts := int(hdr.Infomask2 & HeapNattsMask)
 	for i, ct := range cols {
 		if natts > 0 && i >= natts {
-			dst[i] = HeapVal{Kind: ValNull}
+			want := needed == nil || (i < len(needed) && needed[i])
+			if i < len(missing) && missing[i].HasMissing {
+				if missing[i].Unsupported {
+					if want {
+						return fmt.Errorf("%w: missing default value for column %d requires primary fallback", ErrUnsupportedType, i)
+					}
+					dst[i] = HeapVal{Kind: ValNull}
+					continue
+				}
+				if want {
+					dst[i] = missing[i].Val
+				} else {
+					dst[i] = HeapVal{Kind: ValNull}
+				}
+			} else {
+				dst[i] = HeapVal{Kind: ValNull}
+			}
 			continue
 		}
 		if (hdr.Infomask & HeapHasNull) != 0 {

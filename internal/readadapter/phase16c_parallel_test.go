@@ -118,7 +118,7 @@ func TestPhase16C_ParallelScanAndAggregateCorrectness(t *testing.T) {
 	}
 
 	// 2. parallelScanIter
-	it := newParallelScanIter(ctx, ad, clog, rel, snap, cols, []bool{true, true}, nil, nil, nil, nBlocks, 2)
+	it := newParallelScanIter(ctx, ad, clog, rel, snap, cols, nil, []bool{true, true}, nil, nil, nil, nBlocks, 2)
 	defer it.Close()
 	gotRows := 0
 	for {

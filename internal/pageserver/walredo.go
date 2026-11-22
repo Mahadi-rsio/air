@@ -169,11 +169,8 @@ func (r *DefaultWALRedoer) Redo(ctx context.Context, key Key, basePage []byte, d
 		return cur, err
 	}
 	if r.cfg.WorkerBin == "" {
-		if applied := applyHeapWALRecords(key, cur, pendingWAL); len(applied) == PageSize {
+		if applied, ok := applyHeapWALRecords(key, cur, pendingWAL); ok && len(applied) == PageSize {
 			return applied, nil
-		}
-		if len(cur) == PageSize {
-			return cur, nil
 		}
 		var rmid uint8
 		var rinfo uint8
@@ -210,10 +207,8 @@ func (r *DefaultWALRedoer) RedoBatch(ctx context.Context, reqs []WALRedoRequest)
 			continue
 		}
 		if r.cfg.WorkerBin == "" {
-			if applied := applyHeapWALRecords(req.Key, cur, pendingWAL); len(applied) == PageSize {
+			if applied, ok := applyHeapWALRecords(req.Key, cur, pendingWAL); ok && len(applied) == PageSize {
 				pages[i] = applied
-			} else if len(cur) == PageSize {
-				pages[i] = cur
 			} else {
 				var rmid uint8
 				var rinfo uint8

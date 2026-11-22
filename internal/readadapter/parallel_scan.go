@@ -24,13 +24,14 @@ type parallelScanIter struct {
 	adapter    *Adapter
 	clog       *CLOGResolver
 	snap       *ReadSnapshot
-	allCols    []ColumnType
-	neededCols []bool
-	filterCols []bool
-	filters    []vtabFilter
-	toastFn    TOASTResolverFunc
-	nblocks    uint32
-	workers    int
+	allCols     []ColumnType
+	missingCols []MissingColumnValue
+	neededCols  []bool
+	filterCols  []bool
+	filters     []vtabFilter
+	toastFn     TOASTResolverFunc
+	nblocks     uint32
+	workers     int
 
 	nextBlock atomic.Uint32
 	outCh     chan parallelScanBatch
@@ -45,6 +46,7 @@ func newParallelScanIter(
 	rel *RelationHandle,
 	snap *ReadSnapshot,
 	allCols []ColumnType,
+	missingCols []MissingColumnValue,
 	neededCols []bool,
 	filterCols []bool,
 	filters []vtabFilter,
@@ -60,20 +62,21 @@ func newParallelScanIter(
 	}
 	pctx, pcancel := context.WithCancel(ctx)
 	it := &parallelScanIter{
-		ctx:        pctx,
-		cancel:     pcancel,
-		rel:        rel,
-		adapter:    adapter,
-		clog:       clog,
-		snap:       snap,
-		allCols:    allCols,
-		neededCols: neededCols,
-		filterCols: filterCols,
-		filters:    filters,
-		toastFn:    toastFn,
-		nblocks:    nblocks,
-		workers:    workers,
-		outCh:      make(chan parallelScanBatch, workers*2), // bounded backpressure buffer
+		ctx:         pctx,
+		cancel:      pcancel,
+		rel:         rel,
+		adapter:     adapter,
+		clog:        clog,
+		snap:        snap,
+		allCols:     allCols,
+		missingCols: missingCols,
+		neededCols:  neededCols,
+		filterCols:  filterCols,
+		filters:     filters,
+		toastFn:     toastFn,
+		nblocks:     nblocks,
+		workers:     workers,
+		outCh:       make(chan parallelScanBatch, workers*2), // bounded backpressure buffer
 	}
 	it.wg.Add(workers)
 	for w := 0; w < workers; w++ {
@@ -162,7 +165,7 @@ func (it *parallelScanIter) worker() {
 				}
 				vtabTuplesDecoded.Add(1)
 				if len(it.filterCols) > 0 {
-					if err := DecodeHeapColumnsWithTOASTInto(tup, thdr, it.allCols, it.filterCols, rowBuf, false, it.toastFn); err != nil {
+					if err := DecodeHeapColumnsWithTOASTAndMissingInto(tup, thdr, it.allCols, it.filterCols, rowBuf, false, it.toastFn, it.missingCols); err != nil {
 						select {
 						case it.outCh <- parallelScanBatch{err: err}:
 						case <-it.ctx.Done():
@@ -173,7 +176,7 @@ func (it *parallelScanIter) worker() {
 						continue
 					}
 				}
-				if err := DecodeHeapColumnsWithTOASTInto(tup, thdr, it.allCols, it.neededCols, rowBuf, false, it.toastFn); err != nil {
+				if err := DecodeHeapColumnsWithTOASTAndMissingInto(tup, thdr, it.allCols, it.neededCols, rowBuf, false, it.toastFn, it.missingCols); err != nil {
 					select {
 					case it.outCh <- parallelScanBatch{err: err}:
 					case <-it.ctx.Done():

@@ -256,18 +256,19 @@ const (
 )
 
 type pgVTabSpec struct {
-	ID         uint64
-	db         unsafe.Pointer // *C.sqlite3
-	TenantID   string
-	Generation string
-	Table      DiscoveredTable
-	AllCols    []ColumnType // includes dropped columns for heap offset alignment
-	VisibleIdx []int        // maps SQLite column index -> index in AllCols
-	IndexPlans []btreeIndexPlan
-	Adapter    *Adapter
-	CLOG       *CLOGResolver
-	Optimizer  *QueryOptimizer
-	Adaptive   *AdaptiveTracker
+	ID          uint64
+	db          unsafe.Pointer // *C.sqlite3
+	TenantID    string
+	Generation  string
+	Table       DiscoveredTable
+	AllCols     []ColumnType         // includes dropped columns for heap offset alignment
+	MissingCols []MissingColumnValue // aligned with AllCols for attmissingval fast defaults
+	VisibleIdx  []int                // maps SQLite column index -> index in AllCols
+	IndexPlans  []btreeIndexPlan
+	Adapter     *Adapter
+	CLOG        *CLOGResolver
+	Optimizer   *QueryOptimizer
+	Adaptive    *AdaptiveTracker
 }
 
 type vtabFilter struct {
@@ -400,9 +401,17 @@ func (c *SQLiteConn) RegisterNativeTableWithOptimizer(
 	adaptive *AdaptiveTracker,
 ) (uint64, error) {
 	allCols := make([]ColumnType, len(tbl.Columns))
+	missingCols := make([]MissingColumnValue, len(tbl.Columns))
 	var visibleIdx []int
 	for i, col := range tbl.Columns {
 		allCols[i] = col.ColType
+		if col.HasMissing {
+			missingCols[i] = MissingColumnValue{
+				HasMissing:  true,
+				Unsupported: col.UnsupportedMissing,
+				Val:         col.MissingVal,
+			}
+		}
 		if !col.IsDropped {
 			visibleIdx = append(visibleIdx, i)
 		}
@@ -416,18 +425,19 @@ func (c *SQLiteConn) RegisterNativeTableWithOptimizer(
 
 	id := vtabNextID.Add(1)
 	spec := &pgVTabSpec{
-		ID:         id,
-		db:         unsafe.Pointer(c.db),
-		TenantID:   tenantID,
-		Generation: generation,
-		Table:      tbl,
-		AllCols:    allCols,
-		VisibleIdx: visibleIdx,
-		IndexPlans: buildTableIndexPlans(tbl, allCols, visibleIdx),
-		Adapter:    adapter,
-		CLOG:       clog,
-		Optimizer:  optimizer,
-		Adaptive:   adaptive,
+		ID:          id,
+		db:          unsafe.Pointer(c.db),
+		TenantID:    tenantID,
+		Generation:  generation,
+		Table:       tbl,
+		AllCols:     allCols,
+		MissingCols: missingCols,
+		VisibleIdx:  visibleIdx,
+		IndexPlans:  buildTableIndexPlans(tbl, allCols, visibleIdx),
+		Adapter:     adapter,
+		CLOG:        clog,
+		Optimizer:   optimizer,
+		Adaptive:    adaptive,
 	}
 	vtabMu.Lock()
 	vtabMap[id] = spec
@@ -815,7 +825,7 @@ func (cur *pgVTabCursor) matchesFilters(vals []HeapVal) bool {
 }
 
 func (cur *pgVTabCursor) decodeHeapTupleColumns(_ context.Context, tup []byte, thdr HeapTupleHeader, dst []HeapVal) error {
-	return DecodeHeapColumnsWithTOASTInto(tup, thdr, cur.spec.AllCols, cur.neededCols, dst, false, cur.toastFn)
+	return DecodeHeapColumnsWithTOASTAndMissingInto(tup, thdr, cur.spec.AllCols, cur.neededCols, dst, false, cur.toastFn, cur.spec.MissingCols)
 }
 
 func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
@@ -925,7 +935,7 @@ func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 				vtabTuplesDecoded.Add(1)
 				vtabColsDecoded.Add(decodedColsPerTuple)
 				if len(filterCols) > 0 {
-					if err := DecodeHeapColumnsWithTOASTInto(tup, thdr, cur.spec.AllCols, filterCols, cur.rowBuf, false, cur.toastFn); err != nil {
+					if err := DecodeHeapColumnsWithTOASTAndMissingInto(tup, thdr, cur.spec.AllCols, filterCols, cur.rowBuf, false, cur.toastFn, cur.spec.MissingCols); err != nil {
 						return err
 					}
 					if !cur.matchesFilters(cur.rowBuf) {
@@ -1164,7 +1174,7 @@ func goAirPGFilter(cursorID C.ulonglong, idxNum C.int, idxStr *C.char, argc C.in
 				cur.rowStride = len(cur.spec.AllCols)
 				cur.parallelIter = newParallelScanIter(
 					ctx, cur.spec.Adapter, cur.spec.CLOG, cur.rel, cur.snap,
-					cur.spec.AllCols, cur.neededCols, fcols, cur.filters, cur.toastFn,
+					cur.spec.AllCols, cur.spec.MissingCols, cur.neededCols, fcols, cur.filters, cur.toastFn,
 					cur.nblocks, workers,
 				)
 			}

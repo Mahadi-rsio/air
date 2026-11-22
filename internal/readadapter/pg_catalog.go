@@ -24,12 +24,15 @@ const (
 // DiscoveredColumn describes one user column of a PostgreSQL table discovered
 // directly from PG17 pg_attribute pages.
 type DiscoveredColumn struct {
-	Name       string
-	AttNum     int16
-	PGTypeOID  uint32
-	ColType    ColumnType
-	SQLiteType string
-	IsDropped  bool
+	Name               string
+	AttNum             int16
+	PGTypeOID          uint32
+	ColType            ColumnType
+	SQLiteType         string
+	IsDropped          bool
+	HasMissing         bool
+	MissingVal         HeapVal
+	UnsupportedMissing bool
 }
 
 // DiscoveredIndex describes a PostgreSQL B-tree index discovered from pg_class and pg_index.
@@ -158,48 +161,75 @@ var (
 	}
 
 	pgAttributeCols = []ColumnType{
-		ColOID,  // 1: attrelid
-		ColName, // 2: attname
-		ColOID,  // 3: atttypid
-		ColInt2, // 4: attlen
-		ColInt2, // 5: attnum
-		ColInt4, // 6: attcacheoff
-		ColInt4, // 7: atttypmod
-		ColInt2, // 8: attndims
-		ColBool, // 9: attbyval
-		ColChar, // 10: attalign
-		ColChar, // 11: attstorage
-		ColChar, // 12: attcompression
-		ColBool, // 13: attnotnull
-		ColBool, // 14: atthasdef
-		ColBool, // 15: atthasmissing
-		ColChar, // 16: attidentity
-		ColChar, // 17: attgenerated
-		ColBool, // 18: attisdropped
+		ColOID,   // 1: attrelid
+		ColName,  // 2: attname
+		ColOID,   // 3: atttypid
+		ColInt2,  // 4: attlen
+		ColInt2,  // 5: attnum
+		ColInt4,  // 6: attcacheoff
+		ColInt4,  // 7: atttypmod
+		ColInt2,  // 8: attndims
+		ColBool,  // 9: attbyval
+		ColChar,  // 10: attalign
+		ColChar,  // 11: attstorage
+		ColChar,  // 12: attcompression
+		ColBool,  // 13: attnotnull
+		ColBool,  // 14: atthasdef
+		ColBool,  // 15: atthasmissing
+		ColChar,  // 16: attidentity
+		ColChar,  // 17: attgenerated
+		ColBool,  // 18: attisdropped
+		ColBool,  // 19: attislocal
+		ColInt2,  // 20: attinhcount
+		ColOID,   // 21: attcollation
+		ColInt2,  // 22: attstattarget
+		ColBytea, // 23: attacl
+		ColBytea, // 24: attoptions
+		ColBytea, // 25: attfdwoptions
+		ColBytea, // 26: attmissingval (anyarray)
 	}
 
 	pgAttributeColsPG15 = []ColumnType{
-		ColOID,  // 1: attrelid
-		ColName, // 2: attname
-		ColOID,  // 3: atttypid
-		ColInt4, // 4: attstattarget (PG15)
-		ColInt2, // 5: attlen
-		ColInt2, // 6: attnum
-		ColInt4, // 7: attndims (int4 in PG15)
-		ColInt4, // 8: attcacheoff
-		ColInt4, // 9: atttypmod
-		ColBool, // 10: attbyval
-		ColChar, // 11: attalign
-		ColChar, // 12: attstorage
-		ColChar, // 13: attcompression
-		ColBool, // 14: attnotnull
-		ColBool, // 15: atthasdef
-		ColBool, // 16: atthasmissing
-		ColChar, // 17: attidentity
-		ColChar, // 18: attgenerated
-		ColBool, // 19: attisdropped
+		ColOID,   // 1: attrelid
+		ColName,  // 2: attname
+		ColOID,   // 3: atttypid
+		ColInt4,  // 4: attstattarget (PG15)
+		ColInt2,  // 5: attlen
+		ColInt2,  // 6: attnum
+		ColInt4,  // 7: attndims (int4 in PG15)
+		ColInt4,  // 8: attcacheoff
+		ColInt4,  // 9: atttypmod
+		ColBool,  // 10: attbyval
+		ColChar,  // 11: attalign
+		ColChar,  // 12: attstorage
+		ColChar,  // 13: attcompression
+		ColBool,  // 14: attnotnull
+		ColBool,  // 15: atthasdef
+		ColBool,  // 16: atthasmissing
+		ColChar,  // 17: attidentity
+		ColChar,  // 18: attgenerated
+		ColBool,  // 19: attisdropped
+		ColBool,  // 20: attislocal
+		ColInt2,  // 21: attinhcount
+		ColOID,   // 22: attcollation
+		ColBytea, // 23: attacl
+		ColBytea, // 24: attoptions
+		ColBytea, // 25: attfdwoptions
+		ColBytea, // 26: attmissingval (anyarray)
 	}
 )
+
+var pgAttributeNeeded = func() []bool {
+	n := make([]bool, 26)
+	for i := range n {
+		n[i] = true
+	}
+	// Skip attacl (22), attoptions (23), attfdwoptions (24) to avoid unnecessary allocations/TOAST.
+	n[22] = false
+	n[23] = false
+	n[24] = false
+	return n
+}()
 
 // scanCatalogRelation reads all visible tuples of a PG17 catalog relation at snap.
 func scanCatalogRelation(
@@ -273,7 +303,21 @@ func scanCatalogRelation(
 				if relNumber == PGDatabaseRelID && (thdr.Infomask2&HeapNattsMask) == 16 {
 					decodeCols = pgDatabaseColsPG15
 				}
-				vals, err := DecodeHeapColumns(tup, thdr, decodeCols)
+				var vals []any
+				if relNumber == PGAttributeRelID && len(decodeCols) == 26 {
+					vals, err = DecodeHeapColumnsProjected(tup, thdr, decodeCols, pgAttributeNeeded)
+					if err != nil {
+						// If attmissingval is TOASTed, fall back to decoding fixed prefix so we still
+						// discover the column and mark UnsupportedMissing = true.
+						fixedLen := 18
+						if len(decodeCols) == len(pgAttributeColsPG15) && decodeCols[3] == ColInt4 {
+							fixedLen = 19
+						}
+						vals, err = DecodeHeapColumns(tup, thdr, decodeCols[:fixedLen])
+					}
+				} else {
+					vals, err = DecodeHeapColumns(tup, thdr, decodeCols)
+				}
 				if err != nil {
 					continue
 				}
@@ -458,9 +502,13 @@ func DiscoverCatalog(
 			continue
 		}
 		attNumIdx := 4
+		attLenIdx := 3
+		hasMissingIdx := 14
 		droppedIdx := 17
-		if len(r) == len(pgAttributeColsPG15) {
+		if isPG15 {
+			attLenIdx = 4
 			attNumIdx = 5
+			hasMissingIdx = 15
 			droppedIdx = 18
 		}
 		attNum, _ := r[attNumIdx].(int16)
@@ -469,15 +517,59 @@ func DiscoverCatalog(
 		}
 		attName, _ := r[1].(string)
 		attTypID, _ := r[2].(uint32)
+		attLen, _ := r[attLenIdx].(int16)
+		hasMissing, _ := r[hasMissingIdx].(bool)
 		isDropped, _ := r[droppedIdx].(bool)
 		colType, sqliteType := PGTypeOIDToColumnType(attTypID)
+		if isDropped && colType == ColUnsupported {
+			switch attLen {
+			case 1:
+				colType = ColBool
+			case 2:
+				colType = ColInt2
+			case 4:
+				colType = ColInt4
+			case 8:
+				colType = ColInt8
+			case 16:
+				colType = ColUUID
+			case 64:
+				colType = ColName
+			case -1:
+				colType = ColBytea
+			}
+		}
+		var missingVal HeapVal
+		var unsupportedMissing bool
+		if hasMissing && !isDropped {
+			if len(r) > 25 {
+				if rawArr, ok := r[25].([]byte); ok && len(rawArr) > 0 {
+					mv, decOK := DecodeMissingValArray(colType, rawArr)
+					if decOK {
+						missingVal = mv
+					} else {
+						unsupportedMissing = true
+					}
+				} else if r[25] == nil {
+					missingVal = HeapVal{Kind: ValNull}
+				} else {
+					unsupportedMissing = true
+				}
+			} else {
+				// Fallback prefix decode was used (e.g., TOASTed attmissingval).
+				unsupportedMissing = true
+			}
+		}
 		tbl.Columns = append(tbl.Columns, DiscoveredColumn{
-			Name:       attName,
-			AttNum:     attNum,
-			PGTypeOID:  attTypID,
-			ColType:    colType,
-			SQLiteType: sqliteType,
-			IsDropped:  isDropped,
+			Name:               attName,
+			AttNum:             attNum,
+			PGTypeOID:          attTypID,
+			ColType:            colType,
+			SQLiteType:         sqliteType,
+			IsDropped:          isDropped,
+			HasMissing:         hasMissing,
+			MissingVal:         missingVal,
+			UnsupportedMissing: unsupportedMissing,
 		})
 	}
 

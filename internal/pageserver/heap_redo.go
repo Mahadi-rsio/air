@@ -16,7 +16,27 @@ const (
 	XLogHeapOpMask    uint8 = 0x70
 	XLogHeapInitPage  uint8 = 0x80
 
-	XLogHeap2MultiInsert uint8 = 0x50
+	XLogHeap2PruneOnAccess      uint8 = 0x10
+	XLogHeap2PruneVacuumScan    uint8 = 0x20
+	XLogHeap2PruneVacuumCleanup uint8 = 0x30
+	XLogHeap2Visible            uint8 = 0x40
+	XLogHeap2MultiInsert        uint8 = 0x50
+	XLogHeap2LockUpdated        uint8 = 0x60
+
+	xlhpCleanupLock        uint8 = 1 << 2
+	xlhpHasConflictHorizon uint8 = 1 << 3
+	xlhpHasFreezePlans     uint8 = 1 << 4
+	xlhpHasRedirections    uint8 = 1 << 5
+	xlhpHasDeadItems       uint8 = 1 << 6
+	xlhpHasNowUnusedItems  uint8 = 1 << 7
+
+	xlhFreezeXvac  uint8 = 0x02
+	xlhInvalidXvac uint8 = 0x04
+
+	pgLPUnused   = 0
+	pgLPNormal   = 1
+	pgLPRedirect = 2
+	pgLPDead     = 3
 
 	xlhUpdatePrefixFromOld uint8 = 1 << 5
 	xlhUpdateSuffixFromOld uint8 = 1 << 6
@@ -24,7 +44,6 @@ const (
 	pgPageHeaderSize     = 24
 	pgPageSizeVersion    = 0x2004
 	pgSizeOfHeapTupleHdr = 23
-	pgLPNormal           = 1
 	pgHeapXmaxInvalid    = 0x0800
 )
 
@@ -183,7 +202,9 @@ func findWALBlock(rec *DecodedWALRecord, blockID uint8, key Key) *WALBlockRef {
 
 // applyHeapWALRecords replays pure-Go PG17 Heap/Heap2 WAL records onto basePage
 // when no external walredo worker binary is configured.
-func applyHeapWALRecords(key Key, basePage []byte, records [][]byte) []byte {
+// Returns (page, true) if all WAL records were handled safely, or (nil, false)
+// if an unsupported or malformed WAL record was encountered.
+func applyHeapWALRecords(key Key, basePage []byte, records [][]byte) ([]byte, bool) {
 	var page []byte
 	if len(basePage) == PageSize {
 		page = append([]byte(nil), basePage...)
@@ -192,7 +213,7 @@ func applyHeapWALRecords(key Key, basePage []byte, records [][]byte) []byte {
 	for _, raw := range records {
 		rec, err := DecodeWALRecord(0, raw)
 		if err != nil {
-			continue
+			return nil, false
 		}
 		if rec.Rmid == RmHeapID {
 			op := rec.Info & XLogHeapOpMask
@@ -245,7 +266,15 @@ func applyHeapWALRecords(key Key, basePage []byte, records [][]byte) []byte {
 					}
 				}
 
-				// Block 1 (if present) is old tuple page; if absent, block 0 is both old and new.
+				// Block 1 (if present in rec.Blocks) is the old tuple page for a cross-page update;
+				// if BlockID 1 is absent from rec.Blocks, it is a same-page update where block 0 is both old and new.
+				hasOldBlkRef := false
+				for i := range rec.Blocks {
+					if rec.Blocks[i].BlockID == 1 {
+						hasOldBlkRef = true
+						break
+					}
+				}
 				oldBlk := findWALBlock(rec, 1, key)
 				newBlk := findWALBlock(rec, 0, key)
 				if oldBlk != nil && len(page) == PageSize {
@@ -256,7 +285,7 @@ func applyHeapWALRecords(key Key, basePage []byte, records [][]byte) []byte {
 					if isInit || len(page) != PageSize {
 						page = make([]byte, PageSize)
 						initPGHeapPage(page)
-					} else if oldBlk == nil {
+					} else if !hasOldBlkRef {
 						// Same-page update: snapshot old user data for prefix/suffix reconstruction,
 						// then mark old tuple updated (with t_ctid -> newOffnum and HEAP_HOT_UPDATED) on this page.
 						if oldTup := pageGetHeapTuple(page, oldOffnum); oldTup != nil {
@@ -333,54 +362,235 @@ func applyHeapWALRecords(key Key, basePage []byte, records [][]byte) []byte {
 						copy(tup[hoff:], blk.BlockData)
 					}
 				}
-			}
-		} else if rec.Rmid == RmHeap2ID && (rec.Info&XLogHeapOpMask) == 0x40 {
-			// XLOG_HEAP2_VISIBLE: marks heap page PD_ALL_VISIBLE (0x0004) when base page is present.
-			if len(page) == PageSize {
-				flags := binary.LittleEndian.Uint16(page[10:12])
-				binary.LittleEndian.PutUint16(page[10:12], flags|0x0004)
-			}
-		} else if rec.Rmid == RmHeap2ID && (rec.Info&XLogHeapOpMask) == XLogHeap2MultiInsert {
-			blk := findWALBlock(rec, 0, key)
-			if blk == nil || len(rec.MainData) < 4 {
+
+			case 0x50: // XLOG_HEAP_CONFIRM: speculative insert confirmed; no visibility change needed.
 				continue
+
+			default:
+				return nil, false
 			}
-			isInit := (rec.Info & XLogHeapInitPage) != 0
-			if isInit || len(page) != PageSize {
-				page = make([]byte, PageSize)
-				initPGHeapPage(page)
-			}
-			ntuples := int(binary.LittleEndian.Uint16(rec.MainData[2:4]))
-			data := blk.BlockData
-			off := 0
-			for i := 0; i < ntuples; i++ {
-				off = heapShortAlign(off)
-				if off+7 > len(data) {
-					break
+		} else if rec.Rmid == RmHeap2ID {
+			op := rec.Info & XLogHeapOpMask
+			switch op {
+			case XLogHeap2PruneOnAccess, XLogHeap2PruneVacuumScan, XLogHeap2PruneVacuumCleanup:
+				if !applyHeap2Prune(key, page, rec) {
+					return nil, false
 				}
-				datalen := int(binary.LittleEndian.Uint16(data[off : off+2]))
-				infomask2 := binary.LittleEndian.Uint16(data[off+2 : off+4])
-				infomask := binary.LittleEndian.Uint16(data[off+4 : off+6])
-				hoff := data[off+6]
-				off += 7
-				if off+datalen > len(data) {
-					break
+
+			case XLogHeap2Visible:
+				// XLOG_HEAP2_VISIBLE: marks heap page PD_ALL_VISIBLE (0x0004) when base page is present.
+				if len(page) == PageSize {
+					flags := binary.LittleEndian.Uint16(page[10:12])
+					binary.LittleEndian.PutUint16(page[10:12], flags|0x0004)
 				}
-				var offnum uint16
-				if isInit {
-					offnum = uint16(i + 1)
-				} else if 4+i*2+2 <= len(rec.MainData) {
-					offnum = binary.LittleEndian.Uint16(rec.MainData[4+i*2 : 4+i*2+2])
-				} else {
-					offnum = uint16(i + 1)
+
+			case XLogHeap2MultiInsert:
+				blk := findWALBlock(rec, 0, key)
+				if blk == nil || len(rec.MainData) < 4 {
+					continue
 				}
-				tup := buildTupleFromXLHeader(rec.XID, 0, key.BlockNum, offnum, infomask2, infomask|pgHeapXmaxInvalid, hoff, data[off:off+datalen])
-				pageAddHeapItem(page, offnum, tup)
-				off += datalen
+				isInit := (rec.Info & XLogHeapInitPage) != 0
+				if isInit || len(page) != PageSize {
+					page = make([]byte, PageSize)
+					initPGHeapPage(page)
+				}
+				ntuples := int(binary.LittleEndian.Uint16(rec.MainData[2:4]))
+				data := blk.BlockData
+				off := 0
+				for i := 0; i < ntuples; i++ {
+					off = heapShortAlign(off)
+					if off+7 > len(data) {
+						break
+					}
+					datalen := int(binary.LittleEndian.Uint16(data[off : off+2]))
+					infomask2 := binary.LittleEndian.Uint16(data[off+2 : off+4])
+					infomask := binary.LittleEndian.Uint16(data[off+4 : off+6])
+					hoff := data[off+6]
+					off += 7
+					if off+datalen > len(data) {
+						break
+					}
+					var offnum uint16
+					if isInit {
+						offnum = uint16(i + 1)
+					} else if 4+i*2+2 <= len(rec.MainData) {
+						offnum = binary.LittleEndian.Uint16(rec.MainData[4+i*2 : 4+i*2+2])
+					} else {
+						offnum = uint16(i + 1)
+					}
+					tup := buildTupleFromXLHeader(rec.XID, 0, key.BlockNum, offnum, infomask2, infomask|pgHeapXmaxInvalid, hoff, data[off:off+datalen])
+					pageAddHeapItem(page, offnum, tup)
+					off += datalen
+				}
+
+			case XLogHeap2LockUpdated:
+				blk := findWALBlock(rec, 0, key)
+				if blk == nil || len(rec.MainData) < 8 || len(page) != PageSize {
+					continue
+				}
+				xmax := binary.LittleEndian.Uint32(rec.MainData[0:4])
+				offnum := binary.LittleEndian.Uint16(rec.MainData[4:6])
+				infobits := rec.MainData[6]
+				pageMarkTupleDeleted(page, offnum, xmax, infobits)
+
+			case 0x70: // XLOG_HEAP2_NEW_CID: logical decoding metadata only, does not modify heap page.
+				continue
+
+			default:
+				return nil, false
 			}
 		} else if rec.Rmid == RmBtreeID {
 			page = applyBtreeWALRecords(key, page, [][]byte{raw})
+		} else {
+			return nil, false
 		}
 	}
-	return page
+	if len(page) != PageSize {
+		return nil, false
+	}
+	return page, true
+}
+
+func pageSetLinePointer(page []byte, offnum uint16, lpVal uint32) {
+	if len(page) != PageSize || offnum == 0 {
+		return
+	}
+	lower := int(binary.LittleEndian.Uint16(page[12:14]))
+	lpOff := pgPageHeaderSize + (int(offnum)-1)*4
+	if lpOff+4 > lower {
+		return
+	}
+	binary.LittleEndian.PutUint32(page[lpOff:lpOff+4], lpVal)
+}
+
+// applyHeap2Prune replays PG17 xl_heap_prune (PRUNE_ON_ACCESS, PRUNE_VACUUM_SCAN,
+// PRUNE_VACUUM_CLEANUP) onto page.
+func applyHeap2Prune(key Key, page []byte, rec *DecodedWALRecord) bool {
+	blk := findWALBlock(rec, 0, key)
+	if blk == nil {
+		// Record does not target this block.
+		return true
+	}
+	if len(page) != PageSize || len(rec.MainData) < 2 {
+		return false
+	}
+	flags := rec.MainData[1]
+	data := blk.BlockData
+	off := 0
+
+	type freezePlan struct {
+		xmax       uint32
+		infomask2  uint16
+		infomask   uint16
+		frzflags   uint8
+		ntuples    uint16
+	}
+	var plans []freezePlan
+	totalFrozen := 0
+
+	if (flags & xlhpHasFreezePlans) != 0 {
+		if off+4 > len(data) {
+			return false
+		}
+		nplans := int(binary.LittleEndian.Uint16(data[off : off+2]))
+		off += 4 // uint16 nplans + 2 bytes padding (4-byte alignment)
+		if off+nplans*12 > len(data) {
+			return false
+		}
+		plans = make([]freezePlan, nplans)
+		for i := 0; i < nplans; i++ {
+			p := freezePlan{
+				xmax:      binary.LittleEndian.Uint32(data[off : off+4]),
+				infomask2: binary.LittleEndian.Uint16(data[off+4 : off+6]),
+				infomask:  binary.LittleEndian.Uint16(data[off+6 : off+8]),
+				frzflags:  data[off+8],
+				ntuples:   binary.LittleEndian.Uint16(data[off+10 : off+12]),
+			}
+			plans[i] = p
+			totalFrozen += int(p.ntuples)
+			off += 12
+		}
+	}
+
+	if (flags & xlhpHasRedirections) != 0 {
+		if off+2 > len(data) {
+			return false
+		}
+		nredir := int(binary.LittleEndian.Uint16(data[off : off+2]))
+		off += 2
+		if off+nredir*4 > len(data) {
+			return false
+		}
+		for i := 0; i < nredir; i++ {
+			fromOff := binary.LittleEndian.Uint16(data[off : off+2])
+			toOff := binary.LittleEndian.Uint16(data[off+2 : off+4])
+			off += 4
+			// ItemIdSetRedirect: LP_REDIRECT (2), offset = toOff, length = 0
+			pageSetLinePointer(page, fromOff, uint32(toOff&0x7FFF)|(uint32(pgLPRedirect)<<15))
+		}
+	}
+
+	if (flags & xlhpHasDeadItems) != 0 {
+		if off+2 > len(data) {
+			return false
+		}
+		ndead := int(binary.LittleEndian.Uint16(data[off : off+2]))
+		off += 2
+		if off+ndead*2 > len(data) {
+			return false
+		}
+		for i := 0; i < ndead; i++ {
+			deadOff := binary.LittleEndian.Uint16(data[off : off+2])
+			off += 2
+			// ItemIdSetDead: LP_DEAD (3), offset = 0, length = 0
+			pageSetLinePointer(page, deadOff, uint32(pgLPDead)<<15)
+		}
+	}
+
+	if (flags & xlhpHasNowUnusedItems) != 0 {
+		if off+2 > len(data) {
+			return false
+		}
+		nunused := int(binary.LittleEndian.Uint16(data[off : off+2]))
+		off += 2
+		if off+nunused*2 > len(data) {
+			return false
+		}
+		for i := 0; i < nunused; i++ {
+			unusedOff := binary.LittleEndian.Uint16(data[off : off+2])
+			off += 2
+			// ItemIdSetUnused: LP_UNUSED (0)
+			pageSetLinePointer(page, unusedOff, 0)
+		}
+	}
+
+	if totalFrozen > 0 {
+		if off+totalFrozen*2 > len(data) {
+			return false
+		}
+		frzIdx := 0
+		for _, p := range plans {
+			for k := 0; k < int(p.ntuples); k++ {
+				offnum := binary.LittleEndian.Uint16(data[off+frzIdx*2 : off+frzIdx*2+2])
+				frzIdx++
+				if tup := pageGetHeapTuple(page, offnum); tup != nil {
+					binary.LittleEndian.PutUint32(tup[4:8], p.xmax)
+					binary.LittleEndian.PutUint16(tup[18:20], p.infomask2)
+					binary.LittleEndian.PutUint16(tup[20:22], p.infomask)
+					if (p.frzflags & xlhFreezeXvac) != 0 {
+						binary.LittleEndian.PutUint32(tup[8:12], 2) // FrozenTransactionId
+					} else if (p.frzflags & xlhInvalidXvac) != 0 {
+						binary.LittleEndian.PutUint32(tup[8:12], 0) // InvalidTransactionId
+					}
+				}
+			}
+		}
+	}
+
+	if (flags & xlhpCleanupLock) != 0 {
+		// Clear PD_PAGE_FULL (0x0002)
+		pdFlags := binary.LittleEndian.Uint16(page[10:12])
+		binary.LittleEndian.PutUint16(page[10:12], pdFlags&^0x0002)
+	}
+	return true
 }

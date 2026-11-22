@@ -40,6 +40,9 @@ type SQLiteServerConfig struct {
 	ReadersPerTenant              int
 	QueryTimeout                  time.Duration
 	MaxResultRows                 int64
+	GlobalMemoryLimitBytes        int64
+	TenantMemoryLimitBytes        int64
+	QueryMemoryLimitBytes         int64
 }
 
 type sqliteReaderSlot struct {
@@ -236,7 +239,11 @@ func NewSQLiteReadServer(cfg SQLiteServerConfig) (*SQLiteReadServer, error) {
 	s.queryOptimizer = NewQueryOptimizer(DefaultCostModelConfig(), s.statsCache, s.adaptiveTracker, s.nativeCache)
 	s.planCache = NewQueryPlanCache(0)
 	s.schemaVersions = NewSchemaVersionRegistry()
-	s.memMgr = NewMemoryManager(MemoryManagerConfig{})
+	s.memMgr = NewMemoryManager(MemoryManagerConfig{
+		GlobalLimitBytes:        cfg.GlobalMemoryLimitBytes,
+		DefaultTenantLimitBytes: cfg.TenantMemoryLimitBytes,
+		DefaultQueryLimitBytes:  cfg.QueryMemoryLimitBytes,
+	})
 	s.scheduler = NewTenantScheduler(SchedulerConfig{
 		MemoryManager: s.memMgr,
 	})

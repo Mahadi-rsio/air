@@ -362,7 +362,7 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 		if blk.HasImage {
 			if page, err := RestoreBkpImage(blk); err == nil {
 				if blk.ImageApply && len(rec.RawRecord) > 0 {
-					if applied := applyHeapWALRecords(key, page, [][]byte{rec.RawRecord}); len(applied) == PageSize {
+					if applied, ok := applyHeapWALRecords(key, page, [][]byte{rec.RawRecord}); ok && len(applied) == PageSize {
 						page = applied
 					}
 				}
