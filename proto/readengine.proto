@@ -8,6 +8,8 @@ service ReadEngineService {
   rpc Health(ReadEngineEmpty) returns (ReadEngineHealthResponse);
   rpc EnsureTenant(ReadEngineTenantRequest) returns (ReadEngineTenantRouteResponse);
   rpc GetTenantRoute(ReadEngineTenantRequest) returns (ReadEngineTenantRouteResponse);
+  rpc DeleteTenant(ReadEngineTenantRequest) returns (ReadEngineStatusResponse);
+  rpc ListTenants(ReadEngineEmpty) returns (ReadEngineListTenantsResponse);
   rpc SyncTenant(SyncTenantRequest) returns (ReadEngineStatusResponse);
 }
 
@@ -47,4 +49,8 @@ message SyncTenantRequest {
 message ReadEngineStatusResponse {
   string tenant_id = 1;
   string status = 2;
+}
+
+message ReadEngineListTenantsResponse {
+  repeated string tenant_ids = 1;
 }

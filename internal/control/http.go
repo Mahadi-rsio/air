@@ -25,6 +25,7 @@ const (
 
 type createDatabaseReq struct {
 	TenantID  string `json:"tenant_id"`
+	Namespace string `json:"namespace,omitempty"`
 	AccountID string `json:"account_id,omitempty"`
 }
 
@@ -71,7 +72,7 @@ func (cp *ControlPlane) HTTPHandler() http.Handler {
 
 	v1 := r.Group("/v1", cp.authMiddleware())
 	{
-		v1.POST("/databases", func(c *gin.Context) {
+		createHandler := func(c *gin.Context) {
 			idemKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
 			if idemKey == "" {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "Idempotency-Key header is required"})
@@ -81,12 +82,33 @@ func (cp *ControlPlane) HTTPHandler() http.Handler {
 			if !decodeJSONBody(c, &req, false) {
 				return
 			}
-			resp, err := cp.ProvisionDatabase(c.Request.Context(), c.GetString(accountIDContextKey), idemKey, req.TenantID)
+			tid := strings.TrimSpace(req.TenantID)
+			if tid == "" {
+				tid = strings.TrimSpace(req.Namespace)
+			}
+			resp, err := cp.ProvisionDatabase(c.Request.Context(), c.GetString(accountIDContextKey), idemKey, tid)
 			if err != nil {
 				writeControlError(c, err)
 				return
 			}
 			c.JSON(http.StatusCreated, resp)
+		}
+		v1.POST("/databases", createHandler)
+		v1.POST("/namespaces", createHandler)
+		v1.GET("/namespaces/:id", func(c *gin.Context) {
+			info, err := cp.GetDatabase(c.Request.Context(), c.GetString(accountIDContextKey), c.Param("id"))
+			if err != nil {
+				writeControlError(c, err)
+				return
+			}
+			c.JSON(http.StatusOK, info)
+		})
+		v1.DELETE("/namespaces/:id", func(c *gin.Context) {
+			if err := cp.DeleteDatabase(c.Request.Context(), c.GetString(accountIDContextKey), c.Param("id")); err != nil {
+				writeControlError(c, err)
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"status": "deleted", "tenant_id": c.Param("id")})
 		})
 
 		v1.GET("/databases/:id", func(c *gin.Context) {

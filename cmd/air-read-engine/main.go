@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"github.com/Mahadi-rsio/air/internal/readadapter"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -158,6 +160,32 @@ func (re *SharedReadEngine) EnsureTenantDB(tenantID string) error {
 	return re.sqliteRe.EnsureTenantDB(tenantID)
 }
 
+// DeleteTenantDB removes a tenant namespace from the shared SQLite read engine.
+func (re *SharedReadEngine) DeleteTenantDB(tenantID string) error {
+	if tenantID == "" {
+		return fmt.Errorf("tenant_id is required")
+	}
+	return re.sqliteRe.DeleteTenantDB(tenantID)
+}
+
+func (re *SharedReadEngine) isAuthorizedHTTP(r *http.Request) bool {
+	tok := re.cfg.PageserverInternalToken
+	if tok == "" {
+		return true
+	}
+	if h := strings.TrimSpace(r.Header.Get("X-Air-Internal-Token")); h != "" {
+		if subtle.ConstantTimeCompare([]byte(h), []byte(tok)) == 1 {
+			return true
+		}
+	}
+	if auth := r.Header.Get("Authorization"); len(auth) > 7 && strings.EqualFold(auth[:7], "Bearer ") {
+		if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(auth[7:])), []byte(tok)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
 func (re *SharedReadEngine) HTTPHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -269,12 +297,130 @@ func (re *SharedReadEngine) HTTPHandler() http.Handler {
 			http.Error(w, "not found", http.StatusNotFound)
 		}
 	})
+	handleNamespaces := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !re.isAuthorizedHTTP(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
+		suffix := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/namespaces"), "/")
+		switch {
+		case suffix == "" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"service":    "air-read-engine",
+				"namespaces": re.sqliteRe.Tenants(),
+			})
+		case r.Method == http.MethodPost:
+			var req struct {
+				TenantID  string `json:"tenant_id"`
+				Namespace string `json:"namespace"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			tid := strings.TrimSpace(suffix)
+			if tid == "" {
+				tid = strings.TrimSpace(req.TenantID)
+			}
+			if tid == "" {
+				tid = strings.TrimSpace(req.Namespace)
+			}
+			if tid == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "tenant_id or namespace is required"})
+				return
+			}
+			if err := re.EnsureTenantDB(tid); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":    "active",
+				"service":   "air-read-engine",
+				"tenant_id": tid,
+				"namespace": tid,
+				"engine":    "sqlite",
+				"host":      re.cfg.ListenHost,
+				"pg_port":   re.cfg.PGPort,
+			})
+		case suffix != "" && r.Method == http.MethodGet:
+			found := false
+			for _, t := range re.sqliteRe.Tenants() {
+				if t == suffix {
+					found = true
+					break
+				}
+			}
+			if !found {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "namespace not found"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"service":   "air-read-engine",
+				"tenant_id": suffix,
+				"namespace": suffix,
+				"engine":    "sqlite",
+				"host":      re.cfg.ListenHost,
+				"pg_port":   re.cfg.PGPort,
+				"state":     re.state,
+			})
+		case suffix != "" && r.Method == http.MethodDelete:
+			if err := re.DeleteTenantDB(suffix); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":    "deleted",
+				"service":   "air-read-engine",
+				"tenant_id": suffix,
+			})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
+		}
+	}
+	mux.HandleFunc("/v1/namespaces", handleNamespaces)
+	mux.HandleFunc("/v1/namespaces/", handleNamespaces)
 	return mux
 }
 
 type readEngineGRPCServer struct {
 	pb.UnimplementedReadEngineServiceServer
-	re *SharedReadEngine
+	re            *SharedReadEngine
+	internalToken string
+}
+
+func (s *readEngineGRPCServer) authorize(ctx context.Context) error {
+	if s.internalToken == "" {
+		return nil
+	}
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return status.Error(codes.Unauthenticated, "missing metadata")
+	}
+	for _, key := range []string{"x-air-internal-token", "x-internal-token"} {
+		for _, v := range md.Get(key) {
+			if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(v)), []byte(s.internalToken)) == 1 {
+				return nil
+			}
+		}
+	}
+	return status.Error(codes.Unauthenticated, "unauthorized")
+}
+
+func (s *readEngineGRPCServer) authUnaryInterceptor(
+	ctx context.Context,
+	req any,
+	_ *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+) (any, error) {
+	if err := s.authorize(ctx); err != nil {
+		return nil, err
+	}
+	return handler(ctx, req)
 }
 
 func (s *readEngineGRPCServer) Health(_ context.Context, _ *pb.ReadEngineEmpty) (*pb.ReadEngineHealthResponse, error) {
@@ -327,6 +473,22 @@ func (s *readEngineGRPCServer) GetTenantRoute(_ context.Context, req *pb.ReadEng
 		PgPort:   int32(port),
 		SockDir:  sockDir,
 		State:    state,
+	}, nil
+}
+
+func (s *readEngineGRPCServer) DeleteTenant(_ context.Context, req *pb.ReadEngineTenantRequest) (*pb.ReadEngineStatusResponse, error) {
+	if err := s.re.DeleteTenantDB(req.GetTenantId()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	return &pb.ReadEngineStatusResponse{
+		TenantId: req.GetTenantId(),
+		Status:   "deleted",
+	}, nil
+}
+
+func (s *readEngineGRPCServer) ListTenants(_ context.Context, _ *pb.ReadEngineEmpty) (*pb.ReadEngineListTenantsResponse, error) {
+	return &pb.ReadEngineListTenantsResponse{
+		TenantIds: s.re.sqliteRe.Tenants(),
 	}, nil
 }
 
@@ -386,8 +548,9 @@ func main() {
 			_ = re.Stop()
 			log.Fatalf("grpc listen %s: %v", cfg.GRPCAddr, gErr)
 		}
-		grpcSrv = grpc.NewServer()
-		pb.RegisterReadEngineServiceServer(grpcSrv, &readEngineGRPCServer{re: re})
+		reSvc := &readEngineGRPCServer{re: re, internalToken: cfg.PageserverInternalToken}
+		grpcSrv = grpc.NewServer(grpc.UnaryInterceptor(reSvc.authUnaryInterceptor))
+		pb.RegisterReadEngineServiceServer(grpcSrv, reSvc)
 		go func() {
 			log.Printf("[air-read-engine] gRPC listening on %s", cfg.GRPCAddr)
 			if err := grpcSrv.Serve(grpcLn); err != nil {

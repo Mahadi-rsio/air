@@ -897,6 +897,298 @@ func (x *SetTenantLimitsRequest) GetMaxBackends() int32 {
 	return 0
 }
 
+type RegisterNamespaceRequest struct {
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	TenantId             string                 `protobuf:"bytes,1,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
+	State                string                 `protobuf:"bytes,2,opt,name=state,proto3" json:"state,omitempty"`
+	Host                 string                 `protobuf:"bytes,3,opt,name=host,proto3" json:"host,omitempty"`
+	Port                 int32                  `protobuf:"varint,4,opt,name=port,proto3" json:"port,omitempty"`
+	SockDir              string                 `protobuf:"bytes,5,opt,name=sock_dir,json=sockDir,proto3" json:"sock_dir,omitempty"`
+	AppPassword          string                 `protobuf:"bytes,6,opt,name=app_password,json=appPassword,proto3" json:"app_password,omitempty"`
+	ReadEngineHost       string                 `protobuf:"bytes,7,opt,name=read_engine_host,json=readEngineHost,proto3" json:"read_engine_host,omitempty"`
+	ReadEnginePort       int32                  `protobuf:"varint,8,opt,name=read_engine_port,json=readEnginePort,proto3" json:"read_engine_port,omitempty"`
+	PageserverGeneration string                 `protobuf:"bytes,9,opt,name=pageserver_generation,json=pageserverGeneration,proto3" json:"pageserver_generation,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *RegisterNamespaceRequest) Reset() {
+	*x = RegisterNamespaceRequest{}
+	mi := &file_airdb_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegisterNamespaceRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegisterNamespaceRequest) ProtoMessage() {}
+
+func (x *RegisterNamespaceRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_airdb_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegisterNamespaceRequest.ProtoReflect.Descriptor instead.
+func (*RegisterNamespaceRequest) Descriptor() ([]byte, []int) {
+	return file_airdb_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *RegisterNamespaceRequest) GetTenantId() string {
+	if x != nil {
+		return x.TenantId
+	}
+	return ""
+}
+
+func (x *RegisterNamespaceRequest) GetState() string {
+	if x != nil {
+		return x.State
+	}
+	return ""
+}
+
+func (x *RegisterNamespaceRequest) GetHost() string {
+	if x != nil {
+		return x.Host
+	}
+	return ""
+}
+
+func (x *RegisterNamespaceRequest) GetPort() int32 {
+	if x != nil {
+		return x.Port
+	}
+	return 0
+}
+
+func (x *RegisterNamespaceRequest) GetSockDir() string {
+	if x != nil {
+		return x.SockDir
+	}
+	return ""
+}
+
+func (x *RegisterNamespaceRequest) GetAppPassword() string {
+	if x != nil {
+		return x.AppPassword
+	}
+	return ""
+}
+
+func (x *RegisterNamespaceRequest) GetReadEngineHost() string {
+	if x != nil {
+		return x.ReadEngineHost
+	}
+	return ""
+}
+
+func (x *RegisterNamespaceRequest) GetReadEnginePort() int32 {
+	if x != nil {
+		return x.ReadEnginePort
+	}
+	return 0
+}
+
+func (x *RegisterNamespaceRequest) GetPageserverGeneration() string {
+	if x != nil {
+		return x.PageserverGeneration
+	}
+	return ""
+}
+
+type NamespaceStatusResponse struct {
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	Status              string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	TenantId            string                 `protobuf:"bytes,2,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
+	AirConnected        bool                   `protobuf:"varint,3,opt,name=air_connected,json=airConnected,proto3" json:"air_connected,omitempty"`
+	ReadEngineConnected bool                   `protobuf:"varint,4,opt,name=read_engine_connected,json=readEngineConnected,proto3" json:"read_engine_connected,omitempty"`
+	PageserverConnected bool                   `protobuf:"varint,5,opt,name=pageserver_connected,json=pageserverConnected,proto3" json:"pageserver_connected,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *NamespaceStatusResponse) Reset() {
+	*x = NamespaceStatusResponse{}
+	mi := &file_airdb_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NamespaceStatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NamespaceStatusResponse) ProtoMessage() {}
+
+func (x *NamespaceStatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_airdb_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NamespaceStatusResponse.ProtoReflect.Descriptor instead.
+func (*NamespaceStatusResponse) Descriptor() ([]byte, []int) {
+	return file_airdb_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *NamespaceStatusResponse) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *NamespaceStatusResponse) GetTenantId() string {
+	if x != nil {
+		return x.TenantId
+	}
+	return ""
+}
+
+func (x *NamespaceStatusResponse) GetAirConnected() bool {
+	if x != nil {
+		return x.AirConnected
+	}
+	return false
+}
+
+func (x *NamespaceStatusResponse) GetReadEngineConnected() bool {
+	if x != nil {
+		return x.ReadEngineConnected
+	}
+	return false
+}
+
+func (x *NamespaceStatusResponse) GetPageserverConnected() bool {
+	if x != nil {
+		return x.PageserverConnected
+	}
+	return false
+}
+
+type NamespaceInfoResponse struct {
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	TenantId             string                 `protobuf:"bytes,1,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
+	State                string                 `protobuf:"bytes,2,opt,name=state,proto3" json:"state,omitempty"`
+	AirHost              string                 `protobuf:"bytes,3,opt,name=air_host,json=airHost,proto3" json:"air_host,omitempty"`
+	AirPort              int32                  `protobuf:"varint,4,opt,name=air_port,json=airPort,proto3" json:"air_port,omitempty"`
+	ReadEngineHost       string                 `protobuf:"bytes,5,opt,name=read_engine_host,json=readEngineHost,proto3" json:"read_engine_host,omitempty"`
+	ReadEnginePort       int32                  `protobuf:"varint,6,opt,name=read_engine_port,json=readEnginePort,proto3" json:"read_engine_port,omitempty"`
+	PageserverExists     bool                   `protobuf:"varint,7,opt,name=pageserver_exists,json=pageserverExists,proto3" json:"pageserver_exists,omitempty"`
+	PageserverGeneration string                 `protobuf:"bytes,8,opt,name=pageserver_generation,json=pageserverGeneration,proto3" json:"pageserver_generation,omitempty"`
+	PageserverLastLsn    uint64                 `protobuf:"varint,9,opt,name=pageserver_last_lsn,json=pageserverLastLsn,proto3" json:"pageserver_last_lsn,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *NamespaceInfoResponse) Reset() {
+	*x = NamespaceInfoResponse{}
+	mi := &file_airdb_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NamespaceInfoResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NamespaceInfoResponse) ProtoMessage() {}
+
+func (x *NamespaceInfoResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_airdb_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NamespaceInfoResponse.ProtoReflect.Descriptor instead.
+func (*NamespaceInfoResponse) Descriptor() ([]byte, []int) {
+	return file_airdb_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *NamespaceInfoResponse) GetTenantId() string {
+	if x != nil {
+		return x.TenantId
+	}
+	return ""
+}
+
+func (x *NamespaceInfoResponse) GetState() string {
+	if x != nil {
+		return x.State
+	}
+	return ""
+}
+
+func (x *NamespaceInfoResponse) GetAirHost() string {
+	if x != nil {
+		return x.AirHost
+	}
+	return ""
+}
+
+func (x *NamespaceInfoResponse) GetAirPort() int32 {
+	if x != nil {
+		return x.AirPort
+	}
+	return 0
+}
+
+func (x *NamespaceInfoResponse) GetReadEngineHost() string {
+	if x != nil {
+		return x.ReadEngineHost
+	}
+	return ""
+}
+
+func (x *NamespaceInfoResponse) GetReadEnginePort() int32 {
+	if x != nil {
+		return x.ReadEnginePort
+	}
+	return 0
+}
+
+func (x *NamespaceInfoResponse) GetPageserverExists() bool {
+	if x != nil {
+		return x.PageserverExists
+	}
+	return false
+}
+
+func (x *NamespaceInfoResponse) GetPageserverGeneration() string {
+	if x != nil {
+		return x.PageserverGeneration
+	}
+	return ""
+}
+
+func (x *NamespaceInfoResponse) GetPageserverLastLsn() uint64 {
+	if x != nil {
+		return x.PageserverLastLsn
+	}
+	return 0
+}
+
 var File_airdb_proto protoreflect.FileDescriptor
 
 const file_airdb_proto_rawDesc = "" +
@@ -962,7 +1254,33 @@ const file_airdb_proto_rawDesc = "" +
 	"\x16SetTenantLimitsRequest\x12\x1b\n" +
 	"\ttenant_id\x18\x01 \x01(\tR\btenantId\x12(\n" +
 	"\x10max_client_conns\x18\x02 \x01(\x05R\x0emaxClientConns\x12!\n" +
-	"\fmax_backends\x18\x03 \x01(\x05R\vmaxBackends*\x83\x01\n" +
+	"\fmax_backends\x18\x03 \x01(\x05R\vmaxBackends\"\xbc\x02\n" +
+	"\x18RegisterNamespaceRequest\x12\x1b\n" +
+	"\ttenant_id\x18\x01 \x01(\tR\btenantId\x12\x14\n" +
+	"\x05state\x18\x02 \x01(\tR\x05state\x12\x12\n" +
+	"\x04host\x18\x03 \x01(\tR\x04host\x12\x12\n" +
+	"\x04port\x18\x04 \x01(\x05R\x04port\x12\x19\n" +
+	"\bsock_dir\x18\x05 \x01(\tR\asockDir\x12!\n" +
+	"\fapp_password\x18\x06 \x01(\tR\vappPassword\x12(\n" +
+	"\x10read_engine_host\x18\a \x01(\tR\x0ereadEngineHost\x12(\n" +
+	"\x10read_engine_port\x18\b \x01(\x05R\x0ereadEnginePort\x123\n" +
+	"\x15pageserver_generation\x18\t \x01(\tR\x14pageserverGeneration\"\xda\x01\n" +
+	"\x17NamespaceStatusResponse\x12\x16\n" +
+	"\x06status\x18\x01 \x01(\tR\x06status\x12\x1b\n" +
+	"\ttenant_id\x18\x02 \x01(\tR\btenantId\x12#\n" +
+	"\rair_connected\x18\x03 \x01(\bR\fairConnected\x122\n" +
+	"\x15read_engine_connected\x18\x04 \x01(\bR\x13readEngineConnected\x121\n" +
+	"\x14pageserver_connected\x18\x05 \x01(\bR\x13pageserverConnected\"\xe6\x02\n" +
+	"\x15NamespaceInfoResponse\x12\x1b\n" +
+	"\ttenant_id\x18\x01 \x01(\tR\btenantId\x12\x14\n" +
+	"\x05state\x18\x02 \x01(\tR\x05state\x12\x19\n" +
+	"\bair_host\x18\x03 \x01(\tR\aairHost\x12\x19\n" +
+	"\bair_port\x18\x04 \x01(\x05R\aairPort\x12(\n" +
+	"\x10read_engine_host\x18\x05 \x01(\tR\x0ereadEngineHost\x12(\n" +
+	"\x10read_engine_port\x18\x06 \x01(\x05R\x0ereadEnginePort\x12+\n" +
+	"\x11pageserver_exists\x18\a \x01(\bR\x10pageserverExists\x123\n" +
+	"\x15pageserver_generation\x18\b \x01(\tR\x14pageserverGeneration\x12.\n" +
+	"\x13pageserver_last_lsn\x18\t \x01(\x04R\x11pageserverLastLsn*\x83\x01\n" +
 	"\x0fTenantEventType\x12\x1c\n" +
 	"\x18TENANT_EVENT_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13TENANT_EVENT_UPSERT\x10\x01\x12\x17\n" +
@@ -982,10 +1300,13 @@ const file_airdb_proto_rawDesc = "" +
 	"\x0fSuspendDatabase\x12\x18.air.db.v1.TenantRequest\x1a\x19.air.db.v1.StatusResponse\x12I\n" +
 	"\rStartDatabase\x12\x18.air.db.v1.TenantRequest\x1a\x1e.air.db.v1.TenantRouteResponse\x12C\n" +
 	"\fLockDatabase\x12\x18.air.db.v1.TenantRequest\x1a\x19.air.db.v1.StatusResponse\x12E\n" +
-	"\x0eUnlockDatabase\x12\x18.air.db.v1.TenantRequest\x1a\x19.air.db.v1.StatusResponse2\xa8\x01\n" +
+	"\x0eUnlockDatabase\x12\x18.air.db.v1.TenantRequest\x1a\x19.air.db.v1.StatusResponse2\x9a\x03\n" +
 	"\fGatewayAdmin\x12G\n" +
 	"\vDrainTenant\x12\x1d.air.db.v1.DrainTenantRequest\x1a\x19.air.db.v1.StatusResponse\x12O\n" +
-	"\x0fSetTenantLimits\x12!.air.db.v1.SetTenantLimitsRequest\x1a\x19.air.db.v1.StatusResponseB+Z)github.com/Mahadi-rsio/air/internal/pb;pbb\x06proto3"
+	"\x0fSetTenantLimits\x12!.air.db.v1.SetTenantLimitsRequest\x1a\x19.air.db.v1.StatusResponse\x12\\\n" +
+	"\x11RegisterNamespace\x12#.air.db.v1.RegisterNamespaceRequest\x1a\".air.db.v1.NamespaceStatusResponse\x12F\n" +
+	"\x0fDeleteNamespace\x12\x18.air.db.v1.TenantRequest\x1a\x19.air.db.v1.StatusResponse\x12J\n" +
+	"\fGetNamespace\x12\x18.air.db.v1.TenantRequest\x1a .air.db.v1.NamespaceInfoResponseB+Z)github.com/Mahadi-rsio/air/internal/pb;pbb\x06proto3"
 
 var (
 	file_airdb_proto_rawDescOnce sync.Once
@@ -1000,7 +1321,7 @@ func file_airdb_proto_rawDescGZIP() []byte {
 }
 
 var file_airdb_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_airdb_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_airdb_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_airdb_proto_goTypes = []any{
 	(TenantEventType)(0),              // 0: air.db.v1.TenantEventType
 	(*Empty)(nil),                     // 1: air.db.v1.Empty
@@ -1017,6 +1338,9 @@ var file_airdb_proto_goTypes = []any{
 	(*BatchTouchActivityRequest)(nil), // 12: air.db.v1.BatchTouchActivityRequest
 	(*DrainTenantRequest)(nil),        // 13: air.db.v1.DrainTenantRequest
 	(*SetTenantLimitsRequest)(nil),    // 14: air.db.v1.SetTenantLimitsRequest
+	(*RegisterNamespaceRequest)(nil),  // 15: air.db.v1.RegisterNamespaceRequest
+	(*NamespaceStatusResponse)(nil),   // 16: air.db.v1.NamespaceStatusResponse
+	(*NamespaceInfoResponse)(nil),     // 17: air.db.v1.NamespaceInfoResponse
 }
 var file_airdb_proto_depIdxs = []int32{
 	6,  // 0: air.db.v1.ListDatabasesResponse.databases:type_name -> air.db.v1.DatabaseInfo
@@ -1037,23 +1361,29 @@ var file_airdb_proto_depIdxs = []int32{
 	2,  // 15: air.db.v1.AirDBControl.UnlockDatabase:input_type -> air.db.v1.TenantRequest
 	13, // 16: air.db.v1.GatewayAdmin.DrainTenant:input_type -> air.db.v1.DrainTenantRequest
 	14, // 17: air.db.v1.GatewayAdmin.SetTenantLimits:input_type -> air.db.v1.SetTenantLimitsRequest
-	3,  // 18: air.db.v1.AirDBControl.GetTenantRoute:output_type -> air.db.v1.TenantRouteResponse
-	3,  // 19: air.db.v1.AirDBControl.WakeTenant:output_type -> air.db.v1.TenantRouteResponse
-	1,  // 20: air.db.v1.AirDBControl.TouchActivity:output_type -> air.db.v1.Empty
-	1,  // 21: air.db.v1.AirDBControl.BatchTouchActivity:output_type -> air.db.v1.Empty
-	11, // 22: air.db.v1.AirDBControl.WatchTenantChanges:output_type -> air.db.v1.TenantChangeEvent
-	5,  // 23: air.db.v1.AirDBControl.CreateDatabase:output_type -> air.db.v1.CreateDatabaseResponse
-	8,  // 24: air.db.v1.AirDBControl.ListDatabases:output_type -> air.db.v1.ListDatabasesResponse
-	6,  // 25: air.db.v1.AirDBControl.GetDatabase:output_type -> air.db.v1.DatabaseInfo
-	9,  // 26: air.db.v1.AirDBControl.DeleteDatabase:output_type -> air.db.v1.StatusResponse
-	9,  // 27: air.db.v1.AirDBControl.SuspendDatabase:output_type -> air.db.v1.StatusResponse
-	3,  // 28: air.db.v1.AirDBControl.StartDatabase:output_type -> air.db.v1.TenantRouteResponse
-	9,  // 29: air.db.v1.AirDBControl.LockDatabase:output_type -> air.db.v1.StatusResponse
-	9,  // 30: air.db.v1.AirDBControl.UnlockDatabase:output_type -> air.db.v1.StatusResponse
-	9,  // 31: air.db.v1.GatewayAdmin.DrainTenant:output_type -> air.db.v1.StatusResponse
-	9,  // 32: air.db.v1.GatewayAdmin.SetTenantLimits:output_type -> air.db.v1.StatusResponse
-	18, // [18:33] is the sub-list for method output_type
-	3,  // [3:18] is the sub-list for method input_type
+	15, // 18: air.db.v1.GatewayAdmin.RegisterNamespace:input_type -> air.db.v1.RegisterNamespaceRequest
+	2,  // 19: air.db.v1.GatewayAdmin.DeleteNamespace:input_type -> air.db.v1.TenantRequest
+	2,  // 20: air.db.v1.GatewayAdmin.GetNamespace:input_type -> air.db.v1.TenantRequest
+	3,  // 21: air.db.v1.AirDBControl.GetTenantRoute:output_type -> air.db.v1.TenantRouteResponse
+	3,  // 22: air.db.v1.AirDBControl.WakeTenant:output_type -> air.db.v1.TenantRouteResponse
+	1,  // 23: air.db.v1.AirDBControl.TouchActivity:output_type -> air.db.v1.Empty
+	1,  // 24: air.db.v1.AirDBControl.BatchTouchActivity:output_type -> air.db.v1.Empty
+	11, // 25: air.db.v1.AirDBControl.WatchTenantChanges:output_type -> air.db.v1.TenantChangeEvent
+	5,  // 26: air.db.v1.AirDBControl.CreateDatabase:output_type -> air.db.v1.CreateDatabaseResponse
+	8,  // 27: air.db.v1.AirDBControl.ListDatabases:output_type -> air.db.v1.ListDatabasesResponse
+	6,  // 28: air.db.v1.AirDBControl.GetDatabase:output_type -> air.db.v1.DatabaseInfo
+	9,  // 29: air.db.v1.AirDBControl.DeleteDatabase:output_type -> air.db.v1.StatusResponse
+	9,  // 30: air.db.v1.AirDBControl.SuspendDatabase:output_type -> air.db.v1.StatusResponse
+	3,  // 31: air.db.v1.AirDBControl.StartDatabase:output_type -> air.db.v1.TenantRouteResponse
+	9,  // 32: air.db.v1.AirDBControl.LockDatabase:output_type -> air.db.v1.StatusResponse
+	9,  // 33: air.db.v1.AirDBControl.UnlockDatabase:output_type -> air.db.v1.StatusResponse
+	9,  // 34: air.db.v1.GatewayAdmin.DrainTenant:output_type -> air.db.v1.StatusResponse
+	9,  // 35: air.db.v1.GatewayAdmin.SetTenantLimits:output_type -> air.db.v1.StatusResponse
+	16, // 36: air.db.v1.GatewayAdmin.RegisterNamespace:output_type -> air.db.v1.NamespaceStatusResponse
+	9,  // 37: air.db.v1.GatewayAdmin.DeleteNamespace:output_type -> air.db.v1.StatusResponse
+	17, // 38: air.db.v1.GatewayAdmin.GetNamespace:output_type -> air.db.v1.NamespaceInfoResponse
+	21, // [21:39] is the sub-list for method output_type
+	3,  // [3:21] is the sub-list for method input_type
 	3,  // [3:3] is the sub-list for extension type_name
 	3,  // [3:3] is the sub-list for extension extendee
 	0,  // [0:3] is the sub-list for field type_name
@@ -1070,7 +1400,7 @@ func file_airdb_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_airdb_proto_rawDesc), len(file_airdb_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   14,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

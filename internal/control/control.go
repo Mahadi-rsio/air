@@ -108,6 +108,8 @@ type ControlPlane struct {
 	internalToken        string
 	backendHost          string
 	pageserver           PageserverClient
+	readEngine           ReadEngineClient
+	gatewayAdmin         GatewayAdminClient
 	psMu                 sync.RWMutex
 	wakeGroup            singleflight.Group
 	tenantLocksMu        sync.Mutex
@@ -296,6 +298,32 @@ func (cp *ControlPlane) getPageserver() PageserverClient {
 	cp.psMu.RLock()
 	defer cp.psMu.RUnlock()
 	return cp.pageserver
+}
+
+// SetReadEngineClient attaches a remote air-read-engine gRPC client for namespace orchestration.
+func (cp *ControlPlane) SetReadEngineClient(rec ReadEngineClient) {
+	cp.psMu.Lock()
+	cp.readEngine = rec
+	cp.psMu.Unlock()
+}
+
+func (cp *ControlPlane) getReadEngine() ReadEngineClient {
+	cp.psMu.RLock()
+	defer cp.psMu.RUnlock()
+	return cp.readEngine
+}
+
+// SetGatewayAdminClient attaches a remote air-gateway GatewayAdmin gRPC client for namespace registration.
+func (cp *ControlPlane) SetGatewayAdminClient(gwc GatewayAdminClient) {
+	cp.psMu.Lock()
+	cp.gatewayAdmin = gwc
+	cp.psMu.Unlock()
+}
+
+func (cp *ControlPlane) getGatewayAdmin() GatewayAdminClient {
+	cp.psMu.RLock()
+	defer cp.psMu.RUnlock()
+	return cp.gatewayAdmin
 }
 
 func parsePGLSN(s string) (uint64, error) {
@@ -613,7 +641,11 @@ func (cp *ControlPlane) ProvisionDatabase(ctx context.Context, accountID, idempo
 	gen := newGenerationID()
 
 	if ps := cp.getPageserver(); ps != nil {
-		ps.SetTenantGeneration(ctx, tenantID, gen)
+		// Step 2: Create/ensure tenant namespace on air-pageserver with its wrapped DEK before bootstrapping layers.
+		if _, eErr := ps.EnsureTenant(ctx, tenantID, 1, gen, false, wrappedDEK); eErr != nil {
+			cp.rollbackOp(ctx, opID, tenantID, eErr)
+			return nil, eErr
+		}
 		var pgDataDir string
 		if activeDir, pdErr := cp.agent.TenantPGDataDir(tenantID); pdErr == nil {
 			if _, statErr := os.Stat(filepath.Join(activeDir, "PG_VERSION")); statErr == nil {
@@ -710,6 +742,35 @@ func (cp *ControlPlane) ProvisionDatabase(ctx context.Context, accountID, idempo
 	if err := cp.ensurePageserverBootstrapAndWAL(ctx, tenantID, rt); err != nil {
 		log.Printf("[pageserver] bootstrap/walreceiver for %s failed: %v", tenantID, err)
 	}
+
+	// Step 3: Create tenant namespace on air-read-engine via gRPC (if connected).
+	var reHost string
+	var rePort int
+	if re := cp.getReadEngine(); re != nil {
+		var reErr error
+		reHost, rePort, reErr = re.EnsureTenant(ctx, tenantID)
+		if reErr != nil {
+			log.Printf("[read-engine] ensure namespace %s warning: %v", tenantID, reErr)
+		}
+	}
+
+	// Step 4: Register tenant namespace on air-gateway via GatewayAdmin gRPC (if connected).
+	if gw := cp.getGatewayAdmin(); gw != nil {
+		if gwErr := gw.RegisterNamespace(ctx, GatewayNamespaceSpec{
+			TenantID:             tenantID,
+			State:                "ACTIVE",
+			Host:                 cp.backendHost,
+			Port:                 rt.Port,
+			SockDir:              rt.SockDir,
+			AppPassword:          appPW,
+			ReadEngineHost:       reHost,
+			ReadEnginePort:       rePort,
+			PageserverGeneration: gen,
+		}); gwErr != nil {
+			log.Printf("[gateway] register namespace %s warning: %v", tenantID, gwErr)
+		}
+	}
+
 	cp.TouchTenantActivity(tenantID)
 
 	resp.Password = appPW
@@ -900,6 +961,12 @@ func (cp *ControlPlane) DeleteDatabase(ctx context.Context, accountID, tenantID 
 		tenantID,
 	)
 	cp.stopWALReceiver(tenantID)
+	if gw := cp.getGatewayAdmin(); gw != nil {
+		_ = gw.DeleteNamespace(ctx, tenantID)
+	}
+	if re := cp.getReadEngine(); re != nil {
+		_ = re.DeleteTenant(ctx, tenantID)
+	}
 	if cp.agent != nil {
 		if err := cp.agent.StopAndPurgeTenant(tenantID); err != nil {
 			return err

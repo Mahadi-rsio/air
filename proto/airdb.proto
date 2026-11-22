@@ -101,6 +101,9 @@ message BatchTouchActivityRequest {
 service GatewayAdmin {
   rpc DrainTenant(DrainTenantRequest) returns (StatusResponse);
   rpc SetTenantLimits(SetTenantLimitsRequest) returns (StatusResponse);
+  rpc RegisterNamespace(RegisterNamespaceRequest) returns (NamespaceStatusResponse);
+  rpc DeleteNamespace(TenantRequest) returns (StatusResponse);
+  rpc GetNamespace(TenantRequest) returns (NamespaceInfoResponse);
 }
 
 message DrainTenantRequest {
@@ -112,4 +115,36 @@ message SetTenantLimitsRequest {
   string tenant_id = 1;
   int32 max_client_conns = 2;
   int32 max_backends = 3;
+}
+
+message RegisterNamespaceRequest {
+  string tenant_id = 1;
+  string state = 2;
+  string host = 3;
+  int32 port = 4;
+  string sock_dir = 5;
+  string app_password = 6;
+  string read_engine_host = 7;
+  int32 read_engine_port = 8;
+  string pageserver_generation = 9;
+}
+
+message NamespaceStatusResponse {
+  string status = 1;
+  string tenant_id = 2;
+  bool air_connected = 3;
+  bool read_engine_connected = 4;
+  bool pageserver_connected = 5;
+}
+
+message NamespaceInfoResponse {
+  string tenant_id = 1;
+  string state = 2;
+  string air_host = 3;
+  int32 air_port = 4;
+  string read_engine_host = 5;
+  int32 read_engine_port = 6;
+  bool pageserver_exists = 7;
+  string pageserver_generation = 8;
+  uint64 pageserver_last_lsn = 9;
 }

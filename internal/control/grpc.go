@@ -42,14 +42,14 @@ func (cp *ControlPlane) authorizeGRPCContext(ctx context.Context) error {
 	if !ok {
 		return status.Error(codes.Unauthenticated, "missing metadata")
 	}
-	var got string
-	if vals := md.Get("x-air-internal-token"); len(vals) > 0 {
-		got = strings.TrimSpace(vals[0])
+	for _, key := range []string{"x-air-internal-token", "x-internal-token"} {
+		for _, v := range md.Get(key) {
+			if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(v)), []byte(cp.internalToken)) == 1 {
+				return nil
+			}
+		}
 	}
-	if subtle.ConstantTimeCompare([]byte(got), []byte(cp.internalToken)) != 1 {
-		return status.Error(codes.Unauthenticated, "unauthorized")
-	}
-	return nil
+	return status.Error(codes.Unauthenticated, "unauthorized")
 }
 
 func (cp *ControlPlane) grpcAuthInterceptor(

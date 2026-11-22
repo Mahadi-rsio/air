@@ -76,6 +76,32 @@ func main() {
 		log.Printf("[air-server] connected to standalone pageserver via gRPC (%s)", cfg.PageserverGRPCAddr)
 	}
 
+	var reClient control.ReadEngineClient
+	if cfg.ReadEngineGRPCAddr != "" {
+		var reErr error
+		reClient, reErr = control.NewGRPCReadEngineClient(cfg.ReadEngineGRPCAddr, cfg.InternalToken)
+		if reErr != nil {
+			log.Printf("[air-server] read-engine gRPC dial warning (%s): %v", cfg.ReadEngineGRPCAddr, reErr)
+		} else {
+			cp.SetReadEngineClient(reClient)
+			defer func() { _ = reClient.Close() }()
+			log.Printf("[air-server] connected to air-read-engine via gRPC (%s)", cfg.ReadEngineGRPCAddr)
+		}
+	}
+
+	var gwAdminClient control.GatewayAdminClient
+	if cfg.GatewayAdminGRPCAddr != "" {
+		var gwErr error
+		gwAdminClient, gwErr = control.NewGRPCGatewayAdminClient(cfg.GatewayAdminGRPCAddr, cfg.InternalToken)
+		if gwErr != nil {
+			log.Printf("[air-server] gateway admin gRPC dial warning (%s): %v", cfg.GatewayAdminGRPCAddr, gwErr)
+		} else {
+			cp.SetGatewayAdminClient(gwAdminClient)
+			defer func() { _ = gwAdminClient.Close() }()
+			log.Printf("[air-server] connected to air-gateway admin via gRPC (%s)", cfg.GatewayAdminGRPCAddr)
+		}
+	}
+
 	if cfg.BootstrapAPIKey != "" {
 		keyInfo, err := cp.SeedAPIKey(ctx, cfg.BootstrapAccountID, cfg.BootstrapAPIKey, "bootstrap")
 		if err != nil {

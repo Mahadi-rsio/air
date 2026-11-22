@@ -652,6 +652,45 @@ func (s *SQLiteReadServer) EnsureTenantDB(tenantID string) error {
 	return nil
 }
 
+// DeleteTenantDB closes and removes a tenant namespace from the shared SQLite read engine.
+func (s *SQLiteReadServer) DeleteTenantDB(tenantID string) error {
+	if tenantID == "" {
+		return ErrInvalidTenant
+	}
+	s.mu.Lock()
+	ts, ok := s.tenants[tenantID]
+	if ok {
+		delete(s.tenants, tenantID)
+	}
+	s.mu.Unlock()
+	if !ok || ts == nil {
+		return nil
+	}
+	for _, vid := range ts.vtabIDs {
+		UnregisterNativeTable(vid)
+	}
+	for _, slot := range ts.readers {
+		for _, vid := range slot.vtabIDs {
+			UnregisterNativeTable(vid)
+		}
+		if slot.conn != nil {
+			_ = slot.conn.Close()
+		}
+	}
+	if len(ts.readers) == 0 && ts.Reader != nil {
+		_ = ts.Reader.Close()
+	}
+	if ts.Writer != nil {
+		_ = ts.Writer.Close()
+	}
+	if ts.DBPath != "" && ts.DBPath != ":memory:" {
+		_ = os.Remove(ts.DBPath)
+		_ = os.Remove(ts.DBPath + "-wal")
+		_ = os.Remove(ts.DBPath + "-shm")
+	}
+	return nil
+}
+
 func (s *SQLiteReadServer) ensureTenantLocked(tenantID string) (*SQLiteTenantStore, error) {
 	if ts, ok := s.tenants[tenantID]; ok {
 		return ts, nil

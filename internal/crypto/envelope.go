@@ -86,8 +86,16 @@ func NewEnvelopeKMS() (*EnvelopeKMS, error) {
 	}, nil
 }
 
-// LoadOrCreateEnvelopeKMS loads a persistent 32-byte hex-encoded KEK from keyPath or creates one atomically (0600).
+// LoadOrCreateEnvelopeKMS loads a persistent 32-byte hex-encoded KEK from AIR_MASTER_KEY_HEX
+// (if set) or keyPath, or creates one atomically (0600).
 func LoadOrCreateEnvelopeKMS(keyPath string) (*EnvelopeKMS, error) {
+	if envHex := strings.TrimSpace(os.Getenv("AIR_MASTER_KEY_HEX")); envHex != "" {
+		kek, decErr := hex.DecodeString(envHex)
+		if decErr != nil || len(kek) != 32 {
+			return nil, fmt.Errorf("invalid AIR_MASTER_KEY_HEX (must be 64 hex chars / 32 bytes)")
+		}
+		return &EnvelopeKMS{kek: kek, wrappedDEKs: make(map[string][]byte), aeadCache: make(map[string]cipher.AEAD)}, nil
+	}
 	if raw, err := os.ReadFile(keyPath); err == nil {
 		kek, decErr := hex.DecodeString(strings.TrimSpace(string(raw)))
 		if decErr != nil || len(kek) != 32 {

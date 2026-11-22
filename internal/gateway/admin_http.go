@@ -19,6 +19,8 @@ type AdminHTTPServer struct {
 	discovery     *TenantDiscovery
 	pools         *PoolManager
 	metrics       *MetricsRegistry
+	reGRPC        *ReadEngineGRPCClient
+	psGRPC        *PageserverGRPCClient
 
 	ln  net.Listener
 	srv *http.Server
@@ -32,6 +34,12 @@ func NewAdminHTTPServer(addr, internalToken string, discovery *TenantDiscovery, 
 		pools:         pools,
 		metrics:       metrics,
 	}
+}
+
+// SetNamespaceBackends attaches the read-engine and pageserver gRPC clients for /v1/namespaces endpoints.
+func (s *AdminHTTPServer) SetNamespaceBackends(reGRPC *ReadEngineGRPCClient, psGRPC *PageserverGRPCClient) {
+	s.reGRPC = reGRPC
+	s.psGRPC = psGRPC
 }
 
 func (s *AdminHTTPServer) Start() error {
@@ -99,6 +107,9 @@ func (s *AdminHTTPServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, `{"status":"ok"}`)
 		return
 	}
+	if s.handleNamespacesRoute(w, r) {
+		return
+	}
 	if s.handleDatabasesRoute(w, r) {
 		return
 	}
@@ -106,6 +117,195 @@ func (s *AdminHTTPServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusNotFound, `{"error":"not found"}`)
+}
+
+func (s *AdminHTTPServer) handleNamespacesRoute(w http.ResponseWriter, r *http.Request) bool {
+	if r.URL.Path != "/v1/namespaces" && !strings.HasPrefix(r.URL.Path, "/v1/namespaces/") {
+		return false
+	}
+	if !s.isAuthorized(r) {
+		writeJSON(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
+		return true
+	}
+	suffix := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/namespaces"), "/")
+	switch {
+	case suffix == "" && r.Method == http.MethodGet:
+		routes := []TenantRoute{}
+		if s.discovery != nil {
+			routes = s.discovery.ListCached()
+		}
+		items := make([]map[string]any, 0, len(routes))
+		for _, rt := range routes {
+			items = append(items, map[string]any{
+				"tenant_id": rt.TenantID,
+				"namespace": rt.TenantID,
+				"state":     rt.State,
+				"air_host":  rt.Host,
+				"air_port":  rt.Port,
+			})
+		}
+		b, _ := json.Marshal(map[string]any{
+			"service":    "air-gateway",
+			"namespaces": items,
+		})
+		writeJSON(w, http.StatusOK, string(b))
+		return true
+
+	case r.Method == http.MethodPost:
+		var req struct {
+			TenantID       string `json:"tenant_id"`
+			Namespace      string `json:"namespace"`
+			State          string `json:"state"`
+			Host           string `json:"host"`
+			Port           int    `json:"port"`
+			SockDir        string `json:"sock_dir"`
+			AppPassword    string `json:"app_password"`
+			ReadEngineHost string `json:"read_engine_host"`
+			ReadEnginePort int    `json:"read_engine_port"`
+			Generation     string `json:"generation"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		tid := strings.TrimSpace(suffix)
+		if tid == "" {
+			tid = strings.TrimSpace(req.TenantID)
+		}
+		if tid == "" {
+			tid = strings.TrimSpace(req.Namespace)
+		}
+		if tid == "" {
+			writeJSON(w, http.StatusBadRequest, `{"error":"tenant_id or namespace is required"}`)
+			return true
+		}
+		route := TenantRoute{
+			TenantID:    tid,
+			State:       req.State,
+			Host:        req.Host,
+			Port:        req.Port,
+			SockDir:     req.SockDir,
+			AppPassword: req.AppPassword,
+		}
+		if route.State == "" {
+			route.State = "ACTIVE"
+		}
+		airConnected := route.Port > 0 && route.AppPassword != ""
+		if !airConnected && s.discovery != nil {
+			if resolved, _, err := s.discovery.ResolveTenant(tid); err == nil {
+				if route.Host == "" {
+					route.Host = resolved.Host
+				}
+				if route.Port == 0 {
+					route.Port = resolved.Port
+				}
+				if route.SockDir == "" {
+					route.SockDir = resolved.SockDir
+				}
+				if route.AppPassword == "" {
+					route.AppPassword = resolved.AppPassword
+				}
+				if resolved.State != "" {
+					route.State = resolved.State
+				}
+				airConnected = route.Port > 0
+			}
+		}
+		if s.discovery != nil {
+			s.discovery.UpsertRoute(route)
+		}
+		if s.pools != nil {
+			s.pools.UpsertDiscovered(route)
+			if req.ReadEnginePort > 0 {
+				tp := s.pools.GetOrCreate(route, nil)
+				tp.SetReadEngineEndpoint(req.ReadEngineHost, "", req.ReadEnginePort)
+			}
+		}
+		reConnected := false
+		if s.reGRPC != nil {
+			if _, err := s.reGRPC.EnsureTenant(r.Context(), tid); err == nil {
+				reConnected = true
+			}
+		}
+		psConnected := false
+		if s.psGRPC != nil {
+			if info, err := s.psGRPC.GetTenantInfo(r.Context(), tid); err == nil && info.GetExists() {
+				psConnected = true
+			} else if _, err := s.psGRPC.EnsureTenant(r.Context(), tid, req.Generation); err == nil {
+				psConnected = true
+			}
+		}
+		b, _ := json.Marshal(map[string]any{
+			"status":                "registered",
+			"service":               "air-gateway",
+			"tenant_id":             tid,
+			"namespace":             tid,
+			"air_connected":         airConnected,
+			"read_engine_connected": reConnected,
+			"pageserver_connected":  psConnected,
+		})
+		writeJSON(w, http.StatusCreated, string(b))
+		return true
+
+	case suffix != "" && r.Method == http.MethodGet:
+		var foundRoute *TenantRoute
+		if s.discovery != nil {
+			for _, rt := range s.discovery.ListCached() {
+				if rt.TenantID == suffix {
+					cp := rt
+					foundRoute = &cp
+					break
+				}
+			}
+		}
+		resp := map[string]any{
+			"service":   "air-gateway",
+			"tenant_id": suffix,
+			"namespace": suffix,
+		}
+		if foundRoute != nil {
+			resp["state"] = foundRoute.State
+			resp["air_host"] = foundRoute.Host
+			resp["air_port"] = foundRoute.Port
+			resp["air_connected"] = foundRoute.Port > 0
+		}
+		if s.reGRPC != nil {
+			if rr, err := s.reGRPC.GetTenantRoute(r.Context(), suffix); err == nil {
+				resp["read_engine_host"] = rr.GetHost()
+				resp["read_engine_port"] = rr.GetPgPort()
+				resp["read_engine_connected"] = true
+			}
+		}
+		if s.psGRPC != nil {
+			if info, err := s.psGRPC.GetTenantInfo(r.Context(), suffix); err == nil {
+				resp["pageserver_exists"] = info.GetExists()
+				resp["pageserver_generation"] = info.GetGeneration()
+				resp["pageserver_last_lsn"] = info.GetLastLsn()
+				resp["pageserver_connected"] = info.GetExists()
+			}
+		}
+		if foundRoute == nil && resp["pageserver_exists"] != true {
+			writeJSON(w, http.StatusNotFound, `{"error":"namespace not found"}`)
+			return true
+		}
+		b, _ := json.Marshal(resp)
+		writeJSON(w, http.StatusOK, string(b))
+		return true
+
+	case suffix != "" && r.Method == http.MethodDelete:
+		if s.discovery != nil {
+			s.discovery.EvictCache(suffix)
+		}
+		if s.pools != nil {
+			s.pools.RemoveTenant(suffix)
+		}
+		b, _ := json.Marshal(map[string]any{
+			"status":    "deleted",
+			"service":   "air-gateway",
+			"tenant_id": suffix,
+		})
+		writeJSON(w, http.StatusOK, string(b))
+		return true
+	}
+	writeJSON(w, http.StatusMethodNotAllowed, `{"error":"method not allowed"}`)
+	return true
 }
 
 func (s *AdminHTTPServer) handleDatabasesRoute(w http.ResponseWriter, r *http.Request) bool {

@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/Mahadi-rsio/air/internal/pb"
@@ -15,11 +17,41 @@ import (
 
 const maxGRPCMessageBytes = 64 * 1024 * 1024
 
+// TenantSummary describes a single tenant namespace registered in the pageserver.
+type TenantSummary struct {
+	TenantID   string `json:"tenant_id"`
+	Generation string `json:"generation,omitempty"`
+	LastLSN    uint64 `json:"last_lsn"`
+}
+
 // ActiveTenantCount returns the number of currently loaded tenant timelines.
 func (p *Pageserver) ActiveTenantCount() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return len(p.tenants)
+}
+
+// ListTenants returns sorted summaries of all active tenant namespaces.
+func (p *Pageserver) ListTenants() []TenantSummary {
+	p.mu.RLock()
+	ids := make([]string, 0, len(p.tenants))
+	for tid := range p.tenants {
+		ids = append(ids, tid)
+	}
+	p.mu.RUnlock()
+	sort.Strings(ids)
+	out := make([]TenantSummary, 0, len(ids))
+	for _, tid := range ids {
+		gen, lastLSN, ok := p.GetTenantInfo(tid)
+		if ok {
+			out = append(out, TenantSummary{
+				TenantID:   tid,
+				Generation: gen,
+				LastLSN:    lastLSN,
+			})
+		}
+	}
+	return out
 }
 
 // SetRelSizes records relation sizes in the tenant's in-memory layer and size cache.
@@ -200,6 +232,20 @@ func (s *grpcServer) GetTenantInfo(_ context.Context, req *pb.PageserverTenantRe
 	}, nil
 }
 
+func (s *grpcServer) ListTenants(_ context.Context, _ *pb.PageserverEmpty) (*pb.PageserverListTenantsResponse, error) {
+	list := s.ps.ListTenants()
+	tenants := make([]*pb.PageserverTenantInfoResponse, 0, len(list))
+	for _, t := range list {
+		tenants = append(tenants, &pb.PageserverTenantInfoResponse{
+			TenantId:   t.TenantID,
+			Generation: t.Generation,
+			LastLsn:    t.LastLSN,
+			Exists:     true,
+		})
+	}
+	return &pb.PageserverListTenantsResponse{Tenants: tenants}, nil
+}
+
 func (s *grpcServer) GetPageAtLSN(ctx context.Context, req *pb.GetPageAtLSNRequest) (*pb.GetPageResponse, error) {
 	k := req.GetKey()
 	key := Key{
@@ -365,13 +411,28 @@ func (s *grpcServer) SetTenantGeneration(_ context.Context, req *pb.SetTenantGen
 }
 
 func (s *grpcServer) EnsureTenant(ctx context.Context, req *pb.EnsureTenantRequest) (*pb.EnsureTenantResponse, error) {
-	if req.GetWrappedDek() != "" && s.ps.store != nil && s.ps.store.kms != nil {
-		_ = s.ps.store.kms.LoadWrappedDEK(req.GetTenantId(), req.GetWrappedDek())
+	if req.GetTenantId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "tenant_id is required")
+	}
+	if s.ps.store != nil && s.ps.store.kms != nil {
+		if req.GetWrappedDek() != "" {
+			if err := s.ps.store.kms.LoadWrappedDEK(req.GetTenantId(), req.GetWrappedDek()); err != nil {
+				return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("load wrapped DEK for %s: %v", req.GetTenantId(), err))
+			}
+		} else {
+			if _, err := s.ps.store.kms.EnsureTenantDEK(req.GetTenantId()); err != nil {
+				return nil, status.Error(codes.Internal, fmt.Sprintf("ensure DEK for %s: %v", req.GetTenantId(), err))
+			}
+		}
 	}
 	if req.GetGeneration() != "" {
 		s.ps.SetTenantGeneration(req.GetTenantId(), req.GetGeneration())
 	}
-	tl := s.ps.EnsureTenant(req.GetTenantId(), req.GetEpoch())
+	epoch := req.GetEpoch()
+	if epoch <= 0 {
+		epoch = 1
+	}
+	tl := s.ps.EnsureTenant(req.GetTenantId(), epoch)
 	if req.GetLoadFromR2() && tl.LastLSN() == 0 {
 		_ = tl.LoadLayersFromR2(ctx)
 	}

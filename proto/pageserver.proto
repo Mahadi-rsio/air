@@ -8,6 +8,7 @@ service PageserverService {
   // Health & introspection
   rpc Health(PageserverEmpty) returns (PageserverHealthResponse);
   rpc GetTenantInfo(PageserverTenantRequest) returns (PageserverTenantInfoResponse);
+  rpc ListTenants(PageserverEmpty) returns (PageserverListTenantsResponse);
 
   // Data plane (used by air-read-engine and remote air_smgr proxies)
   rpc GetPageAtLSN(GetPageAtLSNRequest) returns (GetPageResponse);
@@ -61,6 +62,10 @@ message PageserverTenantInfoResponse {
   string generation = 2;
   uint64 last_lsn = 3;
   bool exists = 4;
+}
+
+message PageserverListTenantsResponse {
+  repeated PageserverTenantInfoResponse tenants = 1;
 }
 
 message StorageKey {

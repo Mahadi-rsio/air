@@ -45,6 +45,7 @@ type Config struct {
 	PageserverSocket   string
 	PageserverGRPCAddr string
 	PageserverCacheMB  int
+	ReadEngineGRPCAddr string
 }
 
 // Default returns safe defaults rooted under dataDir.
@@ -98,6 +99,7 @@ func Load(args []string) (Config, error) {
 	cfg.R2Region = envOr("AIR_R2_REGION", cfg.R2Region)
 	cfg.PageserverSocket = envOr("AIR_PAGESERVER_SOCKET", filepath.Join(cfg.DataDir, "pageserver.sock"))
 	cfg.PageserverGRPCAddr = envOr("AIR_PAGESERVER_GRPC_ADDR", cfg.PageserverGRPCAddr)
+	cfg.ReadEngineGRPCAddr = envOr("AIR_READ_ENGINE_GRPC_ADDR", cfg.ReadEngineGRPCAddr)
 	if v := strings.TrimSpace(os.Getenv("AIR_PAGESERVER_ENABLED")); v != "" {
 		cfg.PageserverEnabled = v == "1" || strings.EqualFold(v, "true")
 	}
@@ -147,6 +149,7 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&cfg.GatewayAdminAddr, "gateway-admin-addr", cfg.GatewayAdminAddr, "Gateway internal admin HTTP listen address (healthz and drain)")
 	fs.StringVar(&cfg.GatewayAdminURL, "gateway-admin-url", cfg.GatewayAdminURL, "Optional Gateway admin HTTP base URL used by air-server for cooperative pool draining")
 	fs.StringVar(&cfg.GatewayAdminGRPCAddr, "gateway-admin-grpc-addr", cfg.GatewayAdminGRPCAddr, "Optional Gateway admin gRPC address used by air-server for cooperative pool draining")
+	fs.StringVar(&cfg.ReadEngineGRPCAddr, "read-engine-grpc-addr", cfg.ReadEngineGRPCAddr, "Optional Read Engine gRPC address used by air-server for namespace orchestration")
 	fs.StringVar(&cfg.ControlPlaneURL, "control-plane-url", cfg.ControlPlaneURL, "Control Plane HTTP base URL used by air-gateway")
 	fs.StringVar(&cfg.InternalToken, "internal-token", cfg.InternalToken, "Shared secret token for internal air-gateway <-> air-server HTTP APIs")
 	fs.StringVar(&cfg.BackendHost, "backend-host", cfg.BackendHost, "Backend PostgreSQL host returned/used for remote gateway routing (defaults to 127.0.0.1)")

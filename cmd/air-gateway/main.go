@@ -31,7 +31,7 @@ func main() {
 	var reGRPC *gateway.ReadEngineGRPCClient
 	if cfg.ReadEngineGRPCAddr != "" {
 		var reErr error
-		reGRPC, reErr = gateway.NewReadEngineGRPCClient(cfg.ReadEngineGRPCAddr)
+		reGRPC, reErr = gateway.NewReadEngineGRPCClient(cfg.ReadEngineGRPCAddr, cfg.InternalToken)
 		if reErr != nil {
 			log.Printf("[air-gateway] read-engine gRPC dial warning (%s): %v", cfg.ReadEngineGRPCAddr, reErr)
 		} else {
@@ -40,6 +40,16 @@ func main() {
 				pools.SetReadEngineEndpoint(cfg.ReadEngineHost, cfg.ReadEngineSockDir, cfg.ReadEnginePort)
 			}
 			log.Printf("[air-gateway] connected to air-read-engine via gRPC (%s)", cfg.ReadEngineGRPCAddr)
+		}
+	}
+	var psGRPC *gateway.PageserverGRPCClient
+	if cfg.PageserverGRPCAddr != "" {
+		var psErr error
+		psGRPC, psErr = gateway.NewPageserverGRPCClient(cfg.PageserverGRPCAddr, cfg.InternalToken)
+		if psErr != nil {
+			log.Printf("[air-gateway] pageserver gRPC dial warning (%s): %v", cfg.PageserverGRPCAddr, psErr)
+		} else {
+			log.Printf("[air-gateway] connected to air-pageserver via gRPC (%s)", cfg.PageserverGRPCAddr)
 		}
 	}
 	cancelReg := gateway.NewCancelRegistry()
@@ -63,12 +73,14 @@ func main() {
 	discovery.Start()
 
 	adminSrv := gateway.NewAdminHTTPServer(cfg.AdminAddr, cfg.InternalToken, discovery, pools, metrics)
+	adminSrv.SetNamespaceBackends(reGRPC, psGRPC)
 	if err := adminSrv.Start(); err != nil {
 		discovery.Stop()
 		log.Fatalf("[air-gateway] failed to bind admin HTTP on %s: %v", cfg.AdminAddr, err)
 	}
 
 	adminGRPCSrv := gateway.NewAdminGRPCServer(cfg.AdminGRPCAddr, cfg.InternalToken, pools, metrics)
+	adminGRPCSrv.SetNamespaceBackends(discovery, reGRPC, psGRPC)
 	if cfg.AdminGRPCAddr != "" {
 		if _, err := adminGRPCSrv.Start(); err != nil {
 			adminSrv.Stop()
@@ -160,6 +172,9 @@ func main() {
 	discovery.Stop()
 	if reGRPC != nil {
 		_ = reGRPC.Close()
+	}
+	if psGRPC != nil {
+		_ = psGRPC.Close()
 	}
 	pools.CloseAll()
 

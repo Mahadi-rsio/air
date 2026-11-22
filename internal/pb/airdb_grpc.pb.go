@@ -581,8 +581,11 @@ var AirDBControl_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	GatewayAdmin_DrainTenant_FullMethodName     = "/air.db.v1.GatewayAdmin/DrainTenant"
-	GatewayAdmin_SetTenantLimits_FullMethodName = "/air.db.v1.GatewayAdmin/SetTenantLimits"
+	GatewayAdmin_DrainTenant_FullMethodName       = "/air.db.v1.GatewayAdmin/DrainTenant"
+	GatewayAdmin_SetTenantLimits_FullMethodName   = "/air.db.v1.GatewayAdmin/SetTenantLimits"
+	GatewayAdmin_RegisterNamespace_FullMethodName = "/air.db.v1.GatewayAdmin/RegisterNamespace"
+	GatewayAdmin_DeleteNamespace_FullMethodName   = "/air.db.v1.GatewayAdmin/DeleteNamespace"
+	GatewayAdmin_GetNamespace_FullMethodName      = "/air.db.v1.GatewayAdmin/GetNamespace"
 )
 
 // GatewayAdminClient is the client API for GatewayAdmin service.
@@ -591,6 +594,9 @@ const (
 type GatewayAdminClient interface {
 	DrainTenant(ctx context.Context, in *DrainTenantRequest, opts ...grpc.CallOption) (*StatusResponse, error)
 	SetTenantLimits(ctx context.Context, in *SetTenantLimitsRequest, opts ...grpc.CallOption) (*StatusResponse, error)
+	RegisterNamespace(ctx context.Context, in *RegisterNamespaceRequest, opts ...grpc.CallOption) (*NamespaceStatusResponse, error)
+	DeleteNamespace(ctx context.Context, in *TenantRequest, opts ...grpc.CallOption) (*StatusResponse, error)
+	GetNamespace(ctx context.Context, in *TenantRequest, opts ...grpc.CallOption) (*NamespaceInfoResponse, error)
 }
 
 type gatewayAdminClient struct {
@@ -621,12 +627,45 @@ func (c *gatewayAdminClient) SetTenantLimits(ctx context.Context, in *SetTenantL
 	return out, nil
 }
 
+func (c *gatewayAdminClient) RegisterNamespace(ctx context.Context, in *RegisterNamespaceRequest, opts ...grpc.CallOption) (*NamespaceStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NamespaceStatusResponse)
+	err := c.cc.Invoke(ctx, GatewayAdmin_RegisterNamespace_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayAdminClient) DeleteNamespace(ctx context.Context, in *TenantRequest, opts ...grpc.CallOption) (*StatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StatusResponse)
+	err := c.cc.Invoke(ctx, GatewayAdmin_DeleteNamespace_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayAdminClient) GetNamespace(ctx context.Context, in *TenantRequest, opts ...grpc.CallOption) (*NamespaceInfoResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NamespaceInfoResponse)
+	err := c.cc.Invoke(ctx, GatewayAdmin_GetNamespace_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // GatewayAdminServer is the server API for GatewayAdmin service.
 // All implementations must embed UnimplementedGatewayAdminServer
 // for forward compatibility.
 type GatewayAdminServer interface {
 	DrainTenant(context.Context, *DrainTenantRequest) (*StatusResponse, error)
 	SetTenantLimits(context.Context, *SetTenantLimitsRequest) (*StatusResponse, error)
+	RegisterNamespace(context.Context, *RegisterNamespaceRequest) (*NamespaceStatusResponse, error)
+	DeleteNamespace(context.Context, *TenantRequest) (*StatusResponse, error)
+	GetNamespace(context.Context, *TenantRequest) (*NamespaceInfoResponse, error)
 	mustEmbedUnimplementedGatewayAdminServer()
 }
 
@@ -642,6 +681,15 @@ func (UnimplementedGatewayAdminServer) DrainTenant(context.Context, *DrainTenant
 }
 func (UnimplementedGatewayAdminServer) SetTenantLimits(context.Context, *SetTenantLimitsRequest) (*StatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetTenantLimits not implemented")
+}
+func (UnimplementedGatewayAdminServer) RegisterNamespace(context.Context, *RegisterNamespaceRequest) (*NamespaceStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RegisterNamespace not implemented")
+}
+func (UnimplementedGatewayAdminServer) DeleteNamespace(context.Context, *TenantRequest) (*StatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteNamespace not implemented")
+}
+func (UnimplementedGatewayAdminServer) GetNamespace(context.Context, *TenantRequest) (*NamespaceInfoResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetNamespace not implemented")
 }
 func (UnimplementedGatewayAdminServer) mustEmbedUnimplementedGatewayAdminServer() {}
 func (UnimplementedGatewayAdminServer) testEmbeddedByValue()                      {}
@@ -700,6 +748,60 @@ func _GatewayAdmin_SetTenantLimits_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _GatewayAdmin_RegisterNamespace_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterNamespaceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayAdminServer).RegisterNamespace(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayAdmin_RegisterNamespace_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayAdminServer).RegisterNamespace(ctx, req.(*RegisterNamespaceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayAdmin_DeleteNamespace_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TenantRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayAdminServer).DeleteNamespace(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayAdmin_DeleteNamespace_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayAdminServer).DeleteNamespace(ctx, req.(*TenantRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayAdmin_GetNamespace_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TenantRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayAdminServer).GetNamespace(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayAdmin_GetNamespace_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayAdminServer).GetNamespace(ctx, req.(*TenantRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // GatewayAdmin_ServiceDesc is the grpc.ServiceDesc for GatewayAdmin service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -714,6 +816,18 @@ var GatewayAdmin_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetTenantLimits",
 			Handler:    _GatewayAdmin_SetTenantLimits_Handler,
+		},
+		{
+			MethodName: "RegisterNamespace",
+			Handler:    _GatewayAdmin_RegisterNamespace_Handler,
+		},
+		{
+			MethodName: "DeleteNamespace",
+			Handler:    _GatewayAdmin_DeleteNamespace_Handler,
+		},
+		{
+			MethodName: "GetNamespace",
+			Handler:    _GatewayAdmin_GetNamespace_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

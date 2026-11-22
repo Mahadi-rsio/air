@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -168,6 +169,24 @@ func main() {
 		}
 	}()
 
+	isAuthorized := func(r *http.Request) bool {
+		if cfg.InternalToken == "" {
+			return true
+		}
+		if tok := strings.TrimSpace(r.Header.Get("X-Air-Internal-Token")); tok != "" {
+			if subtle.ConstantTimeCompare([]byte(tok), []byte(cfg.InternalToken)) == 1 {
+				return true
+			}
+		}
+		if auth := r.Header.Get("Authorization"); len(auth) > 7 && strings.EqualFold(auth[:7], "Bearer ") {
+			tok := strings.TrimSpace(auth[7:])
+			if subtle.ConstantTimeCompare([]byte(tok), []byte(cfg.InternalToken)) == 1 {
+				return true
+			}
+		}
+		return false
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -179,6 +198,110 @@ func main() {
 			"unix_socket":    cfg.SocketPath,
 		})
 	})
+
+	handleNamespace := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !isAuthorized(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
+		suffix := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/namespaces"), "/")
+		switch {
+		case suffix == "" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"service":    "air-pageserver",
+				"namespaces": ps.ListTenants(),
+			})
+		case r.Method == http.MethodPost:
+			var req struct {
+				TenantID   string `json:"tenant_id"`
+				Namespace  string `json:"namespace"`
+				Epoch      int64  `json:"epoch"`
+				Generation string `json:"generation"`
+				WrappedDEK string `json:"wrapped_dek"`
+				LoadFromR2 bool   `json:"load_from_r2"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			tid := strings.TrimSpace(suffix)
+			if tid == "" {
+				tid = strings.TrimSpace(req.TenantID)
+			}
+			if tid == "" {
+				tid = strings.TrimSpace(req.Namespace)
+			}
+			if tid == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "tenant_id or namespace is required"})
+				return
+			}
+			if req.WrappedDEK != "" {
+				if err := kms.LoadWrappedDEK(tid, req.WrappedDEK); err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("load wrapped DEK: %v", err)})
+					return
+				}
+			} else {
+				if _, err := kms.EnsureTenantDEK(tid); err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+					return
+				}
+			}
+			if req.Generation != "" {
+				ps.SetTenantGeneration(tid, req.Generation)
+			}
+			epoch := req.Epoch
+			if epoch <= 0 {
+				epoch = 1
+			}
+			tl := ps.EnsureTenant(tid, epoch)
+			if req.LoadFromR2 && tl.LastLSN() == 0 {
+				_ = tl.LoadLayersFromR2(r.Context())
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":     "active",
+				"service":    "air-pageserver",
+				"tenant_id":  tid,
+				"namespace":  tid,
+				"generation": tl.Generation(),
+				"last_lsn":   tl.LastLSN(),
+			})
+		case suffix != "" && r.Method == http.MethodGet:
+			gen, lastLSN, exists := ps.GetTenantInfo(suffix)
+			if !exists {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "namespace not found"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"service":    "air-pageserver",
+				"tenant_id":  suffix,
+				"namespace":  suffix,
+				"generation": gen,
+				"last_lsn":   lastLSN,
+				"exists":     exists,
+			})
+		case suffix != "" && r.Method == http.MethodDelete:
+			gen := r.URL.Query().Get("generation")
+			if err := ps.PurgeTenant(r.Context(), suffix, gen); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":    "deleted",
+				"service":   "air-pageserver",
+				"tenant_id": suffix,
+			})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
+		}
+	}
+	mux.HandleFunc("/v1/namespaces", handleNamespace)
+	mux.HandleFunc("/v1/namespaces/", handleNamespace)
 
 	httpSrv := &http.Server{
 		Addr:              cfg.HTTPAddr,
