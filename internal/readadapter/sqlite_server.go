@@ -51,6 +51,7 @@ type SQLiteServerConfig struct {
 	GlobalMemoryLimitBytes        int64
 	TenantMemoryLimitBytes        int64
 	QueryMemoryLimitBytes         int64
+	NoisyNeighbor                 NoisyNeighborConfig
 }
 
 type sqliteReaderSlot struct {
@@ -139,6 +140,7 @@ type SQLiteReadServer struct {
 	schemaVersions  *SchemaVersionRegistry
 	memMgr          *MemoryManager
 	scheduler       *TenantScheduler
+	noisyNeighbor   *NoisyNeighborController
 
 	mu      sync.RWMutex
 	state   string
@@ -265,6 +267,7 @@ func NewSQLiteReadServer(cfg SQLiteServerConfig) (*SQLiteReadServer, error) {
 	s.scheduler = NewTenantScheduler(SchedulerConfig{
 		MemoryManager: s.memMgr,
 	})
+	s.noisyNeighbor = NewNoisyNeighborController(cfg.NoisyNeighbor)
 	s.globalLSN.Store(0x1000000)
 	return s, nil
 }
@@ -1529,6 +1532,17 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 		ctx, cancel = context.WithTimeout(ctx, s.cfg.QueryTimeout)
 		defer cancel()
 	}
+	if s.noisyNeighbor != nil {
+		var hardCancel context.CancelFunc
+		ctx, hardCancel = s.noisyNeighbor.ApplyHardTimeout(ctx)
+		defer hardCancel()
+		var admitErr error
+		ctx, admitErr = s.noisyNeighbor.Admit(ctx, ts.TenantID, 0)
+		if admitErr != nil {
+			s.queriesFailed.Add(1)
+			return nil, nil, admitErr
+		}
+	}
 
 	if s.scheduler != nil {
 		releaseSched, serr := s.scheduler.Acquire(ctx, ts.TenantID)
@@ -1569,6 +1583,9 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 		dur := time.Since(start)
 		s.recordLatency(dur)
 		s.fallbackTelemetry.RecordQuery(ClassifyQueryShape(sqliteSQL), dur)
+		if s.noisyNeighbor != nil {
+			s.noisyNeighbor.RecordExecution(ts.TenantID, dur)
+		}
 	}()
 
 	var snap *ReadSnapshot
