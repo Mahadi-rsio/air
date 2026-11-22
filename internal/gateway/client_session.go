@@ -170,7 +170,14 @@ func HandleClientConnection(
 	}
 	defer metrics.ReleaseTenantUser(startupTenant, reqUser)
 
-	route, rpcCode, err := discovery.ResolveTenant(startupTenant)
+	var route TenantRoute
+	var rpcCode codes.Code
+	var err error
+	if cfg.PoolMode {
+		route, rpcCode, err = discovery.ResolveTenantNoWake(startupTenant)
+	} else {
+		route, rpcCode, err = discovery.ResolveTenant(startupTenant)
+	}
 	if err != nil {
 		sqlstate := "08006"
 		switch rpcCode {
@@ -183,12 +190,15 @@ func HandleClientConnection(
 		_, _ = conn.Write(BuildErrorResponse("FATAL", sqlstate, fmt.Sprintf("tenant database %q unavailable: %v", startupTenant, err)))
 		return
 	}
-	if route.State != "ACTIVE" || route.Port <= 0 {
+	canServeSuspended := cfg.PoolMode && route.State == "SUSPENDED"
+	if !canServeSuspended && (route.State != "ACTIVE" || route.Port <= 0) {
 		_, _ = conn.Write(BuildErrorResponse("FATAL", "57P03", fmt.Sprintf("tenant database %q is in state %s", startupTenant, route.State)))
 		return
 	}
 
-	discovery.TouchActivity(startupTenant)
+	if route.State == "ACTIVE" {
+		discovery.TouchActivity(startupTenant)
+	}
 
 	if cfg.PoolMode {
 		pool := pools.GetOrCreate(route, func() (TenantRoute, error) {

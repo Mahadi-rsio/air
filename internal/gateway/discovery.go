@@ -179,11 +179,22 @@ func (d *TenantDiscovery) fromProtoRoute(resp *pb.TenantRouteResponse) TenantRou
 
 // ResolveTenant resolves a tenant route from cache or Control Plane gRPC, waking SUSPENDED tenants if needed.
 func (d *TenantDiscovery) ResolveTenant(tenantID string) (TenantRoute, codes.Code, error) {
+	return d.resolveTenant(tenantID, true)
+}
+
+// ResolveTenantNoWake resolves a tenant route from cache or Control Plane gRPC without waking SUSPENDED tenants.
+func (d *TenantDiscovery) ResolveTenantNoWake(tenantID string) (TenantRoute, codes.Code, error) {
+	return d.resolveTenant(tenantID, false)
+}
+
+func (d *TenantDiscovery) resolveTenant(tenantID string, wakeIfSuspended bool) (TenantRoute, codes.Code, error) {
 	d.cacheMu.RLock()
 	targetID := d.resolveAliasLocked(tenantID)
-	if r, ok := d.cache[targetID]; ok && r.State == "ACTIVE" && r.Port > 0 && r.AppPassword != "" {
-		d.cacheMu.RUnlock()
-		return r, codes.OK, nil
+	if r, ok := d.cache[targetID]; ok && r.AppPassword != "" {
+		if (r.State == "ACTIVE" && r.Port > 0) || (!wakeIfSuspended && r.State == "SUSPENDED") {
+			d.cacheMu.RUnlock()
+			return r, codes.OK, nil
+		}
 	}
 	d.cacheMu.RUnlock()
 
@@ -212,11 +223,15 @@ func (d *TenantDiscovery) ResolveTenant(tenantID string) (TenantRoute, codes.Cod
 
 	route := d.fromProtoRoute(resp)
 	if route.State == "SUSPENDED" {
-		wroute, werr := d.WakeTenant(tenantID)
-		if werr != nil {
-			return TenantRoute{}, status.Code(werr), werr
+		if wakeIfSuspended {
+			wroute, werr := d.WakeTenant(tenantID)
+			if werr != nil {
+				return TenantRoute{}, status.Code(werr), werr
+			}
+			return wroute, codes.OK, nil
 		}
-		return wroute, codes.OK, nil
+		d.upsertCache(route)
+		return route, codes.OK, nil
 	}
 	d.upsertCache(route)
 	return route, codes.OK, nil

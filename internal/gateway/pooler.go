@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"path/filepath"
 	"strconv"
@@ -88,6 +89,7 @@ type clientSessionState struct {
 	sessionPinned   bool
 	backendInFlight bool
 	sessionWriteLSN uint64
+	touchActivity   func()
 }
 
 // TenantPool is a per-tenant transaction-mode PostgreSQL connection pooler.
@@ -101,6 +103,7 @@ type TenantPool struct {
 	sockDir        string
 	port           int
 	appPassword    string
+	suspended      bool
 	idlePool       []*BackendConn
 	readHost       string
 	readSockDir    string
@@ -202,16 +205,35 @@ func (p *TenantPool) UpdateEndpoint(host, sockDir string, port int, appPassword 
 	if appPassword != "" {
 		p.appPassword = appPassword
 	}
-	if port > 0 && (p.host != host || p.port != port || p.sockDir != sockDir) {
-		for _, b := range p.idlePool {
-			if b != nil {
-				b.Close()
+	if port > 0 {
+		p.suspended = false
+		if p.host != host || p.port != port || p.sockDir != sockDir {
+			for _, b := range p.idlePool {
+				if b != nil {
+					b.Close()
+				}
 			}
+			p.idlePool = nil
+			p.host = host
+			p.sockDir = sockDir
+			p.port = port
 		}
-		p.idlePool = nil
-		p.host = host
-		p.sockDir = sockDir
-		p.port = port
+	}
+}
+
+// MarkSuspended marks the primary PostgreSQL backend as suspended and closes idle
+// write backends while keeping read-engine idle connections intact.
+func (p *TenantPool) MarkSuspended() {
+	p.mu.Lock()
+	p.suspended = true
+	idle := p.idlePool
+	p.idlePool = nil
+	p.mu.Unlock()
+
+	for _, b := range idle {
+		if b != nil {
+			b.Close()
+		}
 	}
 }
 
@@ -424,6 +446,9 @@ func (p *TenantPool) ensureSessionAndStmts(b *BackendConn, st *clientSessionStat
 
 func (p *TenantPool) ensureBackend(st *clientSessionState) (uint64, bool) {
 	if st.currentBackend != nil {
+		if st.touchActivity != nil {
+			st.touchActivity()
+		}
 		return 0, true
 	}
 	waitStart := time.Now()
@@ -436,6 +461,9 @@ func (p *TenantPool) ensureBackend(st *clientSessionState) (uint64, bool) {
 		_, _ = st.client.Write(BuildErrorResponse("ERROR", "53300", err.Error()))
 		_, _ = st.client.Write(BuildReadyForQuery(st.txStatus))
 		return poolWaitUs, false
+	}
+	if st.touchActivity != nil {
+		st.touchActivity()
 	}
 	st.currentBackend = b
 	if !p.ensureSessionAndStmts(b, st) {
@@ -489,6 +517,7 @@ func (p *TenantPool) tryExecuteOnReadEngine(st *clientSessionState, wireMsg []by
 	rb, err := p.acquireReadBackend(st.clientID)
 	poolWaitUs := uint64(time.Since(waitStart).Microseconds())
 	if err != nil || rb == nil {
+		log.Printf("[air-gateway] read-engine acquire failed tenant=%s err=%v (falling back to primary)", p.tenantID, err)
 		return false, true
 	}
 	if !p.ensureSessionAndStmts(rb, st) {
@@ -518,6 +547,7 @@ func (p *TenantPool) tryExecuteOnReadEngine(st *clientSessionState, wireMsg []by
 		return false, true
 	}
 	if firstT == 'E' {
+		log.Printf("[air-gateway] read-engine returned error for tenant=%s (falling back to primary)", p.tenantID)
 		// ReadEngine cannot serve this query (e.g. TOAST, MultiXact, unsupported type/SQL).
 		// Drain until ReadyForQuery ('Z') and safely fall back to PostgreSQL primary.
 		txStatus := byte('I')
@@ -1036,16 +1066,17 @@ func (p *TenantPool) ServeClient(client net.Conn, startupUser, expectedPass stri
 	_ = client.SetDeadline(time.Time{})
 
 	st := &clientSessionState{
-		client:      client,
-		startupUser: startupUser,
-		clientID:    clientID,
-		gwPID:       gwPID,
-		gwSecret:    gwSecret,
-		metrics:     metrics,
-		cancelReg:   cancelReg,
-		sessionVars: make(map[string]string),
-		clientStmts: make(map[string]PreparedDef),
-		txStatus:    'I',
+		client:        client,
+		startupUser:   startupUser,
+		clientID:      clientID,
+		gwPID:         gwPID,
+		gwSecret:      gwSecret,
+		metrics:       metrics,
+		cancelReg:     cancelReg,
+		sessionVars:   make(map[string]string),
+		clientStmts:   make(map[string]PreparedDef),
+		txStatus:      'I',
+		touchActivity: touchActivity,
 	}
 	cleanup := func() {
 		if st.sessionPinned {
@@ -1073,9 +1104,6 @@ func (p *TenantPool) ServeClient(client net.Conn, startupUser, expectedPass stri
 		}
 		if clientIdleTimeoutMS > 0 {
 			_ = client.SetReadDeadline(time.Time{})
-		}
-		if touchActivity != nil {
-			touchActivity()
 		}
 
 		switch mtype {
@@ -1154,9 +1182,11 @@ func (p *TenantPool) acquireBackend(clientID uint64) (*BackendConn, error) {
 	for {
 		var b *BackendConn
 		p.mu.Lock()
-		if n := len(p.idlePool); n > 0 {
-			b = p.idlePool[n-1]
-			p.idlePool = p.idlePool[:n-1]
+		if !p.suspended {
+			if n := len(p.idlePool); n > 0 {
+				b = p.idlePool[n-1]
+				p.idlePool = p.idlePool[:n-1]
+			}
 		}
 		p.mu.Unlock()
 
@@ -1182,17 +1212,41 @@ func (p *TenantPool) acquireBackend(clientID uint64) (*BackendConn, error) {
 	}
 
 	p.mu.Lock()
-	host, sockDir, port, pass, wake := p.host, p.sockDir, p.port, p.appPassword, p.wakeFn
+	host, sockDir, port, pass, wake, suspended := p.host, p.sockDir, p.port, p.appPassword, p.wakeFn, p.suspended
 	p.mu.Unlock()
 
-	b, err := p.dialAndStartup(host, sockDir, port, pass, clientID)
-	if err != nil && wake != nil {
-		if wroute, werr := wake(); werr == nil && wroute.Port > 0 {
-			p.UpdateEndpoint(wroute.Host, wroute.SockDir, wroute.Port, wroute.AppPassword)
-			p.mu.Lock()
-			host, sockDir, port, pass = p.host, p.sockDir, p.port, p.appPassword
-			p.mu.Unlock()
-			b, err = p.dialAndStartup(host, sockDir, port, pass, clientID)
+	var b *BackendConn
+	var err error
+	if suspended || port <= 0 {
+		if wake == nil {
+			p.releaseSlot()
+			return nil, fmt.Errorf("tenant %s is suspended and wake function is unavailable", p.tenantID)
+		}
+		log.Printf("[air-gateway] tenant=%s is suspended (port=%d); holding query and waking primary", p.tenantID, port)
+		wroute, werr := wake()
+		if werr != nil {
+			p.releaseSlot()
+			return nil, fmt.Errorf("wake tenant %s failed: %w", p.tenantID, werr)
+		}
+		if wroute.Port <= 0 {
+			p.releaseSlot()
+			return nil, fmt.Errorf("wake tenant %s returned invalid port %d", p.tenantID, wroute.Port)
+		}
+		p.UpdateEndpoint(wroute.Host, wroute.SockDir, wroute.Port, wroute.AppPassword)
+		p.mu.Lock()
+		host, sockDir, port, pass = p.host, p.sockDir, p.port, p.appPassword
+		p.mu.Unlock()
+		b, err = p.dialAndStartup(host, sockDir, port, pass, clientID)
+	} else {
+		b, err = p.dialAndStartup(host, sockDir, port, pass, clientID)
+		if err != nil && wake != nil {
+			if wroute, werr := wake(); werr == nil && wroute.Port > 0 {
+				p.UpdateEndpoint(wroute.Host, wroute.SockDir, wroute.Port, wroute.AppPassword)
+				p.mu.Lock()
+				host, sockDir, port, pass = p.host, p.sockDir, p.port, p.appPassword
+				p.mu.Unlock()
+				b, err = p.dialAndStartup(host, sockDir, port, pass, clientID)
+			}
 		}
 	}
 	if err != nil {
@@ -1587,10 +1641,25 @@ func (pm *PoolManager) GetOrCreate(route TenantRoute, wakeFn WakeFn) *TenantPool
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	if p, ok := pm.pools[route.TenantID]; ok {
-		p.UpdateEndpoint(route.Host, route.SockDir, route.Port, route.AppPassword)
+		if wakeFn != nil {
+			p.SetWakeFn(wakeFn)
+		}
+		if route.State == "SUSPENDED" {
+			if route.AppPassword != "" {
+				p.mu.Lock()
+				p.appPassword = route.AppPassword
+				p.mu.Unlock()
+			}
+			p.MarkSuspended()
+		} else {
+			p.UpdateEndpoint(route.Host, route.SockDir, route.Port, route.AppPassword)
+		}
 		return p
 	}
 	p := NewTenantPool(route.TenantID, route.Host, route.SockDir, route.Port, route.AppPassword, pm.maxBackends, pm.idleTimeoutSec)
+	if route.State == "SUSPENDED" {
+		p.MarkSuspended()
+	}
 	if pm.readPort > 0 || pm.readSockDir != "" {
 		p.SetReadEngineEndpoint(pm.readHost, pm.readSockDir, pm.readPort)
 	}
@@ -1627,7 +1696,7 @@ func (pm *PoolManager) UpsertDiscovered(route TenantRoute) {
 		return
 	}
 	if route.State == "SUSPENDED" {
-		p.CloseAllIdle()
+		p.MarkSuspended()
 	} else {
 		p.UpdateEndpoint(route.Host, route.SockDir, route.Port, route.AppPassword)
 	}
