@@ -477,6 +477,19 @@ func (p *TenantPool) tryExecuteOnReadEngine(st *clientSessionState, wireMsg []by
 		p.releaseReadBackend(rb, true)
 		return false, true
 	}
+	if st.cancelReg != nil && rb.BackendPID != 0 {
+		p.mu.Lock()
+		rhost, rsock, rport := p.readHost, p.readSockDir, p.readPort
+		p.mu.Unlock()
+		st.cancelReg.Register(st.gwPID, st.gwSecret, CancelTarget{
+			Host:          rhost,
+			SockDir:       rsock,
+			Port:          rport,
+			BackendPID:    rb.BackendPID,
+			BackendSecret: rb.BackendSecret,
+		})
+		defer st.cancelReg.Unregister(st.gwPID, st.gwSecret)
+	}
 	if _, err := rb.Conn.Write(wireMsg); err != nil {
 		p.releaseReadBackend(rb, true)
 		return false, true

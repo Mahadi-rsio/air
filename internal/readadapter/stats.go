@@ -136,22 +136,35 @@ type statsCacheEntry struct {
 // StatsCache is a bounded, tenant-isolated LRU cache of PostgreSQL relation
 // and column statistics.
 type StatsCache struct {
-	mu         sync.Mutex
-	maxEntries int
-	ll         *list.List
-	entries    map[statsCacheKey]*list.Element
+	mu             sync.Mutex
+	maxEntries     int
+	ll             *list.List
+	entries        map[statsCacheKey]*list.Element
+	tenantVersions map[string]uint64
 
 	hits    atomic.Uint64
 	misses  atomic.Uint64
 	version atomic.Uint64
 }
 
-// Version returns a monotonically increasing version number bumped on stats updates.
+// Version returns a monotonically increasing global version number bumped on stats updates.
 func (sc *StatsCache) Version() uint64 {
 	if sc == nil {
 		return 0
 	}
 	return sc.version.Load()
+}
+
+// TenantVersion returns a monotonically increasing per-tenant stats version number,
+// preventing one tenant's statistics updates from invalidating another tenant's plan cache.
+func (sc *StatsCache) TenantVersion(tenantID string) uint64 {
+	if sc == nil || tenantID == "" {
+		return 0
+	}
+	sc.mu.Lock()
+	v := sc.tenantVersions[tenantID]
+	sc.mu.Unlock()
+	return v
 }
 
 // NewStatsCache creates a bounded StatsCache. If maxEntries <= 0, defaults to 2048.
@@ -160,9 +173,10 @@ func NewStatsCache(maxEntries int) *StatsCache {
 		maxEntries = defaultMaxStatsEntries
 	}
 	return &StatsCache{
-		maxEntries: maxEntries,
-		ll:         list.New(),
-		entries:    make(map[statsCacheKey]*list.Element),
+		maxEntries:     maxEntries,
+		ll:             list.New(),
+		entries:        make(map[statsCacheKey]*list.Element),
+		tenantVersions: make(map[string]uint64),
 	}
 }
 
@@ -192,6 +206,7 @@ func (sc *StatsCache) Put(ts *TableStats) {
 	sc.version.Add(1)
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+	sc.tenantVersions[ts.TenantID]++
 	if elem, ok := sc.entries[key]; ok {
 		ent := elem.Value.(*statsCacheEntry)
 		if ts.Version >= ent.stats.Version {
@@ -252,8 +267,26 @@ func (sc *StatsCache) InvalidateTenant(tenantID string) {
 	}
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+	sc.tenantVersions[tenantID]++
 	for k, elem := range sc.entries {
 		if k.TenantID == tenantID {
+			sc.ll.Remove(elem)
+			delete(sc.entries, k)
+		}
+	}
+}
+
+// InvalidateTable removes cached statistics for a single relation of tenantID
+// and bumps only that tenant's stats version.
+func (sc *StatsCache) InvalidateTable(tenantID string, relOID uint32) {
+	if sc == nil || tenantID == "" || relOID == 0 {
+		return
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.tenantVersions[tenantID]++
+	for k, elem := range sc.entries {
+		if k.TenantID == tenantID && k.RelOID == relOID {
 			sc.ll.Remove(elem)
 			delete(sc.entries, k)
 		}

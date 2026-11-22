@@ -2,6 +2,9 @@ package readadapter
 
 import (
 	"math"
+	"runtime"
+	"sync/atomic"
+	"time"
 )
 
 // CostModelConfig parameterizes AIR's storage-tier and CPU cost model.
@@ -67,6 +70,7 @@ type PlanCandidate struct {
 	EstimatedPages    float64
 	OrderByConsumed   bool
 	ExpectedCacheTier string
+	ParallelWorkers   int
 	Rejected          bool
 	RejectReason      string
 }
@@ -81,12 +85,72 @@ type PlanDecision struct {
 	TotalCols          int
 }
 
+// OptimizerStats reports low-overhead atomic optimizer and accuracy metrics.
+type OptimizerStats struct {
+	PlansEvaluated          uint64 `json:"plans_evaluated"`
+	SeqScansChosen          uint64 `json:"seq_scans_chosen"`
+	IndexScansChosen        uint64 `json:"index_scans_chosen"`
+	OrderedIndexScansChosen uint64 `json:"ordered_index_scans_chosen"`
+	ParallelScansChosen     uint64 `json:"parallel_scans_chosen"`
+	PlanningTimeNsTotal     uint64 `json:"planning_time_ns_total"`
+	EstimatedRowsTotal      uint64 `json:"estimated_rows_total"`
+	ActualRowsTotal         uint64 `json:"actual_rows_total"`
+	EstimatedCostMilliTotal uint64 `json:"estimated_cost_milli_total"`
+	ActualExecNsTotal       uint64 `json:"actual_exec_ns_total"`
+	AdaptiveAdjustments     uint64 `json:"adaptive_adjustments"`
+}
+
 // QueryOptimizer selects the lowest-cost valid execution plan for air_pg scans.
 type QueryOptimizer struct {
 	cfg      CostModelConfig
 	stats    *StatsCache
 	adaptive *AdaptiveTracker
 	cache    *TieredCacheBackend
+
+	plansEvaluated          atomic.Uint64
+	seqScansChosen          atomic.Uint64
+	indexScansChosen        atomic.Uint64
+	orderedIndexScansChosen atomic.Uint64
+	parallelScansChosen     atomic.Uint64
+	planningTimeNsTotal     atomic.Uint64
+	estimatedRowsTotal      atomic.Uint64
+	actualRowsTotal         atomic.Uint64
+	estimatedCostMilliTotal atomic.Uint64
+	actualExecNsTotal       atomic.Uint64
+	adaptiveAdjustments     atomic.Uint64
+}
+
+// Stats returns a snapshot of OptimizerStats.
+func (o *QueryOptimizer) Stats() OptimizerStats {
+	if o == nil {
+		return OptimizerStats{}
+	}
+	return OptimizerStats{
+		PlansEvaluated:          o.plansEvaluated.Load(),
+		SeqScansChosen:          o.seqScansChosen.Load(),
+		IndexScansChosen:        o.indexScansChosen.Load(),
+		OrderedIndexScansChosen: o.orderedIndexScansChosen.Load(),
+		ParallelScansChosen:     o.parallelScansChosen.Load(),
+		PlanningTimeNsTotal:     o.planningTimeNsTotal.Load(),
+		EstimatedRowsTotal:      o.estimatedRowsTotal.Load(),
+		ActualRowsTotal:         o.actualRowsTotal.Load(),
+		EstimatedCostMilliTotal: o.estimatedCostMilliTotal.Load(),
+		ActualExecNsTotal:       o.actualExecNsTotal.Load(),
+		AdaptiveAdjustments:     o.adaptiveAdjustments.Load(),
+	}
+}
+
+// RecordExecutionFeedback records actual vs estimated rows and execution time.
+func (o *QueryOptimizer) RecordExecutionFeedback(estRows, actualRows uint64, estCost float64, actualNs uint64) {
+	if o == nil {
+		return
+	}
+	o.estimatedRowsTotal.Add(estRows)
+	o.actualRowsTotal.Add(actualRows)
+	if estCost > 0 {
+		o.estimatedCostMilliTotal.Add(uint64(estCost * 1000))
+	}
+	o.actualExecNsTotal.Add(actualNs)
 }
 
 // NewQueryOptimizer creates a QueryOptimizer with the given configuration and optional dependencies.
@@ -138,7 +202,43 @@ func (o *QueryOptimizer) cacheTierProbabilities(tenantID string, relOID uint32) 
 	return l1Prob, l2Prob, l3Prob, tierLabel
 }
 
-// ChooseBestPlan evaluates sequential scan and all candidate B-tree index scans
+func (o *QueryOptimizer) chooseParallelWorkers(nblocks uint32, serialCost float64) int {
+	cpus := runtime.GOMAXPROCS(0)
+	// Measured on 2-vCPU AMD EPYC 7763: 128-page L1/in-memory parallel scan (1.20ms)
+	// is slower than serial (0.74ms) due to synchronization overhead. Retain serial
+	// execution on <=2 vCPUs or scans under 512 pages (~4 MiB).
+	if cpus < 4 || nblocks < 512 {
+		return 1
+	}
+	workers := cpus / 2
+	if workers < 2 {
+		workers = 2
+	}
+	if workers > 4 {
+		workers = 4
+	}
+	// Model parallel startup + merge overhead vs CPU/I/O speedup.
+	const parallelStartupCost = 24.0
+	parallelCost := parallelStartupCost + serialCost/(0.75*float64(workers))
+	if parallelCost < serialCost*0.80 {
+		return workers
+	}
+	return 1
+}
+
+// ShouldParallelize returns true and the recommended worker count if parallel
+// sequential scanning is cheaper than serial scanning given current CPU load.
+func (o *QueryOptimizer) ShouldParallelize(cand PlanCandidate, activeGlobalQueries int) (bool, int) {
+	cpus := runtime.GOMAXPROCS(0)
+	if cand.Strategy != StrategySeqScan || cand.ParallelWorkers <= 1 || cpus < 2 {
+		return false, 1
+	}
+	// Avoid CPU oversubscription when concurrent tenant queries already saturate cores.
+	if activeGlobalQueries >= cpus {
+		return false, 1
+	}
+	return true, cand.ParallelWorkers
+}
 // and returns the lowest-cost valid PlanDecision.
 func (o *QueryOptimizer) ChooseBestPlan(
 	tbl DiscoveredTable,
@@ -150,6 +250,7 @@ func (o *QueryOptimizer) ChooseBestPlan(
 	nblocksHint uint32,
 	tenantID, generation string,
 ) PlanDecision {
+	planStart := time.Now()
 	totalCols := len(allCols)
 	if neededCols <= 0 || neededCols > totalCols {
 		neededCols = totalCols
@@ -194,6 +295,9 @@ func (o *QueryOptimizer) ChooseBestPlan(
 	if o.adaptive != nil && tenantID != "" && tbl.RelOID != 0 {
 		if fb, ok := o.adaptive.Get(tenantID, tbl.RelOID); ok && fb.SampleCount > 0 {
 			selFactor = fb.SelectivityFactor
+			if selFactor != 1.0 {
+				o.adaptiveAdjustments.Add(1)
+			}
 		}
 	}
 
@@ -214,14 +318,17 @@ func (o *QueryOptimizer) ChooseBestPlan(
 	if len(orderBy) > 0 && seqOutRows > 1 {
 		seqSortCost = seqOutRows * math.Log2(seqOutRows) * o.cfg.SortTupleCost
 	}
+	seqTotalCost := seqIOCost + seqCPUCost + seqSortCost
+	parallelWorkers := o.chooseParallelWorkers(nblocks, seqTotalCost)
 	seqCand := PlanCandidate{
 		Strategy:          StrategySeqScan,
 		IndexPlanIdx:      -1,
-		EstimatedCost:     seqIOCost + seqCPUCost + seqSortCost,
+		EstimatedCost:     seqTotalCost,
 		EstimatedRows:     int64(math.Ceil(seqOutRows)),
 		EstimatedPages:    seqPages,
 		OrderByConsumed:   false,
 		ExpectedCacheTier: tierLabel,
+		ParallelWorkers:   parallelWorkers,
 	}
 
 	candidates := make([]PlanCandidate, 0, 1+len(indexPlans))
@@ -238,6 +345,20 @@ func (o *QueryOptimizer) ChooseBestPlan(
 		if !cand.Rejected && cand.EstimatedCost < best.EstimatedCost {
 			best = cand
 		}
+	}
+
+	o.plansEvaluated.Add(1)
+	o.planningTimeNsTotal.Add(uint64(time.Since(planStart).Nanoseconds()))
+	switch best.Strategy {
+	case StrategySeqScan:
+		o.seqScansChosen.Add(1)
+	case StrategyIndexScan:
+		o.indexScansChosen.Add(1)
+	case StrategyIndexScanOrdered:
+		o.orderedIndexScansChosen.Add(1)
+	}
+	if best.ParallelWorkers > 1 {
+		o.parallelScansChosen.Add(1)
 	}
 
 	return PlanDecision{

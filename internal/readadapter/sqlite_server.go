@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,6 +39,7 @@ type SQLiteServerConfig struct {
 	MaxConcurrentQueriesPerTenant int
 	ReadersPerTenant              int
 	QueryTimeout                  time.Duration
+	MaxResultRows                 int64
 }
 
 type sqliteReaderSlot struct {
@@ -94,9 +96,14 @@ type ReadServerMetrics struct {
 	ToastFallbacks           uint64            `json:"toast_fallbacks"`
 	MultiXactFallbacks       uint64            `json:"multixact_fallbacks"`
 	UnsupportedTypeFallbacks uint64            `json:"unsupported_type_fallbacks"`
-	TotalFallbacks           uint64            `json:"total_fallbacks"`
-	FallbackReasons          map[string]uint64 `json:"fallback_reasons,omitempty"`
-	PlanCache                PlanCacheStats    `json:"plan_cache"`
+	TotalFallbacks           uint64             `json:"total_fallbacks"`
+	FallbackReasons          map[string]uint64  `json:"fallback_reasons,omitempty"`
+	PlanCache                PlanCacheStats     `json:"plan_cache"`
+	Memory                   MemoryManagerStats `json:"memory"`
+	Scheduler                SchedulerStats     `json:"scheduler"`
+	Optimizer                OptimizerStats     `json:"optimizer"`
+	Goroutines               int                `json:"goroutines"`
+	GoHeapAllocBytes         uint64             `json:"go_heap_alloc_bytes"`
 }
 
 // SQLiteReadServer is a shared, multi-tenant SQLite read-only execution server
@@ -117,10 +124,16 @@ type SQLiteReadServer struct {
 	adaptiveTracker *AdaptiveTracker
 	queryOptimizer  *QueryOptimizer
 	planCache       *QueryPlanCache
+	schemaVersions  *SchemaVersionRegistry
+	memMgr          *MemoryManager
+	scheduler       *TenantScheduler
 
 	mu      sync.RWMutex
 	state   string
 	tenants map[string]*SQLiteTenantStore
+
+	sessionsMu sync.Mutex
+	sessions   map[uint32]context.CancelFunc
 
 	tcpLn  net.Listener
 	unixLn net.Listener
@@ -188,8 +201,9 @@ func NewSQLiteReadServer(cfg SQLiteServerConfig) (*SQLiteReadServer, error) {
 		dbDir:   dbDir,
 		sockDir: sockDir,
 		state:   "STOPPED",
-		tenants: make(map[string]*SQLiteTenantStore),
-		stopCh:  make(chan struct{}),
+		tenants:  make(map[string]*SQLiteTenantStore),
+		sessions: make(map[uint32]context.CancelFunc),
+		stopCh:   make(chan struct{}),
 	}
 	if cfg.NativeBackend != nil || cfg.PageserverSocket != "" {
 		backend := cfg.NativeBackend
@@ -221,6 +235,11 @@ func NewSQLiteReadServer(cfg SQLiteServerConfig) (*SQLiteReadServer, error) {
 	s.adaptiveTracker = NewAdaptiveTracker(0)
 	s.queryOptimizer = NewQueryOptimizer(DefaultCostModelConfig(), s.statsCache, s.adaptiveTracker, s.nativeCache)
 	s.planCache = NewQueryPlanCache(0)
+	s.schemaVersions = NewSchemaVersionRegistry()
+	s.memMgr = NewMemoryManager(MemoryManagerConfig{})
+	s.scheduler = NewTenantScheduler(SchedulerConfig{
+		MemoryManager: s.memMgr,
+	})
 	s.globalLSN.Store(0x1000000)
 	return s, nil
 }
@@ -322,6 +341,20 @@ func (s *SQLiteReadServer) DetailedMetrics() ReadServerMetrics {
 	if s.planCache != nil {
 		planCacheStats = s.planCache.Stats()
 	}
+	var memStats MemoryManagerStats
+	if s.memMgr != nil {
+		memStats = s.memMgr.Stats()
+	}
+	var schedStats SchedulerStats
+	if s.scheduler != nil {
+		schedStats = s.scheduler.Stats()
+	}
+	var optStats OptimizerStats
+	if s.queryOptimizer != nil {
+		optStats = s.queryOptimizer.Stats()
+	}
+	var rms runtime.MemStats
+	runtime.ReadMemStats(&rms)
 
 	return ReadServerMetrics{
 		QueriesTotal:             succeeded + failed + cancelled,
@@ -352,7 +385,40 @@ func (s *SQLiteReadServer) DetailedMetrics() ReadServerMetrics {
 		TotalFallbacks:           totalFB,
 		FallbackReasons:          fbReasons,
 		PlanCache:                planCacheStats,
+		Memory:                   memStats,
+		Scheduler:                schedStats,
+		Optimizer:                optStats,
+		Goroutines:               runtime.NumGoroutine(),
+		GoHeapAllocBytes:         rms.HeapAlloc,
 	}
+}
+
+// PrometheusMetrics renders low-cardinality Prometheus exposition metrics for AIR's
+// read engine without unbounded per-tenant labels.
+func (s *SQLiteReadServer) PrometheusMetrics() string {
+	m := s.DetailedMetrics()
+	var b strings.Builder
+	fmt.Fprintf(&b, "# TYPE air_read_queries_total counter\n")
+	fmt.Fprintf(&b, "air_read_queries_total{status=\"succeeded\"} %d\n", m.QueriesSucceeded)
+	fmt.Fprintf(&b, "air_read_queries_total{status=\"failed\"} %d\n", m.QueriesFailed)
+	fmt.Fprintf(&b, "air_read_queries_total{status=\"cancelled\"} %d\n", m.QueriesCancelled)
+	fmt.Fprintf(&b, "air_read_active_queries %d\n", m.ActiveQueries)
+	fmt.Fprintf(&b, "air_read_queued_queries %d\n", m.Scheduler.QueuedGlobal)
+	fmt.Fprintf(&b, "air_read_latency_ms{quantile=\"0.5\"} %.3f\n", m.LatencyP50Ms)
+	fmt.Fprintf(&b, "air_read_latency_ms{quantile=\"0.95\"} %.3f\n", m.LatencyP95Ms)
+	fmt.Fprintf(&b, "air_read_latency_ms{quantile=\"0.99\"} %.3f\n", m.LatencyP99Ms)
+	fmt.Fprintf(&b, "air_read_plan_cache_hits_total %d\n", m.PlanCache.Hits)
+	fmt.Fprintf(&b, "air_read_plan_cache_misses_total %d\n", m.PlanCache.Misses)
+	fmt.Fprintf(&b, "air_read_plan_cache_invalidations_total %d\n", m.PlanCache.Invalidations)
+	fmt.Fprintf(&b, "air_read_optimizer_plans_total{strategy=\"seq\"} %d\n", m.Optimizer.SeqScansChosen)
+	fmt.Fprintf(&b, "air_read_optimizer_plans_total{strategy=\"index\"} %d\n", m.Optimizer.IndexScansChosen)
+	fmt.Fprintf(&b, "air_read_optimizer_plans_total{strategy=\"index_ordered\"} %d\n", m.Optimizer.OrderedIndexScansChosen)
+	fmt.Fprintf(&b, "air_read_vtab_rows_matched_total %d\n", m.VTabRowsMatched)
+	fmt.Fprintf(&b, "air_read_exec_memory_used_bytes %d\n", m.Memory.GlobalUsedBytes)
+	fmt.Fprintf(&b, "air_read_sqlite_memory_used_bytes %d\n", m.Memory.SQLiteUsedBytes)
+	fmt.Fprintf(&b, "air_read_go_heap_alloc_bytes %d\n", m.GoHeapAllocBytes)
+	fmt.Fprintf(&b, "air_read_fallbacks_total %d\n", m.TotalFallbacks)
+	return b.String()
 }
 
 func (s *SQLiteReadServer) recordQueryError(err error) {
@@ -936,11 +1002,14 @@ func (s *SQLiteReadServer) acceptLoop(ln net.Listener) {
 }
 
 type sqlitePreparedStmt struct {
-	Name       string
-	OrigSQL    string
-	SQLiteSQL  string
-	ParamCount int
-	ParamOIDs  []uint32
+	Name          string
+	OrigSQL       string
+	SQLiteSQL     string
+	ParamCount    int
+	ParamOIDs     []uint32
+	SchemaVersion uint64
+	Generation    string
+	SearchPath    string
 }
 
 type sqlitePortal struct {
@@ -999,6 +1068,14 @@ func (s *SQLiteReadServer) serveConn(c net.Conn) {
 	}
 
 	pid := 20000 + s.connSeq.Add(1)
+	s.sessionsMu.Lock()
+	s.sessions[pid] = connCancel
+	s.sessionsMu.Unlock()
+	defer func() {
+		s.sessionsMu.Lock()
+		delete(s.sessions, pid)
+		s.sessionsMu.Unlock()
+	}()
 	var out bytes.Buffer
 	writePGAuthOk(&out)
 	writePGParamStatus(&out, "server_version", "17.12 (AIR SQLite Read Engine "+SQLiteVersion()+")")
@@ -1112,7 +1189,16 @@ func (s *SQLiteReadServer) performHandshake(c net.Conn) (map[string]string, bool
 			continue
 		}
 		if code == 80877102 {
-			// CancelRequest
+			// CancelRequest: body has [4:8]=pid, [8:12]=secret
+			if len(body) >= 12 {
+				targetPID := binary.BigEndian.Uint32(body[4:8])
+				s.sessionsMu.Lock()
+				cancelFn := s.sessions[targetPID]
+				s.sessionsMu.Unlock()
+				if cancelFn != nil {
+					cancelFn()
+				}
+			}
 			return nil, false
 		}
 		if code != 196608 {
@@ -1255,7 +1341,9 @@ func (s *SQLiteReadServer) refreshNativeCatalogWithSnap(ctx context.Context, ts 
 	if s.statsCache != nil {
 		s.statsCache.PutDiscoveredTables(ts.TenantID, snap.Generation, tables, snap.LSN)
 	}
+	s.reconcileAndInvalidatePlans(ts.TenantID, snap.Generation, tables)
 
+	ts.Reader.InvalidatePreparedStmts()
 	ts.Reader.SetReadOnlyAuthorizer(false)
 	defer ts.Reader.SetReadOnlyAuthorizer(true)
 
@@ -1319,7 +1407,9 @@ func (s *SQLiteReadServer) refreshNativeCatalogOnSlot(ctx context.Context, ts *S
 	if s.statsCache != nil {
 		s.statsCache.PutDiscoveredTables(ts.TenantID, snap.Generation, tables, snap.LSN)
 	}
+	s.reconcileAndInvalidatePlans(ts.TenantID, snap.Generation, tables)
 
+	slot.conn.InvalidatePreparedStmts()
 	slot.conn.SetReadOnlyAuthorizer(false)
 	defer slot.conn.SetReadOnlyAuthorizer(true)
 
@@ -1362,6 +1452,10 @@ func (s *SQLiteReadServer) executeReaderQuery(ctx context.Context, ts *SQLiteTen
 }
 
 func (s *SQLiteReadServer) executeReaderQueryWithPlan(ctx context.Context, ts *SQLiteTenantStore, sqliteSQL string, args []string) (*SQLiteResult, *PlanDecision, error) {
+	return s.executeReaderQueryWithPlanTyped(ctx, ts, sqliteSQL, args, nil)
+}
+
+func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, ts *SQLiteTenantStore, sqliteSQL string, args []string, paramOIDs []uint32) (*SQLiteResult, *PlanDecision, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1369,6 +1463,19 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlan(ctx context.Context, ts *S
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.cfg.QueryTimeout)
 		defer cancel()
+	}
+
+	if s.scheduler != nil {
+		releaseSched, serr := s.scheduler.Acquire(ctx, ts.TenantID)
+		if serr != nil {
+			if errors.Is(serr, context.Canceled) || errors.Is(serr, context.DeadlineExceeded) {
+				s.queriesCancelled.Add(1)
+			} else {
+				s.queriesFailed.Add(1)
+			}
+			return nil, nil, serr
+		}
+		defer releaseSched()
 	}
 
 	if ts.sem != nil {
@@ -1384,6 +1491,14 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlan(ctx context.Context, ts *S
 	start := time.Now()
 	s.activeQueries.Add(1)
 	ts.queriesTotal.Add(1)
+	if s.memMgr != nil {
+		budget := s.memMgr.BeginQuery(ts.TenantID, 0)
+		defer budget.Release()
+		ctx = ContextWithMemoryBudget(ctx, budget)
+	}
+	if s.cfg.MaxResultRows > 0 {
+		ctx = ContextWithResourceLimits(ctx, QueryResourceLimits{MaxResultRows: s.cfg.MaxResultRows})
+	}
 	defer func() {
 		s.activeQueries.Add(-1)
 		s.recordLatency(time.Since(start))
@@ -1414,7 +1529,11 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlan(ctx context.Context, ts *S
 				s.queriesFailed.Add(1)
 				return nil, nil, rerr
 			}
-			res, plan, err := slot.conn.QueryWithContextPlan(ctx, snap, sqliteSQL, args)
+			var schemaVer uint64
+			if s.schemaVersions != nil {
+				schemaVer = s.schemaVersions.SchemaVersion(ts.TenantID, 0)
+			}
+			res, plan, err := slot.conn.QueryWithContextPlanTyped(ctx, snap, sqliteSQL, args, paramOIDs, schemaVer)
 			if err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					s.queriesCancelled.Add(1)
@@ -1434,7 +1553,11 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlan(ctx context.Context, ts *S
 		}
 	}
 
-	res, plan, err := ts.Reader.QueryWithContextPlan(ctx, snap, sqliteSQL, args)
+	var schemaVer uint64
+	if s.schemaVersions != nil {
+		schemaVer = s.schemaVersions.SchemaVersion(ts.TenantID, 0)
+	}
+	res, plan, err := ts.Reader.QueryWithContextPlanTyped(ctx, snap, sqliteSQL, args, paramOIDs, schemaVer)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			s.queriesCancelled.Add(1)
@@ -1786,7 +1909,7 @@ func (sess *sqliteClientSession) execSingleStatement(stmt string, args []string,
 		_ = sess.srv.SyncFromPrimary(context.Background(), sess.tenantID, sess.srv.cfg.PrimaryConnInfo)
 	}
 
-	sqliteSQL, _, _ := sess.srv.translateCached(sess.tenantID, ts.Generation, ts.SyncedLSN.Load(), s)
+	sqliteSQL, _, _ := sess.srv.translateCachedForSession(sess, ts, s, nil)
 	res, err := sess.srv.executeReaderQuery(sess.sessionCtx(), ts, sqliteSQL, args)
 	if err != nil {
 		var roErr *SQLiteReadOnlyError
@@ -1904,6 +2027,25 @@ func (sess *sqliteClientSession) handleCopyToStdout(innerSQL string, out *bytes.
 	return nil
 }
 
+func (s *SQLiteReadServer) reconcileAndInvalidatePlans(tenantID, generation string, tables []DiscoveredTable) {
+	if s.planCache != nil {
+		s.planCache.EvictStaleGeneration(tenantID, generation)
+	}
+	if s.schemaVersions == nil {
+		return
+	}
+	changedTables, changedIndexes, schemaChanged := s.schemaVersions.ReconcileCatalog(tenantID, 0, tables)
+	if !schemaChanged || s.planCache == nil {
+		return
+	}
+	for _, relOID := range changedTables {
+		s.planCache.InvalidateTable(tenantID, relOID)
+	}
+	for _, idxOID := range changedIndexes {
+		s.planCache.InvalidateIndex(tenantID, idxOID)
+	}
+}
+
 func (s *SQLiteReadServer) translateCached(tenantID, generation string, catalogLSN uint64, rawPGSQL string) (string, int, bool) {
 	if s.planCache == nil {
 		sq, pcnt := translatePGToSQLite(rawPGSQL)
@@ -1911,9 +2053,73 @@ func (s *SQLiteReadServer) translateCached(tenantID, generation string, catalogL
 	}
 	var statsVer uint64
 	if s.statsCache != nil {
-		statsVer = s.statsCache.Version()
+		statsVer = s.statsCache.TenantVersion(tenantID)
 	}
-	plan, hit := s.planCache.GetOrTranslate(tenantID, generation, catalogLSN, statsVer, 1, rawPGSQL, translatePGToSQLite)
+	var schemaVer uint64
+	if s.schemaVersions != nil {
+		schemaVer = s.schemaVersions.SchemaVersion(tenantID, 0)
+	}
+	plan, hit := s.planCache.GetOrTranslateScoped(
+		PlanScope{
+			TenantID:      tenantID,
+			Generation:    generation,
+			CatalogLSN:    catalogLSN,
+			SchemaVersion: schemaVer,
+			StatsVersion:  statsVer,
+			CapabilityVer: 1,
+		},
+		rawPGSQL,
+		func(q string) (string, int, []uint32, []uint32) {
+			sq, pcnt := translatePGToSQLite(q)
+			tdeps, ideps := s.schemaVersions.ResolveQueryDeps(tenantID, 0, q)
+			return sq, pcnt, tdeps, ideps
+		},
+	)
+	if plan == nil {
+		sq, pcnt := translatePGToSQLite(rawPGSQL)
+		return sq, pcnt, false
+	}
+	return plan.SQLiteSQL, plan.ParamCount, hit
+}
+
+func (s *SQLiteReadServer) translateCachedForSession(sess *sqliteClientSession, ts *SQLiteTenantStore, rawPGSQL string, paramOIDs []uint32) (string, int, bool) {
+	if s.planCache == nil {
+		sq, pcnt := translatePGToSQLite(rawPGSQL)
+		return sq, pcnt, false
+	}
+	var statsVer uint64
+	if s.statsCache != nil {
+		statsVer = s.statsCache.TenantVersion(sess.tenantID)
+	}
+	var schemaVer uint64
+	if s.schemaVersions != nil {
+		schemaVer = s.schemaVersions.SchemaVersion(sess.tenantID, 0)
+	}
+	searchPath := sess.sessionVars["search_path"]
+	settingsHash := ExecSettingsHash(searchPath, sess.sessionVars["timezone"], sess.sessionVars["lc_collate"])
+	ts.mu.Lock()
+	catModLSN := ts.lastCatalogModLSN
+	gen := ts.Generation
+	ts.mu.Unlock()
+	plan, hit := s.planCache.GetOrTranslateScoped(
+		PlanScope{
+			TenantID:      sess.tenantID,
+			Generation:    gen,
+			SearchPath:    searchPath,
+			CatalogLSN:    catModLSN,
+			SchemaVersion: schemaVer,
+			StatsVersion:  statsVer,
+			CapabilityVer: 1,
+			ParamOIDs:     paramOIDs,
+			SettingsHash:  settingsHash,
+		},
+		rawPGSQL,
+		func(q string) (string, int, []uint32, []uint32) {
+			sq, pcnt := translatePGToSQLite(q)
+			tdeps, ideps := s.schemaVersions.ResolveQueryDeps(sess.tenantID, 0, q)
+			return sq, pcnt, tdeps, ideps
+		},
+	)
 	if plan == nil {
 		sq, pcnt := translatePGToSQLite(rawPGSQL)
 		return sq, pcnt, false
@@ -1934,7 +2140,7 @@ func (sess *sqliteClientSession) handleExplainStmt(s string, args []string, out 
 	if err != nil {
 		return err
 	}
-	sq, _, cacheHit := sess.srv.translateCached(sess.tenantID, ts.Generation, ts.SyncedLSN.Load(), innerSelect)
+	sq, _, cacheHit := sess.srv.translateCachedForSession(sess, ts, innerSelect, nil)
 	res, planDecision, err := sess.srv.executeReaderQueryWithPlan(sess.sessionCtx(), ts, "EXPLAIN QUERY PLAN "+sq, args)
 	if err != nil {
 		return err
@@ -2011,8 +2217,15 @@ func (sess *sqliteClientSession) handleParse(body []byte) bool {
 	}
 	var sq string
 	var pcnt int
+	var schemaVer uint64
+	var gen string
+	searchPath := sess.sessionVars["search_path"]
 	if ts, err := sess.srv.getOrCreateTenant(sess.tenantID); err == nil {
-		sq, pcnt, _ = sess.srv.translateCached(sess.tenantID, ts.Generation, ts.SyncedLSN.Load(), query)
+		sq, pcnt, _ = sess.srv.translateCachedForSession(sess, ts, query, oids)
+		if sess.srv.schemaVersions != nil {
+			schemaVer = sess.srv.schemaVersions.SchemaVersion(sess.tenantID, 0)
+		}
+		gen = ts.Generation
 	} else {
 		sq, pcnt = translatePGToSQLite(query)
 	}
@@ -2020,11 +2233,14 @@ func (sess *sqliteClientSession) handleParse(body []byte) bool {
 		pcnt = len(oids)
 	}
 	sess.stmts[stmtName] = &sqlitePreparedStmt{
-		Name:       stmtName,
-		OrigSQL:    query,
-		SQLiteSQL:  sq,
-		ParamCount: pcnt,
-		ParamOIDs:  oids,
+		Name:          stmtName,
+		OrigSQL:       query,
+		SQLiteSQL:     sq,
+		ParamCount:    pcnt,
+		ParamOIDs:     oids,
+		SchemaVersion: schemaVer,
+		Generation:    gen,
+		SearchPath:    searchPath,
 	}
 	var out bytes.Buffer
 	writePGMsg(&out, '1', nil) // ParseComplete
@@ -2207,6 +2423,7 @@ func (sess *sqliteClientSession) describeColumns(ps *sqlitePreparedStmt, args []
 	if !strings.HasPrefix(upper, "SELECT") && !strings.HasPrefix(upper, "WITH") && !strings.HasPrefix(upper, "VALUES") && !strings.HasPrefix(upper, "EXPLAIN") {
 		return nil
 	}
+	_ = sess.revalidatePreparedStmt(ps)
 	ts, err := sess.srv.getOrCreateTenant(sess.tenantID)
 	if err != nil {
 		return nil
@@ -2249,6 +2466,40 @@ func (s *SQLiteReadServer) describeReaderColumns(ctx context.Context, ts *SQLite
 	return ts.Reader.DescribeColumns(sqliteSQL)
 }
 
+// revalidatePreparedStmt ensures a session-prepared statement is transparently
+// re-translated and re-planned if the tenant's schema version, generation, or
+// search_path changed since Parse.
+func (sess *sqliteClientSession) revalidatePreparedStmt(ps *sqlitePreparedStmt) error {
+	if ps == nil || sess == nil || sess.srv == nil {
+		return nil
+	}
+	ts, err := sess.srv.getOrCreateTenant(sess.tenantID)
+	if err != nil {
+		return err
+	}
+	var curSchemaVer uint64
+	if sess.srv.schemaVersions != nil {
+		curSchemaVer = sess.srv.schemaVersions.SchemaVersion(sess.tenantID, 0)
+	}
+	curSearchPath := sess.sessionVars["search_path"]
+	ts.mu.Lock()
+	curGen := ts.Generation
+	ts.mu.Unlock()
+	if ps.SchemaVersion == curSchemaVer && ps.Generation == curGen && ps.SearchPath == curSearchPath {
+		return nil
+	}
+	sq, pcnt, _ := sess.srv.translateCachedForSession(sess, ts, ps.OrigSQL, ps.ParamOIDs)
+	if len(ps.ParamOIDs) > pcnt {
+		pcnt = len(ps.ParamOIDs)
+	}
+	ps.SQLiteSQL = sq
+	ps.ParamCount = pcnt
+	ps.SchemaVersion = curSchemaVer
+	ps.Generation = curGen
+	ps.SearchPath = curSearchPath
+	return nil
+}
+
 func (sess *sqliteClientSession) handleExecute(body []byte) bool {
 	off := 0
 	portalName := readCStringAdv(body, &off)
@@ -2258,6 +2509,42 @@ func (sess *sqliteClientSession) handleExecute(body []byte) bool {
 		writePGErrorBuf(&out, "ERROR", "34000", fmt.Sprintf("portal %q does not exist", portalName))
 		_, err := sess.conn.Write(out.Bytes())
 		return err == nil
+	}
+
+	if err := sess.revalidatePreparedStmt(portal.Stmt); err != nil {
+		writePGErrorBuf(&out, "ERROR", "42000", err.Error())
+		_, werr := sess.conn.Write(out.Bytes())
+		return werr == nil
+	}
+
+	// Fast path for prepared SELECT/WITH/VALUES statements: execute using pre-translated
+	// SQLiteSQL + typed ParamOIDs + compiled sqlite3_stmt cache.
+	if ts, terr := sess.srv.getOrCreateTenant(sess.tenantID); terr == nil && portal.Stmt.SQLiteSQL != "" {
+		upper := strings.ToUpper(strings.TrimSpace(portal.Stmt.OrigSQL))
+		if (strings.HasPrefix(upper, "SELECT") || strings.HasPrefix(upper, "WITH") || strings.HasPrefix(upper, "VALUES")) &&
+			!strings.Contains(upper, "PG_LAST_WAL_REPLAY_LSN()") &&
+			!strings.Contains(upper, "PG_CURRENT_WAL_LSN()") &&
+			!strings.Contains(upper, "AIR_RO_STATUS()") &&
+			!strings.Contains(upper, "SQLITE_VERSION()") {
+			res, _, execErr := sess.srv.executeReaderQueryWithPlanTyped(sess.sessionCtx(), ts, portal.Stmt.SQLiteSQL, portal.Args, portal.Stmt.ParamOIDs)
+			if execErr != nil {
+				var roErr *SQLiteReadOnlyError
+				sqlState := "42000"
+				if errors.As(execErr, &roErr) {
+					sess.srv.writesBlocked.Add(1)
+					sqlState = "25006"
+				}
+				writePGErrorBuf(&out, "ERROR", sqlState, execErr.Error())
+				if sess.txStatus == 'T' {
+					sess.txStatus = 'E'
+				}
+			} else {
+				sess.srv.queriesAllowed.Add(1)
+				writeResultSet(&out, res.Columns, res.Rows)
+			}
+			_, werr := sess.conn.Write(out.Bytes())
+			return werr == nil
+		}
 	}
 
 	if err := sess.execSingleStatement(portal.Stmt.OrigSQL, portal.Args, &out); err != nil {
@@ -2429,19 +2716,33 @@ func writePGRowDescription(buf *bytes.Buffer, cols []SQLiteColumn) {
 	writePGMsg(buf, 'T', b.Bytes())
 }
 
+var pgRowBufPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
 func writePGDataRow(buf *bytes.Buffer, row []SQLiteValue) {
-	var b bytes.Buffer
-	_ = binary.Write(&b, binary.BigEndian, uint16(len(row)))
+	b := pgRowBufPool.Get().(*bytes.Buffer)
+	b.Reset()
+	var hdr [4]byte
+	binary.BigEndian.PutUint16(hdr[:2], uint16(len(row)))
+	b.Write(hdr[:2])
 	for _, cell := range row {
 		if cell.IsNil {
-			_ = binary.Write(&b, binary.BigEndian, int32(-1))
+			binary.BigEndian.PutUint32(hdr[:], 0xffffffff)
+			b.Write(hdr[:])
 		} else {
-			data := []byte(cell.Text)
-			_ = binary.Write(&b, binary.BigEndian, int32(len(data)))
-			b.Write(data)
+			binary.BigEndian.PutUint32(hdr[:], uint32(len(cell.Text)))
+			b.Write(hdr[:])
+			b.WriteString(cell.Text)
 		}
 	}
 	writePGMsg(buf, 'D', b.Bytes())
+	if b.Cap() <= 64*1024 {
+		b.Reset()
+		pgRowBufPool.Put(b)
+	}
 }
 
 func writeResultSet(buf *bytes.Buffer, cols []SQLiteColumn, rows [][]SQLiteValue) {

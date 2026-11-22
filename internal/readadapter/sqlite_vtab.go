@@ -305,6 +305,7 @@ type pgVTabCursor struct {
 	actualRows    uint64
 	startPages    uint64
 	startTime     time.Time
+	parallelIter  *parallelScanIter
 }
 
 type queryExecContext struct {
@@ -632,6 +633,10 @@ func goAirPGOpen(vtabID C.ulonglong, outCursorID *C.ulonglong) C.int {
 }
 
 func (cur *pgVTabCursor) resetResources() {
+	if cur.parallelIter != nil {
+		cur.parallelIter.Close()
+		cur.parallelIter = nil
+	}
 	if cur.toastRel != nil {
 		_ = cur.spec.Adapter.CloseRelation(cur.toastRel)
 		cur.toastRel = nil
@@ -651,7 +656,13 @@ func (cur *pgVTabCursor) resetResources() {
 	cur.indexScanDone = false
 	cur.neededCols = cur.neededCols[:0]
 	cur.filters = cur.filters[:0]
-	cur.rows = cur.rows[:0]
+	clear(cur.rows)
+	if cap(cur.rows) > 4096 {
+		cur.rows = nil
+	} else {
+		cur.rows = cur.rows[:0]
+	}
+	clear(cur.rowBuf)
 	cur.numRows = 0
 	cur.pageRowIdx = 0
 }
@@ -681,6 +692,9 @@ func goAirPGClose(cursorID C.ulonglong) C.int {
 				est = 1
 			}
 			cur.spec.Adaptive.Record(cur.spec.TenantID, cur.spec.Table.RelOID, uint64(est), cur.actualRows, pagesDelta, l1Hits, l2Hits, execNs)
+			if cur.spec.Optimizer != nil {
+				cur.spec.Optimizer.RecordExecutionFeedback(uint64(est), cur.actualRows, 0, execNs)
+			}
 		}
 		cur.resetResources()
 	}
@@ -845,6 +859,21 @@ func (cur *pgVTabCursor) loadNextBatch(ctx context.Context) error {
 				filterCols[f.allColIdx] = true
 			}
 		}
+	}
+
+	if cur.parallelIter != nil {
+		rows, n, ok, err := cur.parallelIter.Next()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			cur.eof = true
+			return nil
+		}
+		cur.rows = rows
+		cur.numRows = n
+		cur.actualRows += uint64(n)
+		return nil
 	}
 
 	const batchBlocks uint32 = 16
@@ -1115,6 +1144,31 @@ func goAirPGFilter(cursorID C.ulonglong, idxNum C.int, idxStr *C.char, argc C.in
 			return C.SQLITE_OK
 		}
 		// If the index relation was missing/corrupt/in-transition (e.g. REINDEX), fall back safely to sequential heap scan!
+	}
+
+	// Use parallel scan only when optimizer selected SeqScan with ParallelWorkers > 1
+	// and table size >= 64 blocks.
+	if cur.spec.Optimizer != nil && cur.nblocks >= 64 {
+		qctx := getActiveQueryContext(cur.spec.db)
+		if qctx != nil && qctx.lastPlan != nil {
+			if okPar, workers := cur.spec.Optimizer.ShouldParallelize(qctx.lastPlan.Selected, 0); okPar {
+				var fcols []bool
+				if len(cur.filters) > 0 {
+					fcols = make([]bool, len(cur.spec.AllCols))
+					for _, f := range cur.filters {
+						if f.allColIdx >= 0 && f.allColIdx < len(fcols) {
+							fcols[f.allColIdx] = true
+						}
+					}
+				}
+				cur.rowStride = len(cur.spec.AllCols)
+				cur.parallelIter = newParallelScanIter(
+					ctx, cur.spec.Adapter, cur.spec.CLOG, cur.rel, cur.snap,
+					cur.spec.AllCols, cur.neededCols, fcols, cur.filters, cur.toastFn,
+					cur.nblocks, workers,
+				)
+			}
+		}
 	}
 
 	if err := cur.loadNextBatch(ctx); err != nil {

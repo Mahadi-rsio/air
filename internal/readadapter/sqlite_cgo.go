@@ -69,6 +69,12 @@ static void air_set_cancelled(int *cancelled) {
 	}
 }
 
+static void air_reset_cancelled(int *cancelled) {
+	if (cancelled != NULL) {
+		__atomic_store_n(cancelled, 0, __ATOMIC_RELAXED);
+	}
+}
+
 static void air_install_progress_handler(sqlite3 *db, int *cancelled) {
 	if (cancelled != NULL) {
 		sqlite3_progress_handler(db, 100, air_progress_cb, (void *)cancelled);
@@ -80,10 +86,13 @@ static void air_install_progress_handler(sqlite3 *db, int *cancelled) {
 import "C"
 
 import (
+	"container/list"
 	"context"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -113,13 +122,33 @@ type SQLiteResult struct {
 	IsSelect    bool
 }
 
+const maxCachedSQLiteStmts = 64
+
+type stmtCacheKey struct {
+	SQL       string
+	SchemaVer uint64
+}
+
+type cachedSQLiteStmt struct {
+	key  stmtCacheKey
+	stmt *C.sqlite3_stmt
+	cols []SQLiteColumn
+}
+
 // SQLiteConn wraps a single native *C.sqlite3 connection with optional read-only authorizer enforcement.
 type SQLiteConn struct {
-	mu       sync.Mutex
-	db       *C.sqlite3
-	roFlag   *C.int
-	path     string
-	readOnly bool
+	mu         sync.Mutex
+	cancelMu   sync.Mutex
+	db         *C.sqlite3
+	roFlag     *C.int
+	cancelFlag *C.int
+	path       string
+	readOnly   bool
+
+	stmtLRU        *list.List
+	stmtCache      map[stmtCacheKey]*list.Element
+	stmtCacheHits  atomic.Uint64
+	stmtCacheMiss  atomic.Uint64
 }
 
 // OpenSQLiteConn opens a SQLite database at path. If readOnly is true, the database
@@ -150,12 +179,17 @@ func OpenSQLiteConn(path string, readOnly bool, cacheKB int) (*SQLiteConn, error
 
 	roPtr := (*C.int)(C.malloc(C.size_t(unsafe.Sizeof(C.int(0)))))
 	*roPtr = 0
+	cancelPtr := (*C.int)(C.malloc(C.size_t(unsafe.Sizeof(C.int(0)))))
+	*cancelPtr = 0
 
 	conn := &SQLiteConn{
-		db:       db,
-		roFlag:   roPtr,
-		path:     path,
-		readOnly: readOnly,
+		db:         db,
+		roFlag:     roPtr,
+		cancelFlag: cancelPtr,
+		path:       path,
+		readOnly:   readOnly,
+		stmtLRU:    list.New(),
+		stmtCache:  make(map[stmtCacheKey]*list.Element),
 	}
 
 	if !readOnly {
@@ -189,11 +223,45 @@ func (c *SQLiteConn) SetReadOnlyAuthorizer(enabled bool) {
 	}
 }
 
+// InvalidatePreparedStmts finalizes all cached compiled sqlite3_stmt handles on this connection.
+func (c *SQLiteConn) InvalidatePreparedStmts() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clearStmtCacheLocked()
+}
+
+func (c *SQLiteConn) clearStmtCacheLocked() {
+	if c.stmtLRU == nil {
+		return
+	}
+	for elem := c.stmtLRU.Front(); elem != nil; elem = elem.Next() {
+		ent := elem.Value.(*cachedSQLiteStmt)
+		if ent.stmt != nil {
+			C.sqlite3_finalize(ent.stmt)
+			ent.stmt = nil
+		}
+	}
+	c.stmtLRU.Init()
+	clear(c.stmtCache)
+}
+
+// StmtCacheStats returns compiled sqlite3_stmt cache hit/miss counts.
+func (c *SQLiteConn) StmtCacheStats() (hits, misses uint64) {
+	if c == nil {
+		return 0, 0
+	}
+	return c.stmtCacheHits.Load(), c.stmtCacheMiss.Load()
+}
+
 // Close closes the underlying SQLite connection and frees C resources.
 func (c *SQLiteConn) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.cancelMu.Lock()
+	defer c.cancelMu.Unlock()
+	c.clearStmtCacheLocked()
 	if c.db != nil {
+		C.air_install_progress_handler(c.db, nil)
 		C.sqlite3_set_authorizer(c.db, nil, nil)
 		C.sqlite3_close_v2(c.db)
 		c.db = nil
@@ -201,6 +269,10 @@ func (c *SQLiteConn) Close() error {
 	if c.roFlag != nil {
 		C.free(unsafe.Pointer(c.roFlag))
 		c.roFlag = nil
+	}
+	if c.cancelFlag != nil {
+		C.free(unsafe.Pointer(c.cancelFlag))
+		c.cancelFlag = nil
 	}
 	return nil
 }
@@ -274,17 +346,68 @@ func (c *SQLiteConn) Query(sql string, args []string) (*SQLiteResult, error) {
 
 // QueryWithContext executes a SQL statement under ctx and an optional shared ReadSnapshot.
 func (c *SQLiteConn) QueryWithContext(ctx context.Context, snap *ReadSnapshot, sql string, args []string) (*SQLiteResult, error) {
-	res, _, err := c.queryWithContextInternal(ctx, snap, sql, args)
+	res, _, err := c.queryWithContextInternal(ctx, snap, sql, args, nil, 0, false)
 	return res, err
 }
 
 // QueryWithContextPlan executes a SQL statement under ctx and an optional shared ReadSnapshot,
 // also returning the last AIR virtual-table PlanDecision recorded during execution (if any).
 func (c *SQLiteConn) QueryWithContextPlan(ctx context.Context, snap *ReadSnapshot, sql string, args []string) (*SQLiteResult, *PlanDecision, error) {
-	return c.queryWithContextInternal(ctx, snap, sql, args)
+	return c.queryWithContextInternal(ctx, snap, sql, args, nil, 0, false)
 }
 
-func (c *SQLiteConn) queryWithContextInternal(ctx context.Context, snap *ReadSnapshot, sql string, args []string) (*SQLiteResult, *PlanDecision, error) {
+// QueryWithContextPlanTyped executes a SQL statement using the bounded compiled-statement
+// cache (keyed by sql + schemaVer) and typed PostgreSQL->SQLite parameter binding.
+func (c *SQLiteConn) QueryWithContextPlanTyped(ctx context.Context, snap *ReadSnapshot, sql string, args []string, paramOIDs []uint32, schemaVer uint64) (*SQLiteResult, *PlanDecision, error) {
+	return c.queryWithContextInternal(ctx, snap, sql, args, paramOIDs, schemaVer, true)
+}
+
+func bindSQLiteParamTyped(db *C.sqlite3, stmt *C.sqlite3_stmt, idx C.int, arg string, oid uint32) error {
+	if arg == "\x00NULL\x00" {
+		C.sqlite3_bind_null(stmt, idx)
+		return nil
+	}
+	switch oid {
+	case PGOIDInt4, PGOIDInt8, 21: // int4, int8, int2
+		if iv, err := strconv.ParseInt(arg, 10, 64); err == nil {
+			if rc := C.sqlite3_bind_int64(stmt, idx, C.sqlite3_int64(iv)); rc != C.SQLITE_OK {
+				return fmt.Errorf("bind int64 param %d: %s", int(idx), C.GoString(C.sqlite3_errmsg(db)))
+			}
+			return nil
+		}
+	case PGOIDFloat8, 700: // float8, float4
+		if fv, err := strconv.ParseFloat(arg, 64); err == nil {
+			if rc := C.sqlite3_bind_double(stmt, idx, C.double(fv)); rc != C.SQLITE_OK {
+				return fmt.Errorf("bind double param %d: %s", int(idx), C.GoString(C.sqlite3_errmsg(db)))
+			}
+			return nil
+		}
+	case PGOIDBool:
+		var bv int64
+		switch arg {
+		case "1", "t", "T", "true", "TRUE":
+			bv = 1
+		case "0", "f", "F", "false", "FALSE":
+			bv = 0
+		default:
+			goto bindText
+		}
+		if rc := C.sqlite3_bind_int64(stmt, idx, C.sqlite3_int64(bv)); rc != C.SQLITE_OK {
+			return fmt.Errorf("bind bool param %d: %s", int(idx), C.GoString(C.sqlite3_errmsg(db)))
+		}
+		return nil
+	}
+bindText:
+	carg := C.CString(arg)
+	brc := C.air_bind_text(stmt, idx, carg, C.int(len(arg)))
+	C.free(unsafe.Pointer(carg))
+	if brc != C.SQLITE_OK {
+		return fmt.Errorf("bind param %d: %s", int(idx), C.GoString(C.sqlite3_errmsg(db)))
+	}
+	return nil
+}
+
+func (c *SQLiteConn) queryWithContextInternal(ctx context.Context, snap *ReadSnapshot, sql string, args []string, paramOIDs []uint32, schemaVer uint64, useStmtCache bool) (*SQLiteResult, *PlanDecision, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -301,26 +424,20 @@ func (c *SQLiteConn) queryWithContextInternal(ctx context.Context, snap *ReadSna
 		return nil, nil, err
 	}
 
-	if ctx.Done() != nil {
-		cancelPtr := (*C.int)(C.malloc(C.size_t(unsafe.Sizeof(C.int(0)))))
-		*cancelPtr = 0
-		stopWatch := make(chan struct{})
-		doneCh := make(chan struct{})
-		C.air_install_progress_handler(c.db, cancelPtr)
-		go func() {
-			defer close(doneCh)
-			select {
-			case <-ctx.Done():
-				C.air_set_cancelled(cancelPtr)
+	if ctx.Done() != nil && c.cancelFlag != nil {
+		C.air_reset_cancelled(c.cancelFlag)
+		C.air_install_progress_handler(c.db, c.cancelFlag)
+		stopAfter := context.AfterFunc(ctx, func() {
+			c.cancelMu.Lock()
+			if c.db != nil && c.cancelFlag != nil {
+				C.air_set_cancelled(c.cancelFlag)
 				C.sqlite3_interrupt(c.db)
-			case <-stopWatch:
 			}
-		}()
+			c.cancelMu.Unlock()
+		})
 		defer func() {
-			close(stopWatch)
-			<-doneCh
+			stopAfter()
 			C.air_install_progress_handler(c.db, nil)
-			C.free(unsafe.Pointer(cancelPtr))
 		}()
 	}
 
@@ -331,56 +448,121 @@ func (c *SQLiteConn) queryWithContextInternal(ctx context.Context, snap *ReadSna
 	setActiveQueryContext(unsafe.Pointer(c.db), qctx)
 	defer clearActiveQueryContext(unsafe.Pointer(c.db))
 
-	csql := C.CString(sql)
-	defer C.free(unsafe.Pointer(csql))
-
 	var stmt *C.sqlite3_stmt
-	rc := C.sqlite3_prepare_v2(c.db, csql, -1, &stmt, nil)
-	if rc != C.SQLITE_OK {
-		msg := C.GoString(C.sqlite3_errmsg(c.db))
-		if rc == C.SQLITE_AUTH {
-			return nil, nil, &SQLiteReadOnlyError{Message: msg}
+	var cachedCols []SQLiteColumn
+	fromCache := false
+	key := stmtCacheKey{SQL: sql, SchemaVer: schemaVer}
+	if useStmtCache && c.stmtCache != nil {
+		if elem, ok := c.stmtCache[key]; ok {
+			ent := elem.Value.(*cachedSQLiteStmt)
+			c.stmtLRU.MoveToFront(elem)
+			stmt = ent.stmt
+			cachedCols = ent.cols
+			fromCache = true
+			c.stmtCacheHits.Add(1)
+			C.sqlite3_reset(stmt)
+			C.sqlite3_clear_bindings(stmt)
 		}
-		return nil, nil, fmt.Errorf("%s", msg)
 	}
-	if stmt == nil {
-		// Empty statement or comment-only query.
-		return &SQLiteResult{}, nil, nil
-	}
-	defer C.sqlite3_finalize(stmt)
 
-	if C.sqlite3_stmt_readonly(stmt) == 0 && c.readOnly {
-		return nil, nil, &SQLiteReadOnlyError{Message: "statement is not read-only"}
+	if stmt == nil {
+		if useStmtCache {
+			c.stmtCacheMiss.Add(1)
+		}
+		csql := C.CString(sql)
+		var tail *C.char
+		rc := C.sqlite3_prepare_v2(c.db, csql, -1, &stmt, &tail)
+		C.free(unsafe.Pointer(csql))
+		if rc != C.SQLITE_OK {
+			msg := C.GoString(C.sqlite3_errmsg(c.db))
+			if rc == C.SQLITE_AUTH {
+				return nil, nil, &SQLiteReadOnlyError{Message: msg}
+			}
+			return nil, nil, fmt.Errorf("%s", msg)
+		}
+		if stmt == nil {
+			// Empty statement or comment-only query.
+			return &SQLiteResult{}, nil, nil
+		}
+		if C.sqlite3_stmt_readonly(stmt) == 0 && c.readOnly {
+			C.sqlite3_finalize(stmt)
+			return nil, nil, &SQLiteReadOnlyError{Message: "statement is not read-only"}
+		}
+		if useStmtCache && c.stmtCache != nil && (tail == nil || *tail == 0) {
+			colCount := int(C.sqlite3_column_count(stmt))
+			cols := make([]SQLiteColumn, colCount)
+			for i := 0; i < colCount; i++ {
+				cname := C.GoString(C.sqlite3_column_name(stmt, C.int(i)))
+				var decl string
+				if cdecl := C.sqlite3_column_decltype(stmt, C.int(i)); cdecl != nil {
+					decl = C.GoString(cdecl)
+				}
+				oid, sz := declTypeToPG(decl)
+				cols[i] = SQLiteColumn{
+					Name:     cname,
+					DeclType: decl,
+					PGType:   oid,
+					PGSize:   sz,
+				}
+			}
+			cachedCols = cols
+			for c.stmtLRU.Len() >= maxCachedSQLiteStmts {
+				back := c.stmtLRU.Back()
+				if back == nil {
+					break
+				}
+				old := back.Value.(*cachedSQLiteStmt)
+				c.stmtLRU.Remove(back)
+				delete(c.stmtCache, old.key)
+				if old.stmt != nil {
+					C.sqlite3_finalize(old.stmt)
+				}
+			}
+			ent := &cachedSQLiteStmt{key: key, stmt: stmt, cols: cols}
+			c.stmtCache[key] = c.stmtLRU.PushFront(ent)
+			fromCache = true
+		}
+	}
+
+	if fromCache {
+		defer func() {
+			C.sqlite3_reset(stmt)
+			C.sqlite3_clear_bindings(stmt)
+		}()
+	} else {
+		defer C.sqlite3_finalize(stmt)
 	}
 
 	for i, arg := range args {
-		idx := C.int(i + 1)
-		if arg == "\x00NULL\x00" {
-			C.sqlite3_bind_null(stmt, idx)
-			continue
+		var oid uint32
+		if i < len(paramOIDs) {
+			oid = paramOIDs[i]
 		}
-		carg := C.CString(arg)
-		brc := C.air_bind_text(stmt, idx, carg, C.int(len(arg)))
-		C.free(unsafe.Pointer(carg))
-		if brc != C.SQLITE_OK {
-			return nil, nil, fmt.Errorf("bind param %d: %s", i+1, C.GoString(C.sqlite3_errmsg(c.db)))
+		if berr := bindSQLiteParamTyped(c.db, stmt, C.int(i+1), arg, oid); berr != nil {
+			return nil, nil, berr
 		}
 	}
 
+	var cols []SQLiteColumn
 	colCount := int(C.sqlite3_column_count(stmt))
-	cols := make([]SQLiteColumn, colCount)
-	for i := 0; i < colCount; i++ {
-		cname := C.GoString(C.sqlite3_column_name(stmt, C.int(i)))
-		var decl string
-		if cdecl := C.sqlite3_column_decltype(stmt, C.int(i)); cdecl != nil {
-			decl = C.GoString(cdecl)
-		}
-		oid, sz := declTypeToPG(decl)
-		cols[i] = SQLiteColumn{
-			Name:     cname,
-			DeclType: decl,
-			PGType:   oid,
-			PGSize:   sz,
+	if cachedCols != nil {
+		cols = make([]SQLiteColumn, len(cachedCols))
+		copy(cols, cachedCols)
+	} else {
+		cols = make([]SQLiteColumn, colCount)
+		for i := 0; i < colCount; i++ {
+			cname := C.GoString(C.sqlite3_column_name(stmt, C.int(i)))
+			var decl string
+			if cdecl := C.sqlite3_column_decltype(stmt, C.int(i)); cdecl != nil {
+				decl = C.GoString(cdecl)
+			}
+			oid, sz := declTypeToPG(decl)
+			cols[i] = SQLiteColumn{
+				Name:     cname,
+				DeclType: decl,
+				PGType:   oid,
+				PGSize:   sz,
+			}
 		}
 	}
 
@@ -389,10 +571,34 @@ func (c *SQLiteConn) queryWithContextInternal(ctx context.Context, snap *ReadSna
 		IsSelect: colCount > 0,
 	}
 
+	budget := MemoryBudgetFromContext(ctx)
+	limits, hasLimits := ResourceLimitsFromContext(ctx)
+	const valStructSize = int64(unsafe.Sizeof(SQLiteValue{}))
+	// Arena-style slab allocation for row slices reduces per-row heap allocations from O(N) to O(log N).
+	var rowArena []SQLiteValue
+	arenaOff := 0
+	allocRow := func(n int) []SQLiteValue {
+		if n == 0 {
+			return nil
+		}
+		if arenaOff+n > len(rowArena) {
+			slabRows := 16
+			if len(res.Rows) >= 64 {
+				slabRows = 128
+			}
+			rowArena = make([]SQLiteValue, slabRows*n)
+			arenaOff = 0
+		}
+		s := rowArena[arenaOff : arenaOff+n : arenaOff+n]
+		arenaOff += n
+		return s
+	}
+
 	for {
 		stepRC := C.sqlite3_step(stmt)
 		if stepRC == C.SQLITE_ROW {
-			row := make([]SQLiteValue, colCount)
+			row := allocRow(colCount)
+			var rowBytes int64 = int64(colCount)*valStructSize + 24
 			for i := 0; i < colCount; i++ {
 				ct := int(C.sqlite3_column_type(stmt, C.int(i)))
 				switch ct {
@@ -400,22 +606,26 @@ func (c *SQLiteConn) queryWithContextInternal(ctx context.Context, snap *ReadSna
 					row[i] = SQLiteValue{Type: ct, IsNil: true}
 				case C.SQLITE_INTEGER:
 					iv := int64(C.sqlite3_column_int64(stmt, C.int(i)))
+					txt := strconv.FormatInt(iv, 10)
 					row[i] = SQLiteValue{
 						Type:  ct,
 						Int64: iv,
-						Text:  fmt.Sprintf("%d", iv),
+						Text:  txt,
 					}
+					rowBytes += int64(len(txt))
 					if res.Columns[i].DeclType == "" {
 						res.Columns[i].PGType = PGOIDInt8
 						res.Columns[i].PGSize = 8
 					}
 				case C.SQLITE_FLOAT:
 					fv := float64(C.sqlite3_column_double(stmt, C.int(i)))
+					txt := strconv.FormatFloat(fv, 'g', -1, 64)
 					row[i] = SQLiteValue{
 						Type:  ct,
 						Float: fv,
-						Text:  fmt.Sprintf("%g", fv),
+						Text:  txt,
 					}
+					rowBytes += int64(len(txt))
 					if res.Columns[i].DeclType == "" {
 						res.Columns[i].PGType = PGOIDFloat8
 						res.Columns[i].PGSize = 8
@@ -423,15 +633,21 @@ func (c *SQLiteConn) queryWithContextInternal(ctx context.Context, snap *ReadSna
 				case C.SQLITE_BLOB:
 					n := C.sqlite3_column_bytes(stmt, C.int(i))
 					ptr := C.sqlite3_column_blob(stmt, C.int(i))
-					b := []byte{}
+					var b []byte
+					var txt string
 					if n > 0 && ptr != nil {
 						b = C.GoBytes(ptr, n)
+						txt = "\\x" + hex.EncodeToString(b)
+					} else {
+						b = []byte{}
+						txt = "\\x"
 					}
 					row[i] = SQLiteValue{
 						Type: ct,
 						Blob: b,
-						Text: "\\x" + hex.EncodeToString(b),
+						Text: txt,
 					}
+					rowBytes += int64(len(b)) + int64(len(txt))
 					if res.Columns[i].DeclType == "" {
 						res.Columns[i].PGType = PGOIDBytea
 						res.Columns[i].PGSize = -1
@@ -447,6 +663,15 @@ func (c *SQLiteConn) queryWithContextInternal(ctx context.Context, snap *ReadSna
 						Type: C.SQLITE_TEXT,
 						Text: s,
 					}
+					rowBytes += int64(len(s))
+				}
+			}
+			if hasLimits && limits.MaxResultRows > 0 && int64(len(res.Rows)) >= limits.MaxResultRows {
+				return nil, nil, fmt.Errorf("%w: max rows %d exceeded", ErrResultLimitExceeded, limits.MaxResultRows)
+			}
+			if budget != nil {
+				if berr := budget.Reserve(rowBytes); berr != nil {
+					return nil, nil, berr
 				}
 			}
 			res.Rows = append(res.Rows, row)
@@ -520,4 +745,14 @@ func (e *SQLiteReadOnlyError) Error() string {
 // SQLiteVersion returns the linked libsqlite3 version string.
 func SQLiteVersion() string {
 	return C.GoString(C.sqlite3_libversion())
+}
+
+// SQLiteMemoryUsed returns the current C heap bytes allocated by SQLite.
+func SQLiteMemoryUsed() int64 {
+	return int64(C.sqlite3_memory_used())
+}
+
+// SQLiteMemoryHighwater returns the peak C heap bytes allocated by SQLite.
+func SQLiteMemoryHighwater() int64 {
+	return int64(C.sqlite3_memory_highwater(0))
 }
