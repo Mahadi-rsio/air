@@ -136,6 +136,12 @@ func main() {
 		log.Printf("[air-server] cooperative gateway drain enabled (gateway_admin_url=%s)", cfg.GatewayAdminURL)
 	}
 
+	if cfg.GatewayAdminURL != "" {
+		telPub := cell.NewTelemetryPublisher(ag, cfg.GatewayAdminURL, cfg.InternalToken, "", time.Second)
+		telPub.Start(ctx)
+		log.Printf("[air-server] cell resource telemetry publisher enabled (gateway_admin_url=%s)", cfg.GatewayAdminURL)
+	}
+
 	if cfg.IdleTimeout > 0 {
 		cp.StartIdleReaper(ctx, cfg.IdleTimeout, 0, poolDrainFn)
 		log.Printf("[air-server] cooperative scale-to-zero enabled (idle_timeout=%s)", cfg.IdleTimeout)

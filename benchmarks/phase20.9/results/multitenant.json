@@ -1,0 +1,194 @@
+[
+  {
+    "mode": "A_no_governor",
+    "tenant": "tenant_a",
+    "role": "heavy_bulk_16c",
+    "clients": 16,
+    "summary": {
+      "count": 18223,
+      "errors": 0,
+      "tps": 2275.6956590019718,
+      "p50_ms": 6.384,
+      "p95_ms": 11.729,
+      "p99_ms": 14.624,
+      "max_ms": 302.348,
+      "avg_ms": 7.015185040882401
+    }
+  },
+  {
+    "mode": "A_no_governor",
+    "tenant": "tenant_b",
+    "role": "interactive_small_2c",
+    "clients": 2,
+    "summary": {
+      "count": 4059,
+      "errors": 0,
+      "tps": 507.053799608503,
+      "p50_ms": 3.643,
+      "p95_ms": 7.492,
+      "p99_ms": 10.12,
+      "max_ms": 53.21,
+      "avg_ms": 3.9381692535107167
+    }
+  },
+  {
+    "mode": "A_no_governor",
+    "tenant": "tenant_c",
+    "role": "mixed_rw_4c",
+    "clients": 4,
+    "summary": {
+      "count": 7951,
+      "errors": 0,
+      "tps": 993.7720817334565,
+      "p50_ms": 3.662,
+      "p95_ms": 7.678,
+      "p99_ms": 10.524,
+      "max_ms": 127.872,
+      "avg_ms": 4.017334423342976
+    }
+  },
+  {
+    "mode": "A_no_governor",
+    "tenant": "tenant_d",
+    "role": "intermittent_2c",
+    "clients": 2,
+    "summary": {
+      "count": 286,
+      "errors": 0,
+      "tps": 35.69176121339022,
+      "p50_ms": 54.841,
+      "p95_ms": 59.977,
+      "p99_ms": 64.749,
+      "max_ms": 106.407,
+      "avg_ms": 55.62382517482517
+    }
+  },
+  {
+    "mode": "B_static_governor",
+    "tenant": "tenant_a",
+    "role": "heavy_bulk_16c",
+    "clients": 16,
+    "summary": {
+      "count": 12761,
+      "errors": 0,
+      "tps": 1593.3058329079527,
+      "p50_ms": 9.462,
+      "p95_ms": 14.051,
+      "p99_ms": 21.6,
+      "max_ms": 102.393,
+      "avg_ms": 10.017680197476688
+    }
+  },
+  {
+    "mode": "B_static_governor",
+    "tenant": "tenant_b",
+    "role": "interactive_small_2c",
+    "clients": 2,
+    "summary": {
+      "count": 5644,
+      "errors": 0,
+      "tps": 705.4761475868966,
+      "p50_ms": 2.62,
+      "p95_ms": 4.911,
+      "p99_ms": 7.712,
+      "max_ms": 46.459,
+      "avg_ms": 2.831923281360737
+    }
+  },
+  {
+    "mode": "B_static_governor",
+    "tenant": "tenant_c",
+    "role": "mixed_rw_4c",
+    "clients": 4,
+    "summary": {
+      "count": 11225,
+      "errors": 0,
+      "tps": 1402.6725579723839,
+      "p50_ms": 2.618,
+      "p95_ms": 5.095,
+      "p99_ms": 8.286,
+      "max_ms": 97.02,
+      "avg_ms": 2.8466217371937637
+    }
+  },
+  {
+    "mode": "B_static_governor",
+    "tenant": "tenant_d",
+    "role": "intermittent_2c",
+    "clients": 2,
+    "summary": {
+      "count": 294,
+      "errors": 0,
+      "tps": 36.65142184102219,
+      "p50_ms": 53.327,
+      "p95_ms": 57.969,
+      "p99_ms": 70.611,
+      "max_ms": 110.258,
+      "avg_ms": 54.19395238095238
+    }
+  },
+  {
+    "mode": "C_adaptive_governor",
+    "tenant": "tenant_a",
+    "role": "heavy_bulk_16c",
+    "clients": 16,
+    "summary": {
+      "count": 10082,
+      "errors": 0,
+      "tps": 1259.288165458706,
+      "p50_ms": 12.212,
+      "p95_ms": 16.812,
+      "p99_ms": 26.808,
+      "max_ms": 90.987,
+      "avg_ms": 12.674507339813529
+    }
+  },
+  {
+    "mode": "C_adaptive_governor",
+    "tenant": "tenant_b",
+    "role": "interactive_small_2c",
+    "clients": 2,
+    "summary": {
+      "count": 5259,
+      "errors": 0,
+      "tps": 656.6691582239536,
+      "p50_ms": 2.818,
+      "p95_ms": 4.979,
+      "p99_ms": 7.115,
+      "max_ms": 83.336,
+      "avg_ms": 3.0391544019775623
+    }
+  },
+  {
+    "mode": "C_adaptive_governor",
+    "tenant": "tenant_c",
+    "role": "mixed_rw_4c",
+    "clients": 4,
+    "summary": {
+      "count": 13654,
+      "errors": 0,
+      "tps": 1705.807096363607,
+      "p50_ms": 2.15,
+      "p95_ms": 4.33,
+      "p99_ms": 6.114,
+      "max_ms": 66.41,
+      "avg_ms": 2.3414155558810603
+    }
+  },
+  {
+    "mode": "C_adaptive_governor",
+    "tenant": "tenant_d",
+    "role": "intermittent_2c",
+    "clients": 2,
+    "summary": {
+      "count": 296,
+      "errors": 0,
+      "tps": 36.91176007518762,
+      "p50_ms": 53.225,
+      "p95_ms": 56.251,
+      "p99_ms": 62.282,
+      "max_ms": 91.182,
+      "avg_ms": 53.78243918918918
+    }
+  }
+]

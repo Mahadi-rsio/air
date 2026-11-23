@@ -1,0 +1,66 @@
+=== AIR Phase 20.9 Real PostgreSQL 17 Validation Harness ===
+Suite=sweep Duration=5s Sustained=60s GatewayBin=/workspaces/air/benchmarks/phase20.9/bin/air-gateway OutDir=/workspaces/air/benchmarks/phase20.9/results
+
+--- STAGE: Concurrency Sweep (1,2,4,8,16,32 across 5 Phase 20 Configs) ---
+[sweep] A_no_governor      autocommit_insert c=1  TPS= 2121.1 p50= 0.44ms p95=  0.58ms p99=  1.05ms err=0 effLim=32 rej=0 cgCur=406.2MB
+[sweep] A_no_governor      pgbench_tpcb      c=1  TPS=  471.6 avg=  2.12ms effLim=32 cgCur=311.5MB cgPeak=435.7MB
+[sweep] A_no_governor      autocommit_insert c=2  TPS= 2976.3 p50= 0.62ms p95=  1.03ms p99=  1.79ms err=0 effLim=32 rej=0 cgCur=315.4MB
+[sweep] A_no_governor      pgbench_tpcb      c=2  TPS=  701.7 avg=  2.85ms effLim=32 cgCur=318.9MB cgPeak=435.7MB
+[sweep] A_no_governor      autocommit_insert c=4  TPS= 3958.3 p50= 0.96ms p95=  1.50ms p99=  1.99ms err=0 effLim=32 rej=0 cgCur=357.2MB
+[sweep] A_no_governor      pgbench_tpcb      c=4  TPS=  809.8 avg=  4.94ms effLim=32 cgCur=342.6MB cgPeak=435.7MB
+[sweep] A_no_governor      autocommit_insert c=8  TPS= 4594.2 p50= 1.65ms p95=  2.76ms p99=  3.79ms err=0 effLim=32 rej=0 cgCur=351.6MB
+[sweep] A_no_governor      pgbench_tpcb      c=8  TPS=  865.9 avg=  9.24ms effLim=32 cgCur=353.3MB cgPeak=435.7MB
+[sweep] A_no_governor      autocommit_insert c=16 TPS= 5091.7 p50= 2.98ms p95=  5.02ms p99=  6.59ms err=0 effLim=32 rej=0 cgCur=402.1MB
+[sweep] A_no_governor      pgbench_tpcb      c=16 TPS=  855.7 avg= 18.70ms effLim=32 cgCur=388.2MB cgPeak=435.7MB
+[sweep] A_no_governor      autocommit_insert c=32 TPS= 5103.4 p50= 5.82ms p95= 10.54ms p99= 14.35ms err=0 effLim=32 rej=0 cgCur=415.8MB
+[sweep] A_no_governor      pgbench_tpcb      c=32 TPS=  879.5 avg= 36.38ms effLim=32 cgCur=421.0MB cgPeak=435.7MB
+[sweep] B_static_governor  autocommit_insert c=1  TPS= 2140.9 p50= 0.45ms p95=  0.56ms p99=  0.93ms err=0 effLim=16 rej=0 cgCur=353.1MB
+[sweep] B_static_governor  pgbench_tpcb      c=1  TPS=  465.6 avg=  2.15ms effLim=16 cgCur=354.0MB cgPeak=435.7MB
+[sweep] B_static_governor  autocommit_insert c=2  TPS= 2934.1 p50= 0.64ms p95=  0.98ms p99=  1.56ms err=0 effLim=16 rej=0 cgCur=390.0MB
+[sweep] B_static_governor  pgbench_tpcb      c=2  TPS=  686.2 avg=  2.91ms effLim=16 cgCur=374.2MB cgPeak=435.7MB
+[sweep] B_static_governor  autocommit_insert c=4  TPS= 3845.7 p50= 0.98ms p95=  1.57ms p99=  2.10ms err=0 effLim=16 rej=0 cgCur=377.8MB
+[sweep] B_static_governor  pgbench_tpcb      c=4  TPS=  786.9 avg=  5.08ms effLim=16 cgCur=380.4MB cgPeak=435.7MB
+[sweep] B_static_governor  autocommit_insert c=8  TPS= 4491.1 p50= 1.68ms p95=  2.83ms p99=  3.82ms err=0 effLim=16 rej=0 cgCur=389.4MB
+[sweep] B_static_governor  pgbench_tpcb      c=8  TPS=  868.1 avg=  9.21ms effLim=16 cgCur=390.8MB cgPeak=435.7MB
+[sweep] B_static_governor  autocommit_insert c=16 TPS= 4450.3 p50= 3.38ms p95=  5.30ms p99=  7.25ms err=0 effLim=16 rej=0 cgCur=430.7MB
+[sweep] B_static_governor  pgbench_tpcb      c=16 TPS=  877.7 avg= 18.23ms effLim=16 cgCur=424.6MB cgPeak=435.7MB
+[sweep] B_static_governor  autocommit_insert c=32 TPS= 4574.3 p50= 6.77ms p95=  9.07ms p99= 12.52ms err=0 effLim=16 rej=0 cgCur=427.1MB
+[sweep] B_static_governor  pgbench_tpcb      c=32 TPS=  885.6 avg= 36.13ms effLim=16 cgCur=434.7MB cgPeak=435.7MB
+[sweep] C_adaptive_governor autocommit_insert c=1  TPS= 2135.7 p50= 0.45ms p95=  0.57ms p99=  0.98ms err=0 effLim=2 rej=0 cgCur=374.1MB
+[sweep] C_adaptive_governor pgbench_tpcb      c=1  TPS=  468.1 avg=  2.14ms effLim=2 cgCur=374.9MB cgPeak=435.7MB
+[sweep] C_adaptive_governor autocommit_insert c=2  TPS= 2994.7 p50= 0.62ms p95=  0.95ms p99=  1.51ms err=0 effLim=2 rej=0 cgCur=417.1MB
+[sweep] C_adaptive_governor pgbench_tpcb      c=2  TPS=  693.1 avg=  2.89ms effLim=2 cgCur=401.3MB cgPeak=435.7MB
+[sweep] C_adaptive_governor autocommit_insert c=4  TPS= 3202.2 p50= 1.22ms p95=  1.66ms p99=  2.24ms err=0 effLim=2 rej=0 cgCur=404.6MB
+[sweep] C_adaptive_governor pgbench_tpcb      c=4  TPS=  812.9 avg=  4.92ms effLim=2 cgCur=407.2MB cgPeak=435.7MB
+[sweep] C_adaptive_governor autocommit_insert c=8  TPS= 3152.5 p50= 2.46ms p95=  3.24ms p99=  4.46ms err=0 effLim=2 rej=0 cgCur=407.3MB
+[sweep] C_adaptive_governor pgbench_tpcb      c=8  TPS=  888.1 avg=  9.01ms effLim=2 cgCur=417.0MB cgPeak=435.7MB
+[sweep] C_adaptive_governor autocommit_insert c=16 TPS= 3032.0 p50= 4.92ms p95=  5.90ms p99=  7.73ms err=0 effLim=2 rej=0 cgCur=408.9MB
+[sweep] C_adaptive_governor pgbench_tpcb      c=16 TPS=  822.8 avg= 19.45ms effLim=2 cgCur=434.6MB cgPeak=435.7MB
+[sweep] C_adaptive_governor autocommit_insert c=32 TPS= 3115.3 p50=10.03ms p95= 11.79ms p99= 14.95ms err=0 effLim=2 rej=0 cgCur=393.7MB
+[sweep] C_adaptive_governor pgbench_tpcb      c=32 TPS=  847.6 avg= 37.76ms effLim=2 cgCur=434.8MB cgPeak=435.7MB
+[sweep] D_gov_buf_lazylsn  autocommit_insert c=1  TPS= 2152.1 p50= 0.44ms p95=  0.56ms p99=  0.93ms err=0 effLim=16 rej=0 cgCur=371.4MB
+[sweep] D_gov_buf_lazylsn  pgbench_tpcb      c=1  TPS=  455.5 avg=  2.20ms effLim=16 cgCur=374.5MB cgPeak=435.7MB
+[sweep] D_gov_buf_lazylsn  autocommit_insert c=2  TPS= 3060.4 p50= 0.62ms p95=  0.88ms p99=  1.31ms err=0 effLim=16 rej=0 cgCur=375.4MB
+[sweep] D_gov_buf_lazylsn  pgbench_tpcb      c=2  TPS=  685.1 avg=  2.92ms effLim=16 cgCur=379.1MB cgPeak=435.7MB
+[sweep] D_gov_buf_lazylsn  autocommit_insert c=4  TPS= 3862.1 p50= 0.97ms p95=  1.56ms p99=  2.24ms err=0 effLim=16 rej=0 cgCur=417.3MB
+[sweep] D_gov_buf_lazylsn  pgbench_tpcb      c=4  TPS=  818.3 avg=  4.89ms effLim=16 cgCur=402.9MB cgPeak=435.7MB
+[sweep] D_gov_buf_lazylsn  autocommit_insert c=8  TPS= 4589.6 p50= 1.66ms p95=  2.75ms p99=  3.56ms err=0 effLim=16 rej=0 cgCur=411.9MB
+[sweep] D_gov_buf_lazylsn  pgbench_tpcb      c=8  TPS=  894.5 avg=  8.94ms effLim=16 cgCur=413.3MB cgPeak=435.7MB
+[sweep] D_gov_buf_lazylsn  autocommit_insert c=16 TPS= 4456.7 p50= 3.33ms p95=  5.03ms p99=  6.62ms err=0 effLim=16 rej=0 cgCur=420.5MB
+[sweep] D_gov_buf_lazylsn  pgbench_tpcb      c=16 TPS=  841.8 avg= 19.01ms effLim=16 cgCur=434.9MB cgPeak=435.7MB
+[sweep] D_gov_buf_lazylsn  autocommit_insert c=32 TPS= 4653.9 p50= 6.70ms p95=  8.66ms p99= 10.90ms err=0 effLim=16 rej=0 cgCur=417.3MB
+[sweep] D_gov_buf_lazylsn  pgbench_tpcb      c=32 TPS=  860.5 avg= 37.19ms effLim=16 cgCur=434.8MB cgPeak=435.7MB
+[sweep] E_full_phase20     autocommit_insert c=1  TPS= 2150.7 p50= 0.45ms p95=  0.55ms p99=  0.84ms err=0 effLim=2 rej=0 cgCur=366.1MB
+[sweep] E_full_phase20     pgbench_tpcb      c=1  TPS=  457.5 avg=  2.19ms effLim=2 cgCur=369.7MB cgPeak=435.7MB
+[sweep] E_full_phase20     autocommit_insert c=2  TPS= 3026.7 p50= 0.62ms p95=  0.93ms p99=  1.46ms err=0 effLim=2 rej=0 cgCur=372.8MB
+[sweep] E_full_phase20     pgbench_tpcb      c=2  TPS=  679.7 avg=  2.94ms effLim=2 cgCur=375.0MB cgPeak=435.7MB
+[sweep] E_full_phase20     autocommit_insert c=4  TPS= 3077.8 p50= 1.25ms p95=  1.77ms p99=  2.46ms err=0 effLim=2 rej=0 cgCur=412.6MB
+[sweep] E_full_phase20     pgbench_tpcb      c=4  TPS=  817.3 avg=  4.89ms effLim=2 cgCur=398.2MB cgPeak=435.7MB
+[sweep] E_full_phase20     autocommit_insert c=8  TPS= 3127.4 p50= 2.48ms p95=  3.24ms p99=  4.46ms err=0 effLim=2 rej=0 cgCur=396.3MB
+[sweep] E_full_phase20     pgbench_tpcb      c=8  TPS=  854.0 avg=  9.37ms effLim=2 cgCur=407.3MB cgPeak=435.7MB
+[sweep] E_full_phase20     autocommit_insert c=16 TPS= 3087.3 p50= 5.03ms p95=  6.15ms p99=  8.47ms err=0 effLim=2 rej=0 cgCur=402.6MB
+[sweep] E_full_phase20     pgbench_tpcb      c=16 TPS=  818.6 avg= 19.55ms effLim=2 cgCur=434.8MB cgPeak=435.7MB
+[sweep] E_full_phase20     autocommit_insert c=32 TPS= 3125.5 p50= 9.96ms p95= 11.68ms p99= 16.11ms err=0 effLim=2 rej=0 cgCur=374.7MB
+[sweep] E_full_phase20     pgbench_tpcb      c=32 TPS=  795.8 avg= 40.21ms effLim=2 cgCur=434.9MB cgPeak=435.7MB
+
+=== Phase 20.9 Harness Completed ===

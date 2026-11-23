@@ -1,0 +1,22 @@
+=== AIR Phase 20.9 Real PostgreSQL 17 Validation Harness ===
+Suite=workloads Duration=5s Sustained=60s GatewayBin=/workspaces/air/benchmarks/phase20.9/bin/air-gateway OutDir=/workspaces/air/benchmarks/phase20.9/results
+
+--- STAGE: Workload Suite (INSERT, UPDATE, UPSERT, DELETE, COPY, TX) ---
+[workload] insert_single_noindex        c=8  TPS= 4360.3 rows/s=   4360.3 p50= 1.65ms p95=  3.34ms p99=  5.15ms err=0 WAL=18.0MB cgPeak=91.3MB gwRSS=22.1MB
+[workload] insert_single_indexed        c=8  TPS= 4199.8 rows/s=   4199.8 p50= 1.78ms p95=  3.14ms p99=  4.50ms err=0 WAL=6.6MB cgPeak=113.4MB gwRSS=22.1MB
+[workload] insert_multirow_50           c=8  TPS= 1771.5 rows/s=  88575.4 p50= 3.88ms p95=  7.63ms p99= 11.11ms err=0 WAL=36.8MB cgPeak=191.1MB gwRSS=22.1MB
+[workload] update_nonindexed_small      c=8  TPS= 2935.2 rows/s=   2935.2 p50= 2.62ms p95=  3.52ms p99=  4.99ms err=0 WAL=2.8MB cgPeak=191.1MB gwRSS=22.2MB
+[workload] update_indexed_col           c=8  TPS= 2738.2 rows/s=   2738.2 p50= 2.75ms p95=  4.13ms p99=  6.23ms err=0 WAL=4.0MB cgPeak=191.2MB gwRSS=22.2MB
+[workload] update_large_row_4kb         c=8  TPS= 2167.1 rows/s=   2167.1 p50= 3.56ms p95=  4.78ms p99=  6.36ms err=0 WAL=2.6MB cgPeak=191.2MB gwRSS=22.5MB
+[workload] upsert_no_conflict           c=8  TPS= 2911.4 rows/s=   2911.4 p50= 2.57ms p95=  4.17ms p99=  5.94ms err=0 WAL=2.7MB cgPeak=191.2MB gwRSS=22.4MB
+[workload] upsert_on_conflict_low       c=8  TPS= 2938.2 rows/s=   2938.2 p50= 2.62ms p95=  3.46ms p99=  5.51ms err=0 WAL=3.5MB cgPeak=191.2MB gwRSS=22.8MB
+[workload] upsert_high_conflict_hot     c=8  TPS= 2835.3 rows/s=   2835.3 p50= 2.62ms p95=  4.35ms p99=  6.38ms err=0 WAL=2.4MB cgPeak=191.2MB gwRSS=22.4MB
+[workload] delete_small_single          c=8  TPS= 3087.8 rows/s=   3087.8 p50= 2.52ms p95=  3.21ms p99=  4.33ms err=0 WAL=1.4MB cgPeak=208.1MB gwRSS=22.6MB
+[workload] delete_large_batch_100rows   c=4  TPS= 1075.3 rows/s= 107530.0 p50= 3.16ms p95=  7.92ms p99= 11.14ms err=0 WAL=12.6MB cgPeak=208.2MB gwRSS=22.5MB
+[workload] copy_small_1k_rows           c=4  TPS=  446.0 rows/s= 446045.4 p50= 8.05ms p95= 11.95ms p99= 32.91ms err=0 WAL=90.7MB cgPeak=435.9MB gwRSSPeak=23.1MB
+[workload] copy_large_25k_rows          c=4  TPS=   37.5 rows/s= 936746.5 p50=92.74ms p95=186.15ms p99=213.09ms err=0 WAL=198.5MB cgPeak=435.9MB gwRSSPeak=23.0MB
+[workload] tx_explicit_begin_commit     c=8  TPS= 1635.3 rows/s=   3270.6 p50= 4.62ms p95=  6.79ms p99= 10.52ms err=0 WAL=1.8MB cgPeak=435.9MB gwRSS=22.9MB
+[workload] tx_explicit_rollback         c=8  TPS= 2403.0 rows/s=   2403.0 p50= 3.04ms p95=  5.25ms p99=  8.70ms err=0 WAL=1.4MB cgPeak=435.9MB gwRSS=89.7MB
+[workload] tx_savepoint_rollback_to     c=8  TPS= 1275.1 rows/s=   2550.3 p50= 6.02ms p95=  8.60ms p99= 12.40ms err=0 WAL=1.5MB cgPeak=435.9MB gwRSS=24.7MB
+
+=== Phase 20.9 Harness Completed ===

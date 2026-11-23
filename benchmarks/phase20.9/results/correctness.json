@@ -1,0 +1,57 @@
+[
+  {
+    "name": "durability_gucs",
+    "passed": true,
+    "detail": "fsync=on full_page_writes=on synchronous_commit=on"
+  },
+  {
+    "name": "ddl_constraints_triggers_seq",
+    "passed": true,
+    "detail": "err=\u003cnil\u003e"
+  },
+  {
+    "name": "constraints_fk_trigger_upsert",
+    "passed": true,
+    "detail": "pid=1 dupErr=true fkErr=true auditCnt=1"
+  },
+  {
+    "name": "mvcc_isolation_and_tx_affinity",
+    "passed": true,
+    "detail": "txPID1=15186 txPID2=15186 unseenInConn2=0 afterRollback=0"
+  },
+  {
+    "name": "savepoint_semantics",
+    "passed": true,
+    "detail": "keep=1 drop=0"
+  },
+  {
+    "name": "concurrent_updates_atomic",
+    "passed": true,
+    "detail": "expected=200 got=200"
+  },
+  {
+    "name": "copy_from_stdin_streaming",
+    "passed": true,
+    "detail": "rowsAffected=10000 count=10000 err=\u003cnil\u003e"
+  },
+  {
+    "name": "prepared_statements",
+    "passed": true,
+    "detail": "val=\"prep_sql_1\" errs=\u003cnil\u003e/\u003cnil\u003e/\u003cnil\u003e/\u003cnil\u003e"
+  },
+  {
+    "name": "wal_crash_recovery_sigkill",
+    "passed": true,
+    "detail": "committed=1 uncommitted=0 restartErr=\u003cnil\u003e queryErr=\u003cnil\u003e"
+  },
+  {
+    "name": "lazy_lsn_ryow_and_count",
+    "passed": true,
+    "detail": "pure20WritesLSNs=0 afterReadLSNs=1 ryow=1 txCommitLSNs=0 txReadCheckLSNs=0 txAfterReadLSNs=1 txRyow=1"
+  },
+  {
+    "name": "eager_lsn_baseline_count",
+    "passed": true,
+    "detail": "eager20WritesLSNs=20 (expected 20)"
+  }
+]

@@ -1,0 +1,18 @@
+=== AIR Phase 20.9 Real PostgreSQL 17 Validation Harness ===
+Suite=multitenant Duration=8s Sustained=60s GatewayBin=/workspaces/air/benchmarks/phase20.9/bin/air-gateway OutDir=/workspaces/air/benchmarks/phase20.9/results
+
+--- STAGE: 4-Tenant Fairness Validation (DRR) ---
+[fairness] A_no_governor       tenant_a   heavy_bulk_16c       TPS= 2275.7 p50= 6.38ms p95= 11.73ms p99= 14.62ms err=0
+[fairness] A_no_governor       tenant_b   interactive_small_2c TPS=  507.1 p50= 3.64ms p95=  7.49ms p99= 10.12ms err=0
+[fairness] A_no_governor       tenant_c   mixed_rw_4c          TPS=  993.8 p50= 3.66ms p95=  7.68ms p99= 10.52ms err=0
+[fairness] A_no_governor       tenant_d   intermittent_2c      TPS=   35.7 p50=54.84ms p95= 59.98ms p99= 64.75ms err=0
+[fairness] B_static_governor   tenant_a   heavy_bulk_16c       TPS= 1593.3 p50= 9.46ms p95= 14.05ms p99= 21.60ms err=0
+[fairness] B_static_governor   tenant_b   interactive_small_2c TPS=  705.5 p50= 2.62ms p95=  4.91ms p99=  7.71ms err=0
+[fairness] B_static_governor   tenant_c   mixed_rw_4c          TPS= 1402.7 p50= 2.62ms p95=  5.09ms p99=  8.29ms err=0
+[fairness] B_static_governor   tenant_d   intermittent_2c      TPS=   36.7 p50=53.33ms p95= 57.97ms p99= 70.61ms err=0
+[fairness] C_adaptive_governor tenant_a   heavy_bulk_16c       TPS= 1259.3 p50=12.21ms p95= 16.81ms p99= 26.81ms err=0
+[fairness] C_adaptive_governor tenant_b   interactive_small_2c TPS=  656.7 p50= 2.82ms p95=  4.98ms p99=  7.12ms err=0
+[fairness] C_adaptive_governor tenant_c   mixed_rw_4c          TPS= 1705.8 p50= 2.15ms p95=  4.33ms p99=  6.11ms err=0
+[fairness] C_adaptive_governor tenant_d   intermittent_2c      TPS=   36.9 p50=53.23ms p95= 56.25ms p99= 62.28ms err=0
+
+=== Phase 20.9 Harness Completed ===

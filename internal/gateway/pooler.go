@@ -833,7 +833,8 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 		routedToRead := false
 		if !isExecStmt && !st.sessionPinned && st.txStatus == 'I' && st.currentBackend == nil && rport > 0 {
 			rlsn := p.readEngineLSN.Load()
-			if !isSusp && !st.sessionDirtyWrite && st.sessionWriteLSN > 0 && rlsn < st.sessionWriteLSN {
+			if !isSusp && !st.sessionDirtyWrite && st.sessionWriteLSN > 0 && rlsn < st.sessionWriteLSN &&
+				ClassifySQLForRouting(trimmed).Target == RouteTargetReadEngine {
 				if rb, err := p.acquireReadBackend(st.clientID); err == nil && rb != nil {
 					if fresh, ok := queryLSNBackend(rb, "SELECT COALESCE(pg_last_wal_replay_lsn(), pg_current_wal_lsn())::text"); ok {
 						rlsn = fresh

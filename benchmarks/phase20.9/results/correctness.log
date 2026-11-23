@@ -1,0 +1,17 @@
+=== AIR Phase 20.9 Real PostgreSQL 17 Validation Harness ===
+Suite=correctness Duration=5s Sustained=60s GatewayBin=/workspaces/air/benchmarks/phase20.9/bin/air-gateway OutDir=/workspaces/air/benchmarks/phase20.9/results
+
+--- STAGE: PostgreSQL 17 Correctness, Crash Recovery & Lazy LSN ---
+[correctness] durability_gucs                  [PASS] fsync=on full_page_writes=on synchronous_commit=on
+[correctness] ddl_constraints_triggers_seq     [PASS] err=<nil>
+[correctness] constraints_fk_trigger_upsert    [PASS] pid=1 dupErr=true fkErr=true auditCnt=1
+[correctness] mvcc_isolation_and_tx_affinity   [PASS] txPID1=15186 txPID2=15186 unseenInConn2=0 afterRollback=0
+[correctness] savepoint_semantics              [PASS] keep=1 drop=0
+[correctness] concurrent_updates_atomic        [PASS] expected=200 got=200
+[correctness] copy_from_stdin_streaming        [PASS] rowsAffected=10000 count=10000 err=<nil>
+[correctness] prepared_statements              [PASS] val="prep_sql_1" errs=<nil>/<nil>/<nil>/<nil>
+[correctness] wal_crash_recovery_sigkill       [PASS] committed=1 uncommitted=0 restartErr=<nil> queryErr=<nil>
+[correctness] lazy_lsn_ryow_and_count          [PASS] pure20WritesLSNs=0 afterReadLSNs=1 ryow=1 txCommitLSNs=0 txReadCheckLSNs=0 txAfterReadLSNs=1 txRyow=1
+[correctness] eager_lsn_baseline_count         [PASS] eager20WritesLSNs=20 (expected 20)
+
+=== Phase 20.9 Harness Completed ===

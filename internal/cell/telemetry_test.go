@@ -1,9 +1,14 @@
 package cell
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestCollectTenantTelemetryCgroupV2(t *testing.T) {
@@ -76,5 +81,51 @@ func TestCollectTenantTelemetryMissingDegradesGracefully(t *testing.T) {
 	}
 	if snap.MemoryCurrentBytes != 0 {
 		t.Fatalf("expected 0 memory current, got %d", snap.MemoryCurrentBytes)
+	}
+}
+
+func TestTelemetryPublisherPushOnce(t *testing.T) {
+	volDir := t.TempDir()
+	cgRoot := t.TempDir()
+
+	ag, err := NewAgent(volDir, "", nil)
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	defer ag.Close()
+	ag.SetCgroupRoot(cgRoot)
+
+	tid := "t_pub_01"
+	cgDir := filepath.Join(cgRoot, "air_tenant_"+tid)
+	if err := os.MkdirAll(cgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(cgDir, "memory.current"), []byte("104857600\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(cgDir, "memory.high"), []byte("450000000\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(cgDir, "memory.max"), []byte("536870912\n"), 0o644)
+
+	var gotToken string
+	var gotSnap ResourceSnapshot
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/v1/telemetry" || r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		gotToken = r.Header.Get("X-Air-Internal-Token")
+		_ = json.NewDecoder(r.Body).Decode(&gotSnap)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	pub := NewTelemetryPublisher(ag, srv.URL, "secret-tok", tid, 50*time.Millisecond)
+	snap, err := pub.PushOnce(context.Background())
+	if err != nil {
+		t.Fatalf("PushOnce: %v", err)
+	}
+	if gotToken != "secret-tok" {
+		t.Fatalf("expected token secret-tok, got %q", gotToken)
+	}
+	if gotSnap.MemoryCurrentBytes != 104857600 || snap.MemoryMaxBytes != 536870912 {
+		t.Fatalf("unexpected pushed snapshot: %+v", gotSnap)
 	}
 }

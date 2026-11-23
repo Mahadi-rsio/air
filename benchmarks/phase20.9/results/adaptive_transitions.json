@@ -1,0 +1,46 @@
+[
+  {
+    "phase": "1_steady_healthy",
+    "eff_limit": 2,
+    "ctrl_state": 2,
+    "mem_cur_mb": 329.00390625,
+    "mem_high_mb": 435,
+    "mem_psi_some": 0,
+    "high_events": 0,
+    "passed": false,
+    "notes": "Real cgroup telemetry active; effLimit=2"
+  },
+  {
+    "phase": "2_real_cgroup_memory_high_pressure",
+    "eff_limit": 2,
+    "ctrl_state": 2,
+    "mem_cur_mb": 195.4375,
+    "mem_high_mb": 246.75,
+    "mem_psi_some": 0,
+    "high_events": 160,
+    "passed": true,
+    "notes": "Lowered memory.high to 246.8MB; effLimit 2-\u003e2, highEvents 0-\u003e160"
+  },
+  {
+    "phase": "3_recovery_additive_increase",
+    "eff_limit": 2,
+    "ctrl_state": 2,
+    "mem_cur_mb": 189.0078125,
+    "mem_high_mb": 435,
+    "mem_psi_some": 0,
+    "high_events": 160,
+    "passed": false,
+    "notes": "Restored memory.high=435MB; effLimit recovered 2-\u003e2"
+  },
+  {
+    "phase": "4_stale_telemetry_fallback",
+    "eff_limit": 2,
+    "ctrl_state": 4,
+    "mem_cur_mb": 0,
+    "mem_high_mb": 0,
+    "mem_psi_some": 0,
+    "high_events": 0,
+    "passed": true,
+    "notes": "Stale telemetry state=4 (4=stale_fallback), effLimit=2 (max/2=8)"
+  }
+]

@@ -1,0 +1,35 @@
+=== AIR Phase 20.9 Real PostgreSQL 17 Validation Harness ===
+Suite=sustained Duration=8s Sustained=300s GatewayBin=/workspaces/air/benchmarks/phase20.9/bin/air-gateway OutDir=/workspaces/air/benchmarks/phase20.9/results
+
+--- STAGE: Sustained Load Stability Test (300s, 8 clients) ---
+[sustained t= 10s] TPS= 4224.4 p95=  3.02ms p99=  4.47ms err=0 cgCur= 72.1MB cgPeak= 72.6MB pgRSS=259.3MB gwRSS=22.1MB hiEv=0 oom=0 effLim=4 WAL=6.3MB ckpt=0
+[sustained t= 20s] TPS= 3077.6 p95=  3.56ms p99=  5.25ms err=0 cgCur= 55.7MB cgPeak= 75.8MB pgRSS=259.9MB gwRSS=22.2MB hiEv=0 oom=0 effLim=2 WAL=11.4MB ckpt=0
+[sustained t= 30s] TPS= 2815.2 p95=  4.49ms p99=  5.97ms err=0 cgCur= 88.8MB cgPeak= 89.4MB pgRSS=260.0MB gwRSS=22.2MB hiEv=0 oom=0 effLim=2 WAL=16.1MB ckpt=0
+[sustained t= 40s] TPS= 2953.1 p95=  3.67ms p99=  5.61ms err=0 cgCur= 72.5MB cgPeak= 92.5MB pgRSS=260.1MB gwRSS=22.5MB hiEv=0 oom=0 effLim=2 WAL=20.7MB ckpt=0
+[sustained t= 50s] TPS= 2988.7 p95=  3.57ms p99=  5.06ms err=0 cgCur= 72.6MB cgPeak= 92.5MB pgRSS=260.3MB gwRSS=22.4MB hiEv=0 oom=0 effLim=2 WAL=25.4MB ckpt=0
+[sustained t= 60s] TPS= 2959.5 p95=  3.77ms p99=  5.61ms err=0 cgCur=106.2MB cgPeak=109.8MB pgRSS=260.6MB gwRSS=65.7MB hiEv=0 oom=0 effLim=2 WAL=30.4MB ckpt=0
+[sustained t= 70s] TPS= 3022.9 p95=  3.46ms p99=  5.08ms err=0 cgCur= 90.1MB cgPeak=110.0MB pgRSS=260.6MB gwRSS=23.4MB hiEv=0 oom=0 effLim=2 WAL=35.2MB ckpt=0
+[sustained t= 80s] TPS= 2998.1 p95=  3.46ms p99=  5.25ms err=0 cgCur= 90.0MB cgPeak=110.0MB pgRSS=260.8MB gwRSS=23.3MB hiEv=0 oom=0 effLim=2 WAL=40.0MB ckpt=0
+[sustained t= 90s] TPS= 2849.2 p95=  4.45ms p99=  6.01ms err=0 cgCur=123.1MB cgPeak=123.6MB pgRSS=260.9MB gwRSS=23.3MB hiEv=0 oom=0 effLim=2 WAL=44.4MB ckpt=0
+[sustained t=100s] TPS= 2712.8 p95=  4.71ms p99=  6.29ms err=0 cgCur=106.7MB cgPeak=127.4MB pgRSS=261.0MB gwRSS=23.5MB hiEv=0 oom=0 effLim=2 WAL=48.9MB ckpt=0
+[sustained t=110s] TPS= 2999.7 p95=  3.47ms p99=  5.03ms err=0 cgCur=106.8MB cgPeak=127.4MB pgRSS=261.0MB gwRSS=23.3MB hiEv=0 oom=0 effLim=2 WAL=53.6MB ckpt=0
+[sustained t=120s] TPS= 2868.2 p95=  4.02ms p99=  6.17ms err=0 cgCur=107.0MB cgPeak=127.4MB pgRSS=261.2MB gwRSS=79.2MB hiEv=0 oom=0 effLim=2 WAL=58.3MB ckpt=0
+[sustained t=130s] TPS= 2998.7 p95=  3.44ms p99=  5.10ms err=0 cgCur=140.1MB cgPeak=140.6MB pgRSS=261.2MB gwRSS=26.5MB hiEv=0 oom=0 effLim=2 WAL=62.8MB ckpt=0
+[sustained t=140s] TPS= 2998.9 p95=  3.52ms p99=  5.15ms err=0 cgCur=123.8MB cgPeak=143.9MB pgRSS=261.9MB gwRSS=26.3MB hiEv=0 oom=0 effLim=2 WAL=67.8MB ckpt=0
+[sustained t=150s] TPS= 2966.7 p95=  3.65ms p99=  5.62ms err=0 cgCur=123.9MB cgPeak=143.9MB pgRSS=261.9MB gwRSS=26.2MB hiEv=0 oom=0 effLim=2 WAL=72.7MB ckpt=0
+[sustained t=160s] TPS= 2847.9 p95=  4.28ms p99=  6.17ms err=0 cgCur=157.2MB cgPeak=159.6MB pgRSS=262.3MB gwRSS=26.1MB hiEv=0 oom=0 effLim=2 WAL=77.2MB ckpt=0
+[sustained t=170s] TPS= 2976.6 p95=  3.56ms p99=  5.33ms err=0 cgCur=140.6MB cgPeak=160.4MB pgRSS=262.3MB gwRSS=26.6MB hiEv=0 oom=0 effLim=2 WAL=81.8MB ckpt=0
+[sustained t=180s] TPS= 2994.5 p95=  3.55ms p99=  5.19ms err=0 cgCur=141.0MB cgPeak=160.4MB pgRSS=262.4MB gwRSS=26.1MB hiEv=0 oom=0 effLim=2 WAL=86.4MB ckpt=0
+[sustained t=190s] TPS= 2969.7 p95=  3.64ms p99=  5.31ms err=0 cgCur=173.8MB cgPeak=174.7MB pgRSS=262.4MB gwRSS=26.4MB hiEv=0 oom=0 effLim=2 WAL=91.1MB ckpt=0
+[sustained t=200s] TPS= 3020.6 p95=  3.45ms p99=  5.07ms err=0 cgCur=157.5MB cgPeak=177.4MB pgRSS=262.4MB gwRSS=26.1MB hiEv=0 oom=0 effLim=2 WAL=95.9MB ckpt=0
+[sustained t=210s] TPS= 2961.5 p95=  3.64ms p99=  5.23ms err=0 cgCur=157.6MB cgPeak=177.4MB pgRSS=262.4MB gwRSS=26.5MB hiEv=0 oom=0 effLim=2 WAL=100.7MB ckpt=0
+[sustained t=220s] TPS= 2948.8 p95=  3.76ms p99=  5.39ms err=0 cgCur=190.9MB cgPeak=191.5MB pgRSS=262.5MB gwRSS=25.8MB hiEv=0 oom=0 effLim=2 WAL=105.3MB ckpt=0
+[sustained t=230s] TPS= 2966.0 p95=  3.66ms p99=  5.45ms err=0 cgCur=174.5MB cgPeak=194.5MB pgRSS=262.5MB gwRSS=26.5MB hiEv=0 oom=0 effLim=2 WAL=110.1MB ckpt=0
+[sustained t=240s] TPS= 2855.3 p95=  3.96ms p99=  6.31ms err=0 cgCur=174.6MB cgPeak=194.5MB pgRSS=262.5MB gwRSS=62.0MB hiEv=0 oom=0 effLim=2 WAL=114.7MB ckpt=0
+[sustained t=250s] TPS= 3038.5 p95=  3.38ms p99=  4.90ms err=0 cgCur=174.8MB cgPeak=194.5MB pgRSS=262.5MB gwRSS=23.8MB hiEv=0 oom=0 effLim=2 WAL=119.6MB ckpt=0
+[sustained t=260s] TPS= 3018.7 p95=  3.48ms p99=  4.96ms err=0 cgCur=207.8MB cgPeak=215.4MB pgRSS=262.5MB gwRSS=23.5MB hiEv=0 oom=0 effLim=2 WAL=124.1MB ckpt=0
+[sustained t=270s] TPS= 3001.2 p95=  3.68ms p99=  5.26ms err=0 cgCur=191.5MB cgPeak=215.4MB pgRSS=262.5MB gwRSS=23.4MB hiEv=0 oom=0 effLim=2 WAL=128.8MB ckpt=0
+[sustained t=280s] TPS= 2998.7 p95=  3.61ms p99=  5.17ms err=0 cgCur=191.9MB cgPeak=215.4MB pgRSS=262.5MB gwRSS=23.6MB hiEv=0 oom=0 effLim=2 WAL=133.7MB ckpt=0
+[sustained t=290s] TPS= 2980.4 p95=  3.66ms p99=  5.62ms err=0 cgCur=224.7MB cgPeak=225.2MB pgRSS=262.6MB gwRSS=23.5MB hiEv=0 oom=0 effLim=2 WAL=138.4MB ckpt=0
+
+=== Phase 20.9 Harness Completed ===

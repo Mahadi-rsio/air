@@ -1,0 +1,46 @@
+=== AIR Phase 20.9 Real PostgreSQL 17 Validation Harness ===
+Suite=memory512 Duration=6s Sustained=60s GatewayBin=/workspaces/air/benchmarks/phase20.9/bin/air-gateway OutDir=/workspaces/air/benchmarks/phase20.9/results
+
+--- STAGE: 512MB / 256MB / 1GB Cgroup v2 Memory Validation & AIMD ---
+[mem-512MB] A_no_governor       c=4  TPS= 3513.3 p95=  1.83ms err=0 cgPeak=  82.1MB pgRSS=168.2MB gwRSS=22.5MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-512MB] A_no_governor       c=8  TPS= 4161.5 p95=  3.13ms err=0 cgPeak= 130.6MB pgRSS=292.9MB gwRSS=22.6MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-512MB] A_no_governor       c=16 TPS= 4437.9 p95=  6.13ms err=0 cgPeak= 176.4MB pgRSS=555.5MB gwRSS=22.7MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-512MB] A_no_governor       c=32 TPS= 4687.2 p95= 11.49ms err=0 cgPeak= 232.2MB pgRSS=1032.9MB gwRSS=23.3MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-512MB] A_no_governor       c=64 TPS= 4359.3 p95= 25.34ms err=0 cgPeak= 306.8MB pgRSS=1840.1MB gwRSS=23.6MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-512MB] B_static_governor   c=4  TPS= 3515.7 p95=  1.77ms err=0 cgPeak= 306.8MB pgRSS=216.0MB gwRSS=45.3MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-512MB] B_static_governor   c=8  TPS= 3937.5 p95=  3.36ms err=0 cgPeak= 306.8MB pgRSS=323.2MB gwRSS=23.5MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-512MB] B_static_governor   c=16 TPS= 4413.0 p95=  6.09ms err=0 cgPeak= 306.8MB pgRSS=548.6MB gwRSS=23.5MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-512MB] B_static_governor   c=32 TPS= 4355.0 p95= 11.47ms err=0 cgPeak= 334.0MB pgRSS=733.5MB gwRSS=23.5MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-512MB] B_static_governor   c=64 TPS= 4252.7 p95= 22.66ms err=0 cgPeak= 363.1MB pgRSS=893.9MB gwRSS=23.5MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-512MB] C_adaptive_governor c=4  TPS= 3083.9 p95=  2.03ms err=0 cgPeak= 363.1MB pgRSS=196.9MB gwRSS=48.0MB hiEv=0 oom=0 psiM=0.00 eff=2..6
+[mem-512MB] C_adaptive_governor c=8  TPS= 2924.6 p95=  3.57ms err=0 cgPeak= 363.1MB pgRSS=212.1MB gwRSS=23.1MB hiEv=0 oom=0 psiM=0.00 eff=2..2
+[mem-512MB] C_adaptive_governor c=16 TPS= 2778.6 p95=  8.05ms err=0 cgPeak= 363.1MB pgRSS=193.1MB gwRSS=23.1MB hiEv=0 oom=0 psiM=0.00 eff=2..2
+[mem-512MB] C_adaptive_governor c=32 TPS= 2892.8 p95= 12.93ms err=0 cgPeak= 363.1MB pgRSS=208.0MB gwRSS=23.1MB hiEv=0 oom=0 psiM=0.00 eff=2..2
+[mem-512MB] C_adaptive_governor c=64 TPS= 2781.2 p95= 28.44ms err=0 cgPeak= 363.1MB pgRSS=200.1MB gwRSS=23.6MB hiEv=0 oom=0 psiM=0.00 eff=2..2
+[adaptive] 1_steady_healthy                     pass=false effLim= 2 state=2 mem=329.0/435.0MB hiEv=0 | Real cgroup telemetry active; effLimit=2
+[adaptive] 2_real_cgroup_memory_high_pressure   pass=true  effLim= 2 state=2 mem=195.4/246.8MB hiEv=160 | Lowered memory.high to 246.8MB; effLimit 2->2, highEvents 0->160
+[adaptive] 3_recovery_additive_increase         pass=false effLim= 2 state=2 mem=189.0/435.0MB hiEv=160 | Restored memory.high=435MB; effLimit recovered 2->2
+[adaptive] 4_stale_telemetry_fallback           pass=true  effLim= 2 state=4 mem=0.0/0.0MB hiEv=0 | Stale telemetry state=4 (4=stale_fallback), effLimit=2 (max/2=8)
+[mem-256MB] A_no_governor       c=4  TPS= 3224.9 p95=  2.35ms err=0 cgPeak=  80.1MB pgRSS=165.3MB gwRSS=22.3MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-256MB] A_no_governor       c=8  TPS= 4206.4 p95=  3.10ms err=0 cgPeak= 131.7MB pgRSS=288.3MB gwRSS=22.9MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-256MB] A_no_governor       c=16 TPS= 4366.9 p95=  6.28ms err=0 cgPeak= 178.2MB pgRSS=543.0MB gwRSS=22.5MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-256MB] A_no_governor       c=32 TPS= 4740.7 p95= 11.15ms err=0 cgPeak= 218.7MB pgRSS=1020.0MB gwRSS=22.9MB hiEv=61 oom=0 psiM=0.00 eff=16..16
+[mem-256MB] B_static_governor   c=4  TPS= 3530.6 p95=  1.77ms err=0 cgPeak= 218.7MB pgRSS=204.5MB gwRSS=48.4MB hiEv=62 oom=0 psiM=0.00 eff=16..16
+[mem-256MB] B_static_governor   c=8  TPS= 4040.3 p95=  3.35ms err=0 cgPeak= 218.7MB pgRSS=319.9MB gwRSS=26.5MB hiEv=62 oom=0 psiM=0.00 eff=16..16
+[mem-256MB] B_static_governor   c=16 TPS= 4606.8 p95=  5.69ms err=0 cgPeak= 218.7MB pgRSS=542.6MB gwRSS=27.0MB hiEv=106 oom=0 psiM=0.00 eff=16..16
+[mem-256MB] B_static_governor   c=32 TPS= 4446.2 p95= 11.26ms err=0 cgPeak= 218.7MB pgRSS=768.8MB gwRSS=27.1MB hiEv=262 oom=0 psiM=0.00 eff=16..16
+[mem-256MB] C_adaptive_governor c=4  TPS= 3194.4 p95=  1.90ms err=0 cgPeak= 218.7MB pgRSS=201.5MB gwRSS=53.6MB hiEv=262 oom=0 psiM=0.00 eff=2..6
+[mem-256MB] C_adaptive_governor c=8  TPS= 3009.9 p95=  3.37ms err=0 cgPeak= 218.7MB pgRSS=218.4MB gwRSS=23.4MB hiEv=262 oom=0 psiM=0.00 eff=2..2
+[mem-256MB] C_adaptive_governor c=16 TPS= 2958.8 p95=  7.51ms err=0 cgPeak= 218.7MB pgRSS=229.0MB gwRSS=23.4MB hiEv=262 oom=0 psiM=0.00 eff=2..2
+[mem-256MB] C_adaptive_governor c=32 TPS= 2952.1 p95= 13.14ms err=0 cgPeak= 218.7MB pgRSS=179.1MB gwRSS=23.4MB hiEv=307 oom=0 psiM=0.00 eff=2..2
+[mem-1GB  ] A_no_governor       c=8  TPS= 4245.5 p95=  2.99ms err=0 cgPeak=  94.1MB pgRSS=256.4MB gwRSS=22.8MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-1GB  ] A_no_governor       c=16 TPS= 4530.0 p95=  5.97ms err=0 cgPeak= 147.5MB pgRSS=503.3MB gwRSS=22.9MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-1GB  ] A_no_governor       c=32 TPS= 4696.8 p95= 11.33ms err=0 cgPeak= 239.3MB pgRSS=1005.3MB gwRSS=23.4MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-1GB  ] B_static_governor   c=8  TPS= 4136.1 p95=  3.08ms err=0 cgPeak= 239.3MB pgRSS=298.7MB gwRSS=35.7MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-1GB  ] B_static_governor   c=16 TPS= 4452.1 p95=  6.04ms err=0 cgPeak= 239.3MB pgRSS=533.6MB gwRSS=26.1MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-1GB  ] B_static_governor   c=32 TPS= 4532.0 p95= 10.63ms err=0 cgPeak= 252.0MB pgRSS=586.6MB gwRSS=26.1MB hiEv=0 oom=0 psiM=0.00 eff=16..16
+[mem-1GB  ] C_adaptive_governor c=8  TPS= 3175.3 p95=  3.54ms err=0 cgPeak= 252.0MB pgRSS=258.2MB gwRSS=38.2MB hiEv=0 oom=0 psiM=0.00 eff=2..6
+[mem-1GB  ] C_adaptive_governor c=16 TPS= 2891.7 p95=  7.55ms err=0 cgPeak= 252.0MB pgRSS=251.1MB gwRSS=23.4MB hiEv=0 oom=0 psiM=0.00 eff=2..2
+[mem-1GB  ] C_adaptive_governor c=32 TPS= 2893.5 p95= 13.02ms err=0 cgPeak= 252.0MB pgRSS=203.0MB gwRSS=23.9MB hiEv=0 oom=0 psiM=0.00 eff=2..2
+
+=== Phase 20.9 Harness Completed ===
