@@ -160,6 +160,87 @@ func mapRemotePSErr(err error) error {
 	}
 }
 
+func isTransientGRPCErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch status.Code(err) {
+	case codes.Unavailable, codes.ResourceExhausted, codes.Aborted:
+		return true
+	default:
+		return false
+	}
+}
+
+func retryPageserverRPC(ctx context.Context, maxAttempts int, fn func() error) error {
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	var lastErr error
+	backoff := 25 * time.Millisecond
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		lastErr = fn()
+		if lastErr == nil || !isTransientGRPCErr(lastErr) || attempt == maxAttempts-1 {
+			return lastErr
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if backoff < 250*time.Millisecond {
+			backoff *= 2
+		}
+	}
+	return lastErr
+}
+
+// Health verifies connectivity and internal-token authentication with the remote pageserver.
+func (c *GRPCPageserverClient) Health(ctx context.Context) error {
+	rctx, cancel := context.WithTimeout(c.withAuth(ctx), 5*time.Second)
+	defer cancel()
+	_, err := c.client.Health(rctx, &pb.PageserverEmpty{})
+	return mapRemotePSErr(err)
+}
+
+// WaitForHealthy polls Health until the remote pageserver is reachable or timeout expires.
+// Authentication errors (Unauthenticated/PermissionDenied) fail immediately without retrying.
+func (c *GRPCPageserverClient) WaitForHealthy(ctx context.Context, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	backoff := 100 * time.Millisecond
+	for {
+		err := c.Health(ctx)
+		if err == nil {
+			return nil
+		}
+		code := status.Code(err)
+		if code == codes.Unauthenticated || code == codes.PermissionDenied || code == codes.InvalidArgument {
+			return fmt.Errorf("pageserver auth/config error (%s): %w", c.addr, err)
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return fmt.Errorf("pageserver %s unhealthy after %s: %w", c.addr, timeout, err)
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("pageserver %s health check cancelled: %w", c.addr, ctx.Err())
+		case <-timer.C:
+		}
+		if backoff < time.Second {
+			backoff *= 2
+		}
+	}
+}
+
 func (c *GRPCPageserverClient) SetTenantGeneration(ctx context.Context, tenantID, generation string) {
 	rctx, cancel := context.WithTimeout(c.withAuth(ctx), 5*time.Second)
 	defer cancel()
@@ -580,6 +661,162 @@ func (c *GRPCPageserverClient) NewWALReceiver(dsn, tenantID string, epoch int64,
 		epoch:      epoch,
 		generation: generation,
 	}, startLSN)
+}
+
+func (c *GRPCPageserverClient) GetPageAtLSN(ctx context.Context, tenantID string, key pageserver.Key, lsn uint64) ([]byte, error) {
+	var resp *pb.GetPageResponse
+	err := retryPageserverRPC(ctx, 3, func() error {
+		rctx, cancel := context.WithTimeout(c.withAuth(ctx), 10*time.Second)
+		defer cancel()
+		var rerr error
+		resp, rerr = c.client.GetPageAtLSN(rctx, &pb.GetPageAtLSNRequest{
+			TenantId: tenantID,
+			Key: &pb.StorageKey{
+				Kind:      uint32(key.Kind),
+				ForkNum:   uint32(key.ForkNum),
+				Reserved:  uint32(key.Reserved),
+				SpcOid:    key.SpcOID,
+				DbOid:     key.DbOID,
+				RelNumber: key.RelNumber,
+				BlockNum:  key.BlockNum,
+				Extra:     key.Extra,
+			},
+			Lsn: lsn,
+		})
+		return rerr
+	})
+	if err != nil {
+		return nil, mapRemotePSErr(err)
+	}
+	if !resp.GetFound() {
+		return nil, pageserver.ErrNotFound
+	}
+	return resp.GetPage(), nil
+}
+
+func (c *GRPCPageserverClient) GetPageBatch(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, startBlock, nblocks uint32, lsn uint64) ([]byte, uint32, error) {
+	var resp *pb.GetPageBatchResponse
+	err := retryPageserverRPC(ctx, 3, func() error {
+		rctx, cancel := context.WithTimeout(c.withAuth(ctx), 15*time.Second)
+		defer cancel()
+		var rerr error
+		resp, rerr = c.client.GetPageBatch(rctx, &pb.GetPageBatchRequest{
+			TenantId:   tenantID,
+			SpcOid:     spcOID,
+			DbOid:      dbOID,
+			RelNumber:  relNumber,
+			ForkNum:    uint32(forkNum),
+			StartBlock: startBlock,
+			Nblocks:    nblocks,
+			Lsn:        lsn,
+		})
+		return rerr
+	})
+	if err != nil {
+		return nil, 0, mapRemotePSErr(err)
+	}
+	return resp.GetPages(), resp.GetNblocksReturned(), nil
+}
+
+func (c *GRPCPageserverClient) GetRelSize(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) (uint32, error) {
+	var resp *pb.GetRelSizeResponse
+	err := retryPageserverRPC(ctx, 3, func() error {
+		rctx, cancel := context.WithTimeout(c.withAuth(ctx), 10*time.Second)
+		defer cancel()
+		var rerr error
+		resp, rerr = c.client.GetRelSize(rctx, &pb.GetRelRequest{
+			TenantId:  tenantID,
+			SpcOid:    spcOID,
+			DbOid:     dbOID,
+			RelNumber: relNumber,
+			ForkNum:   uint32(forkNum),
+			Lsn:       lsn,
+		})
+		return rerr
+	})
+	if err != nil {
+		return 0, mapRemotePSErr(err)
+	}
+	return resp.GetNblocks(), nil
+}
+
+func (c *GRPCPageserverClient) GetRelExists(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) (bool, error) {
+	var resp *pb.GetRelExistsResponse
+	err := retryPageserverRPC(ctx, 3, func() error {
+		rctx, cancel := context.WithTimeout(c.withAuth(ctx), 10*time.Second)
+		defer cancel()
+		var rerr error
+		resp, rerr = c.client.GetRelExists(rctx, &pb.GetRelRequest{
+			TenantId:  tenantID,
+			SpcOid:    spcOID,
+			DbOid:     dbOID,
+			RelNumber: relNumber,
+			ForkNum:   uint32(forkNum),
+			Lsn:       lsn,
+		})
+		return rerr
+	})
+	if err != nil {
+		return false, mapRemotePSErr(err)
+	}
+	return resp.GetExists(), nil
+}
+
+func (c *GRPCPageserverClient) GetDBSize(ctx context.Context, tenantID string, spcOID, dbOID uint32, lsn uint64) (uint64, error) {
+	var resp *pb.GetDBSizeResponse
+	err := retryPageserverRPC(ctx, 3, func() error {
+		rctx, cancel := context.WithTimeout(c.withAuth(ctx), 10*time.Second)
+		defer cancel()
+		var rerr error
+		resp, rerr = c.client.GetDBSize(rctx, &pb.GetDBSizeRequest{
+			TenantId: tenantID,
+			SpcOid:   spcOID,
+			DbOid:    dbOID,
+			Lsn:      lsn,
+		})
+		return rerr
+	})
+	if err != nil {
+		return 0, mapRemotePSErr(err)
+	}
+	return resp.GetSizeBytes(), nil
+}
+
+func (c *GRPCPageserverClient) PutPageBatch(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, startBlock, nblocks uint32, lsn uint64, pages []byte) error {
+	err := retryPageserverRPC(ctx, 2, func() error {
+		rctx, cancel := context.WithTimeout(c.withAuth(ctx), 15*time.Second)
+		defer cancel()
+		_, rerr := c.client.PutPageBatch(rctx, &pb.PutPageBatchRequest{
+			TenantId:   tenantID,
+			SpcOid:     spcOID,
+			DbOid:      dbOID,
+			RelNumber:  relNumber,
+			ForkNum:    uint32(forkNum),
+			StartBlock: startBlock,
+			Nblocks:    nblocks,
+			Lsn:        lsn,
+			Pages:      pages,
+		})
+		return rerr
+	})
+	return mapRemotePSErr(err)
+}
+
+func (c *GRPCPageserverClient) UnlinkRel(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) error {
+	err := retryPageserverRPC(ctx, 2, func() error {
+		rctx, cancel := context.WithTimeout(c.withAuth(ctx), 10*time.Second)
+		defer cancel()
+		_, rerr := c.client.UnlinkRel(rctx, &pb.UnlinkRelRequest{
+			TenantId:  tenantID,
+			SpcOid:    spcOID,
+			DbOid:     dbOID,
+			RelNumber: relNumber,
+			ForkNum:   uint32(forkNum),
+			Lsn:       lsn,
+		})
+		return rerr
+	})
+	return mapRemotePSErr(err)
 }
 
 func (c *GRPCPageserverClient) Close() error {

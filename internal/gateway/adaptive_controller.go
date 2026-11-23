@@ -202,15 +202,19 @@ func (c *AdaptiveController) Step(now time.Time) int {
 	c.hasPrevEvents = true
 
 	memRatio := tel.MemoryRatio()
-	critical := memRatio >= 0.95 || oomDelta > 0 || tel.MemoryPSIFullAvg10 >= 10.0
-	pressured := critical ||
-		memRatio >= 0.85 ||
+	memCritical := memRatio >= 0.95 || oomDelta > 0 || tel.MemoryPSIFullAvg10 >= 10.0
+	memPressured := memRatio >= 0.85 ||
 		highDelta > 0 ||
 		tel.MemoryPSISomeAvg10 >= 10.0 ||
-		tel.MemoryPSIFullAvg10 >= 2.0 ||
-		tel.IOPSIMaxAvg10 >= 20.0 ||
-		tel.CPUPSISomeAvg10 >= 25.0 ||
-		snap.QueueWaitP95Us >= 250000
+		tel.MemoryPSIFullAvg10 >= 2.0
+	ioPressured := tel.IOPSIMaxAvg10 >= 20.0 || snap.QueueWaitP95Us >= 250000
+	// CPU contention is evaluated as an independent CPU-starvation signal,
+	// not as evidence of memory OOM risk (healthy 2-vCPU OLTP writes routinely
+	// produce 25-65% cpu.some.avg10 with zero memory pressure).
+	cpuPressured := tel.CPUPSISomeAvg10 >= 80.0
+
+	critical := memCritical
+	pressured := critical || memPressured || ioPressured || cpuPressured
 
 	if critical {
 		c.healthyStreak = 0
@@ -244,12 +248,12 @@ func (c *AdaptiveController) Step(now time.Time) int {
 		return current
 	}
 
-	// Healthy band with hysteresis deadband (memRatio < 0.75, low PSI).
+	// Healthy band with hysteresis deadband (low memory/IO pressure, no extreme CPU starvation).
 	healthy := memRatio < 0.75 &&
 		tel.MemoryPSISomeAvg10 < 3.0 &&
 		tel.MemoryPSIFullAvg10 < 0.5 &&
 		tel.IOPSIMaxAvg10 < 10.0 &&
-		tel.CPUPSISomeAvg10 < 15.0
+		tel.CPUPSISomeAvg10 < 65.0
 
 	c.pressuredStreak = 0
 	if healthy {

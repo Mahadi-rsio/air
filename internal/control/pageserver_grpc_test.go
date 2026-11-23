@@ -174,3 +174,123 @@ func TestGRPCPageserverClient_SkeletonRoundTrip(t *testing.T) {
 		t.Fatalf("expected relation fork file to be skipped, stat err=%v", err)
 	}
 }
+
+func TestGRPCPageserverClient_ServiceBridgeAndFailureRecovery(t *testing.T) {
+	dir := t.TempDir()
+	ps, err := pageserver.New(pageserver.Config{
+		DisableUnixSocket: true,
+		LayerDir:          filepath.Join(dir, "layers"),
+		CacheDir:          filepath.Join(dir, "cache"),
+		CacheMaxBytes:     16 * 1024 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("pageserver.New: %v", err)
+	}
+	defer ps.Close()
+
+	const token = "bridge-token"
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := lis.Addr().String()
+	grpcSrv := pageserver.NewGRPCServer(ps, token)
+	go func() { _ = grpcSrv.Serve(lis) }()
+
+	// 1. Auth failure must fail immediately on WaitForHealthy.
+	badClient, err := NewGRPCPageserverClient(addr, "wrong-token")
+	if err != nil {
+		t.Fatalf("NewGRPCPageserverClient(bad): %v", err)
+	}
+	if err := badClient.WaitForHealthy(context.Background(), 5000000000); err == nil {
+		badClient.Close()
+		grpcSrv.Stop()
+		t.Fatalf("expected WaitForHealthy to fail with wrong token")
+	}
+	badClient.Close()
+
+	// 2. Valid client passes WaitForHealthy and bridges UnixServer -> gRPC.
+	client, err := NewGRPCPageserverClient(addr, token)
+	if err != nil {
+		grpcSrv.Stop()
+		t.Fatalf("NewGRPCPageserverClient: %v", err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	if err := client.WaitForHealthy(ctx, 5000000000); err != nil {
+		grpcSrv.Stop()
+		t.Fatalf("WaitForHealthy: %v", err)
+	}
+
+	// Ensure tenant exists on pageserver.
+	client.SetTenantGeneration(ctx, "t_bridge", "gen_1")
+	if _, err := client.EnsureTenant(ctx, "t_bridge", 1, "gen_1", false, ""); err != nil {
+		grpcSrv.Stop()
+		t.Fatalf("EnsureTenant: %v", err)
+	}
+
+	// Start UnixServer backed by GRPCPageserverClient.
+	sockDir, err := os.MkdirTemp("/tmp", "air-p21-sock-")
+	if err != nil {
+		grpcSrv.Stop()
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(sockDir)
+	sockPath := sockDir + "/ps.sock"
+	unixSrv := pageserver.NewUnixServer(sockPath, client)
+	if err := unixSrv.Start(ctx); err != nil {
+		grpcSrv.Stop()
+		t.Fatalf("unixSrv.Start: %v", err)
+	}
+	defer unixSrv.Close()
+
+	// Exercise PutPageBatch, GetRelExists, GetRelSize, GetPageBatch, GetPageAtLSN, UnlinkRel via client.
+	page0 := bytes.Repeat([]byte{0x42}, pageserver.PageSize)
+	if err := client.PutPageBatch(ctx, "t_bridge", 1663, 16384, 5001, 0, 0, 1, 0x1000, page0); err != nil {
+		grpcSrv.Stop()
+		t.Fatalf("PutPageBatch: %v", err)
+	}
+	exists, err := client.GetRelExists(ctx, "t_bridge", 1663, 16384, 5001, 0, 0x1000)
+	if err != nil || !exists {
+		grpcSrv.Stop()
+		t.Fatalf("GetRelExists: exists=%v err=%v", exists, err)
+	}
+	sz, err := client.GetRelSize(ctx, "t_bridge", 1663, 16384, 5001, 0, 0x1000)
+	if err != nil || sz != 1 {
+		grpcSrv.Stop()
+		t.Fatalf("GetRelSize: sz=%d err=%v", sz, err)
+	}
+	gotBatch, nblks, err := client.GetPageBatch(ctx, "t_bridge", 1663, 16384, 5001, 0, 0, 1, 0x1000)
+	if err != nil || nblks != 1 || !bytes.Equal(gotBatch, page0) {
+		grpcSrv.Stop()
+		t.Fatalf("GetPageBatch: nblks=%d err=%v", nblks, err)
+	}
+
+	// 3. Simulate Pageserver restart (stop gRPC server, verify failure, then restart on same addr).
+	grpcSrv.Stop()
+	if err := client.Health(ctx); err == nil {
+		t.Fatalf("expected Health to fail while pageserver is down")
+	}
+
+	lis2, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("re-listen %s: %v", addr, err)
+	}
+	grpcSrv2 := pageserver.NewGRPCServer(ps, token)
+	go func() { _ = grpcSrv2.Serve(lis2) }()
+	defer grpcSrv2.Stop()
+
+	if err := client.WaitForHealthy(ctx, 5000000000); err != nil {
+		t.Fatalf("WaitForHealthy after restart: %v", err)
+	}
+	gotAfter, err := client.GetPageAtLSN(ctx, "t_bridge", pageserver.RelBlockKey(1663, 16384, 5001, 0, 0), 0x1000)
+	if err != nil || !bytes.Equal(gotAfter, page0) {
+		t.Fatalf("GetPageAtLSN after restart: err=%v", err)
+	}
+
+	if err := client.UnlinkRel(ctx, "t_bridge", 1663, 16384, 5001, 0, 0x2000); err != nil {
+		t.Fatalf("UnlinkRel: %v", err)
+	}
+}
+

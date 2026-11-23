@@ -85,3 +85,54 @@ func TestAdaptiveControllerAIMDAndHysteresis(t *testing.T) {
 		t.Fatalf("expected StaleFallback on stale telemetry, got %v", gov.Snapshot().ControllerState)
 	}
 }
+
+func TestAdaptiveController_CPUPsiDecoupledFromMemory(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WriteGovernorEnabled = true
+	cfg.WriteAdaptiveEnabled = true
+	cfg.WriteMinGlobal = 2
+	cfg.WriteMaxGlobal = 16
+	cfg.WriteMaxPerTenant = 8
+
+	gov := NewWriteGovernor(cfg)
+	store := NewTelemetryStore(15 * time.Second)
+	ctrl := NewAdaptiveController(gov, store, time.Second)
+	now := time.Now()
+
+	// Normal 2-vCPU OLTP workload: CPU PSI 50%, healthy memory (40%), zero memory/IO PSI.
+	for i := 0; i < 6; i++ {
+		ts := now.Add(time.Duration(i) * time.Second)
+		store.Update(CellTelemetry{
+			Timestamp:          ts,
+			MemoryCurrentBytes: 200 << 20,
+			MemoryHighBytes:    512 << 20,
+			MemoryMaxBytes:     512 << 20,
+			CPUPSISomeAvg10:    50.0,
+		}, ts)
+		ctrl.Step(ts)
+	}
+	if got := gov.EffectiveGlobalLimit(); got <= 8 {
+		t.Fatalf("expected healthy CPU PSI (50%%) to allow AIMD ramp-up above 8, got %d", got)
+	}
+	if got := gov.Snapshot().ControllerState; got != ControllerStateHealthy {
+		t.Fatalf("expected ControllerStateHealthy, got %v", got)
+	}
+
+	// Extreme CPU starvation (>=80%) still throttles after hysteresis.
+	before := gov.EffectiveGlobalLimit()
+	for i := 6; i < 8; i++ {
+		ts := now.Add(time.Duration(i) * time.Second)
+		store.Update(CellTelemetry{
+			Timestamp:          ts,
+			MemoryCurrentBytes: 200 << 20,
+			MemoryHighBytes:    512 << 20,
+			MemoryMaxBytes:     512 << 20,
+			CPUPSISomeAvg10:    85.0,
+		}, ts)
+		ctrl.Step(ts)
+	}
+	if got := gov.EffectiveGlobalLimit(); got >= before {
+		t.Fatalf("expected extreme CPU starvation (85%%) to throttle below %d, got %d", before, got)
+	}
+}
+
