@@ -676,6 +676,9 @@ func (cp *ControlPlane) ProvisionDatabase(ctx context.Context, accountID, idempo
 		cp.rollbackOp(ctx, opID, tenantID, err)
 		return nil, err
 	}
+	if ps := cp.getPageserver(); ps != nil {
+		_, _ = ps.FlushTenant(ctx, tenantID)
+	}
 	if cp.faultHook != nil {
 		if fErr := cp.faultHook("after_activating"); fErr != nil {
 			cp.rollbackOp(ctx, opID, tenantID, fErr)

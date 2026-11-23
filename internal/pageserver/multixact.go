@@ -58,7 +58,7 @@ func (t *Timeline) slruModifyLocked(key Key, lsn uint64, zero bool, fn func(page
 	if !zero {
 		if cur, ok := t.slruPages[key]; ok && len(cur) == PageSize {
 			copy(page, cur)
-		} else if deltas := t.inMem.Lookup(key, ^uint64(0)); len(deltas) > 0 {
+		} else if deltas, _ := t.lookupInMemLayersLocked(key, ^uint64(0)); len(deltas) > 0 {
 			for i := len(deltas) - 1; i >= 0; i-- {
 				if (deltas[i].Flags&EntryFlagPageImage) != 0 && len(deltas[i].PageImage) == PageSize {
 					copy(page, deltas[i].PageImage)
@@ -71,7 +71,7 @@ func (t *Timeline) slruModifyLocked(key Key, lsn uint64, zero bool, fn func(page
 		fn(page)
 	}
 	t.slruPages[key] = page
-	t.inMem.Put(key, WALDelta{LSN: lsn, Flags: EntryFlagPageImage, PageImage: page})
+	t.putInMemLocked(key, WALDelta{LSN: lsn, Flags: EntryFlagPageImage, PageImage: page})
 }
 
 // MultiXactOldest returns the oldest retained (multixact id, member offset) recorded by the
@@ -205,16 +205,64 @@ func multiXactKeysTouched(rec *DecodedWALRecord) []Key {
 	return keys
 }
 
-// warmMultiXactSLRU loads the latest persisted version of SLRU pages about to be modified when
-// the in-process cache is cold (e.g. after a pageserver restart), so WAL replay never rebuilds a
-// page from zeroes and silently drops previously recorded multixact members.
-// Must be called without t.mu held.
-func (t *Timeline) warmMultiXactSLRU(rec *DecodedWALRecord) {
-	for _, k := range multiXactKeysTouched(rec) {
+func xactKeysTouched(rec *DecodedWALRecord) []Key {
+	if rec.Rmid != RmXactID || rec.XID < 3 {
+		return nil
+	}
+	const clogXactsPerPage = uint32(PageSize) * 4
+	const subtransPerPage = uint32(PageSize) / 4
+	var keys []Key
+	op := rec.Info & XLogXactOpMask
+	switch op {
+	case XLogXactCommit, XLogXactCommitPrepared, XLogXactAbort, XLogXactAbortPrepared:
+		keys = append(keys, Key{Kind: KeyKindSLRU, SpcOID: 0, BlockNum: rec.XID / clogXactsPerPage})
+		if (rec.Info&0x80) != 0 && len(rec.MainData) >= 12 {
+			xinfo := binary.LittleEndian.Uint32(rec.MainData[8:12])
+			off := 12
+			if (xinfo & 0x0001) != 0 {
+				off += 8
+			}
+			if (xinfo&0x0010) != 0 && off+4 <= len(rec.MainData) {
+				nsub := int(binary.LittleEndian.Uint32(rec.MainData[off : off+4]))
+				off += 4
+				for i := 0; i < nsub && off+4 <= len(rec.MainData); i++ {
+					subXID := binary.LittleEndian.Uint32(rec.MainData[off : off+4])
+					off += 4
+					if subXID >= 3 {
+						keys = append(keys,
+							Key{Kind: KeyKindSLRU, SpcOID: 0, BlockNum: subXID / clogXactsPerPage},
+							Key{Kind: KeyKindSLRU, SpcOID: 1, BlockNum: subXID / subtransPerPage},
+						)
+					}
+				}
+			}
+		}
+	case XLogXactAssignment:
+		if len(rec.MainData) >= 8 {
+			nsub := int(binary.LittleEndian.Uint32(rec.MainData[4:8]))
+			off := 8
+			for i := 0; i < nsub && off+4 <= len(rec.MainData); i++ {
+				subXID := binary.LittleEndian.Uint32(rec.MainData[off : off+4])
+				off += 4
+				if subXID >= 3 {
+					keys = append(keys, Key{Kind: KeyKindSLRU, SpcOID: 1, BlockNum: subXID / subtransPerPage})
+				}
+			}
+		}
+	}
+	return keys
+}
+
+func (t *Timeline) warmSLRUKeys(keys []Key) {
+	for _, k := range keys {
 		t.mu.RLock()
 		_, have := t.slruPages[k]
+		if !have {
+			_, have = t.lookupInMemLayersLocked(k, ^uint64(0))
+		}
+		hasLayers := len(t.layers) > 0
 		t.mu.RUnlock()
-		if have {
+		if have || !hasLayers {
 			continue
 		}
 		pg, err := t.GetPageAtLSN(context.Background(), k, ^uint64(0))
@@ -227,4 +275,17 @@ func (t *Timeline) warmMultiXactSLRU(rec *DecodedWALRecord) {
 		}
 		t.mu.Unlock()
 	}
+}
+
+// warmMultiXactSLRU loads the latest persisted version of SLRU pages about to be modified when
+// the in-process cache is cold (e.g. after a pageserver restart or L0 flush).
+// Must be called without t.mu held.
+func (t *Timeline) warmMultiXactSLRU(rec *DecodedWALRecord) {
+	t.warmSLRUKeys(multiXactKeysTouched(rec))
+}
+
+// warmXactSLRU loads the latest persisted version of pg_xact / pg_subtrans SLRU pages about to be modified
+// when t.slruPages was evicted after an L0 flush. Must be called without t.mu held.
+func (t *Timeline) warmXactSLRU(rec *DecodedWALRecord) {
+	t.warmSLRUKeys(xactKeysTouched(rec))
 }

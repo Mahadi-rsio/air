@@ -3,12 +3,6 @@ package pageserver
 import (
 	"errors"
 	"fmt"
-
-	"github.com/klauspost/compress/zstd"
-)
-
-var (
-	zstdDecOnce, _ = zstd.NewReader(nil)
 )
 
 // decompressFPIPayload decompresses a PostgreSQL 17 full-page image payload
@@ -23,7 +17,11 @@ func decompressFPIPayload(imageInfo uint8, src []byte, rawSize int) ([]byte, err
 	case (imageInfo & BkpImageCompressLZ4) != 0:
 		return lz4BlockDecompressFPI(src, rawSize)
 	case (imageInfo & BkpImageCompressZSTD) != 0:
-		out, err := zstdDecOnce.DecodeAll(src, make([]byte, 0, rawSize))
+		_, dec, err := getV2Zstd()
+		if err != nil {
+			return nil, fmt.Errorf("pageserver: zstd FPI decoder init: %w", err)
+		}
+		out, err := dec.DecodeAll(src, make([]byte, 0, rawSize))
 		if err != nil {
 			return nil, fmt.Errorf("pageserver: zstd FPI decompress: %w", err)
 		}

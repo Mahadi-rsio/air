@@ -284,3 +284,54 @@ func (c *boundedIndexCache) clear() {
 	c.blooms = make(map[string]*layerBloom)
 	c.curBytes = 0
 }
+
+func (c *boundedIndexCache) bytesUsed() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.curBytes
+}
+
+func (c *boundedIndexCache) addExtraBytes(r2Key string, delta int64) {
+	if delta <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if elem, ok := c.items[r2Key]; ok {
+		d := elem.Value.(*layerIndexData)
+		d.bytes += delta
+		c.curBytes += delta
+		for c.curBytes > c.maxBytes && c.lru.Len() > 1 {
+			oldest := c.lru.Back()
+			if oldest == nil || oldest == elem {
+				break
+			}
+			c.lru.Remove(oldest)
+			old := oldest.Value.(*layerIndexData)
+			delete(c.items, old.r2Key)
+			c.curBytes -= old.bytes
+		}
+	}
+}
+
+func (c *boundedIndexCache) trimToBytes(targetBytes int64) {
+	if targetBytes < 0 {
+		targetBytes = 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for c.curBytes > targetBytes && c.lru.Len() > 0 {
+		oldest := c.lru.Back()
+		if oldest == nil {
+			break
+		}
+		c.lru.Remove(oldest)
+		old := oldest.Value.(*layerIndexData)
+		delete(c.items, old.r2Key)
+		c.curBytes -= old.bytes
+	}
+	if targetBytes == 0 {
+		c.blooms = make(map[string]*layerBloom)
+	}
+}
+

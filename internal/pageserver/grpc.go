@@ -66,7 +66,7 @@ func (p *Pageserver) SetRelSizes(tenantID string, entries []RelSizeEntry) error 
 	for _, e := range entries {
 		sizeKey := RelSizeKey(e.SpcOID, e.DbOID, e.RelNumber, e.ForkNum)
 		tl.relSizes[sizeKey] = e.NBlocks
-		tl.inMem.Put(sizeKey, WALDelta{
+		tl.putInMemLocked(sizeKey, WALDelta{
 			LSN:     e.LSN,
 			Flags:   EntryFlagRelSize,
 			RelSize: e.NBlocks,
@@ -122,6 +122,11 @@ func (p *Pageserver) IngestWALRecords(
 		p.SetTenantGeneration(tenantID, generation)
 	}
 	tl := p.EnsureTenant(tenantID, epoch)
+	if flushIfNeeded {
+		if err := tl.EnforceInMemBudget(ctx); err != nil {
+			return 0, tl.LastLSN(), err
+		}
+	}
 	sawCheckpoint := false
 	var firstLSN, lastRecLSN uint64
 	var totalBlocks, fpiBlocks int
@@ -142,6 +147,11 @@ func (p *Pageserver) IngestWALRecords(
 			op := rec.Info & XLogInfoOpMask
 			if op == 0x00 || op == 0x10 {
 				sawCheckpoint = true
+			}
+		}
+		if flushIfNeeded && (i+1)%32 == 0 {
+			if err := tl.EnforceInMemBudget(ctx); err != nil {
+				return i + 1, tl.LastLSN(), err
 			}
 		}
 	}
@@ -230,6 +240,8 @@ func mapPageserverGRPCError(err error) error {
 		return status.Error(codes.NotFound, err.Error())
 	case errors.Is(err, ErrFenced), errors.Is(err, ErrStaleGeneration):
 		return status.Error(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, ErrMemoryBudgetExhausted), errors.Is(err, ErrReadQueueFull):
+		return status.Error(codes.ResourceExhausted, err.Error())
 	case errors.Is(err, context.DeadlineExceeded):
 		return status.Error(codes.DeadlineExceeded, err.Error())
 	case errors.Is(err, context.Canceled):

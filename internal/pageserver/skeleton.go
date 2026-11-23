@@ -96,7 +96,7 @@ func isEphemeralPGFile(relSlash string) bool {
 // stored in the Pageserver.
 func PackMetadataSkeleton(pgDataDir string) ([]byte, *SkeletonMeta, error) {
 	var buf bytes.Buffer
-	zw, err := zstd.NewWriter(&buf)
+	zw, err := zstd.NewWriter(&buf, zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(64*1024))
 	if err != nil {
 		return nil, nil, fmt.Errorf("skeleton zstd writer: %w", err)
 	}
@@ -194,7 +194,7 @@ func UnpackMetadataSkeleton(archive []byte, pgDataDir string) (*SkeletonMeta, er
 	if len(archive) == 0 {
 		return nil, fmt.Errorf("empty metadata skeleton archive")
 	}
-	zr, err := zstd.NewReader(bytes.NewReader(archive))
+	zr, err := zstd.NewReader(bytes.NewReader(archive), zstd.WithDecoderConcurrency(1))
 	if err != nil {
 		return nil, fmt.Errorf("skeleton zstd reader: %w", err)
 	}

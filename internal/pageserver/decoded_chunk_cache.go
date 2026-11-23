@@ -217,6 +217,26 @@ func (c *DecodedChunkCache) InvalidateTenantGeneration(tenantID, generation stri
 	}
 }
 
+// TrimToBytes evicts oldest LRU decoded chunks until curBytes <= targetBytes.
+func (c *DecodedChunkCache) TrimToBytes(targetBytes int64) {
+	if targetBytes < 0 {
+		targetBytes = 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for c.curBytes > targetBytes && c.lru.Len() > 0 {
+		oldest := c.lru.Back()
+		if oldest == nil {
+			break
+		}
+		c.lru.Remove(oldest)
+		oldEntry := oldest.Value.(*decodedChunkEntry)
+		delete(c.entries, oldEntry.key)
+		c.curBytes -= oldEntry.size
+		c.evictions.Add(1)
+	}
+}
+
 // Stats returns a snapshot of cache usage and hit/miss metrics.
 func (c *DecodedChunkCache) Stats() DecodedChunkCacheStats {
 	c.mu.Lock()
@@ -233,3 +253,4 @@ func (c *DecodedChunkCache) Stats() DecodedChunkCacheStats {
 		SingleflightWaits: c.singleflightWaits.Load(),
 	}
 }
+

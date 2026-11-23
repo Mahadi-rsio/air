@@ -38,15 +38,32 @@ var (
 	v2ZstdEnc  *zstd.Encoder
 	v2ZstdDec  *zstd.Decoder
 	v2ZstdErr  error
+
+	v2RawChunkPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 0, v2TargetChunkRawBytes+PageSize*2)
+			return &b
+		},
+	}
+	v2CompChunkPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 0, v2TargetChunkRawBytes+PageSize*2)
+			return &b
+		},
+	}
 )
 
 func getV2Zstd() (*zstd.Encoder, *zstd.Decoder, error) {
 	v2ZstdOnce.Do(func() {
-		v2ZstdEnc, v2ZstdErr = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+		v2ZstdEnc, v2ZstdErr = zstd.NewWriter(nil,
+			zstd.WithEncoderLevel(zstd.SpeedDefault),
+			zstd.WithEncoderConcurrency(1),
+			zstd.WithWindowSize(64*1024),
+		)
 		if v2ZstdErr != nil {
 			return
 		}
-		v2ZstdDec, v2ZstdErr = zstd.NewReader(nil)
+		v2ZstdDec, v2ZstdErr = zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
 	})
 	return v2ZstdEnc, v2ZstdDec, v2ZstdErr
 }
@@ -59,9 +76,24 @@ func compressV2Payload(raw []byte, forceNone bool) ([]byte, uint8, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	comp := enc.EncodeAll(raw, make([]byte, 0, len(raw)))
+	comp := enc.EncodeAll(raw, make([]byte, 0, len(raw)/2+64))
 	if len(comp) >= len(raw) {
 		// Preserve original uncompressed data when compression is ineffective.
+		return raw, LayerCodecNone, nil
+	}
+	return comp, LayerCodecZstd, nil
+}
+
+func compressV2PayloadInto(raw []byte, dst []byte, forceNone bool) ([]byte, uint8, error) {
+	if forceNone || len(raw) < 32 {
+		return raw, LayerCodecNone, nil
+	}
+	enc, _, err := getV2Zstd()
+	if err != nil {
+		return nil, 0, err
+	}
+	comp := enc.EncodeAll(raw, dst[:0])
+	if len(comp) >= len(raw) {
 		return raw, LayerCodecNone, nil
 	}
 	return comp, LayerCodecZstd, nil
@@ -220,7 +252,17 @@ func (sw *v2StreamWriter) flushChunk() error {
 	for _, pr := range sw.chunkBuf {
 		totalRaw += 12 + len(pr.rec.Delta.PageImage)
 	}
-	rawChunk := make([]byte, totalRaw)
+	rawPtr := v2RawChunkPool.Get().(*[]byte)
+	if cap(*rawPtr) < totalRaw {
+		*rawPtr = make([]byte, totalRaw)
+	}
+	rawChunk := (*rawPtr)[:totalRaw]
+	defer func() {
+		if cap(*rawPtr) <= 512*1024 {
+			v2RawChunkPool.Put(rawPtr)
+		}
+	}()
+
 	binary.LittleEndian.PutUint32(rawChunk[0:4], uint32(len(sw.chunkBuf)))
 
 	pos := headerSize
@@ -242,7 +284,17 @@ func (sw *v2StreamWriter) flushChunk() error {
 		})
 	}
 
-	payload, codec, err := compressV2Payload(rawChunk, sw.opts.DisableCompression)
+	compPtr := v2CompChunkPool.Get().(*[]byte)
+	if cap(*compPtr) < totalRaw {
+		*compPtr = make([]byte, 0, totalRaw)
+	}
+	defer func() {
+		if cap(*compPtr) <= 512*1024 {
+			v2CompChunkPool.Put(compPtr)
+		}
+	}()
+
+	payload, codec, err := compressV2PayloadInto(rawChunk, *compPtr, sw.opts.DisableCompression)
 	if err != nil {
 		return err
 	}
@@ -412,12 +464,21 @@ func (sw *v2StreamWriter) Finish() (v2EncodeResult, error) {
 // EncodeLayerV2ToWriter streams sorted LayerRecords into Layer Format V2 directly to w
 // with bounded chunk buffers and single-pass incremental SHA-256 computation.
 func EncodeLayerV2ToWriter(w io.Writer, tenantID string, epoch int64, aadKey string, kind LayerKind, endLSN uint64, recs []LayerRecord, kms *crypto.EnvelopeKMS, opts v2EncodeOptions) (v2EncodeResult, error) {
-	sort.Slice(recs, func(i, j int) bool {
-		if c := recs[i].Key.Compare(recs[j].Key); c != 0 {
-			return c < 0
+	sorted := true
+	for i := 1; i < len(recs); i++ {
+		if c := recs[i-1].Key.Compare(recs[i].Key); c > 0 || (c == 0 && recs[i-1].Delta.LSN > recs[i].Delta.LSN) {
+			sorted = false
+			break
 		}
-		return recs[i].Delta.LSN < recs[j].Delta.LSN
-	})
+	}
+	if !sorted {
+		sort.Slice(recs, func(i, j int) bool {
+			if c := recs[i].Key.Compare(recs[j].Key); c != 0 {
+				return c < 0
+			}
+			return recs[i].Delta.LSN < recs[j].Delta.LSN
+		})
+	}
 	sw := newV2StreamWriter(w, tenantID, epoch, aadKey, kind, endLSN, kms, opts)
 	for _, rec := range recs {
 		if err := sw.Add(rec); err != nil {
@@ -559,6 +620,12 @@ func decodeV2WALTable(raw []byte, meta LayerMeta, wm v2WALTableMeta, kms *crypto
 		return nil, fmt.Errorf("pageserver: malformed v2 WAL table count=%d len=%d", count, wm.RawLen)
 	}
 	out := make([][]byte, int(count))
+	arenaCap := int(wm.RawLen) - 4 - int(count)*4
+	var arena []byte
+	if arenaCap > 0 {
+		arena = make([]byte, arenaCap)
+	}
+	arenaOff := 0
 	for i := 0; i < int(count); i++ {
 		if _, err := io.ReadFull(r, hdr[:]); err != nil {
 			return nil, fmt.Errorf("pageserver: truncated v2 WAL entry length: %w", err)
@@ -569,7 +636,8 @@ func decodeV2WALTable(raw []byte, meta LayerMeta, wm v2WALTableMeta, kms *crypto
 			return nil, errors.New("pageserver: truncated v2 WAL entry body")
 		}
 		if n > 0 {
-			entry := make([]byte, n)
+			entry := arena[arenaOff : arenaOff+int(n) : arenaOff+int(n)]
+			arenaOff += int(n)
 			if _, err := io.ReadFull(r, entry); err != nil {
 				return nil, fmt.Errorf("pageserver: truncated v2 WAL entry body: %w", err)
 			}
@@ -664,14 +732,21 @@ func (s *LayerStore) loadV2WALTable(ctx context.Context, meta LayerMeta, idxData
 		}
 	}
 
+	var addedBytes int64
 	idxData.walMu.Lock()
 	if !idxData.walLoaded {
 		idxData.walTable = wt
 		idxData.walLoaded = true
+		for _, wb := range wt {
+			addedBytes += int64(len(wb)) + 24
+		}
 	} else {
 		wt = idxData.walTable
 	}
 	idxData.walMu.Unlock()
+	if addedBytes > 0 && s.idxCache != nil {
+		s.idxCache.addExtraBytes(meta.R2Key, addedBytes)
+	}
 	return wt, nil
 }
 

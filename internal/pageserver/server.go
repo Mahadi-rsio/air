@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,6 +30,7 @@ type Config struct {
 	S3Client          *s3.Client
 	R2Bucket          string
 	KMS               *crypto.EnvelopeKMS
+	MemoryBudget      MemoryBudgetConfig
 	Debug             bool
 }
 
@@ -38,6 +40,7 @@ type Pageserver struct {
 	store   *LayerStore
 	cache   *DiskCache
 	redoer  WALRedoer
+	budget  *MemoryBudget
 	unixSrv *UnixServer
 
 	mu          sync.RWMutex
@@ -57,7 +60,9 @@ func New(cfg Config) (*Pageserver, error) {
 		cfg.CacheMaxBytes = 256 * 1024 * 1024
 	}
 	var cache *DiskCache
-	if cfg.CacheDir != "" {
+	// Only enable DiskCache when LayerDir is empty or S3/R2 is configured; when local LayerDir
+	// is used without R2, layer files already reside directly on disk under LayerDir.
+	if cfg.CacheDir != "" && (cfg.LayerDir == "" || (cfg.S3Client != nil && cfg.R2Bucket != "")) {
 		var err error
 		cache, err = NewDiskCache(cfg.CacheDir, cfg.CacheMaxBytes)
 		if err != nil {
@@ -74,13 +79,19 @@ func New(cfg Config) (*Pageserver, error) {
 		tenants:     make(map[string]*Timeline),
 		generations: make(map[string]string),
 	}
+	ps.budget = newMemoryBudget(ps, cfg.MemoryBudget)
+	store.SetDecodedChunkCache(NewDecodedChunkCache(DecodedChunkCacheConfig{
+		MaxBytes: ps.budget.cfg.DecodedChunkCacheBytes,
+	}))
+	store.SetIndexCacheMaxBytes(ps.budget.cfg.IndexCacheBytes)
 	store.SetGenerationChecker(ps.isGenerationActive)
 	if !cfg.DisableUnixSocket && cfg.SocketPath != "" {
 		ps.unixSrv = NewUnixServer(cfg.SocketPath, ps)
 	}
 	ps.recoverLocalTenants()
-	debugf("server", "initialized pageserver layer_dir=%q cache_dir=%q cache_max_bytes=%d walredo_bin=%q r2_bucket=%q kms=%v unix_socket=%q recovered_tenants=%d",
-		cfg.LayerDir, cfg.CacheDir, cfg.CacheMaxBytes, cfg.WalRedoBin, cfg.R2Bucket, cfg.KMS != nil, cfg.SocketPath, len(ps.tenants))
+	ps.budget.start()
+	debugf("server", "initialized pageserver layer_dir=%q cache_dir=%q cache_max_bytes=%d mem_limit_mb=%d global_soft_inmem_mb=%d tenant_soft_inmem_kb=%d walredo_bin=%q r2_bucket=%q kms=%v unix_socket=%q recovered_tenants=%d",
+		cfg.LayerDir, cfg.CacheDir, cfg.CacheMaxBytes, ps.budget.cfg.MemoryLimitBytes/(1024*1024), ps.budget.cfg.GlobalSoftInMemBytes/(1024*1024), ps.budget.cfg.PerTenantSoftInMemBytes/1024, cfg.WalRedoBin, cfg.R2Bucket, cfg.KMS != nil, cfg.SocketPath, len(ps.tenants))
 	return ps, nil
 }
 
@@ -193,6 +204,7 @@ func (p *Pageserver) recoverLocalTenants() {
 			p.generations[tenantID] = best.gen
 		}
 		tl := NewTimeline(tenantID, best.epoch, p.store, p.redoer)
+		tl.setMemoryBudget(p.budget)
 		if best.gen != "" {
 			tl.SetGeneration(best.gen)
 		}
@@ -247,8 +259,11 @@ func (p *Pageserver) Start(ctx context.Context) error {
 	return p.unixSrv.Start(ctx)
 }
 
-// Close shuts down the Unix socket server and WAL redo worker pool.
+// Close shuts down the memory budget monitor, Unix socket server, and WAL redo worker pool.
 func (p *Pageserver) Close() error {
+	if p.budget != nil {
+		p.budget.close()
+	}
 	var err error
 	if p.unixSrv != nil {
 		err = p.unixSrv.Close()
@@ -274,6 +289,9 @@ func (p *Pageserver) SetTenantGeneration(tenantID, generation string) {
 	}
 	if prev, ok := p.generations[tenantID]; ok && prev != generation {
 		debugf("tenant", "SetTenantGeneration tenant=%s prev=%q new=%q (detaching old timeline)", tenantID, prev, generation)
+		if oldTL, exists := p.tenants[tenantID]; exists && p.budget != nil {
+			p.budget.addInMemBytes(-oldTL.InMemBytes())
+		}
 		delete(p.tenants, tenantID)
 	} else {
 		debugf("tenant", "SetTenantGeneration tenant=%s gen=%q", tenantID, generation)
@@ -283,6 +301,9 @@ func (p *Pageserver) SetTenantGeneration(tenantID, generation string) {
 		if tl.Generation() == "" {
 			tl.SetGeneration(generation)
 		} else {
+			if p.budget != nil {
+				p.budget.addInMemBytes(-tl.InMemBytes())
+			}
 			delete(p.tenants, tenantID)
 		}
 	}
@@ -330,9 +351,15 @@ func (p *Pageserver) PurgeTenant(ctx context.Context, tenantID, generation strin
 	p.mu.Lock()
 	curGen := p.generations[tenantID]
 	if generation == "" || curGen == generation {
+		if oldTL, exists := p.tenants[tenantID]; exists && p.budget != nil {
+			p.budget.addInMemBytes(-oldTL.InMemBytes())
+		}
 		delete(p.generations, tenantID)
 		delete(p.tenants, tenantID)
 	} else if tl, ok := p.tenants[tenantID]; ok && tl.Generation() == generation {
+		if p.budget != nil {
+			p.budget.addInMemBytes(-tl.InMemBytes())
+		}
 		delete(p.tenants, tenantID)
 	}
 	p.mu.Unlock()
@@ -399,14 +426,125 @@ func (p *Pageserver) EnsureTenant(tenantID string, epoch int64) *Timeline {
 			debugf("tenant", "EnsureTenant reuse tenant=%s epoch=%d gen=%q last_lsn=%s layers=%d", tenantID, epoch, tl.Generation(), formatLSNHex(tl.LastLSN()), tl.LayerCount())
 			return tl
 		}
+		if p.budget != nil {
+			p.budget.addInMemBytes(-tl.InMemBytes())
+		}
 	}
 	tl := NewTimeline(tenantID, epoch, p.store, p.redoer)
+	tl.setMemoryBudget(p.budget)
 	if gen != "" {
 		tl.SetGeneration(gen)
 	}
 	p.tenants[tenantID] = tl
 	debugf("tenant", "EnsureTenant created timeline tenant=%s epoch=%d gen=%q active_tenants=%d", tenantID, epoch, gen, len(p.tenants))
 	return tl
+}
+
+func (p *Pageserver) snapshotTimelines() []*Timeline {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]*Timeline, 0, len(p.tenants))
+	for _, tl := range p.tenants {
+		out = append(out, tl)
+	}
+	return out
+}
+
+func (p *Pageserver) dirtyTenantCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	cnt := 0
+	for _, tl := range p.tenants {
+		if tl.InMemBytes() > 0 {
+			cnt++
+		}
+	}
+	return cnt
+}
+
+func (p *Pageserver) flushLargestDirtyTenantsAsync(limit int) {
+	timelines := p.snapshotTimelines()
+	type item struct {
+		tl    *Timeline
+		bytes int64
+	}
+	var dirty []item
+	for _, tl := range timelines {
+		if sz := tl.InMemBytes(); sz > 0 {
+			dirty = append(dirty, item{tl: tl, bytes: sz})
+		}
+	}
+	if len(dirty) == 0 {
+		return
+	}
+	sort.Slice(dirty, func(i, j int) bool { return dirty[i].bytes > dirty[j].bytes })
+	if limit > 0 && len(dirty) > limit {
+		dirty = dirty[:limit]
+	}
+	for _, d := range dirty {
+		d.tl.MaybeFlushAsync()
+	}
+}
+
+// MemoryStats returns a measurable snapshot of global and per-tenant memory budgets,
+// InMemoryLayer consumption, dirty page counts, cache bytes, Go heap stats, and flush counters.
+func (p *Pageserver) MemoryStats() MemoryStatsSnapshot {
+	timelines := p.snapshotTimelines()
+	perTenantBytes := make(map[string]int64, len(timelines))
+	perTenantPages := make(map[string]int, len(timelines))
+	var globalInMem int64
+	var totalDirtyPages int64
+	for _, tl := range timelines {
+		sz := tl.InMemBytes()
+		dp := tl.DirtyPageCount()
+		perTenantBytes[tl.tenantID] = sz
+		perTenantPages[tl.tenantID] = dp
+		globalInMem += sz
+		totalDirtyPages += int64(dp)
+	}
+
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
+	var dcBytes, icBytes int64
+	if p.store != nil {
+		if dc := p.store.DecodedChunkCache(); dc != nil {
+			dcBytes = dc.Stats().Bytes
+		}
+		if ic := p.store.idxCache; ic != nil {
+			icBytes = ic.bytesUsed()
+		}
+	}
+
+	var snap MemoryStatsSnapshot
+	if p.budget != nil {
+		soft, hard := p.budget.effectiveTenantLimits()
+		snap.MemoryLimitBytes = p.budget.cfg.MemoryLimitBytes
+		snap.GoMemoryLimitBytes = p.budget.cfg.GoMemoryLimitBytes
+		snap.GlobalSoftInMemBytes = p.budget.cfg.GlobalSoftInMemBytes
+		snap.GlobalHardInMemBytes = p.budget.cfg.GlobalHardInMemBytes
+		snap.PerTenantSoftInMemBytes = soft
+		snap.PerTenantHardInMemBytes = hard
+		snap.FlushesCompleted = p.budget.flushesTotal.Load()
+		snap.FlushedBytesTotal = p.budget.flushedBytes.Load()
+		snap.BackpressureWaits = p.budget.bpWaits.Load()
+		snap.BackpressureRejects = p.budget.bpRejects.Load()
+		snap.PressureEvictions = p.budget.pressureEvict.Load()
+	}
+	snap.GlobalInMemBytes = globalInMem
+	snap.TotalDirtyPages = totalDirtyPages
+	snap.TenantInMemBytes = perTenantBytes
+	snap.TenantDirtyPages = perTenantPages
+	snap.DecodedChunkCacheBytes = dcBytes
+	snap.IndexCacheBytes = icBytes
+	snap.HeapAllocBytes = ms.HeapAlloc
+	snap.HeapInuseBytes = ms.HeapInuse
+	snap.HeapIdleBytes = ms.HeapIdle
+	snap.HeapReleasedBytes = ms.HeapReleased
+	snap.TotalAllocBytes = ms.TotalAlloc
+	snap.NumGC = ms.NumGC
+	snap.GCPauseTotalNs = ms.PauseTotalNs
+	return snap
 }
 
 // FlushTenant flushes the tenant's InMemoryLayer to an immutable L0 layer (e.g. on SuspendTenant).

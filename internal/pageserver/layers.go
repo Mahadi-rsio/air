@@ -92,8 +92,17 @@ func NewInMemoryLayer(startLSN uint64) *InMemoryLayer {
 	}
 }
 
-// Put appends a delta entry for key at delta.LSN.
-func (m *InMemoryLayer) Put(key Key, delta WALDelta) {
+func deltaApproxBytes(delta WALDelta, isNewKey bool) int64 {
+	b := int64(len(delta.PageImage) + len(delta.WALRecord) + 64)
+	if isNewKey {
+		b += 64
+	}
+	return b
+}
+
+// Put appends a delta entry for key at delta.LSN, coalescing duplicate same-LSN page images
+// or relation-size updates in place to prevent 2x PutPageBatch + WALReceiver FPI duplication.
+func (m *InMemoryLayer) Put(key Key, delta WALDelta) int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.StartLSN == 0 || delta.LSN < m.StartLSN {
@@ -102,8 +111,47 @@ func (m *InMemoryLayer) Put(key Key, delta WALDelta) {
 	if delta.LSN >= m.EndLSN {
 		m.EndLSN = delta.LSN + 1
 	}
-	m.entries[key] = append(m.entries[key], delta)
-	m.ApproxBytes += int64(len(delta.PageImage) + len(delta.WALRecord) + 64)
+	// If this delta carries a materialized full page image, any embedded raw WALRecord is redundant.
+	if (delta.Flags&EntryFlagPageImage) != 0 && len(delta.PageImage) == PageSize && len(delta.WALRecord) > 0 {
+		delta.Flags &^= EntryFlagWALRecord
+		delta.WALRecord = nil
+	}
+	list := m.entries[key]
+	if n := len(list); n > 0 {
+		last := list[n-1]
+		if key.Kind == KeyKindRelSize && (delta.Flags&EntryFlagRelSize) != 0 && delta.LSN >= last.LSN {
+			oldBytes := deltaApproxBytes(last, n == 1)
+			newBytes := deltaApproxBytes(delta, n == 1)
+			list[n-1] = delta
+			m.entries[key] = list
+			diff := newBytes - oldBytes
+			m.ApproxBytes += diff
+			return diff
+		}
+		if last.LSN == delta.LSN && (delta.Flags&EntryFlagPageImage) != 0 && len(delta.PageImage) == PageSize {
+			oldBytes := deltaApproxBytes(last, n == 1)
+			newBytes := deltaApproxBytes(delta, n == 1)
+			list[n-1] = delta
+			m.entries[key] = list
+			diff := newBytes - oldBytes
+			m.ApproxBytes += diff
+			return diff
+		}
+		if last.LSN == delta.LSN && (last.Flags&EntryFlagPageImage) != 0 && len(last.PageImage) == PageSize && (delta.Flags&EntryFlagPageImage) != 0 {
+			return 0
+		}
+	}
+	added := deltaApproxBytes(delta, len(list) == 0)
+	m.entries[key] = append(list, delta)
+	m.ApproxBytes += added
+	return added
+}
+
+// DirtyKeyCount returns the number of distinct keys buffered in this InMemoryLayer.
+func (m *InMemoryLayer) DirtyKeyCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.entries)
 }
 
 // Lookup returns all deltas for key with LSN <= lsn in ascending LSN order.
@@ -127,7 +175,14 @@ func (m *InMemoryLayer) Lookup(key Key, lsn uint64) []WALDelta {
 func (m *InMemoryLayer) SnapshotAll() ([]LayerRecord, uint64, uint64) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	var recs []LayerRecord
+	total := 0
+	for _, deltas := range m.entries {
+		total += len(deltas)
+	}
+	if total == 0 {
+		return nil, m.StartLSN, m.EndLSN
+	}
+	recs := make([]LayerRecord, 0, total)
 	for k, deltas := range m.entries {
 		for _, d := range deltas {
 			recs = append(recs, LayerRecord{Key: k, Delta: d})

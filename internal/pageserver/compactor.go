@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 
@@ -17,6 +18,16 @@ const (
 // CompactIfNeeded compacts L0 delta layers into an L1 (or Image) layer using a bounded-memory
 // streaming K-way merge and streaming V2 output encoding.
 func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materializeImage bool) (*LayerMeta, error) {
+	return t.compactL0s(ctx, threshold, 0, materializeImage)
+}
+
+// CompactL0Batch compacts at most maxBatch oldest L0 layers into an L1 layer to bound
+// memory usage during background compaction.
+func (t *Timeline) CompactL0Batch(ctx context.Context, threshold, maxBatch int) (*LayerMeta, error) {
+	return t.compactL0s(ctx, threshold, maxBatch, false)
+}
+
+func (t *Timeline) compactL0s(ctx context.Context, threshold, maxBatch int, materializeImage bool) (*LayerMeta, error) {
 	t.compactMu.Lock()
 	defer t.compactMu.Unlock()
 
@@ -34,6 +45,15 @@ func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materiali
 
 	if len(l0s) < threshold {
 		return nil, nil
+	}
+	sort.Slice(l0s, func(i, j int) bool {
+		if l0s[i].StartLSN != l0s[j].StartLSN {
+			return l0s[i].StartLSN < l0s[j].StartLSN
+		}
+		return l0s[i].Seq < l0s[j].Seq
+	})
+	if !materializeImage && maxBatch > 0 && len(l0s) > maxBatch {
+		l0s = l0s[:maxBatch]
 	}
 	start := time.Now()
 	debugf("compactor", "CompactIfNeeded start tenant=%s l0_count=%d threshold=%d materialize_image=%v", t.tenantID, len(l0s), threshold, materializeImage)
@@ -164,6 +184,15 @@ func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materiali
 		}
 	}
 	updated = append(updated, written)
+	sort.Slice(updated, func(i, j int) bool {
+		if updated[i].EndLSN != updated[j].EndLSN {
+			return updated[i].EndLSN < updated[j].EndLSN
+		}
+		if updated[i].StartLSN != updated[j].StartLSN {
+			return updated[i].StartLSN < updated[j].StartLSN
+		}
+		return updated[i].Seq < updated[j].Seq
+	})
 	curSeq := t.layerSeq
 	t.mu.RUnlock()
 
@@ -176,6 +205,12 @@ func (t *Timeline) CompactIfNeeded(ctx context.Context, threshold int, materiali
 	t.mu.Lock()
 	t.layers = updated
 	t.mu.Unlock()
+
+	if t.store != nil && t.store.idxCache != nil {
+		for _, lm := range l0s {
+			t.store.idxCache.evict(lm.R2Key)
+		}
+	}
 
 	debugf("compactor", "CompactIfNeeded done tenant=%s compacted_l0=%d out_file=%s kind=%s size=%d lsn=%s..%s total_layers=%d dur=%s",
 		tenantID, len(l0s), written.FileName, written.Kind, written.FileSize, formatLSNHex(minLSN), formatLSNHex(maxLSN), len(updated), time.Since(start))
@@ -243,6 +278,10 @@ func (s *LayerStore) writeLayerFromStream(ctx context.Context, meta LayerMeta, f
 	}
 	res, err := sw.Finish()
 	if err != nil {
+		cleanupOnErr()
+		return meta, err
+	}
+	if err := outFile.Sync(); err != nil {
 		cleanupOnErr()
 		return meta, err
 	}
@@ -402,7 +441,7 @@ func (it *layerRecordIterator) fillNextBatch(ctx context.Context) error {
 				if wIdx >= len(it.walTable) {
 					return fmt.Errorf("pageserver: v2 WAL index %d out of bounds", wIdx)
 				}
-				delta.WALRecord = append([]byte(nil), it.walTable[wIdx]...)
+				delta.WALRecord = it.walTable[wIdx]
 			}
 			it.buf = append(it.buf, LayerRecord{Key: e.Key, Delta: delta})
 			it.pos++

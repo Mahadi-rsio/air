@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -31,6 +32,7 @@ type Config struct {
 	HTTPAddr          string
 	SocketPath        string
 	CacheMB           int
+	MemoryLimitMB     int
 	WalRedoBin        string
 	InternalToken     string
 	R2Endpoint        string
@@ -81,6 +83,7 @@ func loadConfig(args []string) Config {
 		HTTPAddr:          envOr("AIR_PAGESERVER_HTTP_ADDR", "0.0.0.0:8083"),
 		SocketPath:        envOr("AIR_PAGESERVER_SOCKET", ""),
 		CacheMB:           envIntOr("AIR_PAGESERVER_CACHE_MB", 256),
+		MemoryLimitMB:     envIntOr("AIR_PAGESERVER_MEMORY_MB", 0),
 		WalRedoBin:        envOr("AIR_WALREDO_BIN", ""),
 		InternalToken:     envOr("AIR_INTERNAL_TOKEN", ""),
 		R2Endpoint:        envOr("AIR_R2_ENDPOINT", ""),
@@ -98,6 +101,7 @@ func loadConfig(args []string) Config {
 	fs.StringVar(&cfg.HTTPAddr, "http-addr", cfg.HTTPAddr, "Pageserver HTTP health/status listen address")
 	fs.StringVar(&cfg.SocketPath, "socket-path", cfg.SocketPath, "Optional Unix socket path for co-located air_smgr/read-engine")
 	fs.IntVar(&cfg.CacheMB, "cache-mb", cfg.CacheMB, "Bounded LRU disk cache size in MB")
+	fs.IntVar(&cfg.MemoryLimitMB, "memory-mb", cfg.MemoryLimitMB, "Pageserver memory limit in MB (0 = auto-detect from cgroup v2)")
 	fs.StringVar(&cfg.WalRedoBin, "walredo-bin", cfg.WalRedoBin, "Optional path to air-walredo binary")
 	fs.StringVar(&cfg.InternalToken, "internal-token", cfg.InternalToken, "Shared secret token for internal gRPC authentication")
 	fs.StringVar(&cfg.R2Endpoint, "r2-endpoint", cfg.R2Endpoint, "S3/R2 endpoint URL")
@@ -156,8 +160,8 @@ func main() {
 	}
 
 	pageserver.SetDebugLogging(cfg.Debug)
-	log.Printf("[air-pageserver] starting (debug=%v, data_dir=%s, cache_mb=%d, walredo_bin=%q, r2_enabled=%v, r2_bucket=%q, auth_enabled=%v)",
-		cfg.Debug, cfg.DataDir, cfg.CacheMB, cfg.WalRedoBin, s3c != nil, cfg.R2Bucket, cfg.InternalToken != "")
+	log.Printf("[air-pageserver] starting (debug=%v, data_dir=%s, cache_mb=%d, memory_mb=%d, walredo_bin=%q, r2_enabled=%v, r2_bucket=%q, auth_enabled=%v)",
+		cfg.Debug, cfg.DataDir, cfg.CacheMB, cfg.MemoryLimitMB, cfg.WalRedoBin, s3c != nil, cfg.R2Bucket, cfg.InternalToken != "")
 
 	ps, err := pageserver.New(pageserver.Config{
 		SocketPath:        cfg.SocketPath,
@@ -169,7 +173,11 @@ func main() {
 		S3Client:          s3c,
 		R2Bucket:          cfg.R2Bucket,
 		KMS:               kms,
-		Debug:             cfg.Debug,
+		MemoryBudget: pageserver.MemoryBudgetConfig{
+			MemoryLimitBytes:    int64(cfg.MemoryLimitMB) * 1024 * 1024,
+			ApplyGoRuntimeLimit: true,
+		},
+		Debug: cfg.Debug,
 	})
 	if err != nil {
 		log.Fatalf("init pageserver: %v", err)
@@ -221,6 +229,13 @@ func main() {
 			"unix_socket":    cfg.SocketPath,
 		})
 	})
+	mux.HandleFunc("/internal/v1/memory-stats", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ps.MemoryStats())
+	})
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/heap", pprof.Handler("heap").ServeHTTP)
+	mux.HandleFunc("/debug/pprof/goroutine", pprof.Handler("goroutine").ServeHTTP)
 
 	handleNamespace := func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()

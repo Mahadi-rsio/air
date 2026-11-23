@@ -394,6 +394,23 @@ type WALStreamParser struct {
 	contNeed int
 }
 
+func (p *WALStreamParser) consumePage() {
+	if len(p.buf) <= XLogPageSize {
+		p.buf = p.buf[:0]
+	} else {
+		n := copy(p.buf, p.buf[XLogPageSize:])
+		p.buf = p.buf[:n]
+	}
+	// Shrink backing array if it grew excessively (> 256 KiB) and is now small.
+	if cap(p.buf) > 256*1024 && len(p.buf) <= 2*XLogPageSize {
+		shrunk := make([]byte, len(p.buf), 4*XLogPageSize)
+		copy(shrunk, p.buf)
+		p.buf = shrunk
+	}
+	p.pos = 0
+	p.inPage = false
+}
+
 // Push appends a WAL chunk and returns all newly completed WAL records.
 func (p *WALStreamParser) Push(chunk []byte) ([]*DecodedWALRecord, error) {
 	p.buf = append(p.buf, chunk...)
@@ -411,9 +428,7 @@ func (p *WALStreamParser) Push(chunk []byte) ([]*DecodedWALRecord, error) {
 				if len(p.buf) < XLogPageSize {
 					break
 				}
-				p.buf = append([]byte(nil), p.buf[XLogPageSize:]...)
-				p.pos = 0
-				p.inPage = false
+				p.consumePage()
 				continue
 			}
 			if magic != XLogPageMagic && magic != XLogPageMagicPG15 {
@@ -438,10 +453,6 @@ func (p *WALStreamParser) Push(chunk []byte) ([]*DecodedWALRecord, error) {
 					take = XLogPageSize - p.pos
 				}
 				if pageLen < p.pos+take {
-					// Wait for the rest of the continuation bytes on this page.
-					if (info & XLPFirstIsOverwriteContRec) == 0 && len(p.contBuf) > 0 && p.contNeed > 0 {
-						// We'll process once enough bytes arrive.
-					}
 					p.inPage = false
 					break
 				}
@@ -463,7 +474,6 @@ func (p *WALStreamParser) Push(chunk []byte) ([]*DecodedWALRecord, error) {
 				}
 				p.pos += maxAlign8(take)
 				if pageLen < p.pos && pageLen < XLogPageSize {
-					// Wait for alignment padding bytes.
 					p.pos -= maxAlign8(take)
 					p.inPage = false
 					break
@@ -476,9 +486,7 @@ func (p *WALStreamParser) Push(chunk []byte) ([]*DecodedWALRecord, error) {
 			totLen := int(binary.LittleEndian.Uint32(p.buf[p.pos : p.pos+4]))
 			if totLen == 0 {
 				if pageLen == XLogPageSize {
-					p.buf = append([]byte(nil), p.buf[XLogPageSize:]...)
-					p.pos = 0
-					p.inPage = false
+					p.consumePage()
 					advancedPage = true
 				}
 				break
@@ -500,11 +508,9 @@ func (p *WALStreamParser) Push(chunk []byte) ([]*DecodedWALRecord, error) {
 					break
 				}
 				p.contLSN = recLSN
-				p.contBuf = append([]byte(nil), p.buf[p.pos:XLogPageSize]...)
+				p.contBuf = append(p.contBuf[:0], p.buf[p.pos:XLogPageSize]...)
 				p.contNeed = totLen - availInPage
-				p.buf = append([]byte(nil), p.buf[XLogPageSize:]...)
-				p.pos = 0
-				p.inPage = false
+				p.consumePage()
 				advancedPage = true
 				break
 			}
@@ -513,20 +519,16 @@ func (p *WALStreamParser) Push(chunk []byte) ([]*DecodedWALRecord, error) {
 			continue
 		}
 		if pageLen == XLogPageSize && p.pos+SizeOfXLogRecord > XLogPageSize {
-			// A record header may start in the last bytes of this page and continue on the next
-			// (remaining space is a multiple of 8, so xl_tot_len is always readable when >= 8).
 			remaining := XLogPageSize - p.pos
 			if remaining >= 4 {
 				totLen := int(binary.LittleEndian.Uint32(p.buf[p.pos : p.pos+4]))
 				if totLen > remaining {
 					p.contLSN = p.pageAddr + uint64(p.pos)
-					p.contBuf = append([]byte(nil), p.buf[p.pos:XLogPageSize]...)
+					p.contBuf = append(p.contBuf[:0], p.buf[p.pos:XLogPageSize]...)
 					p.contNeed = totLen - remaining
 				}
 			}
-			p.buf = append([]byte(nil), p.buf[XLogPageSize:]...)
-			p.pos = 0
-			p.inPage = false
+			p.consumePage()
 			continue
 		}
 		break

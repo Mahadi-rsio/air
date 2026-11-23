@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-const defaultMaxInMemBytes int64 = 16 * 1024 * 1024
-const maxTimelineModLogEntries = 65536
+const defaultMaxInMemBytes int64 = 2 * 1024 * 1024
+const maxTimelineModLogEntries = 4096
 
 // ModifiedBlockEvent records a block or relation-wide modification at LSN.
 type ModifiedBlockEvent struct {
@@ -55,6 +55,8 @@ type Timeline struct {
 	layers        []LayerMeta      // ordered oldest -> newest
 	store         *LayerStore
 	redoer        WALRedoer
+	budget        *MemoryBudget
+	lastWriteAt   time.Time
 	maxInMemBytes int64
 	relSizes          map[Key]uint32
 	relSizeKnown      map[Key]bool
@@ -84,6 +86,53 @@ func NewTimeline(tenantID string, epoch int64, store *LayerStore, redoer WALRedo
 	}
 }
 
+func (t *Timeline) setMemoryBudget(b *MemoryBudget) {
+	t.mu.Lock()
+	t.budget = b
+	if b != nil && b.cfg.PerTenantSoftInMemBytes > 0 {
+		t.maxInMemBytes = b.cfg.PerTenantSoftInMemBytes
+	}
+	t.mu.Unlock()
+}
+
+func (t *Timeline) putInMemLocked(key Key, delta WALDelta) {
+	diff := t.inMem.Put(key, delta)
+	t.lastWriteAt = time.Now()
+	if t.budget != nil && diff != 0 {
+		t.budget.addInMemBytes(diff)
+	}
+}
+
+func (t *Timeline) lastWriteTime() time.Time {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.lastWriteAt
+}
+
+// DirtyPageCount returns the total number of distinct dirty keys in active and frozen InMemoryLayers.
+func (t *Timeline) DirtyPageCount() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	cnt := t.inMem.DirtyKeyCount()
+	for _, fm := range t.frozenMems {
+		cnt += fm.DirtyKeyCount()
+	}
+	return cnt
+}
+
+// L0LayerCount returns the number of uncompacted L0 delta layers in this Timeline.
+func (t *Timeline) L0LayerCount() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	cnt := 0
+	for _, lm := range t.layers {
+		if lm.Kind == LayerKindL0 {
+			cnt++
+		}
+	}
+	return cnt
+}
+
 // SeedSLRUPage seeds a baseline 8 KiB SLRU page (e.g. pg_xact) into the Timeline
 // so subsequent WAL XACT updates preserve all previously committed XIDs.
 func (t *Timeline) SeedSLRUPage(key Key, page []byte) {
@@ -94,7 +143,7 @@ func (t *Timeline) SeedSLRUPage(key Key, page []byte) {
 	copy(cp, page)
 	t.mu.Lock()
 	t.slruPages[key] = cp
-	t.inMem.Put(key, WALDelta{
+	t.putInMemLocked(key, WALDelta{
 		LSN:       1,
 		Flags:     EntryFlagPageImage,
 		PageImage: cp,
@@ -209,7 +258,7 @@ func (t *Timeline) PutPage(key Key, lsn uint64, page []byte) {
 	copy(p, page)
 
 	t.mu.Lock()
-	t.inMem.Put(key, WALDelta{
+	t.putInMemLocked(key, WALDelta{
 		LSN:       lsn,
 		Flags:     EntryFlagPageImage,
 		PageImage: p,
@@ -217,7 +266,7 @@ func (t *Timeline) PutPage(key Key, lsn uint64, page []byte) {
 	sizeKey := RelSizeKey(key.SpcOID, key.DbOID, key.RelNumber, key.ForkNum)
 	if cur := t.relSizes[sizeKey]; key.BlockNum+1 > cur {
 		t.relSizes[sizeKey] = key.BlockNum + 1
-		t.inMem.Put(sizeKey, WALDelta{
+		t.putInMemLocked(sizeKey, WALDelta{
 			LSN:     lsn,
 			Flags:   EntryFlagRelSize,
 			RelSize: key.BlockNum + 1,
@@ -313,9 +362,15 @@ func (t *Timeline) MaybeFlushAsync() {
 }
 
 // EnforceInMemBudget triggers an async flush at the soft limit and applies backpressure
-// at the hard limit (2x maxInMemBytes) until the flush completes.
+// at the hard limit (both per-tenant and global) until the flush completes.
 func (t *Timeline) EnforceInMemBudget(ctx context.Context) error {
-	if t.store == nil || t.maxInMemBytes <= 0 {
+	if t.store == nil {
+		return nil
+	}
+	if t.budget != nil {
+		return t.budget.enforceBeforeWrite(ctx, t)
+	}
+	if t.maxInMemBytes <= 0 {
 		return nil
 	}
 	cur := t.InMemBytes()
@@ -364,6 +419,9 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 	if rec.Rmid == RmMultiXactID {
 		t.warmMultiXactSLRU(rec)
 	}
+	if rec.Rmid == RmXactID && rec.XID >= 3 {
+		t.warmXactSLRU(rec)
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -384,11 +442,12 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 						page = applied
 					}
 				}
-				delta.Flags |= EntryFlagPageImage
+				delta.Flags = (delta.Flags &^ EntryFlagWALRecord) | EntryFlagPageImage
 				delta.PageImage = page
+				delta.WALRecord = nil
 			}
 		}
-		t.inMem.Put(key, delta)
+		t.putInMemLocked(key, delta)
 		t.recordModifiedLocked(ModifiedBlockEvent{
 			SpcOID:    blk.Rel.SpcOID,
 			DbOID:     blk.Rel.DbOID,
@@ -401,7 +460,7 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 		sizeKey := RelSizeKey(blk.Rel.SpcOID, blk.Rel.DbOID, blk.Rel.RelNumber, blk.ForkNum)
 		if cur := t.relSizes[sizeKey]; blk.BlockNum+1 > cur {
 			t.relSizes[sizeKey] = blk.BlockNum + 1
-			t.inMem.Put(sizeKey, WALDelta{
+			t.putInMemLocked(sizeKey, WALDelta{
 				LSN:     rec.EndLSN,
 				Flags:   EntryFlagRelSize,
 				RelSize: blk.BlockNum + 1,
@@ -431,7 +490,7 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 				page := make([]byte, PageSize)
 				if cur, ok := t.slruPages[slruKey]; ok && len(cur) == PageSize {
 					copy(page, cur)
-				} else if deltas := t.inMem.Lookup(slruKey, ^uint64(0)); len(deltas) > 0 {
+				} else if deltas, _ := t.lookupInMemLayersLocked(slruKey, ^uint64(0)); len(deltas) > 0 {
 					for i := len(deltas) - 1; i >= 0; i-- {
 						if (deltas[i].Flags&EntryFlagPageImage) != 0 && len(deltas[i].PageImage) == PageSize {
 							copy(page, deltas[i].PageImage)
@@ -445,7 +504,7 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 				mask := byte(0x03 << bitShift)
 				page[byteIdx] = (page[byteIdx] &^ mask) | ((status & 0x03) << bitShift)
 				t.slruPages[slruKey] = page
-				t.inMem.Put(slruKey, WALDelta{
+				t.putInMemLocked(slruKey, WALDelta{
 					LSN:       rec.EndLSN,
 					Flags:     EntryFlagPageImage,
 					PageImage: page,
@@ -528,7 +587,7 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 				t.relSizes[sizeKey] = 0
 			}
 			t.relSizeKnown[sizeKey] = true
-			t.inMem.Put(sizeKey, WALDelta{
+			t.putInMemLocked(sizeKey, WALDelta{
 				LSN:     rec.EndLSN,
 				Flags:   EntryFlagRelSize,
 				RelSize: t.relSizes[sizeKey],
@@ -554,7 +613,7 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 					sizeKey := RelSizeKey(rel.SpcOID, rel.DbOID, rel.RelNumber, fork)
 					t.relSizes[sizeKey] = blkno
 					t.relSizeKnown[sizeKey] = true
-					t.inMem.Put(sizeKey, WALDelta{
+					t.putInMemLocked(sizeKey, WALDelta{
 						LSN:     rec.EndLSN,
 						Flags:   EntryFlagRelSize,
 						RelSize: blkno,
@@ -623,6 +682,13 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 	t.flushMu.Lock()
 	defer t.flushMu.Unlock()
 
+	if t.budget != nil {
+		if err := t.budget.acquireFlushSlot(ctx); err != nil {
+			return nil, err
+		}
+		defer t.budget.releaseFlushSlot()
+	}
+
 	t.mu.Lock()
 	recs, startLSN, endLSN := t.inMem.SnapshotAll()
 	if len(recs) == 0 {
@@ -660,16 +726,21 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 	}
 	written, err := t.store.WriteLayer(ctx, meta, recs)
 	if err != nil {
-		// Keep oldMem in frozenMems so concurrent reads never lose visibility,
-		// and also re-index entries into inMem if needed on retry.
+		// Keep oldMem in frozenMems or restore into inMem so concurrent reads never lose visibility.
 		t.mu.Lock()
 		t.removeFrozenMemLocked(oldMem)
+		if t.budget != nil {
+			t.budget.addInMemBytes(-approxBytes)
+		}
 		if !errors.Is(err, ErrStaleGeneration) {
 			for _, r := range recs {
-				t.inMem.Put(r.Key, r.Delta)
+				t.putInMemLocked(r.Key, r.Delta)
 			}
 		}
 		t.mu.Unlock()
+		if t.budget != nil {
+			t.budget.notifyFlushCompleted(0)
+		}
 		return nil, err
 	}
 
@@ -685,12 +756,18 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 		t.manifestMu.Unlock()
 		t.mu.Lock()
 		t.removeFrozenMemLocked(oldMem)
+		if t.budget != nil {
+			t.budget.addInMemBytes(-approxBytes)
+		}
 		if !errors.Is(err, ErrStaleGeneration) {
 			for _, r := range recs {
-				t.inMem.Put(r.Key, r.Delta)
+				t.putInMemLocked(r.Key, r.Delta)
 			}
 		}
 		t.mu.Unlock()
+		if t.budget != nil {
+			t.budget.notifyFlushCompleted(0)
+		}
 		return nil, err
 	}
 	t.mu.Lock()
@@ -700,8 +777,16 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 		t.lastLSN = written.EndLSN
 	}
 	t.removeFrozenMemLocked(oldMem)
+	// Evict in-memory SLRU page cache once persisted to L0 (and no other dirty SLRU entries remain in inMem).
+	if len(t.slruPages) > 0 && len(t.frozenMems) == 0 && t.inMem.DirtyKeyCount() == 0 {
+		t.slruPages = make(map[Key][]byte)
+	}
 	t.mu.Unlock()
 	t.manifestMu.Unlock()
+	if t.budget != nil {
+		t.budget.addInMemBytes(-approxBytes)
+		t.budget.notifyFlushCompleted(approxBytes)
+	}
 	debugf("flush", "FlushInMemory done tenant=%s file=%s size=%d sha256=%s encrypted=%v remote=%v total_layers=%d lsn=%s..%s dur=%s",
 		tenantID, written.FileName, written.FileSize, shortHash(written.SHA256), written.Encrypted, written.RemotelyAvailable, totalLayers, formatLSNHex(written.StartLSN), formatLSNHex(written.EndLSN), time.Since(start))
 	return &written, nil
@@ -753,7 +838,16 @@ func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byt
 		last := deltas[len(deltas)-1]
 		if (last.Flags&EntryFlagPageImage) != 0 && len(last.PageImage) == PageSize {
 			foundBase = true
-			break
+			hasOverlap := false
+			for j := i - 1; j >= 0; j-- {
+				if layersCopy[j].EndLSN > last.LSN {
+					hasOverlap = true
+					break
+				}
+			}
+			if !hasOverlap {
+				break
+			}
 		}
 		if lm.Kind == LayerKindImage {
 			break
@@ -977,7 +1071,7 @@ func (t *Timeline) PutPageBatch(ctx context.Context, spcOID, dbOID, relNumber ui
 		cp := make([]byte, PageSize)
 		copy(cp, pages[off:off+PageSize])
 		key := RelBlockKey(spcOID, dbOID, relNumber, forkNum, blk)
-		t.inMem.Put(key, WALDelta{
+		t.putInMemLocked(key, WALDelta{
 			LSN:       useLSN,
 			Flags:     EntryFlagPageImage,
 			PageImage: cp,
@@ -995,7 +1089,7 @@ func (t *Timeline) PutPageBatch(ctx context.Context, spcOID, dbOID, relNumber ui
 	endBlk := startBlock + nblocks
 	if cur := t.relSizes[sizeKey]; endBlk > cur {
 		t.relSizes[sizeKey] = endBlk
-		t.inMem.Put(sizeKey, WALDelta{
+		t.putInMemLocked(sizeKey, WALDelta{
 			LSN:     useLSN,
 			Flags:   EntryFlagRelSize,
 			RelSize: endBlk,
@@ -1175,7 +1269,7 @@ func (t *Timeline) UnlinkRel(spcOID, dbOID, relNumber uint32, forkNum uint8, lsn
 	if lsn > t.lastLSN {
 		t.lastLSN = lsn
 	}
-	t.inMem.Put(sizeKey, WALDelta{
+	t.putInMemLocked(sizeKey, WALDelta{
 		LSN:     lsn,
 		Flags:   EntryFlagRelSize | EntryFlagRelUnlinked,
 		RelSize: 0,

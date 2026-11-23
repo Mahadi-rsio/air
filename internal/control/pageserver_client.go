@@ -417,9 +417,11 @@ func (c *GRPCPageserverClient) BootstrapTenantFromPGData(ctx context.Context, te
 	}
 
 	const segBlocks = 131072
-	const batchBlocks = 128
+	const batchBlocks = 64
 	buf := make([]byte, pageserver.PageSize)
+	batch := make([]byte, 0, batchBlocks*pageserver.PageSize)
 	relSizes := make(map[[4]uint32]uint32)
+	var unFlushedBlocks uint32
 
 	for _, rf := range files {
 		f, err := os.Open(rf.path)
@@ -427,7 +429,7 @@ func (c *GRPCPageserverClient) BootstrapTenantFromPGData(ctx context.Context, te
 			return nil, err
 		}
 		var blkIdx uint32
-		var batch []byte
+		batch = batch[:0]
 		var batchStart uint32
 		var batchCount uint32
 
@@ -435,22 +437,35 @@ func (c *GRPCPageserverClient) BootstrapTenantFromPGData(ctx context.Context, te
 			if batchCount == 0 {
 				return nil
 			}
-			rctx, cancel := context.WithTimeout(c.withAuth(ctx), 30*time.Second)
-			defer cancel()
-			_, err := c.client.PutPageBatch(rctx, &pb.PutPageBatchRequest{
-				TenantId:   tenantID,
-				SpcOid:     rf.spcOID,
-				DbOid:      rf.dbOID,
-				RelNumber:  rf.relNum,
-				ForkNum:    uint32(rf.forkNum),
-				StartBlock: batchStart,
-				Nblocks:    batchCount,
-				Lsn:        initLSN,
-				Pages:      batch,
+			err := retryPageserverRPC(ctx, 10, func() error {
+				rctx, cancel := context.WithTimeout(c.withAuth(ctx), 30*time.Second)
+				defer cancel()
+				_, rerr := c.client.PutPageBatch(rctx, &pb.PutPageBatchRequest{
+					TenantId:   tenantID,
+					SpcOid:     rf.spcOID,
+					DbOid:      rf.dbOID,
+					RelNumber:  rf.relNum,
+					ForkNum:    uint32(rf.forkNum),
+					StartBlock: batchStart,
+					Nblocks:    batchCount,
+					Lsn:        initLSN,
+					Pages:      batch,
+				})
+				return rerr
 			})
+			unFlushedBlocks += batchCount
 			batch = batch[:0]
 			batchCount = 0
-			return mapRemotePSErr(err)
+			if err != nil {
+				return mapRemotePSErr(err)
+			}
+			// Periodically flush every 256 blocks (2 MiB) during bootstrap so Pageserver
+			// never accumulates 22+ MiB in InMemoryLayer per bootstrapping tenant.
+			if unFlushedBlocks >= 256 {
+				unFlushedBlocks = 0
+				_, _ = c.FlushTenant(ctx, tenantID)
+			}
+			return nil
 		}
 
 		for {
@@ -600,58 +615,93 @@ type grpcWALSink struct {
 }
 
 func (s *grpcWALSink) IngestWALBatch(ctx context.Context, recs []*pageserver.DecodedWALRecord, sawCheckpoint bool) (uint64, error) {
-	pbRecs := make([]*pb.WALRecordMsg, 0, len(recs))
-	for _, rec := range recs {
-		blks := make([]*pb.WALRecordBlockMsg, 0, len(rec.Blocks))
-		for _, b := range rec.Blocks {
-			blks = append(blks, &pb.WALRecordBlockMsg{
-				BlockId:      uint32(b.BlockID),
-				SpcOid:       b.Rel.SpcOID,
-				DbOid:        b.Rel.DbOID,
-				RelNumber:    b.Rel.RelNumber,
-				ForkNum:      uint32(b.ForkNum),
-				BlockNum:     b.BlockNum,
-				WillInit:     b.WillInit,
-				HasImage:     b.HasImage,
-				HasData:      b.HasData,
-				ImageApply:   b.ImageApply,
-				ImageInfo:    uint32(b.ImageInfo),
-				HoleOffset:   uint32(b.HoleOffset),
-				HoleLength:   uint32(b.HoleLength),
-				ImagePayload: b.ImagePayload,
-				BlockData:    b.BlockData,
+	const maxBatchBytes = 512 * 1024 // 512 KiB max WAL batch per gRPC call
+	const maxBatchRecs = 64
+
+	var lastLSN uint64
+	i := 0
+	for i < len(recs) {
+		pbRecs := make([]*pb.WALRecordMsg, 0, min(len(recs)-i, maxBatchRecs))
+		batchBytes := 0
+		for i < len(recs) && len(pbRecs) < maxBatchRecs && (batchBytes < maxBatchBytes || len(pbRecs) == 0) {
+			rec := recs[i]
+			i++
+			blks := make([]*pb.WALRecordBlockMsg, 0, len(rec.Blocks))
+			for _, b := range rec.Blocks {
+				batchBytes += len(b.ImagePayload) + len(b.BlockData) + 48
+				blks = append(blks, &pb.WALRecordBlockMsg{
+					BlockId:      uint32(b.BlockID),
+					SpcOid:       b.Rel.SpcOID,
+					DbOid:        b.Rel.DbOID,
+					RelNumber:    b.Rel.RelNumber,
+					ForkNum:      uint32(b.ForkNum),
+					BlockNum:     b.BlockNum,
+					WillInit:     b.WillInit,
+					HasImage:     b.HasImage,
+					HasData:      b.HasData,
+					ImageApply:   b.ImageApply,
+					ImageInfo:    uint32(b.ImageInfo),
+					HoleOffset:   uint32(b.HoleOffset),
+					HoleLength:   uint32(b.HoleLength),
+					ImagePayload: b.ImagePayload,
+					BlockData:    b.BlockData,
+				})
+			}
+			// Omit RawRecord when all blocks carry full-page images without ImageApply to halve protobuf size.
+			rawRec := rec.RawRecord
+			if len(rec.Blocks) > 0 && rec.Rmid != pageserver.RmXactID && rec.Rmid != pageserver.RmMultiXactID && rec.Rmid != pageserver.RmSmgrID {
+				allPureFPI := true
+				for _, b := range rec.Blocks {
+					if !b.HasImage || b.ImageApply {
+						allPureFPI = false
+						break
+					}
+				}
+				if allPureFPI {
+					rawRec = nil
+				}
+			}
+			batchBytes += len(rawRec) + len(rec.MainData) + 64
+			pbRecs = append(pbRecs, &pb.WALRecordMsg{
+				Lsn:       rec.LSN,
+				EndLsn:    rec.EndLSN,
+				TotalLen:  rec.TotalLen,
+				Xid:       rec.XID,
+				PrevLsn:   rec.PrevLSN,
+				Info:      uint32(rec.Info),
+				Rmid:      uint32(rec.Rmid),
+				Crc:       rec.CRC,
+				MainData:  rec.MainData,
+				Blocks:    blks,
+				RawRecord: rawRec,
 			})
 		}
-		pbRecs = append(pbRecs, &pb.WALRecordMsg{
-			Lsn:       rec.LSN,
-			EndLsn:    rec.EndLSN,
-			TotalLen:  rec.TotalLen,
-			Xid:       rec.XID,
-			PrevLsn:   rec.PrevLSN,
-			Info:      uint32(rec.Info),
-			Rmid:      uint32(rec.Rmid),
-			Crc:       rec.CRC,
-			MainData:  rec.MainData,
-			Blocks:    blks,
-			RawRecord: rec.RawRecord,
+
+		var resp *pb.IngestWALRecordsResponse
+		err := retryPageserverRPC(ctx, 10, func() error {
+			rctx, cancel := context.WithTimeout(s.client.withAuth(ctx), 30*time.Second)
+			defer cancel()
+			var rerr error
+			resp, rerr = s.client.client.IngestWALRecords(rctx, &pb.IngestWALRecordsRequest{
+				TenantId:      s.tenantID,
+				Epoch:         s.epoch,
+				Generation:    s.generation,
+				Records:       pbRecs,
+				FlushIfNeeded: true,
+			})
+			return rerr
 		})
-	}
-	rctx, cancel := context.WithTimeout(s.client.withAuth(ctx), 30*time.Second)
-	defer cancel()
-	resp, err := s.client.client.IngestWALRecords(rctx, &pb.IngestWALRecordsRequest{
-		TenantId:      s.tenantID,
-		Epoch:         s.epoch,
-		Generation:    s.generation,
-		Records:       pbRecs,
-		FlushIfNeeded: true,
-	})
-	if err != nil {
-		return 0, mapRemotePSErr(err)
+		if err != nil {
+			return lastLSN, mapRemotePSErr(err)
+		}
+		if resp.GetLastLsn() > lastLSN {
+			lastLSN = resp.GetLastLsn()
+		}
 	}
 	if sawCheckpoint {
 		_, _ = s.client.FlushTenant(ctx, s.tenantID)
 	}
-	return resp.GetLastLsn(), nil
+	return lastLSN, nil
 }
 
 func (c *GRPCPageserverClient) NewWALReceiver(dsn, tenantID string, epoch int64, generation string, startLSN uint64) *pageserver.WALReceiver {
