@@ -191,14 +191,18 @@ type MetricsRegistry struct {
 	timeouts       atomic.Uint64
 	poolExhausted  atomic.Uint64
 
-	mu                     sync.Mutex
-	activeGlobalConns      int64
-	totalGlobalConns       uint64
-	rejectedGlobalConns    uint64
-	globalQueries          QueryStats
-	tenants                map[string]*TenantStats
-	users                  map[string]*UserStats
-	tenantLimitOverrides   map[string]int
+	mu                   sync.Mutex
+	activeGlobalConns    int64
+	totalGlobalConns     uint64
+	rejectedGlobalConns  uint64
+	globalQueries        QueryStats
+	tenants              map[string]*TenantStats
+	users                map[string]*UserStats
+	tenantLimitOverrides map[string]int
+
+	writeGov  *WriteGovernor
+	bufBudget *BufferBudget
+	telemetry *TelemetryStore
 }
 
 func NewMetricsRegistry(maxGlobalConns, maxTenantConns, maxUserConns int) *MetricsRegistry {
@@ -211,6 +215,15 @@ func NewMetricsRegistry(maxGlobalConns, maxTenantConns, maxUserConns int) *Metri
 		users:                make(map[string]*UserStats),
 		tenantLimitOverrides: make(map[string]int),
 	}
+}
+
+// SetWriteGovernorComponents attaches Phase 20 governor, buffer budget, and telemetry store for metrics export.
+func (m *MetricsRegistry) SetWriteGovernorComponents(gov *WriteGovernor, buf *BufferBudget, tel *TelemetryStore) {
+	m.mu.Lock()
+	m.writeGov = gov
+	m.bufBudget = buf
+	m.telemetry = tel
+	m.mu.Unlock()
 }
 
 func (m *MetricsRegistry) TryAcquireGlobal() bool {
@@ -448,6 +461,57 @@ func (m *MetricsRegistry) ToPrometheus(poolSnaps []PoolTenantSnapshot) string {
 	fmt.Fprintf(&b, "# HELP air_gateway_rpc_errors_total Total Control Plane RPC failures\n# TYPE air_gateway_rpc_errors_total counter\nair_gateway_rpc_errors_total %d\n", m.rpcErrors.Load())
 	fmt.Fprintf(&b, "# HELP air_gateway_timeouts_total Total gateway timeouts\n# TYPE air_gateway_timeouts_total counter\nair_gateway_timeouts_total %d\n", m.timeouts.Load())
 	fmt.Fprintf(&b, "# HELP air_gateway_pool_exhausted_total Total backend pool saturation events\n# TYPE air_gateway_pool_exhausted_total counter\nair_gateway_pool_exhausted_total %d\n", m.poolExhausted.Load())
+
+	var totalActiveBackends, totalIdleBackends int
+	for _, ps := range poolSnaps {
+		totalActiveBackends += ps.ActiveBackends
+		totalIdleBackends += ps.IdleBackends
+	}
+	fmt.Fprintf(&b, "# HELP air_backend_active Total active backend connections across pools\n# TYPE air_backend_active gauge\nair_backend_active %d\n", totalActiveBackends)
+	fmt.Fprintf(&b, "# HELP air_backend_idle Total idle backend connections across pools\n# TYPE air_backend_idle gauge\nair_backend_idle %d\n", totalIdleBackends)
+
+	if m.writeGov != nil {
+		gs := m.writeGov.Snapshot()
+		fmt.Fprintf(&b, "# HELP air_write_active Active write executions\n# TYPE air_write_active gauge\nair_write_active %d\n", gs.ActiveWrites)
+		fmt.Fprintf(&b, "# HELP air_write_queue_depth Queued write requests\n# TYPE air_write_queue_depth gauge\nair_write_queue_depth %d\n", gs.QueueDepth)
+		fmt.Fprintf(&b, "# HELP air_write_queue_bytes Queued write request bytes\n# TYPE air_write_queue_bytes gauge\nair_write_queue_bytes %d\n", gs.QueueBytes)
+		fmt.Fprintf(&b, "# HELP air_write_queue_wait_seconds Write queue wait latency quantiles\n# TYPE air_write_queue_wait_seconds gauge\nair_write_queue_wait_seconds{quantile=\"0.5\"} %.6f\nair_write_queue_wait_seconds{quantile=\"0.95\"} %.6f\nair_write_queue_wait_seconds{quantile=\"0.99\"} %.6f\n",
+			float64(gs.QueueWaitP50Us)/1e6, float64(gs.QueueWaitP95Us)/1e6, float64(gs.QueueWaitP99Us)/1e6)
+		fmt.Fprintf(&b, "# HELP air_write_execution_seconds Write execution latency quantiles\n# TYPE air_write_execution_seconds gauge\nair_write_execution_seconds{quantile=\"0.5\"} %.6f\nair_write_execution_seconds{quantile=\"0.95\"} %.6f\nair_write_execution_seconds{quantile=\"0.99\"} %.6f\n",
+			float64(gs.ExecP50Us)/1e6, float64(gs.ExecP95Us)/1e6, float64(gs.ExecP99Us)/1e6)
+		fmt.Fprintf(&b, "# HELP air_write_rejected_total Total write requests rejected due to full queue\n# TYPE air_write_rejected_total counter\nair_write_rejected_total %d\n", gs.RejectedTotal)
+		fmt.Fprintf(&b, "# HELP air_write_cancelled_total Total write requests cancelled while queued\n# TYPE air_write_cancelled_total counter\nair_write_cancelled_total %d\n", gs.CancelledTotal)
+		fmt.Fprintf(&b, "# HELP air_write_timeout_total Total write requests timed out while queued\n# TYPE air_write_timeout_total counter\nair_write_timeout_total %d\n", gs.TimeoutTotal)
+		fmt.Fprintf(&b, "# HELP air_write_errors_total Total write execution errors\n# TYPE air_write_errors_total counter\nair_write_errors_total %d\n", gs.ErrorsTotal)
+		fmt.Fprintf(&b, "# HELP air_write_throughput Total completed governed writes\n# TYPE air_write_throughput counter\nair_write_throughput %d\n", gs.CompletedTotal)
+		fmt.Fprintf(&b, "# HELP air_write_limit_global Effective global write concurrency limit\n# TYPE air_write_limit_global gauge\nair_write_limit_global %d\n", gs.EffectiveGlobalLimit)
+		fmt.Fprintf(&b, "# HELP air_write_limit_tenant Default per-tenant write concurrency limit\n# TYPE air_write_limit_tenant gauge\nair_write_limit_tenant %d\n", gs.MaxPerTenant)
+		fmt.Fprintf(&b, "# HELP air_write_controller_state Adaptive write governor state (0=static,1=healthy,2=pressured,3=critical,4=stale)\n# TYPE air_write_controller_state gauge\nair_write_controller_state %d\n", int(gs.ControllerState))
+		fmt.Fprintf(&b, "# HELP air_transaction_open Currently open explicit transactions\n# TYPE air_transaction_open gauge\nair_transaction_open %d\n", gs.OpenTransactions)
+		fmt.Fprintf(&b, "# HELP air_transaction_duration_seconds Explicit transaction duration quantiles\n# TYPE air_transaction_duration_seconds gauge\nair_transaction_duration_seconds{quantile=\"0.5\"} %.6f\nair_transaction_duration_seconds{quantile=\"0.95\"} %.6f\nair_transaction_duration_seconds{quantile=\"0.99\"} %.6f\n",
+			float64(gs.TxDurP50Us)/1e6, float64(gs.TxDurP95Us)/1e6, float64(gs.TxDurP99Us)/1e6)
+	}
+
+	if m.bufBudget != nil {
+		used := m.bufBudget.UsedBytes()
+		maxB := m.bufBudget.GlobalMaxBytes()
+		ratio := 0.0
+		if maxB > 0 {
+			ratio = float64(used) / float64(maxB)
+		}
+		fmt.Fprintf(&b, "# HELP air_gateway_buffered_bytes Currently reserved gateway protocol buffer bytes\n# TYPE air_gateway_buffered_bytes gauge\nair_gateway_buffered_bytes %d\n", used)
+		fmt.Fprintf(&b, "# HELP air_gateway_buffer_budget_used Fraction of global gateway protocol buffer budget in use\n# TYPE air_gateway_buffer_budget_used gauge\nair_gateway_buffer_budget_used %.6f\n", ratio)
+		fmt.Fprintf(&b, "# HELP air_gateway_buffer_rejections_total Total protocol buffer reservation rejections\n# TYPE air_gateway_buffer_rejections_total counter\nair_gateway_buffer_rejections_total %d\n", m.bufBudget.Rejections())
+	}
+
+	if m.telemetry != nil {
+		tel, _ := m.telemetry.Latest(time.Now())
+		fmt.Fprintf(&b, "# HELP air_cell_memory_current_bytes Latest cell cgroup memory.current bytes\n# TYPE air_cell_memory_current_bytes gauge\nair_cell_memory_current_bytes %d\n", tel.MemoryCurrentBytes)
+		fmt.Fprintf(&b, "# HELP air_cell_memory_high_bytes Latest cell cgroup memory.high bytes\n# TYPE air_cell_memory_high_bytes gauge\nair_cell_memory_high_bytes %d\n", tel.MemoryHighBytes)
+		fmt.Fprintf(&b, "# HELP air_cell_memory_max_bytes Latest cell cgroup memory.max bytes\n# TYPE air_cell_memory_max_bytes gauge\nair_cell_memory_max_bytes %d\n", tel.MemoryMaxBytes)
+		fmt.Fprintf(&b, "# HELP air_cell_memory_pressure Latest cell memory PSI some avg10\n# TYPE air_cell_memory_pressure gauge\nair_cell_memory_pressure %.4f\n", tel.MemoryPSISomeAvg10)
+		fmt.Fprintf(&b, "# HELP air_cell_memory_oom_events Latest cell cgroup OOM event count\n# TYPE air_cell_memory_oom_events counter\nair_cell_memory_oom_events %d\n", tel.MemoryOOMEvents)
+	}
 
 	return b.String()
 }

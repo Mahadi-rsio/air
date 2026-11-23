@@ -21,6 +21,7 @@ type AdminHTTPServer struct {
 	metrics       *MetricsRegistry
 	reGRPC        *ReadEngineGRPCClient
 	psGRPC        *PageserverGRPCClient
+	telemetry     *TelemetryStore
 
 	ln  net.Listener
 	srv *http.Server
@@ -40,6 +41,11 @@ func NewAdminHTTPServer(addr, internalToken string, discovery *TenantDiscovery, 
 func (s *AdminHTTPServer) SetNamespaceBackends(reGRPC *ReadEngineGRPCClient, psGRPC *PageserverGRPCClient) {
 	s.reGRPC = reGRPC
 	s.psGRPC = psGRPC
+}
+
+// SetTelemetryStore attaches the CellTelemetry store for /internal/v1/telemetry ingestion.
+func (s *AdminHTTPServer) SetTelemetryStore(tel *TelemetryStore) {
+	s.telemetry = tel
 }
 
 func (s *AdminHTTPServer) Start() error {
@@ -425,6 +431,41 @@ func (s *AdminHTTPServer) handleInternalRoute(w http.ResponseWriter, r *http.Req
 		}
 		q := r.URL.Query()
 		writeJSON(w, http.StatusOK, s.metrics.ToJSON(s.pools.Snapshots(), q.Get("tenant_id"), q.Get("user")))
+		return true
+	}
+
+	if r.Method == http.MethodPost && r.URL.Path == "/internal/v1/telemetry" {
+		if !s.isAuthorized(r) {
+			writeJSON(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
+			return true
+		}
+		if s.telemetry == nil {
+			writeJSON(w, http.StatusServiceUnavailable, `{"error":"telemetry store not configured"}`)
+			return true
+		}
+		var snap CellTelemetry
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err := json.Unmarshal(body, &snap); err != nil {
+			writeJSON(w, http.StatusBadRequest, makeErrorJSON(err.Error()))
+			return true
+		}
+		s.telemetry.Update(snap, time.Now())
+		writeJSON(w, http.StatusOK, `{"status":"accepted"}`)
+		return true
+	}
+
+	if r.Method == http.MethodGet && r.URL.Path == "/internal/v1/write-governor" {
+		if !s.isAuthorized(r) {
+			writeJSON(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
+			return true
+		}
+		gov := s.pools.WriteGovernor()
+		if gov == nil {
+			writeJSON(w, http.StatusOK, `{"enabled":false}`)
+			return true
+		}
+		b, _ := json.Marshal(gov.Snapshot())
+		writeJSON(w, http.StatusOK, string(b))
 		return true
 	}
 

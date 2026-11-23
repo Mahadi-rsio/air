@@ -41,30 +41,56 @@ type Config struct {
 	MeteringLogDir        string
 	MeteringMaxFileBytes  int64
 	MeteringFlushInterval time.Duration
+
+	// Phase 20: Resource-Aware Write Governor
+	WriteGovernorEnabled    bool
+	WriteMaxGlobal          int
+	WriteMinGlobal          int
+	WriteMaxPerTenant       int
+	WriteQueueMax           int
+	WriteQueueMaxBytes      int64
+	WriteQueueTimeout       time.Duration
+	WriteControllerInterval time.Duration
+	WriteBufferGlobalMax    int64
+	WriteBufferSessionMax   int64
+	WriteAdaptiveEnabled    bool
+	WriteLazyLSNEnabled     bool
 }
 
 // DefaultConfig returns a Config initialized with default values.
 func DefaultConfig() Config {
 	return Config{
-		GatewayAddr:           "127.0.0.1:5432",
-		AdminAddr:             "127.0.0.1:8081",
-		MetaPort:              15432,
-		ControlPlaneURL:       "http://127.0.0.1:8080",
-		GRPCAddr:              "127.0.0.1:9090",
-		PoolMode:              true,
-		PoolMaxBackends:       16,
-		PoolIdleTimeoutSec:    300,
-		AuthTimeoutMS:         5000,
-		ClientIdleTimeoutMS:   0,
-		MaxClientConns:        1024,
-		MaxTenantClientConns:  128,
-		MaxUserClientConns:    0,
-		DiscoveryIntervalMS:   2000,
-		ReadEngineHost:        "127.0.0.1",
-		ReadEnginePort:        5433,
-		MeteringLogDir:        filepath.Join(os.TempDir(), "air-gateway-metering"),
-		MeteringMaxFileBytes:  10 * 1024 * 1024,
-		MeteringFlushInterval: 2 * time.Minute,
+		GatewayAddr:             "127.0.0.1:5432",
+		AdminAddr:               "127.0.0.1:8081",
+		MetaPort:                15432,
+		ControlPlaneURL:         "http://127.0.0.1:8080",
+		GRPCAddr:                "127.0.0.1:9090",
+		PoolMode:                true,
+		PoolMaxBackends:         16,
+		PoolIdleTimeoutSec:      300,
+		AuthTimeoutMS:           5000,
+		ClientIdleTimeoutMS:     0,
+		MaxClientConns:          1024,
+		MaxTenantClientConns:    128,
+		MaxUserClientConns:      0,
+		DiscoveryIntervalMS:     2000,
+		ReadEngineHost:          "127.0.0.1",
+		ReadEnginePort:          5433,
+		MeteringLogDir:          filepath.Join(os.TempDir(), "air-gateway-metering"),
+		MeteringMaxFileBytes:    10 * 1024 * 1024,
+		MeteringFlushInterval:   2 * time.Minute,
+		WriteGovernorEnabled:    true,
+		WriteMaxGlobal:          32,
+		WriteMinGlobal:          2,
+		WriteMaxPerTenant:       8,
+		WriteQueueMax:           256,
+		WriteQueueMaxBytes:      64 * 1024 * 1024,
+		WriteQueueTimeout:       5 * time.Second,
+		WriteControllerInterval: 1 * time.Second,
+		WriteBufferGlobalMax:    64 * 1024 * 1024,
+		WriteBufferSessionMax:   8 * 1024 * 1024,
+		WriteAdaptiveEnabled:    false,
+		WriteLazyLSNEnabled:     true,
 	}
 }
 
@@ -133,6 +159,39 @@ func LoadConfig(args []string) Config {
 	if sec := envInt("AIR_METERING_FLUSH_INTERVAL_SEC", int(c.MeteringFlushInterval.Seconds())); sec > 0 {
 		c.MeteringFlushInterval = time.Duration(sec) * time.Second
 	}
+
+	c.WriteGovernorEnabled = envBool("AIR_WRITE_GOVERNOR_ENABLED", c.WriteGovernorEnabled)
+	c.WriteMaxGlobal = envInt("AIR_WRITE_MAX_GLOBAL", c.WriteMaxGlobal)
+	c.WriteMinGlobal = envInt("AIR_WRITE_MIN_GLOBAL", c.WriteMinGlobal)
+	c.WriteMaxPerTenant = envInt("AIR_WRITE_MAX_PER_TENANT", c.WriteMaxPerTenant)
+	c.WriteQueueMax = envIntMin("AIR_WRITE_QUEUE_MAX", c.WriteQueueMax, 0)
+	if v := os.Getenv("AIR_WRITE_QUEUE_MAX_BYTES"); v != "" {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed >= 0 {
+			c.WriteQueueMaxBytes = parsed
+		}
+	}
+	if v := os.Getenv("AIR_WRITE_QUEUE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			c.WriteQueueTimeout = d
+		}
+	}
+	if v := os.Getenv("AIR_WRITE_CONTROLLER_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			c.WriteControllerInterval = d
+		}
+	}
+	if v := os.Getenv("AIR_WRITE_BUFFER_GLOBAL_MAX"); v != "" {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed >= 0 {
+			c.WriteBufferGlobalMax = parsed
+		}
+	}
+	if v := os.Getenv("AIR_WRITE_BUFFER_SESSION_MAX"); v != "" {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed >= 0 {
+			c.WriteBufferSessionMax = parsed
+		}
+	}
+	c.WriteAdaptiveEnabled = envBool("AIR_WRITE_ADAPTIVE_ENABLED", c.WriteAdaptiveEnabled)
+	c.WriteLazyLSNEnabled = envBool("AIR_WRITE_LAZY_LSN_ENABLED", c.WriteLazyLSNEnabled)
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -217,6 +276,22 @@ func LoadConfig(args []string) Config {
 					c.MeteringFlushInterval = time.Duration(v) * time.Second
 				}
 			}
+		case "--write-governor":
+			c.WriteGovernorEnabled = true
+		case "--no-write-governor":
+			c.WriteGovernorEnabled = false
+		case "--write-max-global":
+			nextInt(&c.WriteMaxGlobal)
+		case "--write-min-global":
+			nextInt(&c.WriteMinGlobal)
+		case "--write-max-per-tenant":
+			nextInt(&c.WriteMaxPerTenant)
+		case "--write-queue-max":
+			nextInt(&c.WriteQueueMax)
+		case "--write-adaptive":
+			c.WriteAdaptiveEnabled = true
+		case "--no-write-adaptive":
+			c.WriteAdaptiveEnabled = false
 		}
 	}
 
@@ -224,5 +299,63 @@ func LoadConfig(args []string) Config {
 		c.MetaDSN = fmt.Sprintf("host=127.0.0.1 port=%d user=postgres dbname=postgres connect_timeout=3", c.MetaPort)
 	}
 	c.ControlPlaneURL = strings.TrimRight(c.ControlPlaneURL, "/")
+	c.NormalizeWriteGovernor()
 	return c
+}
+
+// NormalizeWriteGovernor clamps invalid Write Governor settings to safe bounds.
+func (c *Config) NormalizeWriteGovernor() {
+	if c.WriteMinGlobal <= 0 {
+		c.WriteMinGlobal = 1
+	}
+	if c.WriteMaxGlobal <= 0 {
+		c.WriteMaxGlobal = 32
+	}
+	if c.WriteMinGlobal > c.WriteMaxGlobal {
+		c.WriteMinGlobal = c.WriteMaxGlobal
+	}
+	if c.WriteMaxPerTenant <= 0 {
+		c.WriteMaxPerTenant = c.WriteMaxGlobal
+	}
+	if c.WriteMaxPerTenant > c.WriteMaxGlobal {
+		c.WriteMaxPerTenant = c.WriteMaxGlobal
+	}
+	if c.WriteQueueMax < 0 {
+		c.WriteQueueMax = 0
+	}
+	if c.WriteQueueMaxBytes < 0 {
+		c.WriteQueueMaxBytes = 0
+	}
+	if c.WriteQueueTimeout <= 0 {
+		c.WriteQueueTimeout = 5 * time.Second
+	}
+	if c.WriteControllerInterval <= 0 {
+		c.WriteControllerInterval = 1 * time.Second
+	}
+	if c.WriteBufferSessionMax > 0 && c.WriteBufferGlobalMax > 0 && c.WriteBufferSessionMax > c.WriteBufferGlobalMax {
+		c.WriteBufferSessionMax = c.WriteBufferGlobalMax
+	}
+}
+
+// Validate checks configuration invariants and returns an error if invalid.
+func (c Config) Validate() error {
+	if c.WriteMinGlobal <= 0 {
+		return fmt.Errorf("write_min_global must be > 0, got %d", c.WriteMinGlobal)
+	}
+	if c.WriteMaxGlobal < c.WriteMinGlobal {
+		return fmt.Errorf("write_max_global (%d) must be >= write_min_global (%d)", c.WriteMaxGlobal, c.WriteMinGlobal)
+	}
+	if c.WriteMaxPerTenant <= 0 {
+		return fmt.Errorf("write_max_per_tenant must be > 0, got %d", c.WriteMaxPerTenant)
+	}
+	if c.WriteQueueTimeout <= 0 {
+		return fmt.Errorf("write_queue_timeout must be > 0")
+	}
+	if c.WriteControllerInterval <= 0 {
+		return fmt.Errorf("write_controller_interval must be > 0")
+	}
+	if c.WriteBufferSessionMax > 0 && c.WriteBufferGlobalMax > 0 && c.WriteBufferSessionMax > c.WriteBufferGlobalMax {
+		return fmt.Errorf("write_buffer_session_max (%d) cannot exceed write_buffer_global_max (%d)", c.WriteBufferSessionMax, c.WriteBufferGlobalMax)
+	}
+	return nil
 }

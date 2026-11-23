@@ -17,6 +17,9 @@ import (
 
 func main() {
 	cfg := gateway.LoadConfig(os.Args[1:])
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("[air-gateway] invalid config: %v", err)
+	}
 
 	var tlsCtx gateway.TLSContext
 	if err := tlsCtx.Init(cfg.TLSCertPath, cfg.TLSKeyPath); err != nil {
@@ -25,6 +28,20 @@ func main() {
 
 	metrics := gateway.NewMetricsRegistry(cfg.MaxClientConns, cfg.MaxTenantClientConns, cfg.MaxUserClientConns)
 	pools := gateway.NewPoolManager(cfg.PoolMaxBackends, cfg.PoolIdleTimeoutSec)
+
+	bufBudget := gateway.NewBufferBudget(cfg.WriteBufferGlobalMax)
+	writeGov := gateway.NewWriteGovernor(cfg)
+	telStore := gateway.NewTelemetryStore(15 * time.Second)
+	pools.SetBufferBudget(bufBudget, cfg.WriteBufferSessionMax, 4096)
+	pools.SetWriteGovernor(writeGov)
+	pools.SetLazyLSN(cfg.WriteLazyLSNEnabled)
+	metrics.SetWriteGovernorComponents(writeGov, bufBudget, telStore)
+
+	var adaptiveCtrl *gateway.AdaptiveController
+	if cfg.WriteGovernorEnabled && cfg.WriteAdaptiveEnabled {
+		adaptiveCtrl = gateway.NewAdaptiveController(writeGov, telStore, cfg.WriteControllerInterval)
+		adaptiveCtrl.Start()
+	}
 	var meteringSaver gateway.MeteringSaver
 	if cfg.MetaDSN != "" {
 		meteringSaver = gateway.NewPGMeteringSaver(cfg.MetaDSN)
@@ -87,6 +104,7 @@ func main() {
 
 	adminSrv := gateway.NewAdminHTTPServer(cfg.AdminAddr, cfg.InternalToken, discovery, pools, metrics)
 	adminSrv.SetNamespaceBackends(reGRPC, psGRPC)
+	adminSrv.SetTelemetryStore(telStore)
 	if err := adminSrv.Start(); err != nil {
 		discovery.Stop()
 		log.Fatalf("[air-gateway] failed to bind admin HTTP on %s: %v", cfg.AdminAddr, err)
@@ -178,6 +196,9 @@ func main() {
 	}
 
 	log.Println("[air-gateway] shutting down...")
+	if adaptiveCtrl != nil {
+		adaptiveCtrl.Stop()
+	}
 	close(reaperStop)
 	reaperWG.Wait()
 	adminGRPCSrv.Stop()

@@ -455,3 +455,144 @@ func RecordReadFallback(metrics *RoutingMetrics) {
 		metrics.ReadErrorsRetried.Add(1)
 	}
 }
+
+// WriteRequestClass categorizes incoming PostgreSQL requests for the Write Governor.
+type WriteRequestClass uint8
+
+const (
+	WriteClassReadOnly WriteRequestClass = iota
+	WriteClassSimpleAutocommit
+	WriteClassExplicitTx
+	WriteClassBulkCopy
+	WriteClassDDLAdmin
+	WriteClassExtended
+	WriteClassUnknown
+)
+
+func (c WriteRequestClass) String() string {
+	switch c {
+	case WriteClassReadOnly:
+		return "read_only"
+	case WriteClassSimpleAutocommit:
+		return "simple_autocommit"
+	case WriteClassExplicitTx:
+		return "explicit_tx"
+	case WriteClassBulkCopy:
+		return "bulk_copy"
+	case WriteClassDDLAdmin:
+		return "ddl_admin"
+	case WriteClassExtended:
+		return "extended"
+	default:
+		return "unknown"
+	}
+}
+
+// NeedsWriteAdmission reports whether a request class must be admitted by the Write Governor.
+// Unknown statements always require write admission (conservative fallback).
+func (c WriteRequestClass) NeedsWriteAdmission() bool {
+	return c != WriteClassReadOnly
+}
+
+func classifySingleWriteClass(toks []sqlToken) WriteRequestClass {
+	if len(toks) == 0 {
+		return WriteClassReadOnly
+	}
+	head := toks[0].upper
+	switch head {
+	case "BEGIN", "START", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE", "ABORT":
+		return WriteClassExplicitTx
+	case "PREPARE":
+		if len(toks) > 1 && toks[1].upper == "TRANSACTION" {
+			return WriteClassExplicitTx
+		}
+		return WriteClassDDLAdmin
+	}
+	if head == "COPY" {
+		d, _ := classifySingleStatement(toks)
+		if d.Target == RouteTargetReadEngine {
+			return WriteClassReadOnly
+		}
+		return WriteClassBulkCopy
+	}
+	if isWriteKeyword(head) {
+		return WriteClassSimpleAutocommit
+	}
+	if isDDLOrWriteHead(head) {
+		return WriteClassDDLAdmin
+	}
+
+	d, _ := classifySingleStatement(toks)
+	if d.Target == RouteTargetReadEngine {
+		return WriteClassReadOnly
+	}
+	switch d.Reason {
+	case RouteReasonModifyingCTE, RouteReasonRowLocking, RouteReasonSelectInto, RouteReasonMutatingFunction:
+		return WriteClassSimpleAutocommit
+	case RouteReasonTransactionWriteState:
+		return WriteClassExplicitTx
+	default:
+		return WriteClassUnknown
+	}
+}
+
+func mergeWriteClass(a, b WriteRequestClass) WriteRequestClass {
+	rank := func(c WriteRequestClass) int {
+		switch c {
+		case WriteClassReadOnly:
+			return 0
+		case WriteClassSimpleAutocommit:
+			return 1
+		case WriteClassExtended:
+			return 2
+		case WriteClassDDLAdmin:
+			return 3
+		case WriteClassBulkCopy:
+			return 4
+		case WriteClassExplicitTx:
+			return 5
+		default: // WriteClassUnknown
+			return 6
+		}
+	}
+	if rank(b) > rank(a) {
+		return b
+	}
+	return a
+}
+
+// ClassifyWriteRequest classifies a SQL string using the gateway's lexical tokenizer.
+func ClassifyWriteRequest(sql string, inTx bool) WriteRequestClass {
+	stmts := tokenizeStatements(sql)
+	overall := WriteClassReadOnly
+	hasNonEmpty := false
+	for _, toks := range stmts {
+		if len(toks) == 0 {
+			continue
+		}
+		hasNonEmpty = true
+		overall = mergeWriteClass(overall, classifySingleWriteClass(toks))
+	}
+	if !hasNonEmpty {
+		return WriteClassReadOnly
+	}
+	if inTx && overall == WriteClassSimpleAutocommit {
+		return WriteClassExplicitTx
+	}
+	return overall
+}
+
+// ClassifyExtendedWrite classifies an extended-query batch of SQL strings.
+func ClassifyExtendedWrite(sqls []string, inTx bool) WriteRequestClass {
+	if len(sqls) == 0 {
+		return WriteClassUnknown
+	}
+	overall := WriteClassReadOnly
+	for _, s := range sqls {
+		overall = mergeWriteClass(overall, ClassifyWriteRequest(s, inTx))
+	}
+	if overall == WriteClassSimpleAutocommit {
+		return WriteClassExtended
+	}
+	return overall
+}

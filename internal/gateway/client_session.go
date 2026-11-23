@@ -48,11 +48,11 @@ func forwardCancelRequest(client net.Conn, cancelReg *CancelRegistry) {
 }
 
 // HandleClientConnection handles an accepted PostgreSQL client socket end-to-end:
-//   1. Pre-startup GSSENCRequest / SSLRequest / CancelRequest handling
-//   2. StartupMessage validation, tenant extraction & SNI consistency check
-//   3. Per-tenant/per-user connection limit enforcement
-//   4. Control Plane tenant resolution & SQLSTATE error mapping
-//   5. Pooled serving (pool_mode=true) or direct bidirectional proxying
+//  1. Pre-startup GSSENCRequest / SSLRequest / CancelRequest handling
+//  2. StartupMessage validation, tenant extraction & SNI consistency check
+//  3. Per-tenant/per-user connection limit enforcement
+//  4. Control Plane tenant resolution & SQLSTATE error mapping
+//  5. Pooled serving (pool_mode=true) or direct bidirectional proxying
 func HandleClientConnection(
 	conn net.Conn,
 	cfg Config,

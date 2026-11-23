@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -74,22 +75,25 @@ type relayStats struct {
 }
 
 type clientSessionState struct {
-	client          net.Conn
-	startupUser     string
-	clientID        uint64
-	gwPID           uint32
-	gwSecret        uint32
-	metrics         *MetricsRegistry
-	cancelReg       *CancelRegistry
-	sessionVars     map[string]string
-	clientStmts     map[string]PreparedDef
-	currentBackend  *BackendConn
-	txStatus        byte
-	inTxCounted     bool
-	sessionPinned   bool
-	backendInFlight bool
-	sessionWriteLSN uint64
-	touchActivity   func()
+	client            net.Conn
+	startupUser       string
+	clientID          uint64
+	gwPID             uint32
+	gwSecret          uint32
+	metrics           *MetricsRegistry
+	cancelReg         *CancelRegistry
+	sessionVars       map[string]string
+	clientStmts       map[string]PreparedDef
+	currentBackend    *BackendConn
+	txStatus          byte
+	inTxCounted       bool
+	txStartedAt       time.Time
+	sessionPinned     bool
+	backendInFlight   bool
+	sessionWriteLSN   uint64
+	sessionDirtyWrite bool
+	bufTracker        *SessionBufferTracker
+	touchActivity     func()
 }
 
 // TenantPool is a per-tenant transaction-mode PostgreSQL connection pooler.
@@ -113,6 +117,12 @@ type TenantPool struct {
 	wakeFn         WakeFn
 	metering       *MeteringLogger
 
+	writeGov           *WriteGovernor
+	bufBudget          *BufferBudget
+	lazyLSN            atomic.Bool
+	sessionBufMaxBytes int64
+	sessionBufMaxMsgs  int
+
 	semMu          sync.Mutex
 	semCond        *sync.Cond
 	activeBackends int
@@ -133,17 +143,41 @@ func NewTenantPool(tenantID, host, sockDir string, port int, appPassword string,
 		idleTimeoutSec = 300
 	}
 	p := &TenantPool{
-		tenantID:    tenantID,
-		maxBackends: maxBackends,
-		host:        host,
-		sockDir:     sockDir,
-		port:        port,
-		appPassword: appPassword,
+		tenantID:           tenantID,
+		maxBackends:        maxBackends,
+		host:               host,
+		sockDir:            sockDir,
+		port:               port,
+		appPassword:        appPassword,
+		sessionBufMaxBytes: 8 * 1024 * 1024,
+		sessionBufMaxMsgs:  4096,
 	}
 	p.idleTimeoutSec.Store(int64(idleTimeoutSec))
 	p.readEngineHealthy.Store(true)
 	p.semCond = sync.NewCond(&p.semMu)
 	return p
+}
+
+func (p *TenantPool) SetWriteGovernor(g *WriteGovernor) {
+	p.mu.Lock()
+	p.writeGov = g
+	p.mu.Unlock()
+}
+
+func (p *TenantPool) SetBufferBudget(b *BufferBudget, sessionMaxBytes int64, sessionMaxMsgs int) {
+	p.mu.Lock()
+	p.bufBudget = b
+	if sessionMaxBytes > 0 {
+		p.sessionBufMaxBytes = sessionMaxBytes
+	}
+	if sessionMaxMsgs > 0 {
+		p.sessionBufMaxMsgs = sessionMaxMsgs
+	}
+	p.mu.Unlock()
+}
+
+func (p *TenantPool) SetLazyLSN(enabled bool) {
+	p.lazyLSN.Store(enabled)
 }
 
 func (p *TenantPool) SetIdleTimeoutSec(sec int) {
@@ -399,13 +433,50 @@ func (p *TenantPool) releaseCurrent(st *clientSessionState, dirty bool) {
 	}
 }
 
+func (p *TenantPool) getWriteGovernor() *WriteGovernor {
+	p.mu.Lock()
+	g := p.writeGov
+	p.mu.Unlock()
+	return g
+}
+
+func (p *TenantPool) acquireWritePermit(st *clientSessionState, bytesIn uint64, qStart time.Time, queryType string, execCount uint64) (*WritePermit, bool, bool) {
+	if st.currentBackend != nil {
+		return nil, true, true
+	}
+	gov := p.getWriteGovernor()
+	if gov == nil || !gov.IsEnabled() {
+		return nil, true, true
+	}
+	permit, err := gov.Acquire(context.Background(), p.tenantID, int64(bytesIn))
+	if err != nil {
+		if _, werr := st.client.Write(BuildErrorResponse("ERROR", "53300", err.Error())); werr != nil {
+			return nil, false, false
+		}
+		if _, werr := st.client.Write(BuildReadyForQuery(st.txStatus)); werr != nil {
+			return nil, false, false
+		}
+		p.recordQueryMetrics(st, qStart, 0, bytesIn, relayStats{}, true, execCount, queryType)
+		return nil, false, true
+	}
+	return permit, true, true
+}
+
 func (p *TenantPool) updateTxCount(st *clientSessionState) {
+	gov := p.getWriteGovernor()
 	if st.txStatus != 'I' && !st.inTxCounted {
 		st.inTxCounted = true
+		st.txStartedAt = time.Now()
 		p.activeTxCount.Add(1)
+		if gov != nil {
+			gov.RecordTxStart()
+		}
 	} else if st.txStatus == 'I' && st.inTxCounted {
 		st.inTxCounted = false
 		p.activeTxCount.Add(-1)
+		if gov != nil {
+			gov.RecordTxEnd(time.Since(st.txStartedAt))
+		}
 	}
 }
 
@@ -762,7 +833,7 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 		routedToRead := false
 		if !isExecStmt && !st.sessionPinned && st.txStatus == 'I' && st.currentBackend == nil && rport > 0 {
 			rlsn := p.readEngineLSN.Load()
-			if !isSusp && st.sessionWriteLSN > 0 && rlsn < st.sessionWriteLSN {
+			if !isSusp && !st.sessionDirtyWrite && st.sessionWriteLSN > 0 && rlsn < st.sessionWriteLSN {
 				if rb, err := p.acquireReadBackend(st.clientID); err == nil && rb != nil {
 					if fresh, ok := queryLSNBackend(rb, "SELECT COALESCE(pg_last_wal_replay_lsn(), pg_current_wal_lsn())::text"); ok {
 						rlsn = fresh
@@ -776,6 +847,11 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 			}
 			readHealthy := p.readEngineHealthy.Load()
 			sessionWriteLSN := st.sessionWriteLSN
+			if st.sessionDirtyWrite && !isSusp {
+				// Lazy LSN watermark: force this read to primary (RYOW) without paying an extra
+				// pg_current_wal_lsn() round-trip on every write.
+				sessionWriteLSN = ^uint64(0)
+			}
 			if isSusp {
 				// While primary is suspended, always attempt read-engine for read queries
 				// instead of waking primary due to a stale health flag or LSN watermark.
@@ -802,14 +878,38 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 			}
 		}
 		if !routedToRead {
+			wclass := ClassifyWriteRequest(trimmed, st.txStatus != 'I')
+			var permit *WritePermit
+			if wclass.NeedsWriteAdmission() {
+				var admitted, ioOK bool
+				permit, admitted, ioOK = p.acquireWritePermit(st, bytesIn, qStart, queryType, 1)
+				if !ioOK {
+					return false
+				}
+				if !admitted {
+					return true
+				}
+			}
 			hadErr, ioOK, ok := p.executeSimpleAndRelay(st, BuildPGMessage('Q', outBody), bytesIn, qStart, queryType)
+			if permit != nil {
+				permit.Release(hadErr || !ok)
+			}
 			if !ok {
 				return ioOK
 			}
-			if rport > 0 && !hadErr && st.txStatus == 'I' && st.currentBackend != nil &&
-				ClassifySQLForRouting(trimmed).Target == RouteTargetWriteEngine {
-				if wlsn, ok := queryLSNBackend(st.currentBackend, "SELECT pg_current_wal_lsn()::text"); ok && wlsn > st.sessionWriteLSN {
-					st.sessionWriteLSN = wlsn
+			if rport > 0 && !hadErr && st.txStatus == 'I' && st.currentBackend != nil {
+				if ClassifySQLForRouting(trimmed).Target == RouteTargetWriteEngine {
+					if p.lazyLSN.Load() {
+						st.sessionDirtyWrite = true
+					} else if wlsn, ok := queryLSNBackend(st.currentBackend, "SELECT pg_current_wal_lsn()::text"); ok && wlsn > st.sessionWriteLSN {
+						st.sessionWriteLSN = wlsn
+						st.sessionDirtyWrite = false
+					}
+				} else if st.sessionDirtyWrite {
+					if wlsn, ok := queryLSNBackend(st.currentBackend, "SELECT pg_current_wal_lsn()::text"); ok && wlsn > st.sessionWriteLSN {
+						st.sessionWriteLSN = wlsn
+						st.sessionDirtyWrite = false
+					}
 				}
 			}
 		}
@@ -869,7 +969,7 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 	sawRoutable := false
 	if rport > 0 {
 		rlsn := p.readEngineLSN.Load()
-		if tryReadEngine && !isSusp && st.sessionWriteLSN > 0 && rlsn < st.sessionWriteLSN {
+		if tryReadEngine && !isSusp && !st.sessionDirtyWrite && st.sessionWriteLSN > 0 && rlsn < st.sessionWriteLSN {
 			if rb, err := p.acquireReadBackend(st.clientID); err == nil && rb != nil {
 				if fresh, ok := queryLSNBackend(rb, "SELECT COALESCE(pg_last_wal_replay_lsn(), pg_current_wal_lsn())::text"); ok {
 					rlsn = fresh
@@ -883,6 +983,9 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 		}
 		readHealthy := p.readEngineHealthy.Load()
 		sessionWriteLSN := st.sessionWriteLSN
+		if st.sessionDirtyWrite && !isSusp {
+			sessionWriteLSN = ^uint64(0)
+		}
 		if isSusp {
 			readHealthy = true
 			sessionWriteLSN = 0
@@ -1052,9 +1155,19 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 				rollbackParses()
 			}
 			p.recordQueryMetrics(st, qStart, waitUs, bytesIn, rstats, hadErr, execCount, batchQueryType)
-			if !isReadBackend && rport > 0 && !hadErr && st.txStatus == 'I' && batchHasWrite {
-				if wlsn, ok := queryLSNBackend(targetB, "SELECT pg_current_wal_lsn()::text"); ok && wlsn > st.sessionWriteLSN {
-					st.sessionWriteLSN = wlsn
+			if !isReadBackend && rport > 0 && !hadErr && st.txStatus == 'I' {
+				if batchHasWrite {
+					if p.lazyLSN.Load() {
+						st.sessionDirtyWrite = true
+					} else if wlsn, ok := queryLSNBackend(targetB, "SELECT pg_current_wal_lsn()::text"); ok && wlsn > st.sessionWriteLSN {
+						st.sessionWriteLSN = wlsn
+						st.sessionDirtyWrite = false
+					}
+				} else if st.sessionDirtyWrite {
+					if wlsn, ok := queryLSNBackend(targetB, "SELECT pg_current_wal_lsn()::text"); ok && wlsn > st.sessionWriteLSN {
+						st.sessionWriteLSN = wlsn
+						st.sessionDirtyWrite = false
+					}
 				}
 			}
 			return 1
@@ -1071,6 +1184,18 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 		return 1
 	}
 
+	resetExtBatch := func() {
+		if st.bufTracker != nil {
+			st.bufTracker.ReleaseAll()
+		}
+		if cap(*extBatch) > 256 {
+			*extBatch = nil
+		} else {
+			*extBatch = (*extBatch)[:0]
+		}
+		*extBatchBytes = 0
+	}
+
 	if tryReadEngine {
 		waitStart := time.Now()
 		if rb, err := p.acquireReadBackend(st.clientID); err == nil && rb != nil {
@@ -1079,14 +1204,12 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 			if p.ensureSessionAndStmts(rb, st) {
 				rc := runBatchOnBackend(rb, true, rwaitUs)
 				if rc == 1 {
-					*extBatch = (*extBatch)[:0]
-					*extBatchBytes = 0
+					resetExtBatch()
 					p.releaseReadBackend(rb, st.txStatus != 'I')
 					return true
 				}
 				if rc == -1 {
-					*extBatch = (*extBatch)[:0]
-					*extBatchBytes = 0
+					resetExtBatch()
 					p.releaseReadBackend(rb, true)
 					return false
 				}
@@ -1096,8 +1219,7 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 			p.readEngineHealthy.Store(false)
 		}
 		if isSusp {
-			*extBatch = (*extBatch)[:0]
-			*extBatchBytes = 0
+			resetExtBatch()
 			if _, werr := st.client.Write(BuildErrorResponse("ERROR", "57P03", "read engine unavailable while database is suspended")); werr != nil {
 				return false
 			}
@@ -1110,18 +1232,37 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 		RecordReadFallback(&p.routingMetrics)
 	}
 
+	var permit *WritePermit
+	wclass := ClassifyExtendedWrite(batchSQLs, st.txStatus != 'I')
+	if wclass.NeedsWriteAdmission() {
+		var admitted, ioOK bool
+		permit, admitted, ioOK = p.acquireWritePermit(st, bytesIn, qStart, batchQueryType, execCount)
+		if !ioOK {
+			resetExtBatch()
+			return false
+		}
+		if !admitted {
+			resetExtBatch()
+			return true
+		}
+	}
+
 	poolWaitUs, acquired := p.ensureBackend(st)
 	if !acquired {
-		*extBatch = (*extBatch)[:0]
-		*extBatchBytes = 0
+		if permit != nil {
+			permit.Release(true)
+		}
+		resetExtBatch()
 		p.recordQueryMetrics(st, qStart, poolWaitUs, bytesIn, relayStats{}, true, execCount, batchQueryType)
 		return true
 	}
 
 	st.backendInFlight = true
 	rc := runBatchOnBackend(st.currentBackend, false, poolWaitUs)
-	*extBatch = (*extBatch)[:0]
-	*extBatchBytes = 0
+	if permit != nil {
+		permit.Release(rc < 0)
+	}
+	resetExtBatch()
 	st.backendInFlight = false
 	if rc == -1 {
 		p.releaseCurrent(st, true)
@@ -1154,6 +1295,24 @@ func (p *TenantPool) ServeClient(client net.Conn, startupUser, expectedPass stri
 
 	_ = client.SetDeadline(time.Time{})
 
+	p.mu.Lock()
+	bufBudget := p.bufBudget
+	sessMaxBytes := p.sessionBufMaxBytes
+	sessMaxMsgs := p.sessionBufMaxMsgs
+	p.mu.Unlock()
+	if sessMaxBytes <= 0 {
+		sessMaxBytes = 32 * 1024 * 1024
+	}
+	if sessMaxMsgs <= 0 {
+		sessMaxMsgs = 4096
+	}
+	var tracker *SessionBufferTracker
+	if bufBudget != nil {
+		tracker = bufBudget.NewSession(sessMaxBytes, sessMaxMsgs)
+	} else {
+		tracker = NewBufferBudget(0).NewSession(sessMaxBytes, sessMaxMsgs)
+	}
+
 	st := &clientSessionState{
 		client:        client,
 		startupUser:   startupUser,
@@ -1165,21 +1324,26 @@ func (p *TenantPool) ServeClient(client net.Conn, startupUser, expectedPass stri
 		sessionVars:   make(map[string]string),
 		clientStmts:   make(map[string]PreparedDef),
 		txStatus:      'I',
+		bufTracker:    tracker,
 		touchActivity: touchActivity,
 	}
 	cleanup := func() {
+		if st.bufTracker != nil {
+			st.bufTracker.ReleaseAll()
+		}
 		if st.sessionPinned {
 			p.pinnedClients.Add(-1)
 		}
 		if st.inTxCounted {
 			p.activeTxCount.Add(-1)
+			if gov := p.getWriteGovernor(); gov != nil {
+				gov.RecordTxEnd(time.Since(st.txStartedAt))
+			}
 		}
 		p.releaseCurrent(st, st.txStatus != 'I' || st.sessionPinned || st.backendInFlight)
 	}
 	defer cleanup()
 
-	const maxExtBatchMsgs = 4096
-	const maxExtBatchBytes = 32 * 1024 * 1024
 	var extBatch []extMsg
 	extBatchBytes := 0
 
@@ -1203,16 +1367,18 @@ func (p *TenantPool) ServeClient(client net.Conn, startupUser, expectedPass stri
 				return
 			}
 		case 'P', 'B', 'D', 'E', 'C':
-			if len(extBatch) >= maxExtBatchMsgs || extBatchBytes+5+len(mbody) > maxExtBatchBytes {
+			pktBytes := 5 + len(mbody)
+			if err := st.bufTracker.Reserve(pktBytes); err != nil {
 				extBatch = nil
 				extBatchBytes = 0
+				st.bufTracker.ReleaseAll()
 				if metrics != nil {
 					metrics.RecordProtocolError()
 				}
-				_, _ = client.Write(BuildErrorResponse("FATAL", "54000", "extended query pipeline buffer limit exceeded"))
+				_, _ = client.Write(BuildErrorResponse("FATAL", "54000", err.Error()))
 				return
 			}
-			extBatchBytes += 5 + len(mbody)
+			extBatchBytes += pktBytes
 			extBatch = append(extBatch, extMsg{msgType: mtype, body: mbody})
 		case 'S', 'H':
 			if !p.handleExtendedBatch(st, mtype, mbody, &extBatch, &extBatchBytes) {
@@ -1683,12 +1849,17 @@ type PoolManager struct {
 	maxBackends    int
 	idleTimeoutSec int
 
-	mu          sync.Mutex
-	readHost    string
-	readSockDir string
-	readPort    int
-	metering    *MeteringLogger
-	pools       map[string]*TenantPool
+	mu                 sync.Mutex
+	readHost           string
+	readSockDir        string
+	readPort           int
+	metering           *MeteringLogger
+	writeGov           *WriteGovernor
+	bufBudget          *BufferBudget
+	sessionBufMaxBytes int64
+	sessionBufMaxMsgs  int
+	lazyLSN            bool
+	pools              map[string]*TenantPool
 }
 
 func NewPoolManager(maxBackends, idleTimeoutSec int) *PoolManager {
@@ -1699,6 +1870,53 @@ func NewPoolManager(maxBackends, idleTimeoutSec int) *PoolManager {
 		maxBackends:    maxBackends,
 		idleTimeoutSec: idleTimeoutSec,
 		pools:          make(map[string]*TenantPool),
+	}
+}
+
+func (pm *PoolManager) SetWriteGovernor(g *WriteGovernor) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.writeGov = g
+	for _, p := range pm.pools {
+		if p != nil {
+			p.SetWriteGovernor(g)
+		}
+	}
+}
+
+func (pm *PoolManager) WriteGovernor() *WriteGovernor {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	return pm.writeGov
+}
+
+func (pm *PoolManager) SetBufferBudget(b *BufferBudget, sessionMaxBytes int64, sessionMaxMsgs int) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.bufBudget = b
+	pm.sessionBufMaxBytes = sessionMaxBytes
+	pm.sessionBufMaxMsgs = sessionMaxMsgs
+	for _, p := range pm.pools {
+		if p != nil {
+			p.SetBufferBudget(b, sessionMaxBytes, sessionMaxMsgs)
+		}
+	}
+}
+
+func (pm *PoolManager) BufferBudget() *BufferBudget {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	return pm.bufBudget
+}
+
+func (pm *PoolManager) SetLazyLSN(enabled bool) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.lazyLSN = enabled
+	for _, p := range pm.pools {
+		if p != nil {
+			p.SetLazyLSN(enabled)
+		}
 	}
 }
 
@@ -1755,6 +1973,13 @@ func (pm *PoolManager) GetOrCreate(route TenantRoute, wakeFn WakeFn) *TenantPool
 	if pm.metering != nil {
 		p.SetMeteringLogger(pm.metering)
 	}
+	if pm.writeGov != nil {
+		p.SetWriteGovernor(pm.writeGov)
+	}
+	if pm.bufBudget != nil || pm.sessionBufMaxBytes > 0 || pm.sessionBufMaxMsgs > 0 {
+		p.SetBufferBudget(pm.bufBudget, pm.sessionBufMaxBytes, pm.sessionBufMaxMsgs)
+	}
+	p.SetLazyLSN(pm.lazyLSN)
 	p.SetWakeFn(wakeFn)
 	pm.pools[route.TenantID] = p
 	return p
