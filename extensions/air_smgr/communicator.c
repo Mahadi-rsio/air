@@ -329,8 +329,17 @@ air_ps_get_pages(const char *socket_path,
 
 	if (resp.status == AIR_PS_STATUS_NOT_FOUND)
 	{
-		for (BlockNumber i = 0; i < nblocks; i++)
-			memset(buffers[i], 0, AIR_PAGE_SIZE);
+		snprintf(errbuf, errbuf_len,
+				 "page not found in pageserver (tenant=%s rel=%u/%u/%u fork=%u blk=%u nblocks=%u lsn=%llu)",
+				 tenant_id ? tenant_id : "",
+				 (unsigned) rlocator.spcOid,
+				 (unsigned) rlocator.dbOid,
+				 (unsigned) rlocator.relNumber,
+				 (unsigned) forknum,
+				 (unsigned) blocknum,
+				 (unsigned) nblocks,
+				 (unsigned long long) lsn);
+		return false;
 	}
 	return true;
 }

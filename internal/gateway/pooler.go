@@ -92,6 +92,7 @@ type clientSessionState struct {
 	backendInFlight   bool
 	sessionWriteLSN   uint64
 	sessionDirtyWrite bool
+	txHasDDL          bool
 	bufTracker        *SessionBufferTracker
 	touchActivity     func()
 }
@@ -133,6 +134,8 @@ type TenantPool struct {
 	activeTxCount     atomic.Int64
 	readEngineLSN     atomic.Uint64
 	readEngineHealthy atomic.Bool
+	poolDDLLSN        atomic.Uint64
+	poolDDLDirty      atomic.Bool
 }
 
 func NewTenantPool(tenantID, host, sockDir string, port int, appPassword string, maxBackends, idleTimeoutSec int) *TenantPool {
@@ -601,6 +604,113 @@ func (p *TenantPool) executeSimpleAndRelay(st *clientSessionState, wireMsg []byt
 	return hadErr, true, true
 }
 
+func (p *TenantPool) advancePoolDDLLSN(lsn uint64) {
+	if lsn == 0 {
+		return
+	}
+	for {
+		cur := p.poolDDLLSN.Load()
+		if lsn <= cur {
+			return
+		}
+		if p.poolDDLLSN.CompareAndSwap(cur, lsn) {
+			return
+		}
+	}
+}
+
+func (p *TenantPool) syncReadEngineForQuery(st *clientSessionState, isSusp bool, tryProbe bool) (rlsn uint64, minWriteLSN uint64, readHealthy bool) {
+	minWriteLSN = st.sessionWriteLSN
+	if ddlLSN := p.poolDDLLSN.Load(); ddlLSN > minWriteLSN {
+		minWriteLSN = ddlLSN
+	}
+	if (st.sessionDirtyWrite || p.poolDDLDirty.Load()) && !isSusp {
+		minWriteLSN = ^uint64(0)
+	}
+	rlsn = p.readEngineLSN.Load()
+	if tryProbe && !isSusp && minWriteLSN != ^uint64(0) && (rlsn == 0 || (minWriteLSN > 0 && rlsn < minWriteLSN)) {
+		if rb, err := p.acquireReadBackend(st.clientID); err == nil && rb != nil {
+			if fresh, ok := queryLSNBackend(rb, "SELECT COALESCE(pg_last_wal_replay_lsn(), pg_current_wal_lsn())::text"); ok {
+				rlsn = fresh
+				p.readEngineLSN.Store(fresh)
+			}
+			p.readEngineHealthy.Store(true)
+			p.releaseReadBackend(rb, false)
+		} else {
+			p.readEngineHealthy.Store(false)
+			p.readEngineLSN.Store(0)
+			rlsn = 0
+		}
+	}
+	readHealthy = p.readEngineHealthy.Load()
+	if !isSusp && rlsn == 0 {
+		readHealthy = false
+	}
+	if isSusp {
+		readHealthy = true
+		minWriteLSN = 0
+	}
+	return rlsn, minWriteLSN, readHealthy
+}
+
+func (p *TenantPool) recordPrimaryWriteState(st *clientSessionState, targetB *BackendConn, hasWrite, hasDDL bool) {
+	if hasDDL {
+		if st.txStatus != 'I' {
+			st.txHasDDL = true
+			p.poolDDLDirty.Store(true)
+			return
+		}
+		st.txHasDDL = false
+		if targetB != nil {
+			if wlsn, ok := queryLSNBackend(targetB, "SELECT pg_current_wal_lsn()::text"); ok && wlsn > 0 {
+				p.advancePoolDDLLSN(wlsn)
+				p.poolDDLDirty.Store(false)
+				if wlsn > st.sessionWriteLSN {
+					st.sessionWriteLSN = wlsn
+				}
+				st.sessionDirtyWrite = false
+				return
+			}
+		}
+		p.poolDDLDirty.Store(true)
+		st.sessionDirtyWrite = true
+		return
+	}
+	if st.txHasDDL && st.txStatus == 'I' {
+		st.txHasDDL = false
+		if targetB != nil {
+			if wlsn, ok := queryLSNBackend(targetB, "SELECT pg_current_wal_lsn()::text"); ok && wlsn > 0 {
+				p.advancePoolDDLLSN(wlsn)
+				p.poolDDLDirty.Store(false)
+				if wlsn > st.sessionWriteLSN {
+					st.sessionWriteLSN = wlsn
+				}
+				st.sessionDirtyWrite = false
+				return
+			}
+		}
+		p.poolDDLDirty.Store(true)
+		st.sessionDirtyWrite = true
+		return
+	}
+	if st.txStatus != 'I' || targetB == nil {
+		return
+	}
+	if hasWrite {
+		if p.lazyLSN.Load() {
+			st.sessionDirtyWrite = true
+		} else if wlsn, ok := queryLSNBackend(targetB, "SELECT pg_current_wal_lsn()::text"); ok && wlsn > st.sessionWriteLSN {
+			st.sessionWriteLSN = wlsn
+			st.sessionDirtyWrite = false
+		}
+	} else if st.sessionDirtyWrite {
+		if wlsn, ok := queryLSNBackend(targetB, "SELECT pg_current_wal_lsn()::text"); ok && wlsn > st.sessionWriteLSN {
+			st.sessionWriteLSN = wlsn
+			st.sessionDirtyWrite = false
+		}
+	}
+}
+
 func (p *TenantPool) tryExecuteOnReadEngine(st *clientSessionState, wireMsg []byte, bytesIn uint64, qStart time.Time, queryType string) (executed bool, ioOK bool) {
 	ioOK = true
 	waitStart := time.Now()
@@ -832,38 +942,13 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 
 		routedToRead := false
 		if !isExecStmt && !st.sessionPinned && st.txStatus == 'I' && st.currentBackend == nil && rport > 0 {
-			rlsn := p.readEngineLSN.Load()
-			if !isSusp && !st.sessionDirtyWrite && st.sessionWriteLSN > 0 && rlsn < st.sessionWriteLSN &&
-				ClassifySQLForRouting(trimmed).Target == RouteTargetReadEngine {
-				if rb, err := p.acquireReadBackend(st.clientID); err == nil && rb != nil {
-					if fresh, ok := queryLSNBackend(rb, "SELECT COALESCE(pg_last_wal_replay_lsn(), pg_current_wal_lsn())::text"); ok {
-						rlsn = fresh
-						p.readEngineLSN.Store(fresh)
-					}
-					p.readEngineHealthy.Store(true)
-					p.releaseReadBackend(rb, false)
-				} else {
-					p.readEngineHealthy.Store(false)
-				}
-			}
-			readHealthy := p.readEngineHealthy.Load()
-			sessionWriteLSN := st.sessionWriteLSN
-			if st.sessionDirtyWrite && !isSusp {
-				// Lazy LSN watermark: force this read to primary (RYOW) without paying an extra
-				// pg_current_wal_lsn() round-trip on every write.
-				sessionWriteLSN = ^uint64(0)
-			}
-			if isSusp {
-				// While primary is suspended, always attempt read-engine for read queries
-				// instead of waking primary due to a stale health flag or LSN watermark.
-				readHealthy = true
-				sessionWriteLSN = 0
-			}
+			wantRead := ClassifySQLForRouting(trimmed).Target == RouteTargetReadEngine
+			rlsn, minWriteLSN, readHealthy := p.syncReadEngineForQuery(st, isSusp, wantRead)
 			rctx := SessionRouteContext{
 				SessionPinned:     st.sessionPinned,
 				InTransaction:     st.txStatus != 'I',
 				ReadEngineHealthy: readHealthy,
-				SessionWriteLSN:   sessionWriteLSN,
+				SessionWriteLSN:   minWriteLSN,
 				ReadEngineLSN:     rlsn,
 			}
 			rdec := RouteQuery(trimmed, rctx, &p.routingMetrics)
@@ -898,20 +983,10 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 			if !ok {
 				return ioOK
 			}
-			if rport > 0 && !hadErr && st.txStatus == 'I' && st.currentBackend != nil {
-				if ClassifySQLForRouting(trimmed).Target == RouteTargetWriteEngine {
-					if p.lazyLSN.Load() {
-						st.sessionDirtyWrite = true
-					} else if wlsn, ok := queryLSNBackend(st.currentBackend, "SELECT pg_current_wal_lsn()::text"); ok && wlsn > st.sessionWriteLSN {
-						st.sessionWriteLSN = wlsn
-						st.sessionDirtyWrite = false
-					}
-				} else if st.sessionDirtyWrite {
-					if wlsn, ok := queryLSNBackend(st.currentBackend, "SELECT pg_current_wal_lsn()::text"); ok && wlsn > st.sessionWriteLSN {
-						st.sessionWriteLSN = wlsn
-						st.sessionDirtyWrite = false
-					}
-				}
+			if rport > 0 && !hadErr && st.currentBackend != nil {
+				hasWrite := ClassifySQLForRouting(trimmed).Target == RouteTargetWriteEngine
+				hasDDL := ClassifyWriteRequest(trimmed, false) == WriteClassDDLAdmin
+				p.recordPrimaryWriteState(st, st.currentBackend, hasWrite, hasDDL)
 			}
 		}
 	}
@@ -966,36 +1041,16 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 	p.mu.Unlock()
 
 	batchHasWrite := false
+	batchHasDDL := false
 	tryReadEngine := rport > 0 && terminatorType == 'S' && !st.sessionPinned && st.txStatus == 'I' && st.currentBackend == nil
 	sawRoutable := false
 	if rport > 0 {
-		rlsn := p.readEngineLSN.Load()
-		if tryReadEngine && !isSusp && !st.sessionDirtyWrite && st.sessionWriteLSN > 0 && rlsn < st.sessionWriteLSN {
-			if rb, err := p.acquireReadBackend(st.clientID); err == nil && rb != nil {
-				if fresh, ok := queryLSNBackend(rb, "SELECT COALESCE(pg_last_wal_replay_lsn(), pg_current_wal_lsn())::text"); ok {
-					rlsn = fresh
-					p.readEngineLSN.Store(fresh)
-				}
-				p.readEngineHealthy.Store(true)
-				p.releaseReadBackend(rb, false)
-			} else {
-				p.readEngineHealthy.Store(false)
-			}
-		}
-		readHealthy := p.readEngineHealthy.Load()
-		sessionWriteLSN := st.sessionWriteLSN
-		if st.sessionDirtyWrite && !isSusp {
-			sessionWriteLSN = ^uint64(0)
-		}
-		if isSusp {
-			readHealthy = true
-			sessionWriteLSN = 0
-		}
+		rlsn, minWriteLSN, readHealthy := p.syncReadEngineForQuery(st, isSusp, tryReadEngine)
 		rctx := SessionRouteContext{
 			SessionPinned:     st.sessionPinned,
 			InTransaction:     st.txStatus != 'I',
 			ReadEngineHealthy: readHealthy,
-			SessionWriteLSN:   sessionWriteLSN,
+			SessionWriteLSN:   minWriteLSN,
 			ReadEngineLSN:     rlsn,
 		}
 		for _, m := range *extBatch {
@@ -1006,6 +1061,9 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 				pq := ReadCStr(m.body, &off)
 				if IsSessionPinningSQL(pq) {
 					tryReadEngine = false
+				}
+				if ClassifyWriteRequest(pq, false) == WriteClassDDLAdmin {
+					batchHasDDL = true
 				}
 				if ClassifySQLForRouting(pq).Target == RouteTargetWriteEngine {
 					batchHasWrite = true
@@ -1021,6 +1079,9 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 				_ = ReadCStr(m.body, &off)
 				sname := ReadCStr(m.body, &off)
 				if def, ok := st.clientStmts[sname]; ok {
+					if ClassifyWriteRequest(def.Query, false) == WriteClassDDLAdmin {
+						batchHasDDL = true
+					}
 					if ClassifySQLForRouting(def.Query).Target == RouteTargetWriteEngine {
 						batchHasWrite = true
 						tryReadEngine = false
@@ -1147,6 +1208,48 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 		}
 
 		if terminatorType == 'S' {
+			if isReadBackend && !isSusp {
+				var outBuf []byte
+				var rstats relayStats
+				var txStatus byte = 'I'
+				var hadErr bool
+				for {
+					t, b, rerr := ReadPGPacket(targetB.Conn)
+					if rerr != nil {
+						rollbackParses()
+						return 0
+					}
+					msg := BuildPGMessage(t, b)
+					rstats.bytesOut += uint64(len(msg))
+					switch t {
+					case 'E':
+						hadErr = true
+					case 'D':
+						rstats.rowsReturned++
+						rstats.dataRowBytes += uint64(len(b))
+					case 'Z':
+						if len(b) > 0 {
+							txStatus = b[0]
+						}
+					}
+					if !hadErr {
+						outBuf = append(outBuf, msg...)
+					}
+					if t == 'Z' {
+						break
+					}
+				}
+				if hadErr {
+					rollbackParses()
+					return 0
+				}
+				if _, werr := st.client.Write(outBuf); werr != nil {
+					return -1
+				}
+				st.txStatus = txStatus
+				p.recordQueryMetrics(st, qStart, waitUs, bytesIn, rstats, false, execCount, batchQueryType)
+				return 1
+			}
 			rstats, txStatus, hadErr, ok := relayUntilReady(targetB, st.client)
 			if !ok {
 				return -1
@@ -1156,20 +1259,8 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 				rollbackParses()
 			}
 			p.recordQueryMetrics(st, qStart, waitUs, bytesIn, rstats, hadErr, execCount, batchQueryType)
-			if !isReadBackend && rport > 0 && !hadErr && st.txStatus == 'I' {
-				if batchHasWrite {
-					if p.lazyLSN.Load() {
-						st.sessionDirtyWrite = true
-					} else if wlsn, ok := queryLSNBackend(targetB, "SELECT pg_current_wal_lsn()::text"); ok && wlsn > st.sessionWriteLSN {
-						st.sessionWriteLSN = wlsn
-						st.sessionDirtyWrite = false
-					}
-				} else if st.sessionDirtyWrite {
-					if wlsn, ok := queryLSNBackend(targetB, "SELECT pg_current_wal_lsn()::text"); ok && wlsn > st.sessionWriteLSN {
-						st.sessionWriteLSN = wlsn
-						st.sessionDirtyWrite = false
-					}
-				}
+			if !isReadBackend && rport > 0 && !hadErr {
+				p.recordPrimaryWriteState(st, targetB, batchHasWrite, batchHasDDL)
 			}
 			return 1
 		}
@@ -1212,12 +1303,15 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 				if rc == -1 {
 					resetExtBatch()
 					p.releaseReadBackend(rb, true)
+					p.readEngineLSN.Store(0)
 					return false
 				}
 			}
 			p.releaseReadBackend(rb, true)
+			p.readEngineLSN.Store(0)
 		} else {
 			p.readEngineHealthy.Store(false)
+			p.readEngineLSN.Store(0)
 		}
 		if isSusp {
 			resetExtBatch()

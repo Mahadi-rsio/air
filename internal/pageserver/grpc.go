@@ -458,14 +458,21 @@ func (s *grpcServer) EnsureTenant(ctx context.Context, req *pb.EnsureTenantReque
 		return nil, status.Error(codes.InvalidArgument, "tenant_id is required")
 	}
 	if s.ps.store != nil && s.ps.store.kms != nil {
+		var wrappedDEK string
 		if req.GetWrappedDek() != "" {
 			if err := s.ps.store.kms.LoadWrappedDEK(req.GetTenantId(), req.GetWrappedDek()); err != nil {
 				return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("load wrapped DEK for %s: %v", req.GetTenantId(), err))
 			}
+			wrappedDEK = req.GetWrappedDek()
 		} else {
-			if _, err := s.ps.store.kms.EnsureTenantDEK(req.GetTenantId()); err != nil {
+			w, err := s.ps.store.kms.EnsureTenantDEK(req.GetTenantId())
+			if err != nil {
 				return nil, status.Error(codes.Internal, fmt.Sprintf("ensure DEK for %s: %v", req.GetTenantId(), err))
 			}
+			wrappedDEK = w
+		}
+		if err := s.ps.PersistTenantWrappedDEK(req.GetTenantId(), wrappedDEK); err != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("persist wrapped DEK for %s: %v", req.GetTenantId(), err))
 		}
 	}
 	if req.GetGeneration() != "" {

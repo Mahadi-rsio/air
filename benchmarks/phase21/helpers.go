@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -139,81 +142,276 @@ func dockerCmd(args ...string) (string, error) {
 }
 
 type CgroupSample struct {
-	Timestamp     time.Time `json:"timestamp"`
-	MemCurrentMB  float64   `json:"mem_current_mb"`
-	MemPeakMB     float64   `json:"mem_peak_mb"`
-	MemMaxMB      float64   `json:"mem_max_mb"`
-	AnonMB        float64   `json:"anon_mb"`
-	FileMB        float64   `json:"file_mb"`
-	HighEvents    uint64    `json:"high_events"`
-	OOMEvents     uint64    `json:"oom_events"`
-	OOMKillEvents uint64    `json:"oom_kill_events"`
-	MemPSISome10  float64   `json:"mem_psi_some_10"`
-	CPUPSISome10  float64   `json:"cpu_psi_some_10"`
-	IOPSIMax10    float64   `json:"io_psi_max_10"`
-	PGRSSMB       float64   `json:"pg_rss_mb"`
-	GatewayRSSMB  float64   `json:"gateway_rss_mb"`
-	PageserverMB  float64   `json:"pageserver_mb"`
+	Timestamp       time.Time `json:"timestamp"`
+	MemCurrentMB    float64   `json:"mem_current_mb"`
+	MemPeakMB       float64   `json:"mem_peak_mb"`
+	MemMaxMB        float64   `json:"mem_max_mb"`
+	AnonMB          float64   `json:"anon_mb"`
+	FileMB          float64   `json:"file_mb"`
+	HighEvents      uint64    `json:"high_events"`
+	OOMEvents       uint64    `json:"oom_events"`
+	OOMKillEvents   uint64    `json:"oom_kill_events"`
+	EventsAvail     bool      `json:"events_avail"`
+	CPUUsageUsec    uint64    `json:"cpu_usage_usec"`
+	CPUUsageAvail   bool      `json:"cpu_usage_avail"`
+	MemPSISome10    float64   `json:"mem_psi_some_10"`
+	CPUPSISome10    float64   `json:"cpu_psi_some_10"`
+	IOPSIMax10      float64   `json:"io_psi_max_10"`
+	PGRSSMB         float64   `json:"pg_rss_mb"`
+	GatewayRSSMB    float64   `json:"gateway_rss_mb"`
+	PageserverMB    float64   `json:"pageserver_mb"`
+	ReadEngineRSSMB float64   `json:"read_engine_rss_mb"`
 }
 
-func sampleContainerCgroup(container string) CgroupSample {
-	s := CgroupSample{Timestamp: time.Now()}
-	script := `
-cat /sys/fs/cgroup/memory.current 2>/dev/null || echo 0
-cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0
-cat /sys/fs/cgroup/memory.max 2>/dev/null || echo 0
-awk '/^anon /{a=$2} /^file /{f=$2} END{printf "%d %d\n", a+0, f+0}' /sys/fs/cgroup/memory.stat 2>/dev/null || echo "0 0"
-awk '/^high /{h=$2} /^oom /{o=$2} /^oom_kill /{k=$2} END{printf "%d %d %d\n", h+0, o+0, k+0}' /sys/fs/cgroup/memory.events 2>/dev/null || echo "0 0 0"
-awk '/^some /{for(i=1;i<=NF;i++) if($i~/^avg10=/) {split($i,x,"="); print x[2]}}' /sys/fs/cgroup/memory.pressure 2>/dev/null || echo 0
-awk '/^some /{for(i=1;i<=NF;i++) if($i~/^avg10=/) {split($i,x,"="); print x[2]}}' /sys/fs/cgroup/cpu.pressure 2>/dev/null || echo 0
-awk '/^some /{for(i=1;i<=NF;i++) if($i~/^avg10=/) {split($i,x,"="); print x[2]}}' /sys/fs/cgroup/io.pressure 2>/dev/null || echo 0
-ps -eo comm,rss --no-headers | awk '/postgres/{sum+=$2} END{printf "%.2f\n", sum/1024}'
-`
+func newUnavailableSample() CgroupSample {
+	nan := math.NaN()
+	return CgroupSample{
+		Timestamp:       time.Now(),
+		MemCurrentMB:    nan,
+		MemPeakMB:       nan,
+		MemMaxMB:        nan,
+		AnonMB:          nan,
+		FileMB:          nan,
+		MemPSISome10:    nan,
+		CPUPSISome10:    nan,
+		IOPSIMax10:      nan,
+		PGRSSMB:         nan,
+		GatewayRSSMB:    nan,
+		PageserverMB:    nan,
+		ReadEngineRSSMB: nan,
+	}
+}
+
+func fmtMetric(v float64) string {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return "NA"
+	}
+	return fmt.Sprintf("%.2f", v)
+}
+
+func parseFloatOrNaN(s string) float64 {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "NA" || s == "max" {
+		return math.NaN()
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return math.NaN()
+	}
+	return v
+}
+
+// readProcRSSMBFromRoot sums VmRSS (in MB) for all processes under procRoot whose
+// comm or cmdline matches targetSubstr. Returns math.NaN() and an error if none match.
+func readProcRSSMBFromRoot(procRoot, targetSubstr string) (float64, error) {
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return math.NaN(), err
+	}
+	var totalKB uint64
+	matched := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+		pdir := filepath.Join(procRoot, e.Name())
+		commRaw, _ := os.ReadFile(filepath.Join(pdir, "comm"))
+		comm := strings.TrimSpace(string(commRaw))
+		match := strings.Contains(comm, targetSubstr)
+		if !match {
+			cmdRaw, _ := os.ReadFile(filepath.Join(pdir, "cmdline"))
+			cmdline := strings.ReplaceAll(string(cmdRaw), "\x00", " ")
+			match = strings.Contains(cmdline, targetSubstr)
+		}
+		if !match {
+			continue
+		}
+		statusRaw, err := os.ReadFile(filepath.Join(pdir, "status"))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(statusRaw), "\n") {
+			if strings.HasPrefix(line, "VmRSS:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					if kb, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+						totalKB += kb
+						matched++
+					}
+				}
+				break
+			}
+		}
+	}
+	if matched == 0 {
+		return math.NaN(), fmt.Errorf("no process matching %q in %s", targetSubstr, procRoot)
+	}
+	return float64(totalKB) / 1024.0, nil
+}
+
+func sampleContainerProcRSSMB(container, procMatch string) float64 {
+	script := fmt.Sprintf(`
+rss_kb=0
+found=0
+for p in /proc/[0-9]*/comm; do
+  [ -r "$p" ] || continue
+  dir=${p%%/comm}
+  comm=$(cat "$p" 2>/dev/null) || continue
+  matched=0
+  case "$comm" in
+    *%s*) matched=1 ;;
+  esac
+  if [ "$matched" -eq 0 ] && [ -r "$dir/cmdline" ]; then
+    cmd=$(tr '\000' ' ' < "$dir/cmdline" 2>/dev/null)
+    case "$cmd" in
+      *%s*) matched=1 ;;
+    esac
+  fi
+  if [ "$matched" -eq 1 ]; then
+    kb=$(awk '/^VmRSS:/{print $2}' "$dir/status" 2>/dev/null)
+    if [ -n "$kb" ]; then
+      rss_kb=$((rss_kb + kb))
+      found=1
+    fi
+  fi
+done
+if [ "$found" -eq 1 ]; then
+  awk "BEGIN{printf \"%%.2f\n\", $rss_kb/1024}"
+else
+  echo "NA"
+fi
+`, procMatch, procMatch)
 	out, err := dockerCmd("exec", container, "sh", "-c", script)
 	if err != nil {
-		return s
+		return math.NaN()
 	}
+	return parseFloatOrNaN(out)
+}
+
+func parseCgroupSampleOutput(out string) CgroupSample {
+	s := newUnavailableSample()
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	parseF := func(idx int) float64 {
+	lineAt := func(idx int) string {
 		if idx >= len(lines) {
-			return 0
+			return "NA"
 		}
-		v, _ := strconv.ParseFloat(strings.TrimSpace(lines[idx]), 64)
-		return v
+		return strings.TrimSpace(lines[idx])
 	}
-	s.MemCurrentMB = parseF(0) / (1024 * 1024)
-	s.MemPeakMB = parseF(1) / (1024 * 1024)
-	s.MemMaxMB = parseF(2) / (1024 * 1024)
-	if len(lines) > 3 {
-		parts := strings.Fields(lines[3])
-		if len(parts) == 2 {
-			a, _ := strconv.ParseFloat(parts[0], 64)
-			f, _ := strconv.ParseFloat(parts[1], 64)
+	if v := parseFloatOrNaN(lineAt(0)); !math.IsNaN(v) {
+		s.MemCurrentMB = v / (1024 * 1024)
+	}
+	if v := parseFloatOrNaN(lineAt(1)); !math.IsNaN(v) {
+		s.MemPeakMB = v / (1024 * 1024)
+	}
+	if v := parseFloatOrNaN(lineAt(2)); !math.IsNaN(v) {
+		s.MemMaxMB = v / (1024 * 1024)
+	}
+	if parts := strings.Fields(lineAt(3)); len(parts) == 2 && parts[0] != "NA" {
+		if a := parseFloatOrNaN(parts[0]); !math.IsNaN(a) {
 			s.AnonMB = a / (1024 * 1024)
+		}
+		if f := parseFloatOrNaN(parts[1]); !math.IsNaN(f) {
 			s.FileMB = f / (1024 * 1024)
 		}
 	}
-	if len(lines) > 4 {
-		parts := strings.Fields(lines[4])
-		if len(parts) == 3 {
-			s.HighEvents, _ = strconv.ParseUint(parts[0], 10, 64)
-			s.OOMEvents, _ = strconv.ParseUint(parts[1], 10, 64)
-			s.OOMKillEvents, _ = strconv.ParseUint(parts[2], 10, 64)
+	if parts := strings.Fields(lineAt(4)); len(parts) == 3 && parts[0] != "NA" {
+		h, err1 := strconv.ParseUint(parts[0], 10, 64)
+		o, err2 := strconv.ParseUint(parts[1], 10, 64)
+		k, err3 := strconv.ParseUint(parts[2], 10, 64)
+		if err1 == nil && err2 == nil && err3 == nil {
+			s.HighEvents = h
+			s.OOMEvents = o
+			s.OOMKillEvents = k
+			s.EventsAvail = true
 		}
 	}
-	s.MemPSISome10 = parseF(5)
-	s.CPUPSISome10 = parseF(6)
-	s.IOPSIMax10 = parseF(7)
-	s.PGRSSMB = parseF(8)
+	s.MemPSISome10 = parseFloatOrNaN(lineAt(5))
+	s.CPUPSISome10 = parseFloatOrNaN(lineAt(6))
+	s.IOPSIMax10 = parseFloatOrNaN(lineAt(7))
+	if u, err := strconv.ParseUint(lineAt(8), 10, 64); err == nil {
+		s.CPUUsageUsec = u
+		s.CPUUsageAvail = true
+	}
+	s.PGRSSMB = parseFloatOrNaN(lineAt(9))
+	return s
+}
 
-	if gwOut, err := dockerCmd("exec", "air-p21-gateway", "sh", "-c", "cat /sys/fs/cgroup/memory.current 2>/dev/null || echo 0"); err == nil {
-		v, _ := strconv.ParseFloat(strings.TrimSpace(gwOut), 64)
-		s.GatewayRSSMB = v / (1024 * 1024)
+func sampleContainerCgroup(container string) CgroupSample {
+	script := `
+cat /sys/fs/cgroup/memory.current 2>/dev/null || echo NA
+cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo NA
+cat /sys/fs/cgroup/memory.max 2>/dev/null || echo NA
+if [ -r /sys/fs/cgroup/memory.stat ]; then
+  awk '/^anon /{a=$2} /^file /{f=$2} END{printf "%d %d\n", a+0, f+0}' /sys/fs/cgroup/memory.stat
+else
+  echo "NA NA"
+fi
+if [ -r /sys/fs/cgroup/memory.events ]; then
+  awk '/^high /{h=$2} /^oom /{o=$2} /^oom_kill /{k=$2} END{printf "%d %d %d\n", h+0, o+0, k+0}' /sys/fs/cgroup/memory.events
+else
+  echo "NA NA NA"
+fi
+if [ -r /sys/fs/cgroup/memory.pressure ]; then
+  awk '/^some /{for(i=1;i<=NF;i++) if($i~/^avg10=/) {split($i,x,"="); print x[2]; found=1}} END{if(!found) print "NA"}' /sys/fs/cgroup/memory.pressure
+else
+  echo NA
+fi
+if [ -r /sys/fs/cgroup/cpu.pressure ]; then
+  awk '/^some /{for(i=1;i<=NF;i++) if($i~/^avg10=/) {split($i,x,"="); print x[2]; found=1}} END{if(!found) print "NA"}' /sys/fs/cgroup/cpu.pressure
+else
+  echo NA
+fi
+if [ -r /sys/fs/cgroup/io.pressure ]; then
+  awk '/^some /{for(i=1;i<=NF;i++) if($i~/^avg10=/) {split($i,x,"="); print x[2]; found=1}} END{if(!found) print "NA"}' /sys/fs/cgroup/io.pressure
+else
+  echo NA
+fi
+if [ -r /sys/fs/cgroup/cpu.stat ]; then
+  awk '/^usage_usec /{print $2; found=1} END{if(!found) print "NA"}' /sys/fs/cgroup/cpu.stat
+else
+  echo NA
+fi
+rss_kb=0
+found=0
+for p in /proc/[0-9]*/comm; do
+  [ -r "$p" ] || continue
+  dir=${p%/comm}
+  comm=$(cat "$p" 2>/dev/null) || continue
+  matched=0
+  case "$comm" in
+    *postgres*) matched=1 ;;
+  esac
+  if [ "$matched" -eq 0 ] && [ -r "$dir/cmdline" ]; then
+    cmd=$(tr '\000' ' ' < "$dir/cmdline" 2>/dev/null)
+    case "$cmd" in
+      *postgres*) matched=1 ;;
+    esac
+  fi
+  if [ "$matched" -eq 1 ]; then
+    kb=$(awk '/^VmRSS:/{print $2}' "$dir/status" 2>/dev/null)
+    if [ -n "$kb" ]; then
+      rss_kb=$((rss_kb + kb))
+      found=1
+    fi
+  fi
+done
+if [ "$found" -eq 1 ]; then
+  awk "BEGIN{printf \"%.2f\n\", $rss_kb/1024}"
+else
+  echo "NA"
+fi
+`
+	out, err := dockerCmd("exec", container, "sh", "-c", script)
+	if err != nil {
+		return newUnavailableSample()
 	}
-	if psOut, err := dockerCmd("exec", "air-p21-pageserver", "sh", "-c", "cat /sys/fs/cgroup/memory.current 2>/dev/null || echo 0"); err == nil {
-		v, _ := strconv.ParseFloat(strings.TrimSpace(psOut), 64)
-		s.PageserverMB = v / (1024 * 1024)
-	}
+	s := parseCgroupSampleOutput(out)
+	s.GatewayRSSMB = sampleContainerProcRSSMB("air-p21-gateway", "air-gateway")
+	s.PageserverMB = sampleContainerProcRSSMB("air-p21-pageserver", "air-pageserver")
+	s.ReadEngineRSSMB = sampleContainerProcRSSMB("air-p21-read-engine", "air-read-engine")
 	return s
 }
 

@@ -2,6 +2,7 @@ package pageserver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -77,9 +78,165 @@ func New(cfg Config) (*Pageserver, error) {
 	if !cfg.DisableUnixSocket && cfg.SocketPath != "" {
 		ps.unixSrv = NewUnixServer(cfg.SocketPath, ps)
 	}
-	debugf("server", "initialized pageserver layer_dir=%q cache_dir=%q cache_max_bytes=%d walredo_bin=%q r2_bucket=%q kms=%v unix_socket=%q",
-		cfg.LayerDir, cfg.CacheDir, cfg.CacheMaxBytes, cfg.WalRedoBin, cfg.R2Bucket, cfg.KMS != nil, cfg.SocketPath)
+	ps.recoverLocalTenants()
+	debugf("server", "initialized pageserver layer_dir=%q cache_dir=%q cache_max_bytes=%d walredo_bin=%q r2_bucket=%q kms=%v unix_socket=%q recovered_tenants=%d",
+		cfg.LayerDir, cfg.CacheDir, cfg.CacheMaxBytes, cfg.WalRedoBin, cfg.R2Bucket, cfg.KMS != nil, cfg.SocketPath, len(ps.tenants))
 	return ps, nil
+}
+
+func parseManifestEpoch(name string) (int64, bool) {
+	if !strings.HasPrefix(name, "timeline_") || !strings.HasSuffix(name, "_layer_manifest.json") {
+		return 0, false
+	}
+	mid := strings.TrimSuffix(strings.TrimPrefix(name, "timeline_"), "_layer_manifest.json")
+	ep, err := strconv.ParseInt(mid, 10, 64)
+	if err != nil || ep <= 0 {
+		return 0, false
+	}
+	return ep, true
+}
+
+func (p *Pageserver) recoverLocalTenants() {
+	if p.cfg.LayerDir == "" {
+		return
+	}
+	tenantEntries, err := os.ReadDir(p.cfg.LayerDir)
+	if err != nil {
+		return
+	}
+	type candidate struct {
+		gen      string
+		epoch    int64
+		manifest TimelineLayerManifest
+		lastLSN  uint64
+		modTime  time.Time
+	}
+	for _, te := range tenantEntries {
+		if !te.IsDir() {
+			continue
+		}
+		tenantID := te.Name()
+		tenantPath := filepath.Join(p.cfg.LayerDir, tenantID)
+		var best *candidate
+
+		scanDir := func(dir, gen string) {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				return
+			}
+			for _, e := range entries {
+				if e.IsDir() {
+					continue
+				}
+				epoch, ok := parseManifestEpoch(e.Name())
+				if !ok {
+					continue
+				}
+				fullPath := filepath.Join(dir, e.Name())
+				raw, err := os.ReadFile(fullPath)
+				if err != nil {
+					continue
+				}
+				var m TimelineLayerManifest
+				if err := json.Unmarshal(raw, &m); err != nil {
+					continue
+				}
+				var maxLSN uint64
+				for _, lm := range m.Layers {
+					if lm.EndLSN > maxLSN {
+						maxLSN = lm.EndLSN
+					}
+				}
+				var modTime time.Time
+				if info, ierr := e.Info(); ierr == nil {
+					modTime = info.ModTime()
+				}
+				c := &candidate{
+					gen:      gen,
+					epoch:    epoch,
+					manifest: m,
+					lastLSN:  maxLSN,
+					modTime:  modTime,
+				}
+				if best == nil ||
+					c.epoch > best.epoch ||
+					(c.epoch == best.epoch && c.lastLSN > best.lastLSN) ||
+					(c.epoch == best.epoch && c.lastLSN == best.lastLSN && c.modTime.After(best.modTime)) {
+					best = c
+				}
+			}
+		}
+
+		// Scan direct tenant directory (legacy empty generation) and generation subdirectories.
+		scanDir(tenantPath, "")
+		subEntries, err := os.ReadDir(tenantPath)
+		if err == nil {
+			for _, se := range subEntries {
+				if se.IsDir() {
+					scanDir(filepath.Join(tenantPath, se.Name()), se.Name())
+				}
+			}
+		}
+
+		if best == nil {
+			continue
+		}
+		if p.store != nil && p.store.kms != nil {
+			dekPath := filepath.Join(tenantPath, "wrapped_dek.b64")
+			if dekRaw, derr := os.ReadFile(dekPath); derr == nil {
+				if lerr := p.store.kms.LoadWrappedDEK(tenantID, strings.TrimSpace(string(dekRaw))); lerr != nil {
+					debugf("recovery", "LoadWrappedDEK failed tenant=%s err=%v", tenantID, lerr)
+				}
+			}
+		}
+		if best.gen != "" {
+			p.generations[tenantID] = best.gen
+		}
+		tl := NewTimeline(tenantID, best.epoch, p.store, p.redoer)
+		if best.gen != "" {
+			tl.SetGeneration(best.gen)
+		}
+		tl.layers = append([]LayerMeta(nil), best.manifest.Layers...)
+		tl.layerSeq = best.manifest.MaxSeq
+		tl.lastLSN = best.lastLSN
+		tl.walLastLSN = best.lastLSN
+		p.tenants[tenantID] = tl
+		debugf("recovery", "recovered local tenant=%s gen=%q epoch=%d layers=%d max_seq=%d last_lsn=%s",
+			tenantID, best.gen, best.epoch, len(tl.layers), tl.layerSeq, formatLSNHex(tl.lastLSN))
+	}
+}
+
+// PersistTenantWrappedDEK atomically writes the KEK-wrapped tenant DEK to LayerDir/<tenantID>/wrapped_dek.b64
+// so Pageserver restarts can decrypt local layers without external re-provisioning.
+func (p *Pageserver) PersistTenantWrappedDEK(tenantID, wrappedB64 string) error {
+	if p.cfg.LayerDir == "" || tenantID == "" || wrappedB64 == "" {
+		return nil
+	}
+	dir := filepath.Join(p.cfg.LayerDir, tenantID)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return err
+	}
+	target := filepath.Join(dir, "wrapped_dek.b64")
+	tmp := target + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(wrappedB64 + "\n"); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, target)
 }
 
 // Start binds the Unix domain socket (if enabled) and begins serving air_smgr requests.
@@ -151,7 +308,7 @@ func (p *Pageserver) GetTenantInfo(tenantID string) (string, uint64, bool) {
 	if gen == "" {
 		gen = tl.Generation()
 	}
-	return gen, tl.LastLSN(), true
+	return gen, tl.WALLastLSN(), true
 }
 
 func (p *Pageserver) isGenerationActive(tenantID, generation string) bool {

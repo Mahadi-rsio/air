@@ -665,7 +665,7 @@ func (c *GRPCPageserverClient) NewWALReceiver(dsn, tenantID string, epoch int64,
 
 func (c *GRPCPageserverClient) GetPageAtLSN(ctx context.Context, tenantID string, key pageserver.Key, lsn uint64) ([]byte, error) {
 	var resp *pb.GetPageResponse
-	err := retryPageserverRPC(ctx, 3, func() error {
+	err := retryPageserverRPC(ctx, 10, func() error {
 		rctx, cancel := context.WithTimeout(c.withAuth(ctx), 10*time.Second)
 		defer cancel()
 		var rerr error
@@ -696,7 +696,7 @@ func (c *GRPCPageserverClient) GetPageAtLSN(ctx context.Context, tenantID string
 
 func (c *GRPCPageserverClient) GetPageBatch(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, startBlock, nblocks uint32, lsn uint64) ([]byte, uint32, error) {
 	var resp *pb.GetPageBatchResponse
-	err := retryPageserverRPC(ctx, 3, func() error {
+	err := retryPageserverRPC(ctx, 10, func() error {
 		rctx, cancel := context.WithTimeout(c.withAuth(ctx), 15*time.Second)
 		defer cancel()
 		var rerr error
@@ -720,7 +720,7 @@ func (c *GRPCPageserverClient) GetPageBatch(ctx context.Context, tenantID string
 
 func (c *GRPCPageserverClient) GetRelSize(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) (uint32, error) {
 	var resp *pb.GetRelSizeResponse
-	err := retryPageserverRPC(ctx, 3, func() error {
+	err := retryPageserverRPC(ctx, 10, func() error {
 		rctx, cancel := context.WithTimeout(c.withAuth(ctx), 10*time.Second)
 		defer cancel()
 		var rerr error
@@ -742,7 +742,7 @@ func (c *GRPCPageserverClient) GetRelSize(ctx context.Context, tenantID string, 
 
 func (c *GRPCPageserverClient) GetRelExists(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) (bool, error) {
 	var resp *pb.GetRelExistsResponse
-	err := retryPageserverRPC(ctx, 3, func() error {
+	err := retryPageserverRPC(ctx, 10, func() error {
 		rctx, cancel := context.WithTimeout(c.withAuth(ctx), 10*time.Second)
 		defer cancel()
 		var rerr error
@@ -764,7 +764,7 @@ func (c *GRPCPageserverClient) GetRelExists(ctx context.Context, tenantID string
 
 func (c *GRPCPageserverClient) GetDBSize(ctx context.Context, tenantID string, spcOID, dbOID uint32, lsn uint64) (uint64, error) {
 	var resp *pb.GetDBSizeResponse
-	err := retryPageserverRPC(ctx, 3, func() error {
+	err := retryPageserverRPC(ctx, 10, func() error {
 		rctx, cancel := context.WithTimeout(c.withAuth(ctx), 10*time.Second)
 		defer cancel()
 		var rerr error
@@ -783,7 +783,7 @@ func (c *GRPCPageserverClient) GetDBSize(ctx context.Context, tenantID string, s
 }
 
 func (c *GRPCPageserverClient) PutPageBatch(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, startBlock, nblocks uint32, lsn uint64, pages []byte) error {
-	err := retryPageserverRPC(ctx, 2, func() error {
+	err := retryPageserverRPC(ctx, 10, func() error {
 		rctx, cancel := context.WithTimeout(c.withAuth(ctx), 15*time.Second)
 		defer cancel()
 		_, rerr := c.client.PutPageBatch(rctx, &pb.PutPageBatchRequest{
@@ -803,7 +803,7 @@ func (c *GRPCPageserverClient) PutPageBatch(ctx context.Context, tenantID string
 }
 
 func (c *GRPCPageserverClient) UnlinkRel(ctx context.Context, tenantID string, spcOID, dbOID, relNumber uint32, forkNum uint8, lsn uint64) error {
-	err := retryPageserverRPC(ctx, 2, func() error {
+	err := retryPageserverRPC(ctx, 10, func() error {
 		rctx, cancel := context.WithTimeout(c.withAuth(ctx), 10*time.Second)
 		defer cancel()
 		_, rerr := c.client.UnlinkRel(rctx, &pb.UnlinkRelRequest{

@@ -20,7 +20,8 @@ import (
 func main() {
 	mode := flag.String("mode", "storage-path", "Mode: storage-path|crash-recovery|soak|multitenant")
 	duration := flag.Duration("duration", 300*time.Second, "Duration for soak/multitenant tests")
-	concurrency := flag.Int("concurrency", 16, "Client concurrency for soak test")
+	concurrency := flag.Int("concurrency", 16, "Client concurrency for soak/overload tests")
+	tenants := flag.Int("tenants", 4, "Number of tenants for mt-overload")
 	tenantPrefix := flag.String("tenant-prefix", "p21", "Tenant ID prefix")
 	flag.Parse()
 
@@ -41,6 +42,14 @@ func main() {
 	case "multitenant":
 		if err := runMultiTenantTest(ctx, *tenantPrefix+"_mt", *duration); err != nil {
 			log.Fatalf("multitenant failed: %v", err)
+		}
+	case "ddl-visibility":
+		if err := runDDLVisibilityValidation(ctx, *tenantPrefix+"_ddl"); err != nil {
+			log.Fatalf("ddl-visibility failed: %v", err)
+		}
+	case "mt-overload":
+		if err := runMultiTenantOverload(ctx, *tenantPrefix+"_mto", *duration, *concurrency, *tenants); err != nil {
+			log.Fatalf("mt-overload failed: %v", err)
 		}
 	default:
 		log.Fatalf("unknown mode: %s", *mode)
@@ -184,7 +193,80 @@ func runStoragePathValidation(ctx context.Context, tenantID string) error {
 		return fmt.Errorf("expected 902 rows after pageserver restart, got %d", cntAfterRestart)
 	}
 	log.Printf("Pageserver restart verified: count=%d", cntAfterRestart)
-	log.Printf("=== Phase 21.3 PASSED ===")
+
+	// 6. Concurrent relation extension + index scan + amcheck
+	var extWG sync.WaitGroup
+	var extErrMu sync.Mutex
+	var extErr error
+	for w := 0; w < 4; w++ {
+		extWG.Add(1)
+		go func(wid int) {
+			defer extWG.Done()
+			for j := 0; j < 250; j++ {
+				if _, e := pool.Exec(ctx, `INSERT INTO p21_orders (acct, amount, payload) VALUES ($1, $2, repeat('z', 200))`,
+					fmt.Sprintf("conc_%d", wid), j); e != nil {
+					extErrMu.Lock()
+					if extErr == nil {
+						extErr = e
+					}
+					extErrMu.Unlock()
+					return
+				}
+			}
+		}(w)
+	}
+	extWG.Wait()
+	if extErr != nil {
+		return fmt.Errorf("concurrent extension: %w", extErr)
+	}
+
+	// 7. Invalidate LFC + restart Pageserver + restart PG (cold LFC & cold Pageserver)
+	if err := suspendTenant(ctx, tenantID); err != nil {
+		return err
+	}
+	_, _ = dockerCmd("exec", "air-p21-server", "sh", "-c", fmt.Sprintf("rm -f /var/lib/air/lfc/%s/*.lfc", tenantID))
+	if _, err := dockerCmd("restart", "air-p21-pageserver"); err != nil {
+		return err
+	}
+	if err := waitHealthy(ctx, pageserverURL+"/healthz", 20*time.Second); err != nil {
+		return err
+	}
+	if err := wakeTenant(ctx, tenantID); err != nil {
+		return err
+	}
+
+	var idxCnt int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM p21_orders WHERE acct = 'conc_2'`).Scan(&idxCnt); err != nil {
+		return fmt.Errorf("index scan after cold LFC+Pageserver restart: %w", err)
+	}
+	if idxCnt != 250 {
+		return fmt.Errorf("expected 250 rows for conc_2, got %d", idxCnt)
+	}
+
+	// Run amcheck if available in PG17 contrib
+	if _, err := pool.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS amcheck`); err == nil {
+		if _, err := pool.Exec(ctx, `SELECT bt_index_check('idx_p21_orders_acct'), bt_index_check('p21_orders_pkey')`); err != nil {
+			return fmt.Errorf("amcheck failed: %w", err)
+		}
+		log.Printf("amcheck bt_index_check PASSED on idx_p21_orders_acct and p21_orders_pkey")
+	}
+
+	// 8. Verify TRUNCATE and DROP TABLE (unlink)
+	if _, err := pool.Exec(ctx, `TRUNCATE TABLE p21_orders`); err != nil {
+		return fmt.Errorf("truncate: %w", err)
+	}
+	var afterTrunc int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM p21_orders`).Scan(&afterTrunc); err != nil {
+		return err
+	}
+	if afterTrunc != 0 {
+		return fmt.Errorf("expected 0 rows after truncate, got %d", afterTrunc)
+	}
+	if _, err := pool.Exec(ctx, `DROP TABLE p21_orders`); err != nil {
+		return fmt.Errorf("drop table: %w", err)
+	}
+
+	log.Printf("=== Phase 21.3/21.10 Storage Path + ZeroExtend + Cold Recovery PASSED ===")
 	return nil
 }
 
@@ -553,21 +635,28 @@ func runSoakTest(ctx context.Context, tenantID string, dur time.Duration, concur
 	csvPath := filepath.Join(outDir, fmt.Sprintf("soak_%s_%ds.csv", tenantID, int(dur.Seconds())))
 	f, _ := os.Create(csvPath)
 	if f != nil {
-		fmt.Fprintln(f, "elapsed_s,tps,p50_ms,p95_ms,p99_ms,errs,cell_cur_mb,cell_peak_mb,anon_mb,file_mb,high_events,oom_kills,pg_rss_mb,gw_mb,ps_mb,mem_psi,cpu_psi,io_psi")
+		fmt.Fprintln(f, "elapsed_s,tps,p50_ms,p95_ms,p99_ms,errs,cell_cur_mb,cell_peak_mb,anon_mb,file_mb,high_events,oom_kills,pg_rss_mb,gw_rss_mb,ps_rss_mb,re_rss_mb,cpu_usage_usec,mem_psi,cpu_psi,io_psi")
 		for _, r := range samples {
-			fmt.Fprintf(f, "%d,%.2f,%.2f,%.2f,%.2f,%d,%.2f,%.2f,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+			cpuUsecStr := "NA"
+			if r.Cgroup.CPUUsageAvail {
+				cpuUsecStr = fmt.Sprintf("%d", r.Cgroup.CPUUsageUsec)
+			}
+			fmt.Fprintf(f, "%d,%.2f,%.2f,%.2f,%.2f,%d,%s,%s,%s,%s,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s\n",
 				r.ElapsedSec, r.IntervalTPS, r.P50Ms, r.P95Ms, r.P99Ms, r.Errs,
-				r.Cgroup.MemCurrentMB, r.Cgroup.MemPeakMB, r.Cgroup.AnonMB, r.Cgroup.FileMB,
-				r.Cgroup.HighEvents, r.Cgroup.OOMKillEvents, r.Cgroup.PGRSSMB, r.Cgroup.GatewayRSSMB,
-				r.Cgroup.PageserverMB, r.Cgroup.MemPSISome10, r.Cgroup.CPUPSISome10, r.Cgroup.IOPSIMax10)
+				fmtMetric(r.Cgroup.MemCurrentMB), fmtMetric(r.Cgroup.MemPeakMB), fmtMetric(r.Cgroup.AnonMB), fmtMetric(r.Cgroup.FileMB),
+				r.Cgroup.HighEvents, r.Cgroup.OOMKillEvents,
+				fmtMetric(r.Cgroup.PGRSSMB), fmtMetric(r.Cgroup.GatewayRSSMB), fmtMetric(r.Cgroup.PageserverMB), fmtMetric(r.Cgroup.ReadEngineRSSMB),
+				cpuUsecStr, fmtMetric(r.Cgroup.MemPSISome10), fmtMetric(r.Cgroup.CPUPSISome10), fmtMetric(r.Cgroup.IOPSIMax10))
 		}
 		_ = f.Close()
 	}
 
 	log.Printf("=== Soak Summary (%s) ===", dur)
 	log.Printf("Total Ops: %d | Avg TPS: %.1f | Errors: %d | p50=%.2fms p95=%.2fms p99=%.2fms", ops, avgTPS, errs, p50, p95, p99)
-	log.Printf("Final Cell Cgroup: current=%.1fMB peak=%.1fMB anon=%.1fMB file=%.1fMB high_ev=%d oom_kills=%d",
-		finalCG.MemCurrentMB, finalCG.MemPeakMB, finalCG.AnonMB, finalCG.FileMB, finalCG.HighEvents, finalCG.OOMKillEvents)
+	log.Printf("Final Cell Cgroup: current=%sMB peak=%sMB anon=%sMB file=%sMB high_ev=%d oom_kills=%d pg_rss=%sMB gw_rss=%sMB ps_rss=%sMB re_rss=%sMB",
+		fmtMetric(finalCG.MemCurrentMB), fmtMetric(finalCG.MemPeakMB), fmtMetric(finalCG.AnonMB), fmtMetric(finalCG.FileMB),
+		finalCG.HighEvents, finalCG.OOMKillEvents,
+		fmtMetric(finalCG.PGRSSMB), fmtMetric(finalCG.GatewayRSSMB), fmtMetric(finalCG.PageserverMB), fmtMetric(finalCG.ReadEngineRSSMB))
 	log.Printf("Raw CSV: %s", csvPath)
 
 	if errs > 0 || finalCG.OOMKillEvents > 0 {
@@ -718,6 +807,277 @@ func runMultiTenantTest(ctx context.Context, prefix string, dur time.Duration) e
 		tps := float64(ops) / dur.Seconds()
 		log.Printf("Tenant %s: ops=%d tps=%.1f errs=%d p50=%.2fms p95=%.2fms p99=%.2fms",
 			names[i], ops, tps, errs, p50, p95, p99)
+	}
+	return nil
+}
+
+func runDDLVisibilityValidation(ctx context.Context, tenantID string) error {
+	log.Printf("=== Phase 21.10: Read Engine DDL Visibility Validation (%s) ===", tenantID)
+	t, err := provisionTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	dsn := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
+		t.Username, t.Password, gatewayPGHost, gatewayPGPort, t.Database)
+
+	// 1. CREATE TABLE followed immediately by SELECT on the same connection
+	conn1, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer conn1.Close(ctx)
+	if _, err := conn1.Exec(ctx, `CREATE TABLE ddl_vis_t1 (id int PRIMARY KEY, v text)`); err != nil {
+		return fmt.Errorf("create table t1: %w", err)
+	}
+	if _, err := conn1.Exec(ctx, `INSERT INTO ddl_vis_t1 VALUES (1, 'hello')`); err != nil {
+		return err
+	}
+	var got string
+	if err := conn1.QueryRow(ctx, `SELECT v FROM ddl_vis_t1 WHERE id = 1`).Scan(&got); err != nil || got != "hello" {
+		return fmt.Errorf("same-conn select after create: got=%q err=%v", got, err)
+	}
+
+	// 2. CREATE TABLE followed immediately by SELECT on a brand-new connection (sessionWriteLSN == 0)
+	for i := 0; i < 10; i++ {
+		tbl := fmt.Sprintf("ddl_vis_new_%d", i)
+		if _, err := conn1.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s (id int PRIMARY KEY, val text)`, tbl)); err != nil {
+			return fmt.Errorf("create %s: %w", tbl, err)
+		}
+		if _, err := conn1.Exec(ctx, fmt.Sprintf(`INSERT INTO %s VALUES (42, 'ok')`, tbl)); err != nil {
+			return err
+		}
+		newConn, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			return fmt.Errorf("newConn %d: %w", i, err)
+		}
+		var v string
+		qerr := newConn.QueryRow(ctx, fmt.Sprintf(`SELECT val FROM %s WHERE id = 42`, tbl)).Scan(&v)
+		_ = newConn.Close(ctx)
+		if qerr != nil || v != "ok" {
+			return fmt.Errorf("new-conn select after create %s failed: v=%q err=%v", tbl, v, qerr)
+		}
+	}
+	log.Printf("PASS: CREATE TABLE + immediate SELECT on brand-new connections (10/10)")
+
+	// 3. CREATE INDEX + ALTER TABLE followed by reads on new connections
+	if _, err := conn1.Exec(ctx, `CREATE INDEX idx_ddl_vis_t1_v ON ddl_vis_t1(v)`); err != nil {
+		return err
+	}
+	if _, err := conn1.Exec(ctx, `ALTER TABLE ddl_vis_t1 ADD COLUMN extra int DEFAULT 99`); err != nil {
+		return err
+	}
+	conn2, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	var extra int
+	if err := conn2.QueryRow(ctx, `SELECT extra FROM ddl_vis_t1 WHERE v = 'hello'`).Scan(&extra); err != nil || extra != 99 {
+		_ = conn2.Close(ctx)
+		return fmt.Errorf("new-conn select after ALTER TABLE: extra=%d err=%v", extra, err)
+	}
+	_ = conn2.Close(ctx)
+	log.Printf("PASS: CREATE INDEX + ALTER TABLE visible on new connection")
+
+	// 4. DROP TABLE followed by reads on new connection (must fail with undefined_table, not stale rows)
+	if _, err := conn1.Exec(ctx, `DROP TABLE ddl_vis_t1`); err != nil {
+		return err
+	}
+	conn3, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	var dummy int
+	dropErr := conn3.QueryRow(ctx, `SELECT count(*) FROM ddl_vis_t1`).Scan(&dummy)
+	_ = conn3.Close(ctx)
+	if dropErr == nil {
+		return fmt.Errorf("expected error querying dropped table ddl_vis_t1, got count=%d", dummy)
+	}
+	log.Printf("PASS: DROP TABLE rejected cleanly (%v)", dropErr)
+
+	// 5. Concurrent DDL + active read traffic + Read Engine restart
+	conn4, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer conn4.Close(ctx)
+	if _, err := conn4.Exec(ctx, `CREATE TABLE ddl_conc (id int PRIMARY KEY, v int)`); err != nil {
+		return err
+	}
+	if _, err := conn4.Exec(ctx, `INSERT INTO ddl_conc SELECT g, g FROM generate_series(1, 100) g`); err != nil {
+		return err
+	}
+	stopCh := make(chan struct{})
+	var readErrs atomic.Int64
+	var readOps atomic.Int64
+	var wg sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stopCh:
+					return
+				default:
+				}
+				c, err := pgx.Connect(ctx, dsn)
+				if err != nil {
+					readErrs.Add(1)
+					continue
+				}
+				var cnt int64
+				if err := c.QueryRow(ctx, `SELECT count(*) FROM ddl_conc`).Scan(&cnt); err != nil {
+					readErrs.Add(1)
+				} else {
+					readOps.Add(1)
+				}
+				_ = c.Close(ctx)
+			}
+		}()
+	}
+	// Restart Read Engine mid-traffic
+	time.Sleep(1 * time.Second)
+	if _, err := dockerCmd("restart", "air-p21-read-engine"); err != nil {
+		close(stopCh)
+		wg.Wait()
+		return err
+	}
+	time.Sleep(3 * time.Second)
+	close(stopCh)
+	wg.Wait()
+	if readErrs.Load() > 0 {
+		return fmt.Errorf("concurrent reads during ReadEngine restart had %d errors (ops=%d)", readErrs.Load(), readOps.Load())
+	}
+	log.Printf("PASS: Concurrent reads + ReadEngine restart (%d ops, 0 errors)", readOps.Load())
+	return nil
+}
+
+func runMultiTenantOverload(ctx context.Context, prefix string, dur time.Duration, totalWriters, numTenants int) error {
+	if totalWriters < 32 {
+		totalWriters = 32
+	}
+	if numTenants < 4 {
+		numTenants = 4
+	}
+	log.Printf("=== Phase 21.10: Multi-Tenant Contention Overload (%d tenants, %d writers > WriteMaxGlobal=16, dur=%s) ===",
+		numTenants, totalWriters, dur)
+
+	pools := make([]*pgxpool.Pool, numTenants)
+	names := make([]string, numTenants)
+	for i := 0; i < numTenants; i++ {
+		tid := fmt.Sprintf("%s_t%d", prefix, i)
+		names[i] = tid
+		t, err := provisionTenant(ctx, tid)
+		if err != nil {
+			return err
+		}
+		p, err := connectGatewayPool(ctx, t, 24)
+		if err != nil {
+			return err
+		}
+		defer p.Close()
+		if _, err := p.Exec(ctx, `CREATE TABLE IF NOT EXISTS mto_data (id bigserial PRIMARY KEY, k int, v text)`); err != nil {
+			return err
+		}
+		pools[i] = p
+	}
+
+	type tStats struct {
+		ops  atomic.Int64
+		errs atomic.Int64
+		mu   sync.Mutex
+		lats []float64
+	}
+	stats := make([]tStats, numTenants)
+	record := func(idx int, us float64, err error) {
+		if err != nil {
+			stats[idx].errs.Add(1)
+			return
+		}
+		stats[idx].ops.Add(1)
+		stats[idx].mu.Lock()
+		stats[idx].lats = append(stats[idx].lats, us)
+		stats[idx].mu.Unlock()
+	}
+
+	// Distribute writers: Tenant 0 = bulk (half of writers), Tenant 1 = interactive (2w),
+	// Tenant 2 = mixed (4w), Tenant 3 = intermittent (1w), remaining tenants = background writers.
+	counts := make([]int, numTenants)
+	counts[1] = 2
+	counts[2] = 4
+	counts[3] = 1
+	if numTenants == 4 {
+		counts[0] = totalWriters - (counts[1] + counts[2] + counts[3])
+	} else {
+		counts[0] = totalWriters / 2
+	}
+	rem := totalWriters - (counts[0] + counts[1] + counts[2] + counts[3])
+	for i := 4; i < numTenants && rem > 0; i++ {
+		share := rem / (numTenants - i)
+		if share < 1 {
+			share = 1
+		}
+		counts[i] = share
+		rem -= share
+	}
+
+	stopCtx, cancel := context.WithTimeout(ctx, dur)
+	defer cancel()
+	var wg sync.WaitGroup
+
+	for ti := 0; ti < numTenants; ti++ {
+		for w := 0; w < counts[ti]; w++ {
+			wg.Add(1)
+			go func(idx, wid int) {
+				defer wg.Done()
+				rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(idx*100+wid)))
+				for stopCtx.Err() == nil {
+					t0 := time.Now()
+					var err error
+					switch idx {
+					case 0:
+						if wid%2 == 0 {
+							_, err = pools[idx].Exec(stopCtx, `INSERT INTO mto_data (k, v) SELECT g, 'bulk_overload' FROM generate_series(1, 50) g`)
+						} else {
+							_, err = pools[idx].Exec(stopCtx, `INSERT INTO mto_data (k, v) VALUES ($1, repeat('b', 150))`, rng.Intn(10000))
+						}
+					case 2:
+						if wid%2 == 0 {
+							var cnt int64
+							err = pools[idx].QueryRow(stopCtx, `SELECT count(*) FROM mto_data`).Scan(&cnt)
+						} else {
+							_, err = pools[idx].Exec(stopCtx, `INSERT INTO mto_data (k, v) VALUES ($1, 'mixed')`, rng.Intn(10000))
+						}
+					case 3:
+						_, err = pools[idx].Exec(stopCtx, `INSERT INTO mto_data (k, v) VALUES ($1, 'intermittent')`, rng.Intn(10000))
+						if stopCtx.Err() == nil {
+							select {
+							case <-stopCtx.Done():
+							case <-time.After(150 * time.Millisecond):
+							}
+						}
+					default:
+						_, err = pools[idx].Exec(stopCtx, `INSERT INTO mto_data (k, v) VALUES ($1, 'interactive_bg')`, rng.Intn(10000))
+					}
+					if stopCtx.Err() != nil {
+						break
+					}
+					record(idx, float64(time.Since(t0).Microseconds()), err)
+				}
+			}(ti, w)
+		}
+	}
+
+	wg.Wait()
+	govStats := getGatewayGovStats(ctx)
+	log.Printf("Gateway Write Governor Stats: %+v", govStats)
+	for i := 0; i < numTenants; i++ {
+		ops := stats[i].ops.Load()
+		errs := stats[i].errs.Load()
+		p50, p95, p99 := calcPercentiles(stats[i].lats)
+		tps := float64(ops) / dur.Seconds()
+		log.Printf("Tenant %s (%dw): ops=%d tps=%.1f errs=%d p50=%.2fms p95=%.2fms p99=%.2fms",
+			names[i], counts[i], ops, tps, errs, p50, p95, p99)
 	}
 	return nil
 }

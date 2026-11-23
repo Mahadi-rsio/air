@@ -46,6 +46,7 @@ type Timeline struct {
 	generation    string
 	epoch         int64
 	lastLSN       uint64
+	walLastLSN    uint64
 	catalogLSN    uint64
 	modLog        []ModifiedBlockEvent
 	modLogBaseLSN uint64
@@ -115,11 +116,18 @@ func (t *Timeline) Generation() string {
 	return t.generation
 }
 
-// LastLSN returns the highest WAL LSN ingested into this Timeline.
+// LastLSN returns the highest LSN ingested into this Timeline (WAL or page snapshot).
 func (t *Timeline) LastLSN() uint64 {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.lastLSN
+}
+
+// WALLastLSN returns the highest WAL LSN replayed into this Timeline via IngestWALRecords or image bootstrap.
+func (t *Timeline) WALLastLSN() uint64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.walLastLSN
 }
 
 // LayerCount returns the number of immutable layers registered in this Timeline.
@@ -136,6 +144,9 @@ func (t *Timeline) AddLayer(meta LayerMeta) {
 	t.layers = append(t.layers, meta)
 	if meta.EndLSN > t.lastLSN {
 		t.lastLSN = meta.EndLSN
+	}
+	if meta.Kind == LayerKindImage && meta.EndLSN > t.walLastLSN {
+		t.walLastLSN = meta.EndLSN
 	}
 }
 
@@ -167,6 +178,9 @@ func (t *Timeline) LoadLayersFromR2(ctx context.Context) error {
 	for _, lm := range layers {
 		if lm.EndLSN > t.lastLSN {
 			t.lastLSN = lm.EndLSN
+		}
+		if lm.EndLSN > t.walLastLSN {
+			t.walLastLSN = lm.EndLSN
 		}
 	}
 	debugf("timeline", "LoadLayersFromR2 tenant=%s gen=%q epoch=%d loaded=%d max_seq=%d last_lsn=%s",
@@ -561,6 +575,9 @@ func (t *Timeline) ApplyWALRecord(rec *DecodedWALRecord) {
 
 	if rec.EndLSN > t.lastLSN {
 		t.lastLSN = rec.EndLSN
+	}
+	if rec.EndLSN > t.walLastLSN {
+		t.walLastLSN = rec.EndLSN
 	}
 }
 

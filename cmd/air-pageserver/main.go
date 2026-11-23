@@ -354,8 +354,21 @@ func main() {
 	log.Println("[air-pageserver] shutting down...")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	grpcSrv.GracefulStop()
+
 	_ = httpSrv.Shutdown(shutCtx)
+
+	grpcDone := make(chan struct{})
+	go func() {
+		grpcSrv.GracefulStop()
+		close(grpcDone)
+	}()
+	select {
+	case <-grpcDone:
+	case <-time.After(2 * time.Second):
+		log.Println("[air-pageserver] gRPC GracefulStop timed out after 2s; forcing Stop()")
+		grpcSrv.Stop()
+	}
+
 	if err := ps.FlushAll(shutCtx); err != nil {
 		log.Printf("[air-pageserver] flush all error: %v", err)
 	}

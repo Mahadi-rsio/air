@@ -157,14 +157,6 @@ air_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	lsn = current_write_lsn();
 
 	(void) skipFsync;
-	air_lfc_insert(air_lfc_dir,
-				   air_tenant_id,
-				   reln->smgr_rlocator.locator,
-				   forknum,
-				   blocknum,
-				   lsn,
-				   buffer);
-	air_relmeta_extend(reln->smgr_rlocator.locator, forknum, blocknum + 1);
 	if (!air_ps_put_pages(air_pageserver_socket,
 						  air_tenant_id,
 						  reln->smgr_rlocator.locator,
@@ -178,6 +170,15 @@ air_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		ereport(ERROR,
 				(errcode(ERRCODE_IO_ERROR),
 				 errmsg("air_smgr extend failed: %s", errbuf)));
+
+	air_lfc_insert(air_lfc_dir,
+				   air_tenant_id,
+				   reln->smgr_rlocator.locator,
+				   forknum,
+				   blocknum,
+				   lsn,
+				   buffer);
+	air_relmeta_extend(reln->smgr_rlocator.locator, forknum, blocknum + 1);
 }
 
 static void
@@ -186,20 +187,49 @@ air_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 {
 	static PGAlignedBlock zero_block;
 	static bool zero_inited = false;
+	const void *stack_ptrs[128];
+	const void **ptrs = stack_ptrs;
 	XLogRecPtr	lsn;
+	char		errbuf[256];
+	bool		ok;
 
 	if (air_smgr_read_only)
 		air_reject_readonly_write("zeroextend");
 
-	lsn = current_write_lsn();
-
 	(void) skipFsync;
+	if (nblocks <= 0)
+		return;
+
+	lsn = current_write_lsn();
 
 	if (!zero_inited)
 	{
 		memset(zero_block.data, 0, BLCKSZ);
 		zero_inited = true;
 	}
+
+	if (nblocks > 128)
+		ptrs = (const void **) palloc(sizeof(void *) * (size_t) nblocks);
+	for (int i = 0; i < nblocks; i++)
+		ptrs[i] = zero_block.data;
+
+	ok = air_ps_put_pages(air_pageserver_socket,
+						  air_tenant_id,
+						  reln->smgr_rlocator.locator,
+						  forknum,
+						  blocknum,
+						  (BlockNumber) nblocks,
+						  lsn,
+						  ptrs,
+						  errbuf,
+						  sizeof(errbuf));
+	if (ptrs != stack_ptrs)
+		pfree(ptrs);
+
+	if (!ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("air_smgr zeroextend failed: %s", errbuf)));
 
 	for (int i = 0; i < nblocks; i++)
 		air_lfc_insert(air_lfc_dir,
@@ -210,9 +240,8 @@ air_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 					   lsn,
 					   zero_block.data);
 
-	if (nblocks > 0)
-		air_relmeta_extend(reln->smgr_rlocator.locator, forknum,
-						   blocknum + (BlockNumber) nblocks);
+	air_relmeta_extend(reln->smgr_rlocator.locator, forknum,
+					   blocknum + (BlockNumber) nblocks);
 }
 
 static bool
@@ -313,18 +342,8 @@ air_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	(void) skipFsync;
 
-	for (BlockNumber i = 0; i < nblocks; i++)
-		air_lfc_insert(air_lfc_dir,
-					   air_tenant_id,
-					   reln->smgr_rlocator.locator,
-					   forknum,
-					   blocknum + i,
-					   lsn,
-					   buffers[i]);
-
 	if (nblocks > 0)
 	{
-		air_relmeta_extend(reln->smgr_rlocator.locator, forknum, blocknum + nblocks);
 		if (!air_ps_put_pages(air_pageserver_socket,
 							  air_tenant_id,
 							  reln->smgr_rlocator.locator,
@@ -338,6 +357,17 @@ air_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			ereport(ERROR,
 					(errcode(ERRCODE_IO_ERROR),
 					 errmsg("air_smgr writev failed: %s", errbuf)));
+
+		for (BlockNumber i = 0; i < nblocks; i++)
+			air_lfc_insert(air_lfc_dir,
+						   air_tenant_id,
+						   reln->smgr_rlocator.locator,
+						   forknum,
+						   blocknum + i,
+						   lsn,
+						   buffers[i]);
+
+		air_relmeta_extend(reln->smgr_rlocator.locator, forknum, blocknum + nblocks);
 	}
 }
 
