@@ -201,6 +201,10 @@ func TestGateway_SuspendedServesReadsViaReadEngineAndHoldsWriteToWake(t *testing
 	}
 	defer conn.Close(ctx)
 
+	// Verify wildcard registration (e.g. air-read-engine listening on 0.0.0.0)
+	// does NOT overwrite the configured dialable read-engine host.
+	pool.SetReadEngineEndpoint("0.0.0.0", "", sqliteSrv.Port())
+
 	// Step A: Read query must succeed via Read Engine WITHOUT waking primary PG.
 	var name string
 	if err := conn.QueryRow(ctx, "SELECT name FROM items WHERE id = 1").Scan(&name); err != nil {
@@ -214,6 +218,18 @@ func TestGateway_SuspendedServesReadsViaReadEngineAndHoldsWriteToWake(t *testing
 	}
 	if got := touchCount.Load(); got != 0 {
 		t.Fatalf("expected 0 primary activity touches for read-only query, got %d", got)
+	}
+
+	// Step A2: Even a failing SELECT while suspended must NOT wake primary PG.
+	var dummy string
+	if err := conn.QueryRow(ctx, "SELECT name FROM nonexistent_table").Scan(&dummy); err == nil {
+		t.Fatalf("expected error for SELECT from nonexistent_table, got nil")
+	}
+	if got := wakeCount.Load(); got != 0 {
+		t.Fatalf("expected 0 wakes for failing SELECT while suspended, got %d", got)
+	}
+	if got := touchCount.Load(); got != 0 {
+		t.Fatalf("expected 0 primary activity touches after failing SELECT, got %d", got)
 	}
 
 	// Step B: Write query must be held, wake primary PG, and succeed.

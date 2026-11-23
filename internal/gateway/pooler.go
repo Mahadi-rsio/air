@@ -237,9 +237,28 @@ func (p *TenantPool) MarkSuspended() {
 	}
 }
 
+func isWildcardReadHost(h string) bool {
+	switch strings.TrimSpace(h) {
+	case "", "0.0.0.0", "::", "[::]":
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *TenantPool) isSuspended() bool {
+	p.mu.Lock()
+	s := p.suspended
+	p.mu.Unlock()
+	return s
+}
+
 func (p *TenantPool) SetReadEngineEndpoint(host, sockDir string, port int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if isWildcardReadHost(host) && !isWildcardReadHost(p.readHost) {
+		host = p.readHost
+	}
 	if p.readHost != host || p.readSockDir != sockDir || p.readPort != port {
 		for _, b := range p.readIdlePool {
 			if b != nil {
@@ -517,11 +536,33 @@ func (p *TenantPool) tryExecuteOnReadEngine(st *clientSessionState, wireMsg []by
 	rb, err := p.acquireReadBackend(st.clientID)
 	poolWaitUs := uint64(time.Since(waitStart).Microseconds())
 	if err != nil || rb == nil {
+		if p.isSuspended() {
+			log.Printf("[air-gateway] read-engine acquire failed tenant=%s err=%v (tenant suspended; not waking primary for read query)", p.tenantID, err)
+			if _, werr := st.client.Write(BuildErrorResponse("ERROR", "57P03", "read engine unavailable while database is suspended")); werr != nil {
+				return true, false
+			}
+			if _, werr := st.client.Write(BuildReadyForQuery(st.txStatus)); werr != nil {
+				return true, false
+			}
+			p.recordQueryMetrics(st, qStart, poolWaitUs, bytesIn, relayStats{}, true, 1, queryType)
+			return true, true
+		}
 		log.Printf("[air-gateway] read-engine acquire failed tenant=%s err=%v (falling back to primary)", p.tenantID, err)
 		return false, true
 	}
+	p.readEngineHealthy.Store(true)
 	if !p.ensureSessionAndStmts(rb, st) {
 		p.releaseReadBackend(rb, true)
+		if p.isSuspended() {
+			if _, werr := st.client.Write(BuildErrorResponse("ERROR", "57P03", "read engine session init failed while database is suspended")); werr != nil {
+				return true, false
+			}
+			if _, werr := st.client.Write(BuildReadyForQuery(st.txStatus)); werr != nil {
+				return true, false
+			}
+			p.recordQueryMetrics(st, qStart, poolWaitUs, bytesIn, relayStats{}, true, 1, queryType)
+			return true, true
+		}
 		return false, true
 	}
 	if st.cancelReg != nil && rb.BackendPID != 0 {
@@ -539,14 +580,34 @@ func (p *TenantPool) tryExecuteOnReadEngine(st *clientSessionState, wireMsg []by
 	}
 	if _, err := rb.Conn.Write(wireMsg); err != nil {
 		p.releaseReadBackend(rb, true)
+		if p.isSuspended() {
+			if _, werr := st.client.Write(BuildErrorResponse("ERROR", "57P03", "read engine write failed while database is suspended")); werr != nil {
+				return true, false
+			}
+			if _, werr := st.client.Write(BuildReadyForQuery(st.txStatus)); werr != nil {
+				return true, false
+			}
+			p.recordQueryMetrics(st, qStart, poolWaitUs, bytesIn, relayStats{}, true, 1, queryType)
+			return true, true
+		}
 		return false, true
 	}
 	firstT, firstBody, err := ReadPGPacket(rb.Conn)
 	if err != nil {
 		p.releaseReadBackend(rb, true)
+		if p.isSuspended() {
+			if _, werr := st.client.Write(BuildErrorResponse("ERROR", "57P03", "read engine read failed while database is suspended")); werr != nil {
+				return true, false
+			}
+			if _, werr := st.client.Write(BuildReadyForQuery(st.txStatus)); werr != nil {
+				return true, false
+			}
+			p.recordQueryMetrics(st, qStart, poolWaitUs, bytesIn, relayStats{}, true, 1, queryType)
+			return true, true
+		}
 		return false, true
 	}
-	if firstT == 'E' {
+	if firstT == 'E' && !p.isSuspended() {
 		log.Printf("[air-gateway] read-engine returned error for tenant=%s (falling back to primary)", p.tenantID)
 		// ReadEngine cannot serve this query (e.g. TOAST, MultiXact, unsupported type/SQL).
 		// Drain until ReadyForQuery ('Z') and safely fall back to PostgreSQL primary.
@@ -695,12 +756,13 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 
 		p.mu.Lock()
 		rport := p.readPort
+		isSusp := p.suspended
 		p.mu.Unlock()
 
 		routedToRead := false
 		if !isExecStmt && !st.sessionPinned && st.txStatus == 'I' && st.currentBackend == nil && rport > 0 {
 			rlsn := p.readEngineLSN.Load()
-			if st.sessionWriteLSN > 0 && rlsn < st.sessionWriteLSN {
+			if !isSusp && st.sessionWriteLSN > 0 && rlsn < st.sessionWriteLSN {
 				if rb, err := p.acquireReadBackend(st.clientID); err == nil && rb != nil {
 					if fresh, ok := queryLSNBackend(rb, "SELECT COALESCE(pg_last_wal_replay_lsn(), pg_current_wal_lsn())::text"); ok {
 						rlsn = fresh
@@ -712,11 +774,19 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 					p.readEngineHealthy.Store(false)
 				}
 			}
+			readHealthy := p.readEngineHealthy.Load()
+			sessionWriteLSN := st.sessionWriteLSN
+			if isSusp {
+				// While primary is suspended, always attempt read-engine for read queries
+				// instead of waking primary due to a stale health flag or LSN watermark.
+				readHealthy = true
+				sessionWriteLSN = 0
+			}
 			rctx := SessionRouteContext{
 				SessionPinned:     st.sessionPinned,
 				InTransaction:     st.txStatus != 'I',
-				ReadEngineHealthy: p.readEngineHealthy.Load(),
-				SessionWriteLSN:   st.sessionWriteLSN,
+				ReadEngineHealthy: readHealthy,
+				SessionWriteLSN:   sessionWriteLSN,
 				ReadEngineLSN:     rlsn,
 			}
 			rdec := RouteQuery(trimmed, rctx, &p.routingMetrics)
@@ -791,6 +861,7 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 
 	p.mu.Lock()
 	rport := p.readPort
+	isSusp := p.suspended
 	p.mu.Unlock()
 
 	batchHasWrite := false
@@ -798,7 +869,7 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 	sawRoutable := false
 	if rport > 0 {
 		rlsn := p.readEngineLSN.Load()
-		if tryReadEngine && st.sessionWriteLSN > 0 && rlsn < st.sessionWriteLSN {
+		if tryReadEngine && !isSusp && st.sessionWriteLSN > 0 && rlsn < st.sessionWriteLSN {
 			if rb, err := p.acquireReadBackend(st.clientID); err == nil && rb != nil {
 				if fresh, ok := queryLSNBackend(rb, "SELECT COALESCE(pg_last_wal_replay_lsn(), pg_current_wal_lsn())::text"); ok {
 					rlsn = fresh
@@ -810,11 +881,17 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 				p.readEngineHealthy.Store(false)
 			}
 		}
+		readHealthy := p.readEngineHealthy.Load()
+		sessionWriteLSN := st.sessionWriteLSN
+		if isSusp {
+			readHealthy = true
+			sessionWriteLSN = 0
+		}
 		rctx := SessionRouteContext{
 			SessionPinned:     st.sessionPinned,
 			InTransaction:     st.txStatus != 'I',
-			ReadEngineHealthy: p.readEngineHealthy.Load(),
-			SessionWriteLSN:   st.sessionWriteLSN,
+			ReadEngineHealthy: readHealthy,
+			SessionWriteLSN:   sessionWriteLSN,
 			ReadEngineLSN:     rlsn,
 		}
 		for _, m := range *extBatch {
@@ -1017,6 +1094,18 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 			p.releaseReadBackend(rb, true)
 		} else {
 			p.readEngineHealthy.Store(false)
+		}
+		if isSusp {
+			*extBatch = (*extBatch)[:0]
+			*extBatchBytes = 0
+			if _, werr := st.client.Write(BuildErrorResponse("ERROR", "57P03", "read engine unavailable while database is suspended")); werr != nil {
+				return false
+			}
+			if _, werr := st.client.Write(BuildReadyForQuery(st.txStatus)); werr != nil {
+				return false
+			}
+			p.recordQueryMetrics(st, qStart, 0, bytesIn, relayStats{}, true, execCount, batchQueryType)
+			return true
 		}
 		RecordReadFallback(&p.routingMetrics)
 	}
