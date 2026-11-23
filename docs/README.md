@@ -4,6 +4,7 @@ Welcome to the AIR documentation index.
 
 ## Getting Started & API
 - [Setup Guide](../setup.md) — Docker Compose (local build & GHCR), external PostgreSQL metadata DB (`AIR_META_DSN`), environment variables, and testing
+- [Fly.io Deployment Guide](deploy-fly.md) — Full 4-service 6PN mesh on Fly.io with dedicated gateway IPv4, persistent volumes, Neon metadata DB, and Cloudflare R2
 - [API Reference](../api.md) — HTTP REST & gRPC reference for all 4 services (`air-server`, `air-pageserver`, `air-read-engine`, `air-gateway`)
 - [Contributing](../CONTRIBUTING.md)
 
