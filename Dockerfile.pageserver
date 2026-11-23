@@ -17,7 +17,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM debian:bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
+    ca-certificates gosu \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home --uid 10003 airps \
     && mkdir -p /var/lib/air-pageserver/ps_layers /var/lib/air-pageserver/ps_cache \
@@ -25,12 +25,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /out/air-pageserver /usr/local/bin/air-pageserver
 COPY --from=builder /out/air-walredo /usr/local/bin/air-walredo
+COPY scripts/pageserver-entrypoint.sh /usr/local/bin/pageserver-entrypoint.sh
+RUN chmod +x /usr/local/bin/pageserver-entrypoint.sh
 
-USER airps
 ENV AIR_DATA_DIR=/var/lib/air-pageserver \
     AIR_PAGESERVER_GRPC_ADDR=0.0.0.0:9091 \
     AIR_PAGESERVER_HTTP_ADDR=0.0.0.0:8083 \
     AIR_WALREDO_BIN=/usr/local/bin/air-walredo
 
 EXPOSE 9091 8083
-ENTRYPOINT ["/usr/local/bin/air-pageserver"]
+ENTRYPOINT ["/usr/local/bin/pageserver-entrypoint.sh"]

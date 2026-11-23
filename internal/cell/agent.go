@@ -509,19 +509,25 @@ shared_preload_libraries = '%s'
 		return err
 	}
 
-	hbaHost := "127.0.0.1/32"
+	hbaHost4 := "127.0.0.1/32"
+	hbaHost6 := "::1/128"
 	if listenAddr != "127.0.0.1" {
-		hbaHost = "0.0.0.0/0"
+		hbaHost4 = "0.0.0.0/0"
+		hbaHost6 = "::/0"
 	}
 	hba := fmt.Sprintf(`
 local   all             postgres                                trust
 local   replication     postgres                                trust
 local   all             app_user                                password
 host    all             postgres        %s            reject
+host    all             postgres        %s            reject
+host    all             all             %s            scram-sha-256
 host    all             all             %s            scram-sha-256
 host    replication     postgres        %s            reject
+host    replication     postgres        %s            reject
 host    replication     all             %s            scram-sha-256
-`, hbaHost, hbaHost, hbaHost, hbaHost)
+host    replication     all             %s            scram-sha-256
+`, hbaHost4, hbaHost6, hbaHost4, hbaHost6, hbaHost4, hbaHost6, hbaHost4, hbaHost6)
 	if err := os.WriteFile(filepath.Join(pgData, "pg_hba.conf"), []byte(strings.TrimSpace(hba)+"\n"), 0o600); err != nil {
 		return err
 	}

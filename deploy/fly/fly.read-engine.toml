@@ -1,0 +1,25 @@
+app = "air-pg-read-engine"
+primary_region = "sin"
+
+[build]
+  dockerfile = "../../Dockerfile.read-engine"
+
+[env]
+  AIR_READ_ENGINE_DATA_DIR = "/var/lib/air-read-engine"
+  AIR_READ_ENGINE_CACHE_DIR = "/var/lib/air-read-engine/cache"
+  AIR_READ_ENGINE_LISTEN_HOST = "[::]"
+  AIR_READ_ENGINE_PG_PORT = "5433"
+  AIR_READ_ENGINE_HTTP_ADDR = "[::]:8082"
+  AIR_READ_ENGINE_GRPC_ADDR = "[::]:9092"
+  AIR_READ_ENGINE_DEBUG = "true"
+  AIR_PAGESERVER_GRPC_ADDR = "air-pg-pageserver.internal:9091"
+
+[mounts]
+  source = "air_read_engine_data"
+  destination = "/var/lib/air-read-engine"
+  initial_size = "1gb"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "256mb"

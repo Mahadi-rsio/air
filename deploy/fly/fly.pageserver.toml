@@ -1,0 +1,24 @@
+app = "air-pg-pageserver"
+primary_region = "sin"
+
+[build]
+  dockerfile = "../../Dockerfile.pageserver"
+
+[env]
+  AIR_DATA_DIR = "/var/lib/air-pageserver"
+  AIR_PAGESERVER_GRPC_ADDR = "[::]:9091"
+  AIR_PAGESERVER_HTTP_ADDR = "[::]:8083"
+  AIR_PAGESERVER_CACHE_MB = "64"
+  AIR_PAGESERVER_DEBUG = "true"
+  AIR_R2_BUCKET = "air-pg-backups"
+  AIR_R2_REGION = "auto"
+
+[mounts]
+  source = "air_pageserver_data"
+  destination = "/var/lib/air-pageserver"
+  initial_size = "1gb"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "256mb"

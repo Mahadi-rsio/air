@@ -21,15 +21,16 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM debian:bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libsqlite3-0 \
+    ca-certificates libsqlite3-0 gosu \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home --uid 10002 airread \
     && mkdir -p /var/lib/air-read-engine/cache \
     && chown -R airread:airread /var/lib/air-read-engine
 
 COPY --from=builder /out/air-read-engine /usr/local/bin/air-read-engine
+COPY scripts/read-engine-entrypoint.sh /usr/local/bin/read-engine-entrypoint.sh
+RUN chmod +x /usr/local/bin/read-engine-entrypoint.sh
 
-USER airread
 ENV AIR_READ_ENGINE_DATA_DIR=/var/lib/air-read-engine \
     AIR_READ_ENGINE_CACHE_DIR=/var/lib/air-read-engine/cache \
     AIR_READ_ENGINE_LISTEN_HOST=0.0.0.0 \
@@ -38,4 +39,4 @@ ENV AIR_READ_ENGINE_DATA_DIR=/var/lib/air-read-engine \
     AIR_READ_ENGINE_GRPC_ADDR=0.0.0.0:9092
 
 EXPOSE 5433 8082 9092
-ENTRYPOINT ["/usr/local/bin/air-read-engine"]
+ENTRYPOINT ["/usr/local/bin/read-engine-entrypoint.sh"]
