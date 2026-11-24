@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
@@ -53,6 +54,11 @@ func NewPageserverGRPCBackend(cfg PageserverGRPCConfig) (*PageserverGRPCBackend,
 	conn, err := grpc.NewClient(
 		cfg.Addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                30 * time.Second,
+			Timeout:             5 * time.Second,
+			PermitWithoutStream: true,
+		}),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(maxPageserverGRPCMsgBytes),
 			grpc.MaxCallSendMsgSize(maxPageserverGRPCMsgBytes),
@@ -199,7 +205,7 @@ func (b *PageserverGRPCBackend) GetTenantGeneration(tenantID string) string {
 	}
 	b.genMu.RUnlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	gen, _, err := b.GetTenantInfo(ctx, tenantID)
 	if err != nil {
