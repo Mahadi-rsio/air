@@ -29,6 +29,7 @@ const (
 	RouteReasonReadEngineUnavailableFallback
 	RouteReasonCausalLagFallback
 	RouteReasonReadErrorFallback
+	RouteReasonSystemCatalog
 )
 
 // QueryPlanHint carries lightweight, zero-RPC query-shape hints extracted
@@ -372,6 +373,9 @@ func classifySingleStatement(toks []sqlToken) (RouteDecision, QueryPlanHint) {
 		if isMutatingFunction(w) && i+1 < len(toks) && toks[i+1].upper == "(" {
 			return RouteDecision{RouteTargetWriteEngine, RouteReasonMutatingFunction}, QueryPlanHint{}
 		}
+		if isSystemCatalogToken(w) {
+			return RouteDecision{RouteTargetWriteEngine, RouteReasonSystemCatalog}, QueryPlanHint{}
+		}
 		switch w {
 		case "JOIN", "GROUP", "HAVING", "UNION", "INTERSECT", "EXCEPT":
 			hint.ComplexJoinOrAgg = true
@@ -387,6 +391,17 @@ func classifySingleStatement(toks []sqlToken) (RouteDecision, QueryPlanHint) {
 	}
 
 	return RouteDecision{RouteTargetWriteEngine, RouteReasonWriteDDL}, QueryPlanHint{}
+}
+
+func isSystemCatalogToken(w string) bool {
+	switch w {
+	case "PG_CATALOG", "PG_CLASS", "PG_NAMESPACE", "PG_TABLES",
+		"PG_ATTRIBUTE", "PG_TYPE", "PG_PROC", "PG_INDEX",
+		"PG_STAT_ACTIVITY", "PG_GET_USERBYID", "PG_TABLE_IS_VISIBLE",
+		"PG_DATABASE", "PG_ROLES", "PG_AUTHID", "PG_SETTINGS":
+		return true
+	}
+	return false
 }
 
 // ClassifySQLWithHint classifies a SQL string and returns lightweight query-shape hints.
