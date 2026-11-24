@@ -186,6 +186,7 @@ type MemoryBudget struct {
 	cfg           MemoryBudgetConfig
 	ps            *Pageserver
 	globalInMem   atomic.Int64
+	dirtyTenants  atomic.Int64
 	flushesTotal  atomic.Int64
 	flushedBytes  atomic.Int64
 	bpWaits       atomic.Int64
@@ -199,6 +200,8 @@ type MemoryBudget struct {
 	notifyMu sync.Mutex
 	notifyCh chan struct{}
 
+	ctx      context.Context
+	cancel   context.CancelFunc
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -209,12 +212,15 @@ func newMemoryBudget(ps *Pageserver, cfg MemoryBudgetConfig) *MemoryBudget {
 	if cfg.ApplyGoRuntimeLimit && cfg.GoMemoryLimitBytes > 0 {
 		debug.SetMemoryLimit(cfg.GoMemoryLimitBytes)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &MemoryBudget{
 		cfg:        cfg,
 		ps:         ps,
 		flushSem:   make(chan struct{}, cfg.MaxConcurrentFlushes),
 		compactSem: make(chan struct{}, cfg.MaxConcurrentCompactions),
 		notifyCh:   make(chan struct{}),
+		ctx:        ctx,
+		cancel:     cancel,
 		stopCh:     make(chan struct{}),
 	}
 }
@@ -226,6 +232,9 @@ func (b *MemoryBudget) start() {
 
 func (b *MemoryBudget) close() {
 	b.stopOnce.Do(func() {
+		if b.cancel != nil {
+			b.cancel()
+		}
 		close(b.stopCh)
 	})
 	b.wg.Wait()
@@ -292,7 +301,7 @@ func (b *MemoryBudget) effectiveTenantLimits() (soft, hard int64) {
 	if b.ps == nil {
 		return soft, hard
 	}
-	dirtyTenants := b.ps.dirtyTenantCount()
+	dirtyTenants := int(b.dirtyTenants.Load())
 	if dirtyTenants > 1 {
 		fairSoft := b.cfg.GlobalSoftInMemBytes / int64(dirtyTenants)
 		const minSoft = 512 * 1024 // 512 KiB floor
@@ -435,6 +444,7 @@ func (b *MemoryBudget) runMaintenanceStep() {
 		}
 	}
 	b.globalInMem.Store(totalInMem)
+	b.dirtyTenants.Store(int64(len(candidates)))
 
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
@@ -472,9 +482,11 @@ func (b *MemoryBudget) runMaintenanceStep() {
 		for _, tl := range timelines {
 			if tl.InMemBytes() == 0 && tl.L0LayerCount() >= 8 {
 				if b.tryAcquireCompactSlot() {
+					b.wg.Add(1)
 					go func(target *Timeline) {
+						defer b.wg.Done()
 						defer b.releaseCompactSlot()
-						ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+						ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
 						defer cancel()
 						_, _ = target.CompactL0Batch(ctx, 8, 4)
 					}(tl)
@@ -484,10 +496,19 @@ func (b *MemoryBudget) runMaintenanceStep() {
 		}
 	}
 
-	// Under high memory pressure or unreleased HeapIdle (> 12 MiB), trim caches and scavenge OS memory.
-	if highPressure || unreleasedIdle > 12*1024*1024 {
+	// Under high memory pressure or excessive unreleased HeapIdle (> 25% of machine profile),
+	// trim caches and scavenge OS memory without triggering STW full-GC loops during normal bursts.
+	idleThreshold := b.cfg.MemoryLimitBytes / 4
+	if idleThreshold < 32*1024*1024 {
+		idleThreshold = 32 * 1024 * 1024
+	}
+	scavengeCooldown := 2 * time.Second
+	if !highPressure {
+		scavengeCooldown = 5 * time.Second
+	}
+	if highPressure || unreleasedIdle > idleThreshold {
 		last := b.lastScavenge.Load()
-		if now.UnixNano()-last > int64(500*time.Millisecond) && b.lastScavenge.CompareAndSwap(last, now.UnixNano()) {
+		if now.UnixNano()-last > int64(scavengeCooldown) && b.lastScavenge.CompareAndSwap(last, now.UnixNano()) {
 			if highPressure && b.ps.store != nil {
 				if dc := b.ps.store.DecodedChunkCache(); dc != nil {
 					dc.TrimToBytes(b.cfg.DecodedChunkCacheBytes / 4)

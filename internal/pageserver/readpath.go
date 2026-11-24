@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -56,6 +57,7 @@ type Timeline struct {
 	store         *LayerStore
 	redoer        WALRedoer
 	budget        *MemoryBudget
+	dirtyTracked  atomic.Bool
 	lastWriteAt   time.Time
 	maxInMemBytes int64
 	relSizes          map[Key]uint32
@@ -100,6 +102,9 @@ func (t *Timeline) putInMemLocked(key Key, delta WALDelta) {
 	t.lastWriteAt = time.Now()
 	if t.budget != nil && diff != 0 {
 		t.budget.addInMemBytes(diff)
+		if diff > 0 && t.dirtyTracked.CompareAndSwap(false, true) {
+			t.budget.dirtyTenants.Add(1)
+		}
 	}
 }
 
@@ -351,8 +356,27 @@ func (t *Timeline) MaybeFlushAsync() {
 	t.bgFlushMu.Unlock()
 
 	debugf("flush", "MaybeFlushAsync scheduled tenant=%s inmem_bytes=%d max_inmem_bytes=%d", t.tenantID, t.InMemBytes(), t.maxInMemBytes)
+	flushCtx := context.Background()
+	var trackedBudget *MemoryBudget
+	if t.budget != nil {
+		if t.budget.ctx != nil && t.budget.ctx.Err() != nil {
+			t.bgFlushMu.Lock()
+			t.bgFlushing = false
+			close(done)
+			t.bgFlushMu.Unlock()
+			return
+		}
+		if t.budget.ctx != nil {
+			flushCtx = t.budget.ctx
+		}
+		trackedBudget = t.budget
+		trackedBudget.wg.Add(1)
+	}
 	go func() {
-		_, err := t.FlushInMemory(context.Background())
+		if trackedBudget != nil {
+			defer trackedBudget.wg.Done()
+		}
+		_, err := t.FlushInMemory(flushCtx)
 		t.bgFlushMu.Lock()
 		t.lastFlushErr = err
 		t.bgFlushing = false
@@ -785,6 +809,9 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 	// Evict in-memory SLRU page cache once persisted to L0 (and no other dirty SLRU entries remain in inMem).
 	if len(t.slruPages) > 0 && len(t.frozenMems) == 0 && t.inMem.DirtyKeyCount() == 0 {
 		t.slruPages = make(map[Key][]byte)
+	}
+	if t.budget != nil && len(t.frozenMems) == 0 && t.inMem.DirtyKeyCount() == 0 && t.dirtyTracked.CompareAndSwap(true, false) {
+		t.budget.dirtyTenants.Add(-1)
 	}
 	t.mu.Unlock()
 	t.manifestMu.Unlock()
