@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -45,10 +46,18 @@ func (b *BackendConn) Close() {
 }
 
 func dialBackendSocket(host, sockDir string, port int) (net.Conn, error) {
+	return dialBackendSocketCtx(context.Background(), host, sockDir, port)
+}
+
+func dialBackendSocketCtx(ctx context.Context, host, sockDir string, port int) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	dialer := net.Dialer{Timeout: 5 * time.Second}
 	isLocal := host == "" || host == "127.0.0.1" || host == "localhost"
 	if sockDir != "" && isLocal {
 		sockPath := filepath.Join(sockDir, fmt.Sprintf(".s.PGSQL.%d", port))
-		if conn, err := net.DialTimeout("unix", sockPath, 5*time.Second); err == nil {
+		if conn, err := dialer.DialContext(ctx, "unix", sockPath); err == nil {
 			return conn, nil
 		}
 	}
@@ -56,7 +65,7 @@ func dialBackendSocket(host, sockDir string, port int) (net.Conn, error) {
 	if targetHost == "" {
 		targetHost = "127.0.0.1"
 	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(targetHost, strconv.Itoa(port)), 5*time.Second)
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(targetHost, strconv.Itoa(port)))
 	if err != nil {
 		return nil, err
 	}
@@ -82,6 +91,10 @@ type clientSessionState struct {
 	gwSecret          uint32
 	metrics           *MetricsRegistry
 	cancelReg         *CancelRegistry
+	sessionCtx        context.Context
+	sessionCancel     context.CancelFunc
+	queryMu           sync.Mutex
+	queryCancel       context.CancelFunc
 	sessionVars       map[string]string
 	clientStmts       map[string]PreparedDef
 	currentBackend    *BackendConn
@@ -97,11 +110,44 @@ type clientSessionState struct {
 	touchActivity     func()
 }
 
+func (st *clientSessionState) beginQueryContext() (context.Context, func()) {
+	base := st.sessionCtx
+	if base == nil {
+		base = context.Background()
+	}
+	qctx, qcancel := context.WithCancel(base)
+	st.queryMu.Lock()
+	st.queryCancel = qcancel
+	st.queryMu.Unlock()
+	return qctx, func() {
+		st.queryMu.Lock()
+		st.queryCancel = nil
+		st.queryMu.Unlock()
+		qcancel()
+	}
+}
+
+func (st *clientSessionState) cancelActiveQuery() {
+	st.queryMu.Lock()
+	qc := st.queryCancel
+	st.queryMu.Unlock()
+	if qc != nil {
+		qc()
+	}
+}
+
+const (
+	readBreakerThreshold = 3
+	readBreakerCooldown  = 5 * time.Second
+)
+
 // TenantPool is a per-tenant transaction-mode PostgreSQL connection pooler.
 type TenantPool struct {
 	tenantID       string
 	maxBackends    int
 	idleTimeoutSec atomic.Int64
+	poolCtx        context.Context
+	poolCancel     context.CancelFunc
 
 	mu             sync.Mutex
 	host           string
@@ -128,14 +174,17 @@ type TenantPool struct {
 	semCond        *sync.Cond
 	activeBackends int
 
-	stmtSeq           atomic.Uint64
-	clientSeq         atomic.Uint64
-	pinnedClients     atomic.Int64
-	activeTxCount     atomic.Int64
-	readEngineLSN     atomic.Uint64
-	readEngineHealthy atomic.Bool
-	poolDDLLSN        atomic.Uint64
-	poolDDLDirty      atomic.Bool
+	stmtSeq              atomic.Uint64
+	clientSeq            atomic.Uint64
+	pinnedClients        atomic.Int64
+	activeTxCount        atomic.Int64
+	readEngineLSN        atomic.Uint64
+	readEngineHealthy    atomic.Bool
+	readConsecFails      atomic.Int32
+	readBreakerOpenUntil atomic.Int64
+	readProbeInFlight    atomic.Bool
+	poolDDLLSN           atomic.Uint64
+	poolDDLDirty         atomic.Bool
 }
 
 func NewTenantPool(tenantID, host, sockDir string, port int, appPassword string, maxBackends, idleTimeoutSec int) *TenantPool {
@@ -145,9 +194,12 @@ func NewTenantPool(tenantID, host, sockDir string, port int, appPassword string,
 	if idleTimeoutSec <= 0 {
 		idleTimeoutSec = 300
 	}
+	poolCtx, poolCancel := context.WithCancel(context.Background())
 	p := &TenantPool{
 		tenantID:           tenantID,
 		maxBackends:        maxBackends,
+		poolCtx:            poolCtx,
+		poolCancel:         poolCancel,
 		host:               host,
 		sockDir:            sockDir,
 		port:               port,
@@ -159,6 +211,36 @@ func NewTenantPool(tenantID, host, sockDir string, port int, appPassword string,
 	p.readEngineHealthy.Store(true)
 	p.semCond = sync.NewCond(&p.semMu)
 	return p
+}
+
+func (p *TenantPool) recordReadEngineSuccess() {
+	p.readConsecFails.Store(0)
+	p.readBreakerOpenUntil.Store(0)
+	p.readProbeInFlight.Store(false)
+	p.readEngineHealthy.Store(true)
+}
+
+func (p *TenantPool) recordReadEngineFailure() {
+	p.readProbeInFlight.Store(false)
+	fails := p.readConsecFails.Add(1)
+	if fails >= readBreakerThreshold {
+		p.readBreakerOpenUntil.Store(time.Now().Add(readBreakerCooldown).UnixNano())
+	}
+	p.readEngineHealthy.Store(false)
+	p.readEngineLSN.Store(0)
+}
+
+func (p *TenantPool) canAttemptReadEngine() (allowed bool, isProbe bool) {
+	if p.readEngineHealthy.Load() {
+		return true, false
+	}
+	openUntil := p.readBreakerOpenUntil.Load()
+	if openUntil == 0 || time.Now().UnixNano() >= openUntil {
+		if p.readProbeInFlight.CompareAndSwap(false, true) {
+			return true, true
+		}
+	}
+	return false, false
 }
 
 func (p *TenantPool) SetWriteGovernor(g *WriteGovernor) {
@@ -359,6 +441,16 @@ func (p *TenantPool) CloseAllIdle() {
 	}
 }
 
+func (p *TenantPool) Close() {
+	if p.poolCancel != nil {
+		p.poolCancel()
+	}
+	p.semMu.Lock()
+	p.semCond.Broadcast()
+	p.semMu.Unlock()
+	p.CloseAllIdle()
+}
+
 func (p *TenantPool) RequestDrain(timeout time.Duration) error {
 	if n := p.pinnedClients.Load(); n > 0 {
 		return fmt.Errorf("drain vetoed: %d pinned client session(s)", n)
@@ -443,7 +535,7 @@ func (p *TenantPool) getWriteGovernor() *WriteGovernor {
 	return g
 }
 
-func (p *TenantPool) acquireWritePermit(st *clientSessionState, bytesIn uint64, qStart time.Time, queryType string, execCount uint64) (*WritePermit, bool, bool) {
+func (p *TenantPool) acquireWritePermit(ctx context.Context, st *clientSessionState, bytesIn uint64, qStart time.Time, queryType string, execCount uint64) (*WritePermit, bool, bool) {
 	if st.currentBackend != nil {
 		return nil, true, true
 	}
@@ -451,9 +543,16 @@ func (p *TenantPool) acquireWritePermit(st *clientSessionState, bytesIn uint64, 
 	if gov == nil || !gov.IsEnabled() {
 		return nil, true, true
 	}
-	permit, err := gov.Acquire(context.Background(), p.tenantID, int64(bytesIn))
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	permit, err := gov.Acquire(ctx, p.tenantID, int64(bytesIn))
 	if err != nil {
-		if _, werr := st.client.Write(BuildErrorResponse("ERROR", "53300", err.Error())); werr != nil {
+		sqlstate := "53300"
+		if errors.Is(err, context.Canceled) {
+			sqlstate = "57014"
+		}
+		if _, werr := st.client.Write(BuildErrorResponse("ERROR", sqlstate, err.Error())); werr != nil {
 			return nil, false, false
 		}
 		if _, werr := st.client.Write(BuildReadyForQuery(st.txStatus)); werr != nil {
@@ -537,7 +636,7 @@ func (p *TenantPool) ensureSessionAndStmts(b *BackendConn, st *clientSessionStat
 	return true
 }
 
-func (p *TenantPool) ensureBackend(st *clientSessionState) (uint64, bool) {
+func (p *TenantPool) ensureBackend(ctx context.Context, st *clientSessionState) (uint64, bool) {
 	if st.currentBackend != nil {
 		if st.touchActivity != nil {
 			st.touchActivity()
@@ -545,13 +644,16 @@ func (p *TenantPool) ensureBackend(st *clientSessionState) (uint64, bool) {
 		return 0, true
 	}
 	waitStart := time.Now()
-	b, err := p.acquireBackend(st.clientID)
+	b, err := p.acquireBackend(ctx, st.clientID)
 	poolWaitUs := uint64(time.Since(waitStart).Microseconds())
 	if err != nil {
-		if st.metrics != nil {
+		sqlstate := "53300"
+		if errors.Is(err, context.Canceled) {
+			sqlstate = "57014"
+		} else if st.metrics != nil {
 			st.metrics.RecordPoolExhausted()
 		}
-		_, _ = st.client.Write(BuildErrorResponse("ERROR", "53300", err.Error()))
+		_, _ = st.client.Write(BuildErrorResponse("ERROR", sqlstate, err.Error()))
 		_, _ = st.client.Write(BuildReadyForQuery(st.txStatus))
 		return poolWaitUs, false
 	}
@@ -580,9 +682,9 @@ func (p *TenantPool) ensureBackend(st *clientSessionState) (uint64, bool) {
 	return poolWaitUs, true
 }
 
-func (p *TenantPool) executeSimpleAndRelay(st *clientSessionState, wireMsg []byte, bytesIn uint64, qStart time.Time, queryType string) (hadErr bool, ioOK bool, ok bool) {
+func (p *TenantPool) executeSimpleAndRelay(ctx context.Context, st *clientSessionState, wireMsg []byte, bytesIn uint64, qStart time.Time, queryType string) (hadErr bool, ioOK bool, ok bool) {
 	ioOK = true
-	poolWaitUs, acquired := p.ensureBackend(st)
+	poolWaitUs, acquired := p.ensureBackend(ctx, st)
 	if !acquired {
 		p.recordQueryMetrics(st, qStart, poolWaitUs, bytesIn, relayStats{}, true, 1, queryType)
 		return true, true, false
@@ -619,7 +721,7 @@ func (p *TenantPool) advancePoolDDLLSN(lsn uint64) {
 	}
 }
 
-func (p *TenantPool) syncReadEngineForQuery(st *clientSessionState, isSusp bool, tryProbe bool) (rlsn uint64, minWriteLSN uint64, readHealthy bool) {
+func (p *TenantPool) syncReadEngineForQuery(ctx context.Context, st *clientSessionState, isSusp bool, tryProbe bool) (rlsn uint64, minWriteLSN uint64, readHealthy bool) {
 	minWriteLSN = st.sessionWriteLSN
 	if ddlLSN := p.poolDDLLSN.Load(); ddlLSN > minWriteLSN {
 		minWriteLSN = ddlLSN
@@ -628,19 +730,27 @@ func (p *TenantPool) syncReadEngineForQuery(st *clientSessionState, isSusp bool,
 		minWriteLSN = ^uint64(0)
 	}
 	rlsn = p.readEngineLSN.Load()
-	if tryProbe && !isSusp && minWriteLSN != ^uint64(0) && (rlsn == 0 || (minWriteLSN > 0 && rlsn < minWriteLSN)) {
-		if rb, err := p.acquireReadBackend(st.clientID); err == nil && rb != nil {
+	allowed, isHalfOpenProbe := p.canAttemptReadEngine()
+	if !allowed {
+		if isSusp {
+			return rlsn, 0, true
+		}
+		return 0, minWriteLSN, false
+	}
+	if tryProbe && !isSusp && minWriteLSN != ^uint64(0) && (isHalfOpenProbe || rlsn == 0 || (minWriteLSN > 0 && rlsn < minWriteLSN)) {
+		if rb, err := p.acquireReadBackend(ctx, st.clientID); err == nil && rb != nil {
 			if fresh, ok := queryLSNBackend(rb, "SELECT COALESCE(pg_last_wal_replay_lsn(), pg_current_wal_lsn())::text"); ok {
 				rlsn = fresh
 				p.readEngineLSN.Store(fresh)
 			}
-			p.readEngineHealthy.Store(true)
+			p.recordReadEngineSuccess()
 			p.releaseReadBackend(rb, false)
 		} else {
-			p.readEngineHealthy.Store(false)
-			p.readEngineLSN.Store(0)
+			p.recordReadEngineFailure()
 			rlsn = 0
 		}
+	} else if isHalfOpenProbe {
+		p.readProbeInFlight.Store(false)
 	}
 	readHealthy = p.readEngineHealthy.Load()
 	if !isSusp && rlsn == 0 {
@@ -711,12 +821,13 @@ func (p *TenantPool) recordPrimaryWriteState(st *clientSessionState, targetB *Ba
 	}
 }
 
-func (p *TenantPool) tryExecuteOnReadEngine(st *clientSessionState, wireMsg []byte, bytesIn uint64, qStart time.Time, queryType string) (executed bool, ioOK bool) {
+func (p *TenantPool) tryExecuteOnReadEngine(ctx context.Context, st *clientSessionState, wireMsg []byte, bytesIn uint64, qStart time.Time, queryType string) (executed bool, ioOK bool) {
 	ioOK = true
 	waitStart := time.Now()
-	rb, err := p.acquireReadBackend(st.clientID)
+	rb, err := p.acquireReadBackend(ctx, st.clientID)
 	poolWaitUs := uint64(time.Since(waitStart).Microseconds())
 	if err != nil || rb == nil {
+		p.recordReadEngineFailure()
 		if p.isSuspended() {
 			log.Printf("[air-gateway] read-engine acquire failed tenant=%s err=%v (tenant suspended; not waking primary for read query)", p.tenantID, err)
 			if _, werr := st.client.Write(BuildErrorResponse("ERROR", "57P03", "read engine unavailable while database is suspended")); werr != nil {
@@ -731,9 +842,10 @@ func (p *TenantPool) tryExecuteOnReadEngine(st *clientSessionState, wireMsg []by
 		log.Printf("[air-gateway] read-engine acquire failed tenant=%s err=%v (falling back to primary)", p.tenantID, err)
 		return false, true
 	}
-	p.readEngineHealthy.Store(true)
+	p.recordReadEngineSuccess()
 	if !p.ensureSessionAndStmts(rb, st) {
 		p.releaseReadBackend(rb, true)
+		p.recordReadEngineFailure()
 		if p.isSuspended() {
 			if _, werr := st.client.Write(BuildErrorResponse("ERROR", "57P03", "read engine session init failed while database is suspended")); werr != nil {
 				return true, false
@@ -842,6 +954,8 @@ func (p *TenantPool) tryExecuteOnReadEngine(st *clientSessionState, wireMsg []by
 func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) bool {
 	qStart := time.Now()
 	bytesIn := uint64(5 + len(mbody))
+	qctx, endQuery := st.beginQueryContext()
+	defer endQuery()
 
 	off := 0
 	q := ReadCStr(mbody, &off)
@@ -855,7 +969,7 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 
 	if sm := reSetStmt.FindStringSubmatch(trimmed); sm != nil {
 		key, val := sm[1], sm[2]
-		hadErr, ioOK, ok := p.executeSimpleAndRelay(st, BuildPGMessage('Q', mbody), bytesIn, qStart, queryType)
+		hadErr, ioOK, ok := p.executeSimpleAndRelay(qctx, st, BuildPGMessage('Q', mbody), bytesIn, qStart, queryType)
 		if !ok {
 			return ioOK
 		}
@@ -864,7 +978,7 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 		}
 	} else if sm := reResetStmt.FindStringSubmatch(trimmed); sm != nil {
 		key := sm[1]
-		hadErr, ioOK, ok := p.executeSimpleAndRelay(st, BuildPGMessage('Q', mbody), bytesIn, qStart, queryType)
+		hadErr, ioOK, ok := p.executeSimpleAndRelay(qctx, st, BuildPGMessage('Q', mbody), bytesIn, qStart, queryType)
 		if !ok {
 			return ioOK
 		}
@@ -879,7 +993,7 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 		clientName, typeList, innerQ := sm[1], sm[2], sm[3]
 		globalName := fmt.Sprintf("_air_s_%d_%d", st.clientID, p.stmtSeq.Add(1))
 		rewritten := fmt.Sprintf("PREPARE %s%s AS %s", globalName, typeList, innerQ)
-		hadErr, ioOK, ok := p.executeSimpleAndRelay(st, BuildSimpleQuery(rewritten), bytesIn, qStart, queryType)
+		hadErr, ioOK, ok := p.executeSimpleAndRelay(qctx, st, BuildSimpleQuery(rewritten), bytesIn, qStart, queryType)
 		if !ok {
 			return ioOK
 		}
@@ -907,7 +1021,7 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 		} else {
 			deallocSQL = "DEALLOCATE " + cname
 		}
-		hadErr, ioOK, ok := p.executeSimpleAndRelay(st, BuildSimpleQuery(deallocSQL), bytesIn, qStart, queryType)
+		hadErr, ioOK, ok := p.executeSimpleAndRelay(qctx, st, BuildSimpleQuery(deallocSQL), bytesIn, qStart, queryType)
 		if !ok {
 			return ioOK
 		}
@@ -943,7 +1057,7 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 		routedToRead := false
 		if !isExecStmt && !st.sessionPinned && st.txStatus == 'I' && st.currentBackend == nil && rport > 0 {
 			wantRead := ClassifySQLForRouting(trimmed).Target == RouteTargetReadEngine
-			rlsn, minWriteLSN, readHealthy := p.syncReadEngineForQuery(st, isSusp, wantRead)
+			rlsn, minWriteLSN, readHealthy := p.syncReadEngineForQuery(qctx, st, isSusp, wantRead)
 			rctx := SessionRouteContext{
 				SessionPinned:     st.sessionPinned,
 				InTransaction:     st.txStatus != 'I',
@@ -953,7 +1067,7 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 			}
 			rdec := RouteQuery(trimmed, rctx, &p.routingMetrics)
 			if rdec.Target == RouteTargetReadEngine {
-				execOK, ioOK := p.tryExecuteOnReadEngine(st, BuildPGMessage('Q', outBody), bytesIn, qStart, queryType)
+				execOK, ioOK := p.tryExecuteOnReadEngine(qctx, st, BuildPGMessage('Q', outBody), bytesIn, qStart, queryType)
 				if !ioOK {
 					return false
 				}
@@ -968,7 +1082,7 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 			var permit *WritePermit
 			if wclass.NeedsWriteAdmission() {
 				var admitted, ioOK bool
-				permit, admitted, ioOK = p.acquireWritePermit(st, bytesIn, qStart, queryType, 1)
+				permit, admitted, ioOK = p.acquireWritePermit(qctx, st, bytesIn, qStart, queryType, 1)
 				if !ioOK {
 					return false
 				}
@@ -976,7 +1090,7 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 					return true
 				}
 			}
-			hadErr, ioOK, ok := p.executeSimpleAndRelay(st, BuildPGMessage('Q', outBody), bytesIn, qStart, queryType)
+			hadErr, ioOK, ok := p.executeSimpleAndRelay(qctx, st, BuildPGMessage('Q', outBody), bytesIn, qStart, queryType)
 			if permit != nil {
 				permit.Release(hadErr || !ok)
 			}
@@ -1004,6 +1118,8 @@ type extMsg struct {
 
 func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType byte, terminatorBody []byte, extBatch *[]extMsg, extBatchBytes *int) bool {
 	qStart := time.Now()
+	qctx, endQuery := st.beginQueryContext()
+	defer endQuery()
 	*extBatch = append(*extBatch, extMsg{msgType: terminatorType, body: terminatorBody})
 	var bytesIn, execCount uint64
 	var batchSQLs []string
@@ -1045,7 +1161,7 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 	tryReadEngine := rport > 0 && terminatorType == 'S' && !st.sessionPinned && st.txStatus == 'I' && st.currentBackend == nil
 	sawRoutable := false
 	if rport > 0 {
-		rlsn, minWriteLSN, readHealthy := p.syncReadEngineForQuery(st, isSusp, tryReadEngine)
+		rlsn, minWriteLSN, readHealthy := p.syncReadEngineForQuery(qctx, st, isSusp, tryReadEngine)
 		rctx := SessionRouteContext{
 			SessionPinned:     st.sessionPinned,
 			InTransaction:     st.txStatus != 'I',
@@ -1290,9 +1406,9 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 
 	if tryReadEngine {
 		waitStart := time.Now()
-		if rb, err := p.acquireReadBackend(st.clientID); err == nil && rb != nil {
+		if rb, err := p.acquireReadBackend(qctx, st.clientID); err == nil && rb != nil {
 			rwaitUs := uint64(time.Since(waitStart).Microseconds())
-			p.readEngineHealthy.Store(true)
+			p.recordReadEngineSuccess()
 			if p.ensureSessionAndStmts(rb, st) {
 				rc := runBatchOnBackend(rb, true, rwaitUs)
 				if rc == 1 {
@@ -1303,15 +1419,14 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 				if rc == -1 {
 					resetExtBatch()
 					p.releaseReadBackend(rb, true)
-					p.readEngineLSN.Store(0)
+					p.recordReadEngineFailure()
 					return false
 				}
 			}
 			p.releaseReadBackend(rb, true)
-			p.readEngineLSN.Store(0)
+			p.recordReadEngineFailure()
 		} else {
-			p.readEngineHealthy.Store(false)
-			p.readEngineLSN.Store(0)
+			p.recordReadEngineFailure()
 		}
 		if isSusp {
 			resetExtBatch()
@@ -1331,7 +1446,7 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 	wclass := ClassifyExtendedWrite(batchSQLs, st.txStatus != 'I')
 	if wclass.NeedsWriteAdmission() {
 		var admitted, ioOK bool
-		permit, admitted, ioOK = p.acquireWritePermit(st, bytesIn, qStart, batchQueryType, execCount)
+		permit, admitted, ioOK = p.acquireWritePermit(qctx, st, bytesIn, qStart, batchQueryType, execCount)
 		if !ioOK {
 			resetExtBatch()
 			return false
@@ -1342,7 +1457,7 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 		}
 	}
 
-	poolWaitUs, acquired := p.ensureBackend(st)
+	poolWaitUs, acquired := p.ensureBackend(qctx, st)
 	if !acquired {
 		if permit != nil {
 			permit.Release(true)
@@ -1408,6 +1523,12 @@ func (p *TenantPool) ServeClient(client net.Conn, startupUser, expectedPass stri
 		tracker = NewBufferBudget(0).NewSession(sessMaxBytes, sessMaxMsgs)
 	}
 
+	baseCtx := p.poolCtx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	sessCtx, sessCancel := context.WithCancel(baseCtx)
+
 	st := &clientSessionState{
 		client:        client,
 		startupUser:   startupUser,
@@ -1416,13 +1537,22 @@ func (p *TenantPool) ServeClient(client net.Conn, startupUser, expectedPass stri
 		gwSecret:      gwSecret,
 		metrics:       metrics,
 		cancelReg:     cancelReg,
+		sessionCtx:    sessCtx,
+		sessionCancel: sessCancel,
 		sessionVars:   make(map[string]string),
 		clientStmts:   make(map[string]PreparedDef),
 		txStatus:      'I',
 		bufTracker:    tracker,
 		touchActivity: touchActivity,
 	}
+	if cancelReg != nil {
+		cancelReg.RegisterSession(gwPID, gwSecret, st.cancelActiveQuery)
+	}
 	cleanup := func() {
+		sessCancel()
+		if cancelReg != nil {
+			cancelReg.UnregisterSession(gwPID, gwSecret)
+		}
 		if st.bufTracker != nil {
 			st.bufTracker.ReleaseAll()
 		}
@@ -1493,12 +1623,28 @@ func (p *TenantPool) ServeClient(client net.Conn, startupUser, expectedPass stri
 	}
 }
 
-func (p *TenantPool) acquireSlot() error {
+func (p *TenantPool) acquireSlot(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stopAfter := context.AfterFunc(ctx, func() {
+		p.semMu.Lock()
+		p.semCond.Broadcast()
+		p.semMu.Unlock()
+	})
+	defer stopAfter()
+
 	deadline := time.Now().Add(10 * time.Second)
 	p.semMu.Lock()
 	defer p.semMu.Unlock()
 
 	for p.activeBackends >= p.maxBackends {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		rem := time.Until(deadline)
 		if rem <= 0 {
 			return fmt.Errorf("backend connection pool saturated for tenant %s", p.tenantID)
@@ -1522,8 +1668,11 @@ func (p *TenantPool) releaseSlot() {
 	p.semCond.Signal()
 }
 
-func (p *TenantPool) acquireBackend(clientID uint64) (*BackendConn, error) {
-	if err := p.acquireSlot(); err != nil {
+func (p *TenantPool) acquireBackend(ctx context.Context, clientID uint64) (*BackendConn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := p.acquireSlot(ctx); err != nil {
 		return nil, err
 	}
 
@@ -1561,6 +1710,11 @@ func (p *TenantPool) acquireBackend(clientID uint64) (*BackendConn, error) {
 		return b, nil
 	}
 
+	if err := ctx.Err(); err != nil {
+		p.releaseSlot()
+		return nil, err
+	}
+
 	p.mu.Lock()
 	host, sockDir, port, pass, wake, suspended := p.host, p.sockDir, p.port, p.appPassword, p.wakeFn, p.suspended
 	p.mu.Unlock()
@@ -1578,6 +1732,10 @@ func (p *TenantPool) acquireBackend(clientID uint64) (*BackendConn, error) {
 			p.releaseSlot()
 			return nil, fmt.Errorf("wake tenant %s failed: %w", p.tenantID, werr)
 		}
+		if err := ctx.Err(); err != nil {
+			p.releaseSlot()
+			return nil, err
+		}
 		if wroute.Port <= 0 {
 			p.releaseSlot()
 			return nil, fmt.Errorf("wake tenant %s returned invalid port %d", p.tenantID, wroute.Port)
@@ -1586,16 +1744,16 @@ func (p *TenantPool) acquireBackend(clientID uint64) (*BackendConn, error) {
 		p.mu.Lock()
 		host, sockDir, port, pass = p.host, p.sockDir, p.port, p.appPassword
 		p.mu.Unlock()
-		b, err = p.dialAndStartup(host, sockDir, port, pass, clientID)
+		b, err = p.dialAndStartupCtx(ctx, host, sockDir, port, pass, clientID)
 	} else {
-		b, err = p.dialAndStartup(host, sockDir, port, pass, clientID)
-		if err != nil && wake != nil {
-			if wroute, werr := wake(); werr == nil && wroute.Port > 0 {
+		b, err = p.dialAndStartupCtx(ctx, host, sockDir, port, pass, clientID)
+		if err != nil && ctx.Err() == nil && wake != nil {
+			if wroute, werr := wake(); werr == nil && wroute.Port > 0 && ctx.Err() == nil {
 				p.UpdateEndpoint(wroute.Host, wroute.SockDir, wroute.Port, wroute.AppPassword)
 				p.mu.Lock()
 				host, sockDir, port, pass = p.host, p.sockDir, p.port, p.appPassword
 				p.mu.Unlock()
-				b, err = p.dialAndStartup(host, sockDir, port, pass, clientID)
+				b, err = p.dialAndStartupCtx(ctx, host, sockDir, port, pass, clientID)
 			}
 		}
 	}
@@ -1628,7 +1786,13 @@ func (p *TenantPool) releaseBackend(b *BackendConn, dirty bool) {
 	p.releaseSlot()
 }
 
-func (p *TenantPool) acquireReadBackend(clientID uint64) (*BackendConn, error) {
+func (p *TenantPool) acquireReadBackend(ctx context.Context, clientID uint64) (*BackendConn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	now := time.Now()
 	timeout := time.Duration(p.idleTimeoutSec.Load()) * time.Second
 	for {
@@ -1667,7 +1831,7 @@ func (p *TenantPool) acquireReadBackend(clientID uint64) (*BackendConn, error) {
 	if rport <= 0 && rsock == "" {
 		return nil, fmt.Errorf("read engine disabled")
 	}
-	return p.dialAndStartup(rhost, rsock, rport, pass, clientID)
+	return p.dialAndStartupCtx(ctx, rhost, rsock, rport, pass, clientID)
 }
 
 func (p *TenantPool) releaseReadBackend(b *BackendConn, dirty bool) {
@@ -1690,7 +1854,11 @@ func (p *TenantPool) releaseReadBackend(b *BackendConn, dirty bool) {
 }
 
 func (p *TenantPool) dialAndStartup(host, sockDir string, port int, appPass string, clientID uint64) (*BackendConn, error) {
-	conn, err := dialBackendSocket(host, sockDir, port)
+	return p.dialAndStartupCtx(context.Background(), host, sockDir, port, appPass, clientID)
+}
+
+func (p *TenantPool) dialAndStartupCtx(ctx context.Context, host, sockDir string, port int, appPass string, clientID uint64) (*BackendConn, error) {
+	conn, err := dialBackendSocketCtx(ctx, host, sockDir, port)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to tenant backend on port %d: %w", port, err)
 	}
@@ -2117,7 +2285,7 @@ func (pm *PoolManager) RemoveTenant(tenantID string) {
 	delete(pm.pools, tenantID)
 	pm.mu.Unlock()
 	if p != nil {
-		p.CloseAllIdle()
+		p.Close()
 	}
 }
 
@@ -2165,9 +2333,10 @@ func (pm *PoolManager) CloseAll() {
 			list = append(list, p)
 		}
 	}
+	clear(pm.pools)
 	pm.mu.Unlock()
 
 	for _, p := range list {
-		p.CloseAllIdle()
+		p.Close()
 	}
 }

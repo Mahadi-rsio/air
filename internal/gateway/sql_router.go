@@ -30,6 +30,7 @@ const (
 	RouteReasonCausalLagFallback
 	RouteReasonReadErrorFallback
 	RouteReasonSystemCatalog
+	RouteReasonCapabilityFallback
 )
 
 // QueryPlanHint carries lightweight, zero-RPC query-shape hints extracted
@@ -56,11 +57,12 @@ type SessionRouteContext struct {
 }
 
 type RoutingMetrics struct {
-	ReadRouted        atomic.Uint64
-	WriteRouted       atomic.Uint64
-	ExplainRouted     atomic.Uint64
-	FallbacksToWrite  atomic.Uint64
-	ReadErrorsRetried atomic.Uint64
+	ReadRouted          atomic.Uint64
+	WriteRouted         atomic.Uint64
+	ExplainRouted       atomic.Uint64
+	FallbacksToWrite    atomic.Uint64
+	CapabilityFallbacks atomic.Uint64
+	ReadErrorsRetried   atomic.Uint64
 }
 
 // ReadFallbackRate returns the fraction of read-eligible queries that fell back to WriteEngine.
@@ -404,16 +406,25 @@ func isSystemCatalogToken(w string) bool {
 	return false
 }
 
-// ClassifySQLWithHint classifies a SQL string and returns lightweight query-shape hints.
+// ClassifySQLWithHint classifies a SQL string using the AST parser and CapabilityRegistry
+// and returns lightweight query-shape hints.
 func ClassifySQLWithHint(sql string) (RouteDecision, QueryPlanHint) {
-	stmts := tokenizeStatements(sql)
+	return ClassifySQLWithRegistry(sql, DefaultCapabilityRegistry())
+}
+
+// ClassifySQLWithRegistry classifies a SQL string against the provided CapabilityRegistry.
+func ClassifySQLWithRegistry(sql string, reg *CapabilityRegistry) (RouteDecision, QueryPlanHint) {
+	if reg == nil {
+		reg = DefaultCapabilityRegistry()
+	}
+	script := ParseSQLAST(sql)
 	overall := RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlySelect}
 	var overallHint QueryPlanHint
-	for _, toks := range stmts {
-		if len(toks) == 0 {
+	for _, stmt := range script.Statements {
+		if stmt == nil || stmt.Kind == StmtEmpty {
 			continue
 		}
-		d, h := classifySingleStatement(toks)
+		d, h := classifySingleAST(stmt, reg)
 		if d.Target == RouteTargetWriteEngine {
 			return d, h
 		}
@@ -421,6 +432,68 @@ func ClassifySQLWithHint(sql string) (RouteDecision, QueryPlanHint) {
 		overallHint = h
 	}
 	return overall, overallHint
+}
+
+func classifySingleAST(ast *SQLStmtAST, reg *CapabilityRegistry) (RouteDecision, QueryPlanHint) {
+	switch ast.Kind {
+	case StmtEmpty:
+		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}, QueryPlanHint{}
+	case StmtInsert, StmtUpdate, StmtDelete, StmtMerge:
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonWriteDML}, QueryPlanHint{}
+	case StmtDDL, StmtPrepare, StmtExecute, StmtOther:
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonWriteDDL}, QueryPlanHint{}
+	case StmtTx:
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonTransactionWriteState}, QueryPlanHint{}
+	case StmtShow, StmtDiscard, StmtDeallocate:
+		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}, QueryPlanHint{}
+	case StmtSet, StmtReset:
+		if ast.SetReadOnly {
+			return RouteDecision{RouteTargetWriteEngine, RouteReasonSessionPinned}, QueryPlanHint{}
+		}
+		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}, QueryPlanHint{}
+	case StmtCopy:
+		if ast.HasModCTE {
+			return RouteDecision{RouteTargetWriteEngine, RouteReasonModifyingCTE}, QueryPlanHint{}
+		}
+		if ast.MutatingFunc != "" {
+			return RouteDecision{RouteTargetWriteEngine, RouteReasonMutatingFunction}, QueryPlanHint{}
+		}
+		if ast.CopyToStdout {
+			return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}, QueryPlanHint{}
+		}
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonWriteDML}, QueryPlanHint{}
+	}
+
+	if ast.HasModCTE {
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonModifyingCTE}, QueryPlanHint{}
+	}
+	if ast.HasSelectInto {
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonSelectInto}, QueryPlanHint{}
+	}
+	if ast.HasForLocking {
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonRowLocking}, QueryPlanHint{}
+	}
+	if ast.MutatingFunc != "" {
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonMutatingFunction}, QueryPlanHint{}
+	}
+	if ast.HasSysCatalog {
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonSystemCatalog}, QueryPlanHint{}
+	}
+
+	// Evaluate all AST features against CapabilityRegistry.
+	// PARTIAL_SUPPORT, UNSUPPORTED, and UNKNOWN safely fall back to WriteEngine.
+	if eval := reg.Evaluate(ast.Features); !eval.Support.IsReadEngineEligible() {
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonCapabilityFallback}, QueryPlanHint{}
+	}
+
+	var hint QueryPlanHint
+	hint.ExplainQuery = ast.Kind == StmtExplain
+	hint.ComplexJoinOrAgg = len(ast.Joins) > 0 || ast.HasGroupBy || ast.HasHaving ||
+		len(ast.SetOps) > 0 || ast.HasWindowFunc || len(ast.CTEs) > 0
+	hint.HasOrderLimit = ast.HasOrderBy || ast.HasLimit
+	hint.SimpleRead = !hint.ComplexJoinOrAgg && !hint.ExplainQuery
+
+	return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlySelect}, hint
 }
 
 // ClassifySQLForRouting classifies a SQL string (single or multi-statement) for ReadEngine vs WriteEngine routing.
@@ -458,6 +531,9 @@ func RouteQuery(sql string, ctx SessionRouteContext, metrics *RoutingMetrics) Ro
 			}
 		} else {
 			metrics.WriteRouted.Add(1)
+			if d.Reason == RouteReasonCapabilityFallback {
+				metrics.CapabilityFallbacks.Add(1)
+			}
 		}
 	}
 	return d
@@ -542,6 +618,8 @@ func classifySingleWriteClass(toks []sqlToken) WriteRequestClass {
 		return WriteClassReadOnly
 	}
 	switch d.Reason {
+	case RouteReasonCapabilityFallback:
+		return WriteClassReadOnly
 	case RouteReasonModifyingCTE, RouteReasonRowLocking, RouteReasonSelectInto, RouteReasonMutatingFunction:
 		return WriteClassSimpleAutocommit
 	case RouteReasonTransactionWriteState:

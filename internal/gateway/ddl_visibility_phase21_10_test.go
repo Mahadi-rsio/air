@@ -1,6 +1,9 @@
 package gateway
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestTenantPool_DDLVisibilityBarrierBlocksNewConnectionLag(t *testing.T) {
 	pool := NewTenantPool("t_ddl", "127.0.0.1", "", 5432, "pw", 8, 60)
@@ -11,7 +14,7 @@ func TestTenantPool_DDLVisibilityBarrierBlocksNewConnectionLag(t *testing.T) {
 	pool.readEngineHealthy.Store(true)
 
 	// Before any DDL, new connection can route reads to ReadEngine.
-	rlsn, minLSN, healthy := pool.syncReadEngineForQuery(newConn, false, false)
+	rlsn, minLSN, healthy := pool.syncReadEngineForQuery(context.Background(), newConn, false, false)
 	dec := RouteQuery("SELECT * FROM t1", SessionRouteContext{
 		ReadEngineHealthy: healthy,
 		SessionWriteLSN:   minLSN,
@@ -25,7 +28,7 @@ func TestTenantPool_DDLVisibilityBarrierBlocksNewConnectionLag(t *testing.T) {
 	pool.advancePoolDDLLSN(0x2000)
 
 	// Brand-new Connection 2 (sessionWriteLSN == 0) must NOT bypass DDL visibility.
-	rlsn, minLSN, healthy = pool.syncReadEngineForQuery(newConn, false, false)
+	rlsn, minLSN, healthy = pool.syncReadEngineForQuery(context.Background(), newConn, false, false)
 	dec = RouteQuery("SELECT * FROM soak_kv", SessionRouteContext{
 		ReadEngineHealthy: healthy,
 		SessionWriteLSN:   minLSN,
@@ -37,7 +40,7 @@ func TestTenantPool_DDLVisibilityBarrierBlocksNewConnectionLag(t *testing.T) {
 
 	// Once ReadEngine catches up to 0x2000, Connection 2 routes to ReadEngine again.
 	pool.readEngineLSN.Store(0x2000)
-	rlsn, minLSN, healthy = pool.syncReadEngineForQuery(newConn, false, false)
+	rlsn, minLSN, healthy = pool.syncReadEngineForQuery(context.Background(), newConn, false, false)
 	dec = RouteQuery("SELECT * FROM soak_kv", SessionRouteContext{
 		ReadEngineHealthy: healthy,
 		SessionWriteLSN:   minLSN,
@@ -49,7 +52,7 @@ func TestTenantPool_DDLVisibilityBarrierBlocksNewConnectionLag(t *testing.T) {
 
 	// Uncommitted / dirty DDL must force fallback to primary PostgreSQL.
 	pool.poolDDLDirty.Store(true)
-	rlsn, minLSN, healthy = pool.syncReadEngineForQuery(newConn, false, false)
+	rlsn, minLSN, healthy = pool.syncReadEngineForQuery(context.Background(), newConn, false, false)
 	dec = RouteQuery("SELECT * FROM soak_kv", SessionRouteContext{
 		ReadEngineHealthy: healthy,
 		SessionWriteLSN:   minLSN,
@@ -62,7 +65,7 @@ func TestTenantPool_DDLVisibilityBarrierBlocksNewConnectionLag(t *testing.T) {
 
 	// Unconfirmed ReadEngine (LSN == 0) must safely fall back when primary is active.
 	pool.readEngineLSN.Store(0)
-	rlsn, minLSN, healthy = pool.syncReadEngineForQuery(newConn, false, false)
+	rlsn, minLSN, healthy = pool.syncReadEngineForQuery(context.Background(), newConn, false, false)
 	dec = RouteQuery("SELECT * FROM soak_kv", SessionRouteContext{
 		ReadEngineHealthy: healthy,
 		SessionWriteLSN:   minLSN,

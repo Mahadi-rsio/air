@@ -35,6 +35,7 @@ func forwardCancelRequest(client net.Conn, cancelReg *CancelRegistry) {
 	}
 	gwPID := binary.BigEndian.Uint32(cancelPayload[0:4])
 	gwSecret := binary.BigEndian.Uint32(cancelPayload[4:8])
+	cancelReg.CancelSession(gwPID, gwSecret)
 	target, ok := cancelReg.Lookup(gwPID, gwSecret)
 	if !ok || target.Port <= 0 {
 		return

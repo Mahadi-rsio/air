@@ -161,15 +161,18 @@ type CancelTarget struct {
 }
 
 // CancelRegistry maps gateway-issued (pid, secret) pairs from BackendKeyData
-// to the currently active backend PostgreSQL (pid, secret, endpoint).
+// to the currently active backend PostgreSQL (pid, secret, endpoint) and
+// optional in-process query cancel function (for queued admission cancellation).
 type CancelRegistry struct {
-	mu      sync.Mutex
-	targets map[uint64]CancelTarget
+	mu       sync.Mutex
+	targets  map[uint64]CancelTarget
+	sessions map[uint64]func()
 }
 
 func NewCancelRegistry() *CancelRegistry {
 	return &CancelRegistry{
-		targets: make(map[uint64]CancelTarget),
+		targets:  make(map[uint64]CancelTarget),
+		sessions: make(map[uint64]func()),
 	}
 }
 
@@ -187,6 +190,40 @@ func (r *CancelRegistry) Unregister(gwPID, gwSecret uint32) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.targets, cancelKey(gwPID, gwSecret))
+}
+
+func (r *CancelRegistry) RegisterSession(gwPID, gwSecret uint32, cancelFn func()) {
+	if r == nil || cancelFn == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sessions[cancelKey(gwPID, gwSecret)] = cancelFn
+}
+
+func (r *CancelRegistry) UnregisterSession(gwPID, gwSecret uint32) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.sessions, cancelKey(gwPID, gwSecret))
+}
+
+// CancelSession invokes the registered in-process cancel callback (e.g. to abort
+// queued WriteGovernor/pooler admission) and returns true if a session was found.
+func (r *CancelRegistry) CancelSession(gwPID, gwSecret uint32) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	fn := r.sessions[cancelKey(gwPID, gwSecret)]
+	r.mu.Unlock()
+	if fn != nil {
+		fn()
+		return true
+	}
+	return false
 }
 
 func (r *CancelRegistry) Lookup(gwPID, gwSecret uint32) (CancelTarget, bool) {
