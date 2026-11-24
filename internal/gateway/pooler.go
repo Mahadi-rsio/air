@@ -1251,6 +1251,14 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 					sqlGname := fmt.Sprintf("_air_s_%d_%d", st.clientID, p.stmtSeq.Add(1))
 					query = fmt.Sprintf("PREPARE %s%s AS %s", sqlGname, sqlTlist, sqlInner)
 					rewritten = MakeParseBody(gname, query, oids)
+					var sqlUndo undoParse
+					sqlUndo.cname = sqlCname
+					sqlUndo.gname = sqlGname
+					if prev, ok := st.clientStmts[sqlCname]; ok {
+						sqlUndo.hadPrev = true
+						sqlUndo.prev = prev
+					}
+					undoParses = append(undoParses, sqlUndo)
 					st.clientStmts[sqlCname] = PreparedDef{
 						ClientName: sqlCname,
 						GlobalName: sqlGname,

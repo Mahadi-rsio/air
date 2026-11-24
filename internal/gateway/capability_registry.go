@@ -97,13 +97,14 @@ func NewDefaultCapabilityRegistry() *CapabilityRegistry {
 
 	// Statements
 	reg(CatStatement, CapFullSupport, "read-only query supported on ReadEngine",
-		"SELECT", "WITH", "VALUES", "TABLE", "EXPLAIN", "SHOW", "DISCARD", "DEALLOCATE", "COPY_TO", "EMPTY")
+		"SELECT", "WITH", "VALUES", "TABLE", "EXPLAIN", "COPY_TO", "EMPTY")
 	reg(CatStatement, CapUnsupported, "mutating or stateful statement requires WriteEngine",
 		"INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP", "TRUNCATE",
 		"COPY_FROM", "BEGIN", "START", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE", "ABORT",
 		"DO", "CALL", "VACUUM", "ANALYZE", "CLUSTER", "REINDEX", "COMMENT", "REFRESH",
 		"GRANT", "REVOKE", "LOCK", "CHECKPOINT", "IMPORT", "REASSIGN", "SECURITY",
-		"NOTIFY", "LISTEN", "UNLISTEN", "PREPARE", "EXECUTE", "SET", "RESET")
+		"NOTIFY", "LISTEN", "UNLISTEN", "PREPARE", "EXECUTE", "SET", "RESET",
+		"SHOW", "DISCARD", "DEALLOCATE")
 
 	// Clauses
 	reg(CatClause, CapFullSupport, "clause supported on ReadEngine",
@@ -130,8 +131,9 @@ func NewDefaultCapabilityRegistry() *CapabilityRegistry {
 	// Aggregates
 	reg(CatAggregate, CapFullSupport, "aggregate supported on ReadEngine",
 		"COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL",
-		"GROUP_CONCAT", "STRING_AGG", "ARRAY_AGG", "BOOL_AND", "BOOL_OR", "EVERY",
-		"JSON_AGG", "JSONB_AGG")
+		"GROUP_CONCAT", "STRING_AGG", "BOOL_AND", "BOOL_OR", "EVERY")
+	reg(CatAggregate, CapPartialSupport, "PG-specific aggregate falls back to WriteEngine",
+		"ARRAY_AGG", "JSON_AGG", "JSONB_AGG")
 	reg(CatAggregate, CapUnsupported, "statistical/ordered-set aggregate requires WriteEngine",
 		"PERCENTILE_CONT", "PERCENTILE_DISC", "MODE", "STDDEV", "STDDEV_POP", "STDDEV_SAMP",
 		"VARIANCE", "VAR_POP", "VAR_SAMP", "CORR", "COVAR_POP", "COVAR_SAMP", "XMLAGG")
@@ -139,11 +141,12 @@ func NewDefaultCapabilityRegistry() *CapabilityRegistry {
 	// Operators
 	reg(CatOperator, CapFullSupport, "operator supported on ReadEngine",
 		"=", "!=", "<>", "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "||",
-		"AND", "OR", "NOT", "IS_NULL", "IS_NOT_NULL", "IS_DISTINCT_FROM", "IS_NOT_DISTINCT_FROM",
+		"AND", "OR", "NOT", "IS_NULL", "IS_NOT_NULL",
 		"IN", "NOT_IN", "BETWEEN", "NOT_BETWEEN", "LIKE", "NOT_LIKE", "ILIKE", "NOT_ILIKE",
-		"~", "~*", "!~", "!~*", "->", "->>", "#>", "#>>", "::")
+		"~", "~*", "!~", "!~*", "->", "->>", "::")
 	reg(CatOperator, CapPartialSupport, "PG-specific operator falls back to WriteEngine",
-		"@>", "<@", "?", "?|", "?&", "@@", "@?", "SIMILAR_TO", "ANY", "ALL", "SOME", "OVERLAPS")
+		"@>", "<@", "?", "?|", "?&", "@@", "@?", "SIMILAR_TO", "ANY", "ALL", "SOME", "OVERLAPS",
+		"IS_DISTINCT_FROM", "IS_NOT_DISTINCT_FROM", "#>", "#>>")
 
 	// Scalar Functions
 	reg(CatFunction, CapFullSupport, "scalar function supported on ReadEngine",
@@ -151,11 +154,11 @@ func NewDefaultCapabilityRegistry() *CapabilityRegistry {
 		"COALESCE", "NULLIF", "IFNULL", "IIF", "GREATEST", "LEAST",
 		// String
 		"LOWER", "UPPER", "LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH", "OCTET_LENGTH",
-		"SUBSTR", "SUBSTRING", "TRIM", "BTRIM", "LTRIM", "RTRIM", "REPLACE",
+		"SUBSTR", "SUBSTRING", "TRIM", "LTRIM", "RTRIM", "REPLACE",
 		"CONCAT", "CONCAT_WS", "LEFT", "RIGHT", "SPLIT_PART", "STRPOS", "POSITION",
 		"REPEAT", "REVERSE", "LPAD", "RPAD", "INITCAP", "INSTR", "PRINTF", "FORMAT",
-		"ASCII", "CHR", "CHAR", "UNICODE", "HEX", "UNHEX", "QUOTE", "QUOTE_IDENT", "QUOTE_LITERAL",
-		"MD5", "ENCODE", "DECODE", "REGEXP_REPLACE", "REGEXP_MATCH", "TRANSLATE",
+		"CHAR", "UNICODE", "HEX", "UNHEX", "QUOTE",
+		"MD5", "REGEXP_REPLACE", "TRANSLATE",
 		// Math
 		"ABS", "ROUND", "CEIL", "CEILING", "FLOOR", "TRUNC", "MOD", "POWER", "POW",
 		"SQRT", "EXP", "LN", "LOG", "LOG10", "SIGN", "RANDOM", "PI",
@@ -163,21 +166,24 @@ func NewDefaultCapabilityRegistry() *CapabilityRegistry {
 		// Date/Time
 		"NOW", "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME",
 		"DATE", "TIME", "DATETIME", "JULIANDAY", "UNIXEPOCH", "STRFTIME",
-		"DATE_TRUNC", "DATE_PART", "EXTRACT", "TO_CHAR", "TO_DATE", "TO_TIMESTAMP", "AGE",
+		"DATE_TRUNC", "DATE_PART", "EXTRACT", "TO_CHAR",
 		// JSON
 		"JSON", "JSON_ARRAY", "JSON_OBJECT", "JSON_EXTRACT", "JSON_TYPE", "JSON_VALID",
 		"JSON_ARRAY_LENGTH", "JSON_GROUP_ARRAY", "JSON_GROUP_OBJECT",
-		"JSONB_EXTRACT_PATH", "JSONB_EXTRACT_PATH_TEXT", "JSONB_TYPEOF", "JSON_TYPEOF",
 		// Misc / Type / Utility
 		"TYPEOF", "ZEROBLOB", "CHANGES", "TOTAL_CHANGES", "LAST_INSERT_ROWID",
-		"GEN_RANDOM_UUID", "UUID_GENERATE_V4", "VERSION", "CURRENT_SCHEMA", "CURRENT_DATABASE",
-		"CURRENT_USER", "SESSION_USER", "USER",
+		"GEN_RANDOM_UUID", "UUID_GENERATE_V4", "CURRENT_SCHEMA",
 		// Window/Aggregate names that may also appear as function calls
 		"ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE", "LAG", "LEAD",
 		"FIRST_VALUE", "LAST_VALUE", "NTH_VALUE", "PERCENT_RANK", "CUME_DIST",
 		"COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL",
-		"GROUP_CONCAT", "STRING_AGG", "ARRAY_AGG", "BOOL_AND", "BOOL_OR", "EVERY",
-		"JSON_AGG", "JSONB_AGG")
+		"GROUP_CONCAT", "STRING_AGG", "BOOL_AND", "BOOL_OR", "EVERY")
+	reg(CatFunction, CapPartialSupport, "PG-specific function falls back to WriteEngine",
+		"BTRIM", "ASCII", "CHR", "QUOTE_IDENT", "QUOTE_LITERAL", "ENCODE", "DECODE",
+		"REGEXP_MATCH", "TO_DATE", "TO_TIMESTAMP", "AGE",
+		"JSONB_EXTRACT_PATH", "JSONB_EXTRACT_PATH_TEXT", "JSONB_TYPEOF", "JSON_TYPEOF",
+		"ARRAY_AGG", "JSON_AGG", "JSONB_AGG",
+		"VERSION", "CURRENT_DATABASE", "CURRENT_USER", "SESSION_USER", "USER")
 	reg(CatFunction, CapUnsupported, "mutating or backend-stateful function requires WriteEngine",
 		"NEXTVAL", "SETVAL", "CURRVAL", "LASTVAL",
 		"PG_ADVISORY_LOCK", "PG_ADVISORY_LOCK_SHARED",

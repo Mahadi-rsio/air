@@ -1,6 +1,7 @@
 package readadapter
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -30,28 +31,28 @@ func replaceDollarParamsTokenAware(sql string) (string, int) {
 }
 
 // mapPGTypeToSQLiteCast maps a PostgreSQL type name to a SQLite cast expression
-// or helper function name.
-func mapPGTypeToSQLiteCast(pgType string) (sqliteType string, helperFn string) {
+// or helper function name. Unknown, array, or schema-qualified types return ok=false
+// so callers reject them or fall back to PostgreSQL instead of silently converting to TEXT.
+func mapPGTypeToSQLiteCast(pgType string) (sqliteType string, helperFn string, ok bool) {
 	u := strings.ToUpper(strings.TrimSpace(pgType))
 	switch u {
 	case "INT", "INT2", "INT4", "INT8", "SMALLINT", "INTEGER", "BIGINT", "TINYINT", "MEDIUMINT":
-		return "INTEGER", ""
+		return "INTEGER", "", true
 	case "REAL", "FLOAT", "FLOAT4", "FLOAT8", "DOUBLE", "DOUBLE PRECISION":
-		return "REAL", ""
+		return "REAL", "", true
 	case "TEXT", "VARCHAR", "CHAR", "BPCHAR", "CHARACTER", "CHARACTER VARYING", "NVARCHAR",
 		"UUID", "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ",
 		"TIMESTAMP WITH TIME ZONE", "TIMESTAMP WITHOUT TIME ZONE",
 		"JSON", "JSONB":
-		return "TEXT", ""
+		return "TEXT", "", true
 	case "BYTEA", "BLOB":
-		return "BLOB", ""
+		return "BLOB", "", true
 	case "BOOL", "BOOLEAN":
-		return "", "air_pg_cast_bool"
+		return "", "air_pg_cast_bool", true
 	case "NUMERIC", "DECIMAL":
-		return "", "air_pg_cast_numeric"
+		return "", "air_pg_cast_numeric", true
 	default:
-		// Unknown or complex type: preserve as TEXT cast rather than silently stripping.
-		return "TEXT", ""
+		return "", "", false
 	}
 }
 
@@ -96,6 +97,13 @@ func parsePGTypeSpec(toks []rwTok, idx int) (string, int, bool) {
 	if len(parts) == 0 {
 		return "", idx, false
 	}
+	// Handle schema-qualified types like my_schema.my_enum or pg_catalog.int4
+	if dot := nextSigTok(toks, lastConsumed+1); dot >= 0 && toks[dot].raw == "." {
+		if typTok := nextSigTok(toks, dot+1); typTok >= 0 && toks[typTok].kind == rwWord {
+			parts = []string{parts[0] + "." + toks[typTok].upper}
+			lastConsumed = typTok
+		}
+	}
 	// Skip optional precision/scale like (10, 2)
 	ns := nextSigTok(toks, lastConsumed+1)
 	if ns >= 0 && toks[ns].raw == "(" {
@@ -113,20 +121,34 @@ func parsePGTypeSpec(toks []rwTok, idx int) (string, int, bool) {
 			lastConsumed = j - 1
 		}
 	}
-	// Skip optional [] array suffix
+	// Preserve [] array suffix so array casts are not misclassified as scalar casts.
+	isArray := false
 	ns2 := nextSigTok(toks, lastConsumed+1)
 	if ns2 >= 0 && toks[ns2].raw == "[" {
 		ns3 := nextSigTok(toks, ns2+1)
 		if ns3 >= 0 && toks[ns3].raw == "]" {
 			lastConsumed = ns3
+			isArray = true
 		}
 	}
-	return strings.Join(parts, " "), lastConsumed, true
+	typeName := strings.Join(parts, " ")
+	if isArray {
+		typeName += "[]"
+	}
+	return typeName, lastConsumed, true
 }
 
 // rewritePGCasts replaces PostgreSQL `expr::type` and `CAST(expr AS pg_type)`
 // with semantic-preserving SQLite CAST or helper calls, without touching string literals.
 func rewritePGCasts(sql string) string {
+	s, err := rewritePGCastsStrict(sql)
+	if err != nil {
+		return sql
+	}
+	return s
+}
+
+func rewritePGCastsStrict(sql string) (string, error) {
 	toks := tokenizeSQLForRewrite(sql)
 	var out []rwTok
 
@@ -139,7 +161,10 @@ func rewritePGCasts(sql string) string {
 				if lhsStart, okLHS := prevPrimaryBounds(out); okLHS {
 					lhs := strings.TrimSpace(joinTokens(out[lhsStart:]))
 					out = out[:lhsStart]
-					sqliteType, helperFn := mapPGTypeToSQLiteCast(pgType)
+					sqliteType, helperFn, known := mapPGTypeToSQLiteCast(pgType)
+					if !known {
+						return "", fmt.Errorf("unsupported cast to type %q", pgType)
+					}
 					var expr string
 					if helperFn != "" {
 						expr = helperFn + "(" + lhs + ")"
@@ -175,11 +200,17 @@ func rewritePGCasts(sql string) string {
 				}
 				if rp > 0 && asIdx > lp {
 					innerExpr := strings.TrimSpace(joinTokens(toks[lp+1 : asIdx]))
-					// Recursively rewrite nested casts inside innerExpr
-					innerExpr = rewritePGCasts(innerExpr)
+					var err error
+					innerExpr, err = rewritePGCastsStrict(innerExpr)
+					if err != nil {
+						return "", err
+					}
 					typeStart := nextSigTok(toks, asIdx+1)
 					if pgType, _, ok := parsePGTypeSpec(toks, typeStart); ok {
-						sqliteType, helperFn := mapPGTypeToSQLiteCast(pgType)
+						sqliteType, helperFn, known := mapPGTypeToSQLiteCast(pgType)
+						if !known {
+							return "", fmt.Errorf("unsupported cast to type %q", pgType)
+						}
 						var expr string
 						if helperFn != "" {
 							expr = helperFn + "(" + innerExpr + ")"
@@ -197,7 +228,7 @@ func rewritePGCasts(sql string) string {
 		out = append(out, toks[i])
 	}
 
-	return joinTokens(out)
+	return joinTokens(out), nil
 }
 
 // rewritePGSpecialSyntax rewrites PostgreSQL EXTRACT(field FROM expr),

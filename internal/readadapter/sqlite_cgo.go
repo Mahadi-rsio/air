@@ -15,6 +15,9 @@ static int air_sqlite_ro_authorizer(void *user_data, int action, const char *arg
 		case SQLITE_SELECT:
 		case SQLITE_READ:
 		case SQLITE_FUNCTION:
+#ifdef SQLITE_RECURSIVE
+		case SQLITE_RECURSIVE:
+#endif
 			return SQLITE_OK;
 		case SQLITE_TRANSACTION:
 			if (arg1 != NULL && (
@@ -664,6 +667,15 @@ func (c *SQLiteConn) queryStreamInternal(
 	if streaming {
 		res.Rows = make([][]SQLiteValue, 0, batchSize)
 	}
+	defer func() {
+		if budget != nil && batchBytes > 0 {
+			budget.ReleaseBytes(batchBytes)
+			batchBytes = 0
+		}
+		if streaming {
+			res.Rows = nil
+		}
+	}()
 
 	flushBatch := func() error {
 		if !streaming {

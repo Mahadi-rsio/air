@@ -688,6 +688,15 @@ func analyzeQueryBody(ast *SQLStmtAST, toks []ASTToken) {
 			ast.Operators = append(ast.Operators, opName)
 			ast.addFeature(CatOperator, opName)
 		}
+		if w == "IS" {
+			if i+2 < len(toks) && toks[i+1].Upper == "DISTINCT" && toks[i+2].Upper == "FROM" {
+				ast.Operators = append(ast.Operators, "IS_DISTINCT_FROM")
+				ast.addFeature(CatOperator, "IS_DISTINCT_FROM")
+			} else if i+3 < len(toks) && toks[i+1].Upper == "NOT" && toks[i+2].Upper == "DISTINCT" && toks[i+3].Upper == "FROM" {
+				ast.Operators = append(ast.Operators, "IS_NOT_DISTINCT_FROM")
+				ast.addFeature(CatOperator, "IS_NOT_DISTINCT_FROM")
+			}
+		}
 		if w == "SIMILAR" && i+1 < len(toks) && toks[i+1].Upper == "TO" {
 			ast.Operators = append(ast.Operators, "SIMILAR_TO")
 			ast.addFeature(CatOperator, "SIMILAR_TO")
@@ -704,6 +713,11 @@ func analyzeQueryBody(ast *SQLStmtAST, toks []ASTToken) {
 			ast.addFeature(CatOperator, "OVERLAPS")
 		}
 
+		if w == "CURRENT_USER" || w == "SESSION_USER" || w == "CURRENT_ROLE" {
+			ast.Functions = append(ast.Functions, w)
+			ast.addFeature(CatFunction, w)
+		}
+
 		// Function calls: word followed by '(' (excluding SQL keywords and CTE column lists)
 		if tok.Kind == TokWord && i+1 < len(toks) && toks[i+1].Upper == "(" && !isNonFuncKeyword(w) && !isCTEColumnList(toks, i+1) {
 			if w == "CAST" {
@@ -714,19 +728,20 @@ func analyzeQueryBody(ast *SQLStmtAST, toks []ASTToken) {
 					ast.addFeature(CatCast, typeName)
 				}
 			} else {
-				// Handle schema-qualified function calls like pg_catalog.lower(...)
+				// Preserve schema-qualified function calls (e.g. my_schema.fn(...)) so custom
+				// or unknown schema UDFs never masquerade as built-in SQLite functions.
 				fnName := w
 				if i >= 2 && toks[i-1].Raw == "." && toks[i-2].Kind == TokWord {
 					schema := toks[i-2].Upper
+					fnName = schema + "." + w
 					if schema == "PG_CATALOG" {
-						// Standard pg_catalog.* system functions are system catalog
-						if isMutatingFunction(fnName) || isSystemCatalogToken(fnName) {
+						if isMutatingFunction(w) || isSystemCatalogToken(w) {
 							ast.HasSysCatalog = true
 						}
 					}
 				}
 				ast.Functions = append(ast.Functions, fnName)
-				if isMutatingFunction(fnName) {
+				if isMutatingFunction(w) {
 					ast.MutatingFunc = fnName
 				}
 				ast.addFeature(CatFunction, fnName)
@@ -747,6 +762,27 @@ func analyzeQueryBody(ast *SQLStmtAST, toks []ASTToken) {
 func parseCastTypeName(toks []ASTToken, start int) (string, int) {
 	if start >= len(toks) {
 		return "", 0
+	}
+	// Handle schema-qualified types like my_schema.my_enum or pg_catalog.int4
+	if start+2 < len(toks) && toks[start].Kind == TokWord && toks[start+1].Raw == "." && toks[start+2].Kind == TokWord {
+		qualified := toks[start].Upper + "." + toks[start+2].Upper
+		i := start + 3
+		if i < len(toks) && toks[i].Raw == "(" {
+			depth := 1
+			i++
+			for i < len(toks) && depth > 0 {
+				if toks[i].Raw == "(" {
+					depth++
+				} else if toks[i].Raw == ")" {
+					depth--
+				}
+				i++
+			}
+		}
+		if i+1 < len(toks) && toks[i].Raw == "[" && toks[i+1].Raw == "]" {
+			return "ARRAY", (i + 2) - start
+		}
+		return qualified, i - start
 	}
 	var parts []string
 	i := start

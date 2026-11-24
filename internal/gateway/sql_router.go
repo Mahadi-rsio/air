@@ -343,16 +343,11 @@ func classifySingleStatement(toks []sqlToken) (RouteDecision, QueryPlanHint) {
 		return RouteDecision{RouteTargetWriteEngine, RouteReasonTransactionWriteState}, QueryPlanHint{}
 	}
 
+	// Session-mutating and session-utility statements must execute on WriteEngine
+	// unless exact session semantics are implemented in ReadEngine.
 	switch head {
-	case "SHOW", "DISCARD", "DEALLOCATE":
-		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}, QueryPlanHint{}
-	case "SET", "RESET":
-		for i := 1; i < len(toks); i++ {
-			if toks[i].upper == "TRANSACTION_READ_ONLY" || toks[i].upper == "DEFAULT_TRANSACTION_READ_ONLY" {
-				return RouteDecision{RouteTargetWriteEngine, RouteReasonSessionPinned}, QueryPlanHint{}
-			}
-		}
-		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}, QueryPlanHint{}
+	case "SHOW", "DISCARD", "DEALLOCATE", "SET", "RESET":
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonSessionPinned}, QueryPlanHint{}
 	}
 
 	var hint QueryPlanHint
@@ -444,13 +439,8 @@ func classifySingleAST(ast *SQLStmtAST, reg *CapabilityRegistry) (RouteDecision,
 		return RouteDecision{RouteTargetWriteEngine, RouteReasonWriteDDL}, QueryPlanHint{}
 	case StmtTx:
 		return RouteDecision{RouteTargetWriteEngine, RouteReasonTransactionWriteState}, QueryPlanHint{}
-	case StmtShow, StmtDiscard, StmtDeallocate:
-		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}, QueryPlanHint{}
-	case StmtSet, StmtReset:
-		if ast.SetReadOnly {
-			return RouteDecision{RouteTargetWriteEngine, RouteReasonSessionPinned}, QueryPlanHint{}
-		}
-		return RouteDecision{RouteTargetReadEngine, RouteReasonReadOnlyUtility}, QueryPlanHint{}
+	case StmtShow, StmtDiscard, StmtDeallocate, StmtSet, StmtReset:
+		return RouteDecision{RouteTargetWriteEngine, RouteReasonSessionPinned}, QueryPlanHint{}
 	case StmtCopy:
 		if ast.HasModCTE {
 			return RouteDecision{RouteTargetWriteEngine, RouteReasonModifyingCTE}, QueryPlanHint{}

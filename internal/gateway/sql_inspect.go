@@ -11,12 +11,14 @@ var (
 	reListenStmt    = regexp.MustCompile(`(?i)^\s*(LISTEN|UNLISTEN)\b`)
 	reTempTableStmt = regexp.MustCompile(`(?i)^\s*CREATE\s+(TEMP|TEMPORARY)\s+TABLE\b`)
 	reAdvLockStmt   = regexp.MustCompile(`(?i)pg_advisory_lock`)
+	reRoleAuthStmt  = regexp.MustCompile(`(?i)^\s*(?:SET|RESET)\s+(?:LOCAL\s+|SESSION\s+)?(?:ROLE|SESSION\s+AUTHORIZATION)\b`)
 )
 
-// IsSessionPinningSQL returns true if sql creates session-scoped state (LISTEN, TEMP TABLE, advisory locks)
-// that requires pinning the backend connection to this client until disconnect.
+// IsSessionPinningSQL returns true if sql creates session-scoped state (LISTEN, TEMP TABLE, advisory locks,
+// or role/authorization changes) that requires pinning the backend connection to this client until disconnect.
 func IsSessionPinningSQL(sql string) bool {
 	return reListenStmt.MatchString(sql) ||
 		reTempTableStmt.MatchString(sql) ||
-		reAdvLockStmt.MatchString(sql)
+		reAdvLockStmt.MatchString(sql) ||
+		reRoleAuthStmt.MatchString(sql)
 }

@@ -1413,13 +1413,24 @@ var (
 )
 
 func translatePGToSQLite(sql string) (string, int) {
+	s, maxParam, err := translatePGToSQLiteStrict(sql)
+	if err != nil {
+		return sql, maxParam
+	}
+	return s, maxParam
+}
+
+func translatePGToSQLiteStrict(sql string) (string, int, error) {
 	s, maxParam := replaceDollarParamsTokenAware(sql)
-	s = rewritePGCasts(s)
+	s, err := rewritePGCastsStrict(s)
+	if err != nil {
+		return "", maxParam, err
+	}
 	s = rewritePGSpecialSyntax(s)
 	s = rewriteDistinctOn(s)
 	s = rewriteILikeAndRegex(s)
 	s = rewriteOrderByNulls(s)
-	return s, maxParam
+	return s, maxParam, nil
 }
 
 func (s *SQLiteReadServer) refreshNativeCatalog(ctx context.Context, ts *SQLiteTenantStore) error {
@@ -1599,6 +1610,35 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlan(ctx context.Context, ts *S
 }
 
 func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, ts *SQLiteTenantStore, sqliteSQL string, args []string, paramOIDs []uint32) (*SQLiteResult, *PlanDecision, error) {
+	return s.runReaderQueryWithPlanTyped(ctx, ts, sqliteSQL, args, paramOIDs, 0, nil, nil)
+}
+
+func (s *SQLiteReadServer) streamReaderQueryWithPlanTyped(
+	ctx context.Context,
+	ts *SQLiteTenantStore,
+	sqliteSQL string,
+	args []string,
+	paramOIDs []uint32,
+	batchSize int,
+	onMeta func([]SQLiteColumn) error,
+	onBatch func([][]SQLiteValue) error,
+) (*SQLiteResult, *PlanDecision, error) {
+	if batchSize <= 0 {
+		batchSize = 128
+	}
+	return s.runReaderQueryWithPlanTyped(ctx, ts, sqliteSQL, args, paramOIDs, batchSize, onMeta, onBatch)
+}
+
+func (s *SQLiteReadServer) runReaderQueryWithPlanTyped(
+	ctx context.Context,
+	ts *SQLiteTenantStore,
+	sqliteSQL string,
+	args []string,
+	paramOIDs []uint32,
+	batchSize int,
+	onMeta func([]SQLiteColumn) error,
+	onBatch func([][]SQLiteValue) error,
+) (*SQLiteResult, *PlanDecision, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1700,7 +1740,14 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 			if s.schemaVersions != nil {
 				schemaVer = s.schemaVersions.SchemaVersion(ts.TenantID, 0)
 			}
-			res, plan, err := slot.conn.QueryWithContextPlanTyped(ctx, snap, sqliteSQL, args, paramOIDs, schemaVer)
+			var res *SQLiteResult
+			var plan *PlanDecision
+			var err error
+			if onBatch != nil {
+				res, plan, err = slot.conn.QueryStreamWithContext(ctx, snap, sqliteSQL, args, paramOIDs, schemaVer, batchSize, onMeta, onBatch)
+			} else {
+				res, plan, err = slot.conn.QueryWithContextPlanTyped(ctx, snap, sqliteSQL, args, paramOIDs, schemaVer)
+			}
 			if err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					s.queriesCancelled.Add(1)
@@ -1716,8 +1763,12 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 			if plan != nil && plan.Selected.Strategy != "" {
 				strategy = string(plan.Selected.Strategy)
 			}
+			rowCount := len(res.Rows)
+			if onBatch != nil {
+				rowCount = int(res.RowsChanged)
+			}
 			debugf("query", "exec tenant=%s mode=native_pool gen=%s lsn=%s strategy=%s rows=%d cols=%d dur=%s sql=%q",
-				ts.TenantID, snap.Generation, formatLSNHex(snap.LSN), strategy, len(res.Rows), len(res.Columns), time.Since(start), truncateSQL(sqliteSQL, 160))
+				ts.TenantID, snap.Generation, formatLSNHex(snap.LSN), strategy, rowCount, len(res.Columns), time.Since(start), truncateSQL(sqliteSQL, 160))
 			return res, plan, nil
 		}
 
@@ -1740,7 +1791,14 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 	if s.schemaVersions != nil {
 		schemaVer = s.schemaVersions.SchemaVersion(ts.TenantID, 0)
 	}
-	res, plan, err := ts.Reader.QueryWithContextPlanTyped(ctx, snap, sqliteSQL, args, paramOIDs, schemaVer)
+	var res *SQLiteResult
+	var plan *PlanDecision
+	var err error
+	if onBatch != nil {
+		res, plan, err = ts.Reader.QueryStreamWithContext(ctx, snap, sqliteSQL, args, paramOIDs, schemaVer, batchSize, onMeta, onBatch)
+	} else {
+		res, plan, err = ts.Reader.QueryWithContextPlanTyped(ctx, snap, sqliteSQL, args, paramOIDs, schemaVer)
+	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			s.queriesCancelled.Add(1)
@@ -1752,8 +1810,12 @@ func (s *SQLiteReadServer) executeReaderQueryWithPlanTyped(ctx context.Context, 
 			ts.TenantID, err, time.Since(start), truncateSQL(sqliteSQL, 160))
 		return nil, nil, err
 	}
+	rowCount := len(res.Rows)
+	if onBatch != nil {
+		rowCount = int(res.RowsChanged)
+	}
 	debugf("query", "exec tenant=%s mode=reader rows=%d cols=%d dur=%s sql=%q",
-		ts.TenantID, len(res.Rows), len(res.Columns), time.Since(start), truncateSQL(sqliteSQL, 160))
+		ts.TenantID, rowCount, len(res.Columns), time.Since(start), truncateSQL(sqliteSQL, 160))
 	return res, plan, nil
 }
 
@@ -2099,8 +2161,22 @@ func (sess *sqliteClientSession) execSingleStatement(stmt string, args []string,
 	}
 
 	sqliteSQL, _, planHit := sess.srv.translateCachedForSession(sess, ts, s, nil)
+	if _, _, strictErr := translatePGToSQLiteStrict(s); strictErr != nil {
+		return strictErr
+	}
 	debugf("sql", "simple tenant=%s plan_cache_hit=%v pg_sql=%q sqlite_sql=%q",
 		sess.tenantID, planHit, truncateSQL(s, 140), truncateSQL(sqliteSQL, 140))
+	if sess.conn != nil {
+		if err := sess.streamQueryToClient(ts, sqliteSQL, args, nil, out); err != nil {
+			var roErr *SQLiteReadOnlyError
+			if errors.As(err, &roErr) {
+				sess.srv.writesBlocked.Add(1)
+			}
+			return err
+		}
+		sess.srv.queriesAllowed.Add(1)
+		return nil
+	}
 	res, err := sess.srv.executeReaderQuery(sess.sessionCtx(), ts, sqliteSQL, args)
 	if err != nil {
 		var roErr *SQLiteReadOnlyError
@@ -2128,7 +2204,16 @@ func (sess *sqliteClientSession) handleSetStmt(s string, out *bytes.Buffer) erro
 		if len(parts) >= 3 && strings.EqualFold(parts[1], "TO") {
 			k = strings.ToLower(parts[0])
 			v = strings.Trim(strings.Join(parts[2:], " "), "'\"")
+		} else if len(parts) >= 2 && strings.EqualFold(parts[0], "ROLE") {
+			k = "role"
+			v = strings.Trim(strings.Join(parts[1:], " "), "'\"")
+		} else if len(parts) >= 3 && strings.EqualFold(parts[0], "SESSION") && strings.EqualFold(parts[1], "AUTHORIZATION") {
+			k = "session authorization"
+			v = strings.Trim(strings.Join(parts[2:], " "), "'\"")
 		}
+	}
+	if k == "role" || k == "session authorization" || strings.HasPrefix(k, "session ") {
+		return sess.rejectWrite("SET ROLE / SESSION AUTHORIZATION is not permitted on read-only SQLite engine")
 	}
 	if k == "transaction_read_only" || k == "default_transaction_read_only" || k == "air_ro.enabled" {
 		vl := strings.ToLower(v)
@@ -2167,7 +2252,7 @@ func (sess *sqliteClientSession) handleShowStmt(s string, out *bytes.Buffer) err
 	}
 	val, ok := sess.sessionVars[k]
 	if !ok {
-		val = "on"
+		return fmt.Errorf("unrecognized configuration parameter %q", k)
 	}
 	sess.srv.queriesAllowed.Add(1)
 	writeSingleTextCellResult(out, k, val)
@@ -2179,43 +2264,97 @@ func (sess *sqliteClientSession) handleCopyToStdout(innerSQL string, out *bytes.
 	if err != nil {
 		return err
 	}
-	sq, _ := translatePGToSQLite(innerSQL)
-	res, err := sess.srv.executeReaderQuery(sess.sessionCtx(), ts, sq, nil)
+	sq, _, err := translatePGToSQLiteStrict(innerSQL)
 	if err != nil {
 		return err
 	}
-	sess.srv.queriesAllowed.Add(1)
-
-	// CopyOutResponse ('H')
-	var hbody bytes.Buffer
-	hbody.WriteByte(0) // text format
-	_ = binary.Write(&hbody, binary.BigEndian, uint16(len(res.Columns)))
-	for range res.Columns {
-		_ = binary.Write(&hbody, binary.BigEndian, uint16(0))
-	}
-	writePGMsg(out, 'H', hbody.Bytes())
-
-	// CopyData ('d') per row
-	for _, row := range res.Rows {
-		var line strings.Builder
-		for i, cell := range row {
-			if i > 0 {
-				line.WriteByte('\t')
-			}
-			if cell.IsNil {
-				line.WriteString(`\N`)
-			} else {
-				line.WriteString(cell.Text)
-			}
+	if sess.conn == nil {
+		res, err := sess.srv.executeReaderQuery(sess.sessionCtx(), ts, sq, nil)
+		if err != nil {
+			return err
 		}
-		line.WriteByte('\n')
-		writePGMsg(out, 'd', []byte(line.String()))
+		sess.srv.queriesAllowed.Add(1)
+		var hbody bytes.Buffer
+		hbody.WriteByte(0)
+		_ = binary.Write(&hbody, binary.BigEndian, uint16(len(res.Columns)))
+		for range res.Columns {
+			_ = binary.Write(&hbody, binary.BigEndian, uint16(0))
+		}
+		writePGMsg(out, 'H', hbody.Bytes())
+		for _, row := range res.Rows {
+			var line strings.Builder
+			for i, cell := range row {
+				if i > 0 {
+					line.WriteByte('\t')
+				}
+				if cell.IsNil {
+					line.WriteString(`\N`)
+				} else {
+					line.WriteString(cell.Text)
+				}
+			}
+			line.WriteByte('\n')
+			writePGMsg(out, 'd', []byte(line.String()))
+		}
+		writePGMsg(out, 'c', nil)
+		writePGCommandComplete(out, fmt.Sprintf("COPY %d", len(res.Rows)))
+		return nil
 	}
 
-	// CopyDone ('c') + CommandComplete
-	writePGMsg(out, 'c', nil)
-	writePGCommandComplete(out, fmt.Sprintf("COPY %d", len(res.Rows)))
-	return nil
+	sw := newPGStreamWriter(sess.conn, 64*1024)
+	defer sw.Close()
+	var totalRows int64
+	var lineBuf strings.Builder
+
+	_, _, err = sess.srv.streamReaderQueryWithPlanTyped(
+		sess.sessionCtx(), ts, sq, nil, nil, 128,
+		func(cols []SQLiteColumn) error {
+			sw.takePrefix(out)
+			var hbody bytes.Buffer
+			hbody.WriteByte(0) // text format
+			_ = binary.Write(&hbody, binary.BigEndian, uint16(len(cols)))
+			for range cols {
+				_ = binary.Write(&hbody, binary.BigEndian, uint16(0))
+			}
+			writePGMsg(sw.buf, 'H', hbody.Bytes())
+			return sw.flushIfNeeded(false)
+		},
+		func(rows [][]SQLiteValue) error {
+			for _, row := range rows {
+				lineBuf.Reset()
+				for i, cell := range row {
+					if i > 0 {
+						lineBuf.WriteByte('\t')
+					}
+					if cell.IsNil {
+						lineBuf.WriteString(`\N`)
+					} else {
+						lineBuf.WriteString(cell.Text)
+					}
+				}
+				lineBuf.WriteByte('\n')
+				writePGMsg(sw.buf, 'd', []byte(lineBuf.String()))
+				totalRows++
+				if ferr := sw.flushIfNeeded(false); ferr != nil {
+					return ferr
+				}
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		if sw.flushed {
+			_ = sw.Flush()
+		} else {
+			sw.DiscardUnsent()
+		}
+		return err
+	}
+	sess.srv.queriesAllowed.Add(1)
+	sw.takePrefix(out)
+	writePGMsg(sw.buf, 'c', nil)
+	writePGCommandComplete(sw.buf, fmt.Sprintf("COPY %d", totalRows))
+	return sw.Flush()
 }
 
 func (s *SQLiteReadServer) reconcileAndInvalidatePlans(tenantID, generation string, tables []DiscoveredTable) {
@@ -2410,6 +2549,12 @@ func (sess *sqliteClientSession) handleParse(body []byte) bool {
 	var pcnt int
 	var schemaVer uint64
 	var gen string
+	if _, _, strictErr := translatePGToSQLiteStrict(query); strictErr != nil {
+		var out bytes.Buffer
+		writePGErrorBuf(&out, "ERROR", "42704", strictErr.Error())
+		_, werr := sess.conn.Write(out.Bytes())
+		return werr == nil
+	}
 	searchPath := sess.sessionVars["search_path"]
 	if ts, err := sess.srv.getOrCreateTenant(sess.tenantID); err == nil {
 		sq, pcnt, _ = sess.srv.translateCachedForSession(sess, ts, query, oids)
@@ -2719,7 +2864,7 @@ func (sess *sqliteClientSession) handleExecute(body []byte) bool {
 			!strings.Contains(upper, "SQLITE_VERSION()") {
 			debugf("sql", "extended_exec tenant=%s portal=%q stmt=%q args=%d sqlite_sql=%q",
 				sess.tenantID, portalName, portal.Stmt.Name, len(portal.Args), truncateSQL(portal.Stmt.SQLiteSQL, 140))
-			res, _, execErr := sess.srv.executeReaderQueryWithPlanTyped(sess.sessionCtx(), ts, portal.Stmt.SQLiteSQL, portal.Args, portal.Stmt.ParamOIDs)
+			execErr := sess.streamQueryToClient(ts, portal.Stmt.SQLiteSQL, portal.Args, portal.Stmt.ParamOIDs, &out)
 			if execErr != nil {
 				var roErr *SQLiteReadOnlyError
 				sqlState := "42000"
@@ -2731,18 +2876,11 @@ func (sess *sqliteClientSession) handleExecute(body []byte) bool {
 				if sess.txStatus == 'T' {
 					sess.txStatus = 'E'
 				}
-			} else {
-				sess.srv.queriesAllowed.Add(1)
-				if len(res.Rows) > 64 {
-					if serr := writeResultSetStream(sess.conn, &out, res.Columns, res.Rows, 64*1024); serr != nil {
-						return false
-					}
-					return true
-				}
-				writeResultSet(&out, res.Columns, res.Rows)
+				_, werr := sess.conn.Write(out.Bytes())
+				return werr == nil
 			}
-			_, werr := sess.conn.Write(out.Bytes())
-			return werr == nil
+			sess.srv.queriesAllowed.Add(1)
+			return true
 		}
 	}
 
@@ -2999,6 +3137,107 @@ func writeResultSetStream(w io.Writer, prefix *bytes.Buffer, cols []SQLiteColumn
 	}
 	writePGCommandComplete(buf, fmt.Sprintf("SELECT %d", len(rows)))
 	return flushIfNeeded(true)
+}
+
+type pgStreamWriter struct {
+	w              io.Writer
+	buf            *bytes.Buffer
+	flushThreshold int
+	flushed        bool
+	prefixTaken    bool
+}
+
+func newPGStreamWriter(w io.Writer, flushThreshold int) *pgStreamWriter {
+	if flushThreshold <= 0 {
+		flushThreshold = 64 * 1024
+	}
+	buf := pgRowBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	return &pgStreamWriter{
+		w:              w,
+		buf:            buf,
+		flushThreshold: flushThreshold,
+	}
+}
+
+func (sw *pgStreamWriter) Close() {
+	if sw.buf != nil && sw.buf.Cap() <= 128*1024 {
+		sw.buf.Reset()
+		pgRowBufPool.Put(sw.buf)
+	}
+	sw.buf = nil
+}
+
+func (sw *pgStreamWriter) takePrefix(prefix *bytes.Buffer) {
+	if sw.prefixTaken || prefix == nil || prefix.Len() == 0 {
+		return
+	}
+	sw.prefixTaken = true
+	sw.buf.Write(prefix.Bytes())
+	prefix.Reset()
+}
+
+func (sw *pgStreamWriter) flushIfNeeded(force bool) error {
+	if sw.buf.Len() == 0 {
+		return nil
+	}
+	if force || sw.buf.Len() >= sw.flushThreshold {
+		if _, err := sw.w.Write(sw.buf.Bytes()); err != nil {
+			return err
+		}
+		sw.flushed = true
+		sw.buf.Reset()
+	}
+	return nil
+}
+
+func (sw *pgStreamWriter) Flush() error {
+	return sw.flushIfNeeded(true)
+}
+
+func (sw *pgStreamWriter) DiscardUnsent() {
+	if sw.buf != nil {
+		sw.buf.Reset()
+	}
+}
+
+func (sess *sqliteClientSession) streamQueryToClient(ts *SQLiteTenantStore, sqliteSQL string, args []string, paramOIDs []uint32, prefix *bytes.Buffer) error {
+	sw := newPGStreamWriter(sess.conn, 64*1024)
+	defer sw.Close()
+
+	var totalRows int64
+	_, _, err := sess.srv.streamReaderQueryWithPlanTyped(
+		sess.sessionCtx(), ts, sqliteSQL, args, paramOIDs, 128,
+		func(cols []SQLiteColumn) error {
+			sw.takePrefix(prefix)
+			if len(cols) > 0 {
+				writePGRowDescription(sw.buf, cols)
+				return sw.flushIfNeeded(false)
+			}
+			return nil
+		},
+		func(rows [][]SQLiteValue) error {
+			for _, r := range rows {
+				writePGDataRow(sw.buf, r)
+				totalRows++
+				if ferr := sw.flushIfNeeded(false); ferr != nil {
+					return ferr
+				}
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		if sw.flushed {
+			_ = sw.Flush()
+		} else {
+			sw.DiscardUnsent()
+		}
+		return err
+	}
+	sw.takePrefix(prefix)
+	writePGCommandComplete(sw.buf, fmt.Sprintf("SELECT %d", totalRows))
+	return sw.Flush()
 }
 
 func writeSingleTextCellResult(buf *bytes.Buffer, colName, val string) {
