@@ -1277,6 +1277,9 @@ func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drai
 			cp.finishOffloadOpFailed(ctx, opID, uploaded, 1, 0, eErr.Error())
 			return fmt.Errorf("evict local pgdata for %s after R2 sync: %w", tenantID, eErr)
 		}
+		if ps != nil {
+			_ = ps.EvictTenantCache(ctx, tenantID, gen)
+		}
 	}
 
 	_, err := cp.db.Exec(ctx,

@@ -290,3 +290,33 @@ func TestBootstrapFromPGData(t *testing.T) {
 		t.Fatalf("GetPageAtLSN blk 1 got err=%v", err)
 	}
 }
+
+func TestDiskCacheEvictPrefix(t *testing.T) {
+	dc, err := NewDiskCache(t.TempDir(), 64*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDiskCache: %v", err)
+	}
+	if err := dc.Put("tenants/t_a/gen1/layers/l0_1.layer", []byte("aaaa")); err != nil {
+		t.Fatal(err)
+	}
+	if err := dc.Put("tenants/t_a/gen1/layers/l0_2.layer#chunk:0", []byte("bbbb")); err != nil {
+		t.Fatal(err)
+	}
+	if err := dc.Put("tenants/t_b/gen1/layers/l0_1.layer", []byte("cccc")); err != nil {
+		t.Fatal(err)
+	}
+
+	removed := dc.EvictPrefix("tenants/t_a/gen1/")
+	if removed != 2 {
+		t.Fatalf("EvictPrefix removed=%d, want 2", removed)
+	}
+	if _, ok := dc.GetRange("tenants/t_a/gen1/layers/l0_1.layer", 0, 4); ok {
+		t.Fatalf("expected t_a layer to be evicted")
+	}
+	if _, ok := dc.GetRange("tenants/t_a/gen1/layers/l0_2.layer#chunk:0", 0, 4); ok {
+		t.Fatalf("expected t_a chunk to be evicted")
+	}
+	if got, ok := dc.GetRange("tenants/t_b/gen1/layers/l0_1.layer", 0, 4); !ok || string(got) != "cccc" {
+		t.Fatalf("expected t_b layer to remain, got=%q ok=%v", string(got), ok)
+	}
+}

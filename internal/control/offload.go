@@ -482,10 +482,16 @@ func (cp *ControlPlane) processColdOffloadJob(ctx context.Context, job coldOfflo
 	}
 
 	if !cp.agent.HasLocalPGData(job.tenantID) {
+		if ps != nil {
+			_ = ps.EvictTenantCache(offloadCtx, job.tenantID, curGen)
+		}
 		return false, uploaded, failed, false, nil
 	}
 	if eErr := cp.agent.EvictTenantLocalData(job.tenantID); eErr != nil {
 		return false, uploaded, failed, false, fmt.Errorf("evict local pgdata: %w", eErr)
+	}
+	if ps != nil {
+		_ = ps.EvictTenantCache(offloadCtx, job.tenantID, curGen)
 	}
 	return true, uploaded, failed, false, nil
 }

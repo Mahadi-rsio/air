@@ -78,7 +78,7 @@ func loadConfig(args []string) Config {
 		GRPCAddr:          envOr("AIR_PAGESERVER_GRPC_ADDR", "0.0.0.0:9091"),
 		HTTPAddr:          envOr("AIR_PAGESERVER_HTTP_ADDR", "0.0.0.0:8083"),
 		SocketPath:        envOr("AIR_PAGESERVER_SOCKET", ""),
-		CacheMB:           envIntOr("AIR_PAGESERVER_CACHE_MB", 256),
+		CacheMB:           envIntOr("AIR_PAGESERVER_CACHE_MB", 64),
 		MemoryLimitMB:     envIntOr("AIR_PAGESERVER_MEMORY_MB", 0),
 		WalRedoBin:        envOr("AIR_WALREDO_BIN", ""),
 		InternalToken:     envOr("AIR_INTERNAL_TOKEN", ""),

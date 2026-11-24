@@ -68,7 +68,7 @@ func Default(dataDir string) Config {
 		PoolMaxBackends:    16,
 		R2Region:           "auto",
 		PageserverSocket:   filepath.Join(dataDir, "pageserver.sock"),
-		PageserverCacheMB:  256,
+		PageserverCacheMB:  64,
 	}
 }
 
@@ -116,6 +116,8 @@ func Load(args []string) (Config, error) {
 	}
 	if v := strings.TrimSpace(os.Getenv("AIR_EVICT_ON_SUSPEND")); v != "" {
 		cfg.EvictOnSuspend = v == "1" || strings.EqualFold(v, "true")
+	} else if cfg.R2Primary {
+		cfg.EvictOnSuspend = true
 	}
 	if v := strings.TrimSpace(os.Getenv("AIR_POOL_MODE")); v != "" {
 		cfg.PoolMode = v == "1" || strings.EqualFold(v, "true")

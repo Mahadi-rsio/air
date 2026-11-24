@@ -28,6 +28,7 @@ type PageserverClient interface {
 	EnsureTenant(ctx context.Context, tenantID string, epoch int64, generation string, loadFromR2 bool, wrappedDEK string) (uint64, error)
 	FlushTenant(ctx context.Context, tenantID string) (*pageserver.LayerMeta, error)
 	FlushAll(ctx context.Context) error
+	EvictTenantCache(ctx context.Context, tenantID, generation string) error
 	PurgeTenant(ctx context.Context, tenantID, generation string) error
 	BootstrapTenantFromPGData(ctx context.Context, tenantID string, epoch int64, pgDataDir string, initLSN uint64) (*pageserver.LayerMeta, error)
 	HasMetadataSkeleton(ctx context.Context, tenantID string) bool
@@ -68,6 +69,10 @@ func (c *LocalPageserverClient) FlushTenant(ctx context.Context, tenantID string
 
 func (c *LocalPageserverClient) FlushAll(ctx context.Context) error {
 	return c.ps.FlushAll(ctx)
+}
+
+func (c *LocalPageserverClient) EvictTenantCache(ctx context.Context, tenantID, generation string) error {
+	return c.ps.EvictTenantCache(ctx, tenantID, generation)
 }
 
 func (c *LocalPageserverClient) PurgeTenant(ctx context.Context, tenantID, generation string) error {
@@ -289,6 +294,10 @@ func (c *GRPCPageserverClient) FlushAll(ctx context.Context) error {
 	defer cancel()
 	_, err := c.client.FlushAll(rctx, &pb.PageserverEmpty{})
 	return mapRemotePSErr(err)
+}
+
+func (c *GRPCPageserverClient) EvictTenantCache(_ context.Context, _, _ string) error {
+	return nil
 }
 
 func (c *GRPCPageserverClient) PurgeTenant(ctx context.Context, tenantID, generation string) error {

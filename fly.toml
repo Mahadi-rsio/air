@@ -21,6 +21,7 @@ primary_region = "iad"
   AIR_R2_PRIMARY = "true"
   AIR_EVICT_ON_SUSPEND = "true"
   AIR_PAGESERVER_ENABLED = "true"
+  AIR_PAGESERVER_CACHE_MB = "64"
 
 [mounts]
   source = "air_data"

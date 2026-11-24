@@ -32,6 +32,7 @@ type DiskCache struct {
 
 type cacheItem struct {
 	key           string
+	rawKey        string
 	filePath      string
 	size          int64
 	activeReads   int
@@ -42,7 +43,7 @@ type cacheItem struct {
 // existing *.layer cache files from a previous run while cleaning up stale *.tmp files.
 func NewDiskCache(dir string, maxBytes int64) (*DiskCache, error) {
 	if maxBytes <= 0 {
-		maxBytes = 256 * 1024 * 1024
+		maxBytes = 64 * 1024 * 1024
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -183,7 +184,7 @@ func (c *DiskCache) Put(key string, data []byte) error {
 			}
 		}
 	}
-	item := &cacheItem{key: hashKey, filePath: p, size: int64(len(data))}
+	item := &cacheItem{key: hashKey, rawKey: key, filePath: p, size: int64(len(data))}
 	elem := c.lru.PushFront(item)
 	c.entries[hashKey] = elem
 	c.curBytes += item.size
@@ -294,7 +295,7 @@ func (c *DiskCache) EvictPrefix(prefix string) int {
 	c.mu.Lock()
 	for hashKey, elem := range c.entries {
 		item := elem.Value.(*cacheItem)
-		if strings.HasPrefix(item.key, prefix) {
+		if strings.HasPrefix(item.rawKey, prefix) {
 			c.lru.Remove(elem)
 			delete(c.entries, hashKey)
 			c.curBytes -= item.size

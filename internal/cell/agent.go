@@ -391,10 +391,10 @@ func (a *Agent) HasLocalPGData(tenantID string) bool {
 	return err == nil
 }
 
-// EvictTenantLocalData removes local pgdata, WAL spool, and local backup staging files for a suspended tenant
-// after its durable state has been synced to R2.
+// EvictTenantLocalData removes local pgdata, LFC cache, WAL spool, and local backup staging files
+// for a suspended tenant after its durable state has been synced to R2.
 func (a *Agent) EvictTenantLocalData(tenantID string) error {
-	for _, prefix := range []string{"tenants/active", "spool/wal", "backups"} {
+	for _, prefix := range []string{"tenants/active", "lfc", "spool/wal", "backups"} {
 		dir, err := tenant.SafeSubpath(a.volDir, prefix, tenantID)
 		if err != nil {
 			return err

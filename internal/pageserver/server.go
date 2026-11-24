@@ -58,7 +58,7 @@ func New(cfg Config) (*Pageserver, error) {
 		cfg.SocketPath = "/var/lib/air/pageserver.sock"
 	}
 	if cfg.CacheMaxBytes <= 0 {
-		cfg.CacheMaxBytes = 256 * 1024 * 1024
+		cfg.CacheMaxBytes = 64 * 1024 * 1024
 	}
 	var cache *DiskCache
 	// Only enable DiskCache when LayerDir is empty or S3/R2 is configured; when local LayerDir
@@ -426,6 +426,54 @@ func (p *Pageserver) PurgeTenant(ctx context.Context, tenantID, generation strin
 		}
 	}
 	debugf("tenant", "PurgeTenant done tenant=%s gen=%q cur_gen=%q deleted_r2=%d dur=%s", tenantID, generation, curGen, deletedR2, time.Since(start))
+	return nil
+}
+
+// EvictTenantCache evicts all local disk and in-memory cached data for tenantID (and generation)
+// when a tenant is suspended. When R2 is configured as durable storage and the tenant's in-memory
+// deltas are already flushed, local layer/skeleton files in LayerDir and the in-memory Timeline
+// are also removed so suspended tenants consume zero local volume storage.
+func (p *Pageserver) EvictTenantCache(ctx context.Context, tenantID, generation string) error {
+	if tenantID == "" {
+		return nil
+	}
+	if generation == "" {
+		generation = p.GetTenantGeneration(tenantID)
+	}
+	if p.store != nil {
+		if p.store.decodedChunks != nil {
+			p.store.decodedChunks.InvalidateTenantGeneration(tenantID, generation)
+		}
+		prefix := TenantR2Prefix(tenantID, generation) + "/"
+		if p.store.idxCache != nil {
+			p.store.idxCache.evictPrefix(prefix)
+		}
+		if p.cache != nil {
+			p.cache.EvictPrefix(prefix)
+		}
+	}
+
+	if p.store != nil && p.store.s3c != nil && p.store.bucket != "" {
+		p.mu.Lock()
+		if tl, ok := p.tenants[tenantID]; ok && (generation == "" || tl.Generation() == generation) {
+			if tl.InMemBytes() == 0 {
+				if p.budget != nil {
+					p.budget.addInMemBytes(-tl.InMemBytes())
+				}
+				delete(p.tenants, tenantID)
+			}
+		}
+		p.mu.Unlock()
+
+		if p.cfg.LayerDir != "" {
+			if generation != "" {
+				_ = os.RemoveAll(filepath.Join(p.cfg.LayerDir, tenantID, generation))
+			} else {
+				_ = os.RemoveAll(filepath.Join(p.cfg.LayerDir, tenantID))
+			}
+		}
+	}
+	debugf("tenant", "EvictTenantCache done tenant=%s gen=%q", tenantID, generation)
 	return nil
 }
 

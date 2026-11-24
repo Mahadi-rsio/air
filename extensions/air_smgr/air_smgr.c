@@ -24,7 +24,7 @@ static bool air_smgr_read_only = false;
 static char *air_pageserver_socket = NULL;
 static char *air_tenant_id = NULL;
 static char *air_lfc_dir = NULL;
-static int	air_lfc_max_mb = 256;
+static int	air_lfc_max_mb = 64;
 
 static int	air_smgr_id = -1;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
