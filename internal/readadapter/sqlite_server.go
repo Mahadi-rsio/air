@@ -1406,26 +1406,19 @@ func (sess *sqliteClientSession) handleSimpleQuery(rawSQL string) bool {
 }
 
 var (
-	reDollarParam = regexp.MustCompile(`\$(\d+)`)
-	reTypeCast    = regexp.MustCompile(`::[a-zA-Z_][a-zA-Z0-9_]*(\[\])?`)
-	rePrepareSQL  = regexp.MustCompile(`(?is)^PREPARE\s+([a-zA-Z0-9_]+)\s*(?:\([^)]*\))?\s+AS\s+(.+)$`)
-	reExecuteSQL  = regexp.MustCompile(`(?is)^EXECUTE\s+([a-zA-Z0-9_]+)\s*(?:\((.*)\))?$`)
-	reDeallocSQL  = regexp.MustCompile(`(?is)^DEALLOCATE\s+(?:PREPARE\s+)?([a-zA-Z0-9_]+)$`)
-	reCopyToSQL   = regexp.MustCompile(`(?is)^COPY\s+\((.+)\)\s+TO\s+STDOUT.*$`)
+	rePrepareSQL = regexp.MustCompile(`(?is)^PREPARE\s+([a-zA-Z0-9_]+)\s*(?:\([^)]*\))?\s+AS\s+(.+)$`)
+	reExecuteSQL = regexp.MustCompile(`(?is)^EXECUTE\s+([a-zA-Z0-9_]+)\s*(?:\((.*)\))?$`)
+	reDeallocSQL = regexp.MustCompile(`(?is)^DEALLOCATE\s+(?:PREPARE\s+)?([a-zA-Z0-9_]+)$`)
+	reCopyToSQL  = regexp.MustCompile(`(?is)^COPY\s+\((.+)\)\s+TO\s+STDOUT.*$`)
 )
 
 func translatePGToSQLite(sql string) (string, int) {
-	maxParam := 0
-	s := reDollarParam.ReplaceAllStringFunc(sql, func(m string) string {
-		n, _ := strconv.Atoi(m[1:])
-		if n > maxParam {
-			maxParam = n
-		}
-		return "?" + m[1:]
-	})
-	s = reTypeCast.ReplaceAllString(s, "")
+	s, maxParam := replaceDollarParamsTokenAware(sql)
+	s = rewritePGCasts(s)
+	s = rewritePGSpecialSyntax(s)
 	s = rewriteDistinctOn(s)
 	s = rewriteILikeAndRegex(s)
+	s = rewriteOrderByNulls(s)
 	return s, maxParam
 }
 

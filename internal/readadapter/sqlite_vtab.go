@@ -579,12 +579,20 @@ func goAirPGBestIndexCost(
 	}
 
 	neededCols := len(spec.AllCols)
+	var neededAllCols []int
 	if len(parts) >= 1 && parts[0] != "" {
 		if colUsed, err := strconv.ParseUint(parts[0], 16, 64); err == nil {
 			if (colUsed >> 63) == 0 {
 				cnt := bits.OnesCount64(colUsed)
 				if cnt > 0 && cnt < neededCols {
 					neededCols = cnt
+				}
+				if colUsed != 0 {
+					for bit := 0; bit < len(spec.AllCols) && bit < 63; bit++ {
+						if (colUsed & (1 << uint(bit))) != 0 {
+							neededAllCols = append(neededAllCols, bit)
+						}
+					}
 				}
 			}
 		}
@@ -644,13 +652,14 @@ func goAirPGBestIndexCost(
 	if opt == nil {
 		opt = NewQueryOptimizer(DefaultCostModelConfig(), nil, spec.Adaptive, nil)
 	}
-	dec := opt.ChooseBestPlan(
+	dec := opt.ChooseBestPlanWithNeededCols(
 		spec.Table,
 		spec.IndexPlans,
 		spec.AllCols,
 		constraints,
 		orderBy,
 		neededCols,
+		neededAllCols,
 		0,
 		spec.TenantID,
 		spec.Generation,

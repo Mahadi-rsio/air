@@ -77,11 +77,10 @@ func (c *SQLiteConn) registerPGFuncs() error {
 	if c.db == nil {
 		return fmt.Errorf("sqlite db is closed")
 	}
-	rc := C.air_register_pg_funcs(c.db)
-	if rc != C.SQLITE_OK {
+	if rc := C.air_register_pg_funcs(c.db); rc != C.SQLITE_OK {
 		return fmt.Errorf("sqlite3_create_function_v2 pg_funcs failed: rc=%d %s", int(rc), C.GoString(C.sqlite3_errmsg(c.db)))
 	}
-	return nil
+	return c.registerPGFuncsExt()
 }
 
 func sqliteValToString(v *C.sqlite3_value) (string, bool) {

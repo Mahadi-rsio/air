@@ -69,6 +69,7 @@ type PlanCandidate struct {
 	EstimatedRows     int64
 	EstimatedPages    float64
 	OrderByConsumed   bool
+	IsCovering        bool
 	ExpectedCacheTier string
 	ParallelWorkers   int
 	Rejected          bool
@@ -250,6 +251,26 @@ func (o *QueryOptimizer) ChooseBestPlan(
 	nblocksHint uint32,
 	tenantID, generation string,
 ) PlanDecision {
+	return o.ChooseBestPlanWithNeededCols(
+		tbl, indexPlans, allCols, constraints, orderBy,
+		neededCols, nil, nblocksHint, tenantID, generation,
+	)
+}
+
+// ChooseBestPlanWithNeededCols evaluates scan candidates and selects the
+// lowest-cost plan, using neededAllCols (when non-empty) to detect covering
+// index scans that avoid heap page fetches.
+func (o *QueryOptimizer) ChooseBestPlanWithNeededCols(
+	tbl DiscoveredTable,
+	indexPlans []btreeIndexPlan,
+	allCols []ColumnType,
+	constraints []FilterConstraint,
+	orderBy []OrderBySpec,
+	neededCols int,
+	neededAllCols []int,
+	nblocksHint uint32,
+	tenantID, generation string,
+) PlanDecision {
 	planStart := time.Now()
 	totalCols := len(allCols)
 	if neededCols <= 0 || neededCols > totalCols {
@@ -339,7 +360,7 @@ func (o *QueryOptimizer) ChooseBestPlan(
 	for i, plan := range indexPlans {
 		cand := o.evaluateIndexCandidate(
 			i, plan, tbl, tstats, constraints, orderBy,
-			neededCols, baseRows, seqPages, pageCost, selFactor, tierLabel,
+			neededCols, neededAllCols, baseRows, seqPages, pageCost, selFactor, tierLabel,
 		)
 		candidates = append(candidates, cand)
 		if !cand.Rejected && cand.EstimatedCost < best.EstimatedCost {
@@ -379,6 +400,7 @@ func (o *QueryOptimizer) evaluateIndexCandidate(
 	constraints []FilterConstraint,
 	orderBy []OrderBySpec,
 	neededCols int,
+	neededAllCols []int,
 	baseRows float64,
 	seqPages float64,
 	pageCost float64,
@@ -480,7 +502,7 @@ func (o *QueryOptimizer) evaluateIndexCandidate(
 		}
 	}
 
-	if !hasLeadingEQ && !hasLeadingRange {
+	if !hasLeadingEQ && !hasLeadingRange && !orderConsumed {
 		cand.Rejected = true
 		cand.RejectReason = "no usable predicate on leading index column"
 		return cand
@@ -501,12 +523,17 @@ func (o *QueryOptimizer) evaluateIndexCandidate(
 	}
 	leafPages := math.Max(1.0, matchedRows/120.0)
 	// Heap pages fetched (capped at total table pages using Mackert-Lohman approximation).
-	heapPages := seqPages
-	if matchedRows < seqPages {
-		heapPages = matchedRows
-	}
-	if heapPages < 1.0 {
-		heapPages = 1.0
+	// Covering index scans satisfy all needed columns from the index and skip heap fetches.
+	covering := isCoveringIndex(plan, neededAllCols, constraints)
+	heapPages := 0.0
+	if !covering {
+		heapPages = seqPages
+		if matchedRows < seqPages {
+			heapPages = matchedRows
+		}
+		if heapPages < 1.0 {
+			heapPages = 1.0
+		}
 	}
 	// Metapage and upper internal pages are hot shared pages (modeled at L1 cost);
 	// leaf and heap page fetches use the full cache-weighted random page cost.
@@ -529,7 +556,33 @@ func (o *QueryOptimizer) evaluateIndexCandidate(
 	cand.EstimatedRows = int64(math.Ceil(matchedRows))
 	cand.EstimatedPages = totalIndexPages
 	cand.OrderByConsumed = orderConsumed
+	cand.IsCovering = covering
 	return cand
+}
+
+func isCoveringIndex(plan btreeIndexPlan, neededAllCols []int, constraints []FilterConstraint) bool {
+	if len(neededAllCols) == 0 || len(plan.KeyAllCols) == 0 {
+		return false
+	}
+	inKey := func(col int) bool {
+		for _, k := range plan.KeyAllCols {
+			if k == col {
+				return true
+			}
+		}
+		return false
+	}
+	for _, col := range neededAllCols {
+		if !inKey(col) {
+			return false
+		}
+	}
+	for _, c := range constraints {
+		if !inKey(c.AllColIdx) {
+			return false
+		}
+	}
+	return true
 }
 
 func clampRows(r float64) float64 {

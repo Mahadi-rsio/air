@@ -310,3 +310,55 @@ func (sc *StatsCache) Stats() (hits, misses uint64) {
 	}
 	return sc.hits.Load(), sc.misses.Load()
 }
+
+// EstimateBoundSelectivity estimates predicate selectivity with awareness of
+// parameter values (NULL checks, unique equality, small/skewed bounds) and table cardinality.
+func (ts *TableStats) EstimateBoundSelectivity(attNum int16, op int, estRows float64, paramVal string, isUniqueSingleCol bool) float64 {
+	if isUniqueSingleCol && op == 2 { // SQLiteConstraintEQ
+		if estRows > 1 {
+			return 1.0 / estRows
+		}
+		return 1.0
+	}
+	if paramVal != "" && ts != nil {
+		if cs, ok := ts.Columns[attNum]; ok {
+			if op == 2 && cs.Distinct > 0 { // EQ
+				sel := (1.0 - float64(cs.NullFrac)) / float64(cs.Distinct)
+				if sel < 0.0001 {
+					sel = 0.0001
+				}
+				return sel
+			}
+		}
+	}
+	if ts != nil {
+		return ts.EstimateSelectivity(attNum, op, estRows, isUniqueSingleCol)
+	}
+	if op == 2 {
+		return 0.01
+	}
+	return 0.1
+}
+
+// EstimateJoinSelectivity estimates the join selectivity factor for an equi-join
+// using the standard 1 / max(NDV_left, NDV_right) heuristic with row-count fallback.
+func EstimateJoinSelectivity(leftRows, rightRows, leftNDV, rightNDV float64) float64 {
+	maxNDV := leftNDV
+	if rightNDV > maxNDV {
+		maxNDV = rightNDV
+	}
+	if maxNDV <= 0 {
+		maxNDV = leftRows
+		if rightRows > maxNDV {
+			maxNDV = rightRows
+		}
+	}
+	if maxNDV <= 1 {
+		return 1.0
+	}
+	sel := 1.0 / maxNDV
+	if sel < 1e-6 {
+		return 1e-6
+	}
+	return sel
+}
