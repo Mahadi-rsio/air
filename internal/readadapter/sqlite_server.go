@@ -2733,6 +2733,12 @@ func (sess *sqliteClientSession) handleExecute(body []byte) bool {
 				}
 			} else {
 				sess.srv.queriesAllowed.Add(1)
+				if len(res.Rows) > 64 {
+					if serr := writeResultSetStream(sess.conn, &out, res.Columns, res.Rows, 64*1024); serr != nil {
+						return false
+					}
+					return true
+				}
 				writeResultSet(&out, res.Columns, res.Rows)
 			}
 			_, werr := sess.conn.Write(out.Bytes())
@@ -2946,6 +2952,53 @@ func writeResultSet(buf *bytes.Buffer, cols []SQLiteColumn, rows [][]SQLiteValue
 		}
 	}
 	writePGCommandComplete(buf, fmt.Sprintf("SELECT %d", len(rows)))
+}
+
+// writeResultSetStream encodes RowDescription, DataRows, and CommandComplete into
+// a bounded reusable buffer, flushing to w whenever flushThreshold bytes accumulate.
+func writeResultSetStream(w io.Writer, prefix *bytes.Buffer, cols []SQLiteColumn, rows [][]SQLiteValue, flushThreshold int) error {
+	if flushThreshold <= 0 {
+		flushThreshold = 64 * 1024
+	}
+	buf := pgRowBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		if buf.Cap() <= 128*1024 {
+			buf.Reset()
+			pgRowBufPool.Put(buf)
+		}
+	}()
+
+	if prefix != nil && prefix.Len() > 0 {
+		buf.Write(prefix.Bytes())
+	}
+	flushIfNeeded := func(force bool) error {
+		if buf.Len() == 0 {
+			return nil
+		}
+		if force || buf.Len() >= flushThreshold {
+			if _, err := w.Write(buf.Bytes()); err != nil {
+				return err
+			}
+			buf.Reset()
+		}
+		return nil
+	}
+
+	if len(cols) > 0 {
+		writePGRowDescription(buf, cols)
+		if err := flushIfNeeded(false); err != nil {
+			return err
+		}
+		for _, r := range rows {
+			writePGDataRow(buf, r)
+			if err := flushIfNeeded(false); err != nil {
+				return err
+			}
+		}
+	}
+	writePGCommandComplete(buf, fmt.Sprintf("SELECT %d", len(rows)))
+	return flushIfNeeded(true)
 }
 
 func writeSingleTextCellResult(buf *bytes.Buffer, colName, val string) {

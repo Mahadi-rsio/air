@@ -1325,45 +1325,24 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 
 		if terminatorType == 'S' {
 			if isReadBackend && !isSusp {
-				var outBuf []byte
-				var rstats relayStats
-				var txStatus byte = 'I'
-				var hadErr bool
-				for {
-					t, b, rerr := ReadPGPacket(targetB.Conn)
-					if rerr != nil {
-						rollbackParses()
-						return 0
-					}
-					msg := BuildPGMessage(t, b)
-					rstats.bytesOut += uint64(len(msg))
-					switch t {
-					case 'E':
-						hadErr = true
-					case 'D':
-						rstats.rowsReturned++
-						rstats.dataRowBytes += uint64(len(b))
-					case 'Z':
-						if len(b) > 0 {
-							txStatus = b[0]
-						}
-					}
-					if !hadErr {
-						outBuf = append(outBuf, msg...)
-					}
-					if t == 'Z' {
-						break
-					}
+				const readFallbackBufferCap = 1 << 20 // 1 MiB bounded pre-stream fallback buffer
+				rstats, txStatus, hadErr, streamStarted, clientOK := relayReadBackendBatch(targetB.Conn, st.client, readFallbackBufferCap)
+				if !clientOK {
+					rollbackParses()
+					return -1
 				}
-				if hadErr {
+				if hadErr && !streamStarted {
+					// Zero bytes sent to client -> safe to fall back to PostgreSQL.
 					rollbackParses()
 					return 0
 				}
-				if _, werr := st.client.Write(outBuf); werr != nil {
-					return -1
+				if hadErr {
+					// Partial rows were already streamed; error was forwarded to client.
+					// Never retry on PostgreSQL after streaming has started.
+					rollbackParses()
 				}
 				st.txStatus = txStatus
-				p.recordQueryMetrics(st, qStart, waitUs, bytesIn, rstats, false, execCount, batchQueryType)
+				p.recordQueryMetrics(st, qStart, waitUs, bytesIn, rstats, hadErr, execCount, batchQueryType)
 				return 1
 			}
 			rstats, txStatus, hadErr, ok := relayUntilReady(targetB, st.client)
@@ -2339,4 +2318,81 @@ func (pm *PoolManager) CloseAll() {
 	for _, p := range list {
 		p.Close()
 	}
+}
+
+// relayReadBackendBatch relays a read-engine Extended Query response to clientConn.
+// Before fallbackCap bytes are buffered, an ErrorResponse ('E') triggers no client
+// writes (streamStarted == false), allowing safe PostgreSQL fallback. Once the
+// buffered response reaches fallbackCap, it flushes incrementally to clientConn
+// (streamStarted == true) and never falls back to PostgreSQL even on mid-stream 'E'.
+func relayReadBackendBatch(readConn, clientConn net.Conn, fallbackCap int) (rstats relayStats, txStatus byte, hadErr, streamStarted, clientOK bool) {
+	const flushChunkBytes = 64 * 1024
+	if fallbackCap <= 0 {
+		fallbackCap = 1 << 20
+	}
+	txStatus = 'I'
+	clientOK = true
+	outBuf := make([]byte, 0, 4096)
+
+	flushOut := func() bool {
+		if len(outBuf) == 0 {
+			return true
+		}
+		if _, werr := clientConn.Write(outBuf); werr != nil {
+			clientOK = false
+			return false
+		}
+		outBuf = outBuf[:0]
+		streamStarted = true
+		return true
+	}
+
+	for {
+		t, b, rerr := ReadPGPacket(readConn)
+		if rerr != nil {
+			hadErr = true
+			return
+		}
+		msg := BuildPGMessage(t, b)
+		rstats.bytesOut += uint64(len(msg))
+		switch t {
+		case 'E':
+			hadErr = true
+		case 'D':
+			rstats.rowsReturned++
+			rstats.dataRowBytes += uint64(len(b))
+		case 'Z':
+			if len(b) > 0 {
+				txStatus = b[0]
+			}
+		}
+
+		if streamStarted {
+			outBuf = append(outBuf, msg...)
+			if len(outBuf) >= flushChunkBytes || t == 'Z' {
+				if !flushOut() {
+					return
+				}
+			}
+		} else if !hadErr {
+			outBuf = append(outBuf, msg...)
+			if len(outBuf) >= fallbackCap && t != 'Z' {
+				if !flushOut() {
+					return
+				}
+			}
+		}
+
+		if t == 'Z' {
+			break
+		}
+	}
+
+	if hadErr && !streamStarted {
+		return
+	}
+	if !flushOut() {
+		return
+	}
+	return
 }

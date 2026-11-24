@@ -283,6 +283,33 @@ func (b *QueryMemoryBudget) Used() int64 {
 	return u
 }
 
+// ReleaseBytes returns n previously reserved bytes back to the query, tenant,
+// and global budgets after a streamed batch has been flushed.
+func (b *QueryMemoryBudget) ReleaseBytes(n int64) {
+	if b == nil || n <= 0 {
+		return
+	}
+	b.mu.Lock()
+	if b.released || b.used == 0 {
+		b.mu.Unlock()
+		return
+	}
+	if n > b.used {
+		n = b.used
+	}
+	b.used -= n
+	tenantCtr := b.tenantCtr
+	mgr := b.mgr
+	b.mu.Unlock()
+
+	if tenantCtr != nil {
+		tenantCtr.Add(-n)
+	}
+	if mgr != nil {
+		mgr.globalUsed.Add(-n)
+	}
+}
+
 // Release returns all reserved bytes back to the tenant and global budgets.
 // Safe to call multiple times.
 func (b *QueryMemoryBudget) Release() {

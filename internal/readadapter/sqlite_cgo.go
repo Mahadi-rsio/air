@@ -437,6 +437,40 @@ bindText:
 }
 
 func (c *SQLiteConn) queryWithContextInternal(ctx context.Context, snap *ReadSnapshot, sql string, args []string, paramOIDs []uint32, schemaVer uint64, useStmtCache bool) (*SQLiteResult, *PlanDecision, error) {
+	return c.queryStreamInternal(ctx, snap, sql, args, paramOIDs, schemaVer, useStmtCache, 0, nil, nil)
+}
+
+// QueryStreamWithContext executes sql and streams result rows in bounded batches
+// of batchSize rows to onBatch, calling onMeta once before the first batch.
+func (c *SQLiteConn) QueryStreamWithContext(
+	ctx context.Context,
+	snap *ReadSnapshot,
+	sql string,
+	args []string,
+	paramOIDs []uint32,
+	schemaVer uint64,
+	batchSize int,
+	onMeta func([]SQLiteColumn) error,
+	onBatch func([][]SQLiteValue) error,
+) (*SQLiteResult, *PlanDecision, error) {
+	if batchSize <= 0 {
+		batchSize = 128
+	}
+	return c.queryStreamInternal(ctx, snap, sql, args, paramOIDs, schemaVer, true, batchSize, onMeta, onBatch)
+}
+
+func (c *SQLiteConn) queryStreamInternal(
+	ctx context.Context,
+	snap *ReadSnapshot,
+	sql string,
+	args []string,
+	paramOIDs []uint32,
+	schemaVer uint64,
+	useStmtCache bool,
+	batchSize int,
+	onMeta func([]SQLiteColumn) error,
+	onBatch func([][]SQLiteValue) error,
+) (*SQLiteResult, *PlanDecision, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -623,9 +657,51 @@ func (c *SQLiteConn) queryWithContextInternal(ctx context.Context, snap *ReadSna
 		return s
 	}
 
+	var totalRows int64
+	var batchBytes int64
+	metaSent := false
+	streaming := onBatch != nil && batchSize > 0
+	if streaming {
+		res.Rows = make([][]SQLiteValue, 0, batchSize)
+	}
+
+	flushBatch := func() error {
+		if !streaming {
+			return nil
+		}
+		if !metaSent {
+			metaSent = true
+			if onMeta != nil {
+				if err := onMeta(res.Columns); err != nil {
+					return err
+				}
+			}
+		}
+		if len(res.Rows) > 0 {
+			if err := onBatch(res.Rows); err != nil {
+				return err
+			}
+			res.Rows = res.Rows[:0]
+			arenaOff = 0
+		}
+		if budget != nil && batchBytes > 0 {
+			budget.ReleaseBytes(batchBytes)
+			batchBytes = 0
+		}
+		return nil
+	}
+
 	for {
+		if streaming {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, nil, ctxErr
+			}
+		}
 		stepRC := C.sqlite3_step(stmt)
 		if stepRC == C.SQLITE_ROW {
+			if hasLimits && limits.MaxResultRows > 0 && totalRows >= limits.MaxResultRows {
+				return nil, nil, fmt.Errorf("%w: max rows %d exceeded", ErrResultLimitExceeded, limits.MaxResultRows)
+			}
 			row := allocRow(colCount)
 			var rowBytes int64 = int64(colCount)*valStructSize + 24
 			for i := 0; i < colCount; i++ {
@@ -695,17 +771,27 @@ func (c *SQLiteConn) queryWithContextInternal(ctx context.Context, snap *ReadSna
 					rowBytes += int64(len(s))
 				}
 			}
-			if hasLimits && limits.MaxResultRows > 0 && int64(len(res.Rows)) >= limits.MaxResultRows {
-				return nil, nil, fmt.Errorf("%w: max rows %d exceeded", ErrResultLimitExceeded, limits.MaxResultRows)
-			}
 			if budget != nil {
 				if berr := budget.Reserve(rowBytes); berr != nil {
 					return nil, nil, berr
 				}
+				batchBytes += rowBytes
 			}
+			totalRows++
 			res.Rows = append(res.Rows, row)
+			if streaming && len(res.Rows) >= batchSize {
+				if ferr := flushBatch(); ferr != nil {
+					return nil, nil, ferr
+				}
+			}
 		} else if stepRC == C.SQLITE_DONE {
 			res.RowsChanged = int64(C.sqlite3_changes(c.db))
+			if streaming {
+				if ferr := flushBatch(); ferr != nil {
+					return nil, nil, ferr
+				}
+				res.RowsChanged = totalRows
+			}
 			break
 		} else if stepRC == C.SQLITE_AUTH {
 			return nil, nil, &SQLiteReadOnlyError{Message: C.GoString(C.sqlite3_errmsg(c.db))}
