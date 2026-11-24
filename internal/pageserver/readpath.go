@@ -725,6 +725,11 @@ func (t *Timeline) FlushInMemory(ctx context.Context) (*LayerMeta, error) {
 		EndLSN:     endLSN,
 	}
 	written, err := t.store.WriteLayer(ctx, meta, recs)
+	if t.store != nil && t.store.cawal != nil {
+		for _, h := range written.CAWALBlobHashes {
+			defer t.store.cawal.Unpin(h)
+		}
+	}
 	if err != nil {
 		// Keep oldMem in frozenMems or restore into inMem so concurrent reads never lose visibility.
 		t.mu.Lock()

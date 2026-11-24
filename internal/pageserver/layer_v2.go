@@ -20,8 +20,9 @@ import (
 const (
 	LayerVersionV2 uint16 = 2
 
-	LayerCodecNone uint8 = 0
-	LayerCodecZstd uint8 = 1
+	LayerCodecNone  uint8 = 0
+	LayerCodecZstd  uint8 = 1
+	LayerCodecCAWAL uint8 = 2
 
 	v2TargetChunkRawBytes = 64 * 1024
 	v2MaxRecordsPerChunk  = 64
@@ -100,8 +101,12 @@ func compressV2PayloadInto(raw []byte, dst []byte, forceNone bool) ([]byte, uint
 }
 
 func decompressV2Payload(data []byte, codec uint8, rawLen uint32) ([]byte, error) {
-	if uint64(rawLen) > maxV2DecompressedSize {
-		return nil, fmt.Errorf("pageserver: v2 rawLen %d exceeds max %d", rawLen, maxV2DecompressedSize)
+	return decompressV2PayloadMax(data, codec, rawLen, maxV2DecompressedSize)
+}
+
+func decompressV2PayloadMax(data []byte, codec uint8, rawLen uint32, maxAllowed uint64) ([]byte, error) {
+	if uint64(rawLen) > maxAllowed {
+		return nil, fmt.Errorf("pageserver: v2 rawLen %d exceeds max %d", rawLen, maxAllowed)
 	}
 	switch codec {
 	case LayerCodecNone:
@@ -146,14 +151,17 @@ type v2WALTableMeta struct {
 }
 
 type v2EncodeResult struct {
-	FileSize  int64
-	SHA256Hex string
-	StartKey  Key
-	EndKey    Key
+	FileSize        int64
+	SHA256Hex       string
+	StartKey        Key
+	EndKey          Key
+	CAWALBlobHashes []string
 }
 
 type v2EncodeOptions struct {
 	DisableCompression bool
+	CAWAL              *CAWALStore
+	Ctx                context.Context
 }
 
 func v2ChunkAAD(aadKey string, chunkIdx int, codec uint8, rawLen uint32) string {
@@ -362,15 +370,38 @@ func (sw *v2StreamWriter) Finish() (v2EncodeResult, error) {
 			copy(walRaw[pos+4:pos+4+len(wBytes)], wBytes)
 			pos += 4 + len(wBytes)
 		}
-		walPayload, walCodec, err := compressV2Payload(walRaw, sw.opts.DisableCompression)
-		if err != nil {
-			return res, err
-		}
 		walRawLen := uint32(len(walRaw))
-		if sw.encrypted {
-			walPayload, err = sw.kms.EncryptObject(sw.tenantID, sw.epoch, v2WALTableAAD(sw.aadKey, walCodec, walRawLen), walPayload)
-			if err != nil {
-				return res, err
+		var walPayload []byte
+		var walCodec uint8
+		if sw.opts.CAWAL != nil && !sw.encrypted {
+			cctx := sw.opts.Ctx
+			if cctx == nil {
+				cctx = context.Background()
+			}
+			putRes, pErr := sw.opts.CAWAL.PutBlobIfAbsent(cctx, walRaw)
+			if pErr != nil {
+				return res, pErr
+			}
+			sw.opts.CAWAL.Pin(putRes.Hash)
+			rawHash, hErr := hex.DecodeString(putRes.Hash)
+			if hErr != nil {
+				sw.opts.CAWAL.Unpin(putRes.Hash)
+				return res, hErr
+			}
+			walPayload = rawHash
+			walCodec = LayerCodecCAWAL
+			res.CAWALBlobHashes = []string{putRes.Hash}
+		} else {
+			var cErr error
+			walPayload, walCodec, cErr = compressV2Payload(walRaw, sw.opts.DisableCompression)
+			if cErr != nil {
+				return res, cErr
+			}
+			if sw.encrypted {
+				walPayload, cErr = sw.kms.EncryptObject(sw.tenantID, sw.epoch, v2WALTableAAD(sw.aadKey, walCodec, walRawLen), walPayload)
+				if cErr != nil {
+					return res, cErr
+				}
 			}
 		}
 		if _, err := sw.bw.Write(walPayload); err != nil {
@@ -567,6 +598,10 @@ func decodeLayerV2Index(raw []byte, meta LayerMeta, count uint32, kms *crypto.En
 }
 
 func decodeV2WALTable(raw []byte, meta LayerMeta, wm v2WALTableMeta, kms *crypto.EnvelopeKMS) ([][]byte, error) {
+	return decodeV2WALTableWithCAS(context.Background(), raw, meta, wm, kms, nil)
+}
+
+func decodeV2WALTableWithCAS(ctx context.Context, raw []byte, meta LayerMeta, wm v2WALTableMeta, kms *crypto.EnvelopeKMS, cawal *CAWALStore) ([][]byte, error) {
 	if wm.CipherLen == 0 {
 		return nil, nil
 	}
@@ -585,69 +620,64 @@ func decodeV2WALTable(raw []byte, meta LayerMeta, wm v2WALTableMeta, kms *crypto
 		}
 	}
 
-	var r io.Reader
-	var closeFn func()
+	var plain []byte
 	switch wm.Codec {
 	case LayerCodecNone:
 		if uint32(len(payload)) != wm.RawLen {
 			return nil, fmt.Errorf("pageserver: v2 raw length mismatch got=%d want=%d", len(payload), wm.RawLen)
 		}
-		r = bytes.NewReader(payload)
+		plain = payload
 	case LayerCodecZstd:
-		zr, err := zstd.NewReader(bytes.NewReader(payload))
+		var err error
+		plain, err = decompressV2PayloadMax(payload, LayerCodecZstd, wm.RawLen, maxV2WALTableSize)
 		if err != nil {
-			return nil, fmt.Errorf("pageserver: v2 zstd reader: %w", err)
+			return nil, err
 		}
-		closeFn = zr.Close
-		r = io.LimitReader(zr, int64(wm.RawLen)+1)
+	case LayerCodecCAWAL:
+		if cawal == nil {
+			return nil, errors.New("pageserver: LayerCodecCAWAL requires CAWALStore")
+		}
+		if len(payload) != 32 {
+			return nil, fmt.Errorf("pageserver: invalid CA-WAL hash length %d", len(payload))
+		}
+		hashHex := hex.EncodeToString(payload)
+		var err error
+		plain, err = cawal.GetBlobVerified(ctx, hashHex)
+		if err != nil {
+			return nil, err
+		}
+		if uint32(len(plain)) != wm.RawLen {
+			return nil, fmt.Errorf("pageserver: v2 CA-WAL length mismatch got=%d want=%d", len(plain), wm.RawLen)
+		}
 	default:
 		return nil, fmt.Errorf("pageserver: unsupported v2 codec %d", wm.Codec)
 	}
-	if closeFn != nil {
-		defer closeFn()
-	}
 
-	if wm.RawLen < 4 {
+	if len(plain) < 4 {
 		return nil, errors.New("pageserver: truncated v2 WAL table")
 	}
-	var hdr [4]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, fmt.Errorf("pageserver: v2 wal table header: %w", err)
-	}
-	readBytes := uint64(4)
-	count := uint64(binary.LittleEndian.Uint32(hdr[:]))
-	if count*4 > uint64(wm.RawLen)-4 {
-		return nil, fmt.Errorf("pageserver: malformed v2 WAL table count=%d len=%d", count, wm.RawLen)
+	count := uint64(binary.LittleEndian.Uint32(plain[0:4]))
+	if count*4 > uint64(len(plain))-4 {
+		return nil, fmt.Errorf("pageserver: malformed v2 WAL table count=%d len=%d", count, len(plain))
 	}
 	out := make([][]byte, int(count))
-	arenaCap := int(wm.RawLen) - 4 - int(count)*4
-	var arena []byte
-	if arenaCap > 0 {
-		arena = make([]byte, arenaCap)
-	}
-	arenaOff := 0
+	pos := 4
 	for i := 0; i < int(count); i++ {
-		if _, err := io.ReadFull(r, hdr[:]); err != nil {
-			return nil, fmt.Errorf("pageserver: truncated v2 WAL entry length: %w", err)
+		if pos+4 > len(plain) {
+			return nil, errors.New("pageserver: truncated v2 WAL entry length")
 		}
-		n := uint64(binary.LittleEndian.Uint32(hdr[:]))
-		readBytes += 4
-		if readBytes+n > uint64(wm.RawLen) {
+		n := int(binary.LittleEndian.Uint32(plain[pos : pos+4]))
+		pos += 4
+		if pos+n > len(plain) {
 			return nil, errors.New("pageserver: truncated v2 WAL entry body")
 		}
 		if n > 0 {
-			entry := arena[arenaOff : arenaOff+int(n) : arenaOff+int(n)]
-			arenaOff += int(n)
-			if _, err := io.ReadFull(r, entry); err != nil {
-				return nil, fmt.Errorf("pageserver: truncated v2 WAL entry body: %w", err)
-			}
-			out[i] = entry
-			readBytes += n
+			out[i] = plain[pos : pos+n : pos+n]
+			pos += n
 		}
 	}
-	var extra [1]byte
-	if n, _ := r.Read(extra[:]); n > 0 || readBytes != uint64(wm.RawLen) {
-		return nil, fmt.Errorf("pageserver: v2 wal table length mismatch got=%d want=%d", readBytes+uint64(n), wm.RawLen)
+	if pos != len(plain) {
+		return nil, fmt.Errorf("pageserver: v2 wal table length mismatch got=%d want=%d", pos, len(plain))
 	}
 	return out, nil
 }
@@ -717,13 +747,13 @@ func (s *LayerStore) loadV2WALTable(ctx context.Context, meta LayerMeta, idxData
 	if err != nil {
 		return nil, err
 	}
-	wt, err := decodeV2WALTable(raw, meta, idxData.walMeta, s.kms)
+	wt, err := decodeV2WALTableWithCAS(ctx, raw, meta, idxData.walMeta, s.kms, s.cawal)
 	if err != nil {
 		if !errors.Is(err, crypto.ErrDEKMissing) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			if s.cache != nil && s.s3c != nil && s.bucket != "" {
 				s.evictCorruptDiskCache(meta, int64(idxData.walMeta.Offset), int64(idxData.walMeta.CipherLen))
 				if raw2, rErr := s.ReadRange(ctx, meta, int64(idxData.walMeta.Offset), int64(idxData.walMeta.CipherLen)); rErr == nil {
-					wt, err = decodeV2WALTable(raw2, meta, idxData.walMeta, s.kms)
+					wt, err = decodeV2WALTableWithCAS(ctx, raw2, meta, idxData.walMeta, s.kms, s.cawal)
 				}
 			}
 		}
@@ -926,7 +956,7 @@ func (s *LayerStore) lookupKeysInLayerV2(ctx context.Context, meta LayerMeta, id
 			if idx >= len(walTable) {
 				return nil, fmt.Errorf("pageserver: v2 WAL index %d out of bounds (%d)", idx, len(walTable))
 			}
-			rm.delta.WALRecord = append([]byte(nil), walTable[idx]...)
+			rm.delta.WALRecord = walTable[idx]
 		}
 		out[rm.keySlot] = append(out[rm.keySlot], rm.delta)
 	}

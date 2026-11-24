@@ -245,6 +245,7 @@ type LayerMeta struct {
 	FileSize          int64     `json:"file_size"`
 	Encrypted         bool      `json:"encrypted"`
 	RemotelyAvailable bool      `json:"remotely_available,omitempty"`
+	CAWALBlobHashes   []string  `json:"cawal_blob_hashes,omitempty"`
 }
 
 func (m LayerMeta) aadKey() string {
@@ -453,9 +454,33 @@ type LayerStore struct {
 	prefetchSem        chan struct{}
 	readLimiter        *ReadLimiter
 	decodedChunks      *DecodedChunkCache
+	cawal              *CAWALStore
+	enableCAWAL        bool
 	generationCheck    func(tenantID, generation string) bool
 	metricsMu          sync.Mutex
 	lastMetrics        UploadMetrics
+}
+
+// SetCAWALStore attaches a Content-Addressed WAL blob store to LayerStore.
+func (s *LayerStore) SetCAWALStore(c *CAWALStore) {
+	s.cawal = c
+}
+
+// CAWALStore returns the attached CAWALStore (if any).
+func (s *LayerStore) CAWALStore() *CAWALStore {
+	return s.cawal
+}
+
+// SetEnableCAWAL enables or disables writing new V2 WAL tables to CAWALStore.
+func (s *LayerStore) SetEnableCAWAL(v bool) {
+	s.enableCAWAL = v
+}
+
+func (s *LayerStore) activeCAWALStore() *CAWALStore {
+	if s.enableCAWAL && s.cawal != nil {
+		return s.cawal
+	}
+	return nil
 }
 
 // SetGenerationChecker registers a callback that validates whether (tenantID, generation) is still active.
@@ -717,7 +742,10 @@ func (s *LayerStore) WriteLayer(ctx context.Context, meta LayerMeta, recs []Laye
 		}
 
 		if outFile != nil {
-			res, encErr := EncodeLayerV2ToWriter(outFile, meta.TenantID, meta.Epoch, meta.aadKey(), meta.Kind, meta.EndLSN, recs, s.kms, v2EncodeOptions{})
+			res, encErr := EncodeLayerV2ToWriter(outFile, meta.TenantID, meta.Epoch, meta.aadKey(), meta.Kind, meta.EndLSN, recs, s.kms, v2EncodeOptions{
+				CAWAL: s.activeCAWALStore(),
+				Ctx:   ctx,
+			})
 			var syncErr error
 			if encErr == nil && tmpPath != "" {
 				syncErr = outFile.Sync()
@@ -753,9 +781,13 @@ func (s *LayerStore) WriteLayer(ctx context.Context, meta LayerMeta, recs []Laye
 			meta.SHA256 = res.SHA256Hex
 			meta.StartKey = res.StartKey
 			meta.EndKey = res.EndKey
+			meta.CAWALBlobHashes = res.CAWALBlobHashes
 		} else {
 			var buf bytes.Buffer
-			res, err := EncodeLayerV2ToWriter(&buf, meta.TenantID, meta.Epoch, meta.aadKey(), meta.Kind, meta.EndLSN, recs, s.kms, v2EncodeOptions{})
+			res, err := EncodeLayerV2ToWriter(&buf, meta.TenantID, meta.Epoch, meta.aadKey(), meta.Kind, meta.EndLSN, recs, s.kms, v2EncodeOptions{
+				CAWAL: s.activeCAWALStore(),
+				Ctx:   ctx,
+			})
 			if err != nil {
 				return meta, err
 			}
@@ -764,6 +796,7 @@ func (s *LayerStore) WriteLayer(ctx context.Context, meta LayerMeta, recs []Laye
 			meta.SHA256 = res.SHA256Hex
 			meta.StartKey = res.StartKey
 			meta.EndKey = res.EndKey
+			meta.CAWALBlobHashes = res.CAWALBlobHashes
 		}
 	}
 

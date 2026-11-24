@@ -238,7 +238,7 @@ payloads:
 			if off+n > int(totLen) {
 				return nil, ErrTruncatedWAL
 			}
-			hdrs[i].ref.ImagePayload = append([]byte(nil), recBuf[off:off+n]...)
+			hdrs[i].ref.ImagePayload = rec.RawRecord[off : off+n : off+n]
 			off += n
 		}
 	}
@@ -248,7 +248,7 @@ payloads:
 			if off+n > int(totLen) {
 				return nil, ErrTruncatedWAL
 			}
-			hdrs[i].ref.BlockData = append([]byte(nil), recBuf[off:off+n]...)
+			hdrs[i].ref.BlockData = rec.RawRecord[off : off+n : off+n]
 			off += n
 		}
 		rec.Blocks = append(rec.Blocks, hdrs[i].ref)
@@ -257,7 +257,7 @@ payloads:
 		if off+int(mainDataLen) > int(totLen) {
 			return nil, ErrTruncatedWAL
 		}
-		rec.MainData = append([]byte(nil), recBuf[off:off+int(mainDataLen)]...)
+		rec.MainData = rec.RawRecord[off : off+int(mainDataLen) : off+int(mainDataLen)]
 	}
 	return rec, nil
 }

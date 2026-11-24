@@ -168,6 +168,11 @@ func (t *Timeline) compactL0s(ctx context.Context, threshold, maxBatch int, mate
 	if err != nil {
 		return nil, err
 	}
+	if t.store != nil && t.store.cawal != nil {
+		for _, h := range written.CAWALBlobHashes {
+			defer t.store.cawal.Unpin(h)
+		}
+	}
 
 	t.manifestMu.Lock()
 	defer t.manifestMu.Unlock()
@@ -271,7 +276,10 @@ func (s *LayerStore) writeLayerFromStream(ctx context.Context, meta LayerMeta, f
 		defer os.Remove(localPath)
 	}
 
-	sw := newV2StreamWriter(outFile, meta.TenantID, meta.Epoch, meta.aadKey(), meta.Kind, meta.EndLSN, s.kms, v2EncodeOptions{})
+	sw := newV2StreamWriter(outFile, meta.TenantID, meta.Epoch, meta.aadKey(), meta.Kind, meta.EndLSN, s.kms, v2EncodeOptions{
+		CAWAL: s.activeCAWALStore(),
+		Ctx:   ctx,
+	})
 	if err := feed(sw); err != nil {
 		cleanupOnErr()
 		return meta, err
@@ -295,6 +303,7 @@ func (s *LayerStore) writeLayerFromStream(ctx context.Context, meta LayerMeta, f
 	meta.SHA256 = res.SHA256Hex
 	meta.StartKey = res.StartKey
 	meta.EndKey = res.EndKey
+	meta.CAWALBlobHashes = res.CAWALBlobHashes
 
 	uploadPath := localPath
 	if tmpPath != "" {

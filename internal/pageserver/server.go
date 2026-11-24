@@ -31,6 +31,7 @@ type Config struct {
 	R2Bucket          string
 	KMS               *crypto.EnvelopeKMS
 	MemoryBudget      MemoryBudgetConfig
+	EnableCAWAL       bool
 	Debug             bool
 }
 
@@ -70,6 +71,9 @@ func New(cfg Config) (*Pageserver, error) {
 		}
 	}
 	store := NewLayerStore(cfg.LayerDir, cfg.S3Client, cfg.R2Bucket, cfg.KMS, cache)
+	cawal := NewCAWALStore(cfg.LayerDir)
+	store.SetCAWALStore(cawal)
+	store.SetEnableCAWAL(cfg.EnableCAWAL)
 	redoer := NewDefaultWALRedoer(cfg.WalRedoBin)
 	ps := &Pageserver{
 		cfg:         cfg,

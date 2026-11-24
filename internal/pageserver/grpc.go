@@ -130,8 +130,14 @@ func (p *Pageserver) IngestWALRecords(
 	sawCheckpoint := false
 	var firstLSN, lastRecLSN uint64
 	var totalBlocks, fpiBlocks int
+	curWALLSN := tl.WALLastLSN()
+	appliedCount := 0
 	for i, rec := range recs {
-		if i == 0 {
+		if rec.EndLSN > 0 && curWALLSN > 0 && rec.EndLSN <= curWALLSN {
+			continue
+		}
+		appliedCount++
+		if firstLSN == 0 {
 			firstLSN = rec.LSN
 		}
 		lastRecLSN = rec.EndLSN
@@ -151,7 +157,7 @@ func (p *Pageserver) IngestWALRecords(
 		}
 		if flushIfNeeded && (i+1)%32 == 0 {
 			if err := tl.EnforceInMemBudget(ctx); err != nil {
-				return i + 1, tl.LastLSN(), err
+				return appliedCount, tl.LastLSN(), err
 			}
 		}
 	}
