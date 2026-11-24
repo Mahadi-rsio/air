@@ -210,11 +210,11 @@ Confirm:
 ```bash
 GATEWAY_IP="$(fly ips list --app air-pg-gateway --json | jq -r '.[] | select(.Type=="v4") | .Address')"
 
-# Create a tenant database via the gateway HTTP proxy
+# Create a tenant database via the gateway Admin HTTP API
 curl -sS -X POST https://air-pg-gateway.fly.dev/v1/databases \
-  -H "Authorization: Bearer $AIR_BOOTSTRAP_API_KEY" \
+  -H "Authorization: Bearer $AIR_INTERNAL_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"name":"fly_smoke_test"}' | jq .
+  -d '{"tenant_id":"fly_smoke_test"}' | jq .
 ```
 
 Connect with `psql` using the returned password:

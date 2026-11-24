@@ -30,13 +30,8 @@ All runtime configuration is loaded from environment variables first, then overr
 | `AIR_MASTER_KEY_PATH` | `--master-key-path` | `<data-dir>/master.key` | Path to the 32-byte EnvelopeKMS master KEK. |
 | `AIR_PG_BIN_DIR` | `--pg-bin-dir` | `/usr/lib/postgresql/17/bin` | PostgreSQL 17 binary directory. |
 | `AIR_META_PORT` | `--meta-port` | `15432` | TCP port for embedded metadata PostgreSQL 17. |
-| `AIR_HTTP_ADDR` | `--http-addr` | `127.0.0.1:8080` | Control Plane HTTP API listen address. |
-| `AIR_GRPC_ADDR` | `--grpc-addr` | `127.0.0.1:9090` | `AirDBControl` gRPC server listen address. |
 | `AIR_GATEWAY_ADDR` | `--gateway-addr` | `127.0.0.1:5432` | PostgreSQL wire-protocol gateway listen address. |
-| `AIR_GATEWAY_ADMIN_ADDR` | `--gateway-admin-addr` | `127.0.0.1:8081` | Gateway admin HTTP listen address. |
-| `AIR_GATEWAY_ADMIN_URL` | `--gateway-admin-url` | `""` | Gateway admin HTTP URL used by `air-server` for pool draining. |
-| `AIR_GATEWAY_ADMIN_GRPC_ADDR` | `--gateway-admin-grpc-addr` | `""` | Gateway admin gRPC address used by `air-server` for pool draining. |
-| `AIR_CONTROL_PLANE_URL` | `--control-plane-url` | `http://127.0.0.1:8080` | Control Plane HTTP base URL. |
+| `AIR_GATEWAY_ADMIN_ADDR` | `--gateway-admin-addr` | `127.0.0.1:8081` | Main Gateway Admin HTTP API listen address. |
 | `AIR_INTERNAL_TOKEN` | `--internal-token` | `""` | Shared secret for internal gateway $\leftrightarrow$ server calls. |
 | `AIR_BACKEND_HOST` | `--backend-host` | `""` (`127.0.0.1`) | Backend PostgreSQL host returned to remote gateways. |
 | `AIR_BOOTSTRAP_API_KEY` | `--bootstrap-api-key` | `""` | Optional initial Bearer token seeded on startup. |
@@ -76,7 +71,6 @@ go build ./cmd/air-read-engine
 ```bash
 go run ./cmd/air-server \
   --data-dir /tmp/air-live \
-  --http-addr 127.0.0.1:8080 \
   --grpc-addr 127.0.0.1:9090 \
   --meta-port 15432 \
   --bootstrap-account-id acct_demo \
@@ -88,7 +82,7 @@ go run ./cmd/air-server \
 ```bash
 go run ./cmd/air-read-engine \
   -data-dir /tmp/air-read-engine \
-  -http-addr 127.0.0.1:8082 \
+  -grpc-addr 127.0.0.1:9092 \
   -pg-port 5433
 ```
 

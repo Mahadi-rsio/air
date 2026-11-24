@@ -29,13 +29,12 @@ flowchart TB
         HTTPClient["REST API Clients (Bearer Token)"]
     end
 
-    subgraph GatewayProcess["C++20 Gateway (gateway/)"]
+    subgraph GatewayProcess["Go Gateway (cmd/air-gateway)"]
         GWWire["PG Wire Listener (:5432)<br/>SNI==db check, Transaction Pooler"]
-        GWAdmin["Gateway Admin & Metrics (:8081)<br/>/v1/databases/*, /metrics"]
+        GWAdmin["Main Admin HTTP & Metrics (:8081)<br/>/v1/databases/*, /v1/namespaces/*, /v1/api-keys/*, /metrics"]
     end
 
     subgraph ServerProcess["Go Engine & Control Plane (cmd/air-server)"]
-        HTTPAPI["Control Plane HTTP (:8080)<br/>internal/control/http.go"]
         GRPCAPI["AirDBControl gRPC (:9090)<br/>internal/control/grpc.go"]
         Ctrl["Control Plane Service<br/>internal/control/"]
         MetaPG[("Metadata PostgreSQL 17<br/>clusters, api_keys, backup_ops, restore_ops")]
@@ -47,7 +46,7 @@ flowchart TB
     end
 
     subgraph ReadEngineProcess["Read Engine (cmd/air-read-engine)"]
-        REHTTP["Read Engine HTTP (:8082)<br/>/healthz, /v1/tenants/{id}/start"]
+        REGRPC["ReadEngineService gRPC (:9092)"]
         PGRO["Read-Only PG17 (:5433)<br/>air_ro.so + hot_standby / air_smgr.read_only"]
     end
 
@@ -64,14 +63,13 @@ flowchart TB
     end
 
     PSQL --> GWWire
-    HTTPClient --> HTTPAPI
     HTTPClient --> GWAdmin
     GWWire -->|"Wake / Route (gRPC)"| GRPCAPI
-    GWAdmin -->|"Lifecycle RPCs (gRPC)"| GRPCAPI
+    GWAdmin -->|"Control Plane RPCs (gRPC)"| GRPCAPI
+    GWAdmin -->|"Read Engine RPCs (gRPC)"| REGRPC
     GWWire -->|"Writes & Causal Fallback"| PG17
     GWWire -->|"Read-Only SQL (sql_router)"| PGRO
 
-    HTTPAPI --> Ctrl
     GRPCAPI --> Ctrl
     Ctrl --> MetaPG
     Ctrl --> Cell
@@ -101,8 +99,8 @@ flowchart TB
 
 | Component | Package / Directory | Primary Responsibilities |
 | :--- | :--- | :--- |
-| **Server Entrypoint** | [cmd/air-server](file:///workspaces/air/cmd/air-server/main.go) | Parses flags/env ([internal/config](file:///workspaces/air/internal/config/config.go)), initializes `cell.Agent`, `pageserver.Server`, and `control.Service`, runs startup reconciliation, and serves HTTP (`:8080`) + gRPC (`:9090`). |
-| **Read Engine Entrypoint** | [cmd/air-read-engine](file:///workspaces/air/cmd/air-read-engine/main.go) | Supervises standalone read-only PostgreSQL 17 instances (`air_ro.so`, `hot_standby = on`, `pg_basebackup` streaming standby or `air_smgr.read_only`) with HTTP control on `:8082`. |
+| **Server Entrypoint** | [cmd/air-server](file:///workspaces/air/cmd/air-server/main.go) | Parses flags/env ([internal/config](file:///workspaces/air/internal/config/config.go)), initializes `cell.Agent`, `pageserver.Server`, and `control.Service`, runs startup reconciliation, and serves `AirDBControl` gRPC (`:9090`). |
+| **Read Engine Entrypoint** | [cmd/air-read-engine](file:///workspaces/air/cmd/air-read-engine/main.go) | Serves read-only SQLite/PG wire queries (`:5433`) and `ReadEngineService` gRPC (`:9092`). |
 | **Control Plane** | [internal/control](file:///workspaces/air/internal/control/control.go) | Manages metadata tables (`clusters`, `api_keys`, `backup_ops`, `restore_ops`), tenant state transitions, `singleflight` wake coalescing, idle suspend reaper, cold offload worker, and backup/restore orchestration. |
 | **Cell Agent** | [internal/cell](file:///workspaces/air/internal/cell/agent.go) | Manages local PostgreSQL 17 processes, warm `initdb` pool, `flock` lockfiles, `cgroup v2` limits, `supautils` configuration, cooperative drain checks, and local `EnvelopeKMS` access. |
 | **Pageserver** | [internal/pageserver](file:///workspaces/air/internal/pageserver/server.go) | Consumes PostgreSQL WAL via replication or local PGDATA segments, maintains per-timeline `InMemoryLayer`, L0/L1/Image disk layers, serves `GetPage@LSN` to `air_smgr.so`, and uploads CAU layers to R2. |

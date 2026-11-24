@@ -89,10 +89,9 @@ go test -v -race -count=1 ./...
 ### Running `air-server`, `air-read-engine`, and `air-gateway` Locally (Zero-Sync Native Mode)
 
 ```bash
-# 1. Start air-server (Control Plane HTTP :8080 + Air DB gRPC :9090 + Cell + Pageserver)
+# 1. Start air-server (Air DB gRPC :9090 + Cell + Pageserver)
 go run ./cmd/air-server \
   -data-dir /tmp/air-live \
-  -http-addr 127.0.0.1:8080 \
   -grpc-addr 127.0.0.1:9090 \
   -meta-port 15432 \
   -bootstrap-account-id acct_demo \
@@ -101,20 +100,20 @@ go run ./cmd/air-server \
   -pageserver \
   -pageserver-socket /tmp/air-live/pageserver.sock
 
-# 2. Start shared air-read-engine in native Pageserver mode (PG wire :5433, HTTP :8082, zero /sync!)
+# 2. Start shared air-read-engine in native Pageserver mode (PG wire :5433, gRPC :9092)
 go run ./cmd/air-read-engine \
   -data-dir /tmp/air-read-engine \
   -cache-dir /tmp/air-read-engine/cache \
-  -http-addr 127.0.0.1:8082 \
+  -grpc-addr 127.0.0.1:9092 \
   -pg-port 5433 \
   -pageserver-socket /tmp/air-live/pageserver.sock
 
-# 3. Start Go air-gateway (PG Pooler :5432 + Admin API :8081; defaults to read-engine :5433)
+# 3. Start Go air-gateway (PG Pooler :5432 + Main Admin HTTP API :8081; gRPC client only)
 go run ./cmd/air-gateway \
   --gateway-addr 127.0.0.1:5432 \
   --gateway-admin-addr 127.0.0.1:8081 \
   --db-grpc-addr 127.0.0.1:9090 \
-  --control-plane-url http://127.0.0.1:8080 \
+  --read-engine-grpc-addr 127.0.0.1:9092 \
   --internal-token air_internal_secret \
   --pool-mode
 ```
@@ -125,28 +124,32 @@ Published automatically on `v*` tags and manual workflow dispatches by [.github/
 
 | Component | GHCR Image | Dockerfile | Default Ports |
 | :--- | :--- | :--- | :--- |
-| **AIR Server** (Control Plane + Cell + Pageserver) | `ghcr.io/mahadi-rsio/air` | [Dockerfile](file:///workspaces/air/Dockerfile) | `8080` (HTTP), `9090` (gRPC) |
-| **AIR Gateway** (Go PG Pooler + Read Router) | `ghcr.io/mahadi-rsio/air-gateway` | [gateway/Dockerfile](file:///workspaces/air/gateway/Dockerfile) | `5432` (PG), `8081` (Admin) |
-| **AIR Read Engine** (Native SQLite `air_pg` VTab) | `ghcr.io/mahadi-rsio/air-read-engine` | [Dockerfile.read-engine](file:///workspaces/air/Dockerfile.read-engine) | `5433` (PG), `8082` (HTTP) |
+| **AIR Server** (Control Plane + Cell) | `ghcr.io/mahadi-rsio/air` | [Dockerfile](file:///workspaces/air/Dockerfile) | `9090` (gRPC) |
+| **AIR Gateway** (Go PG Pooler + Main Admin API) | `ghcr.io/mahadi-rsio/air-gateway` | [gateway/Dockerfile](file:///workspaces/air/gateway/Dockerfile) | `5432` (PG), `8081` (Admin HTTP) |
+| **AIR Read Engine** (Native SQLite `air_pg` VTab) | `ghcr.io/mahadi-rsio/air-read-engine` | [Dockerfile.read-engine](file:///workspaces/air/Dockerfile.read-engine) | `5433` (PG), `9092` (gRPC) |
+| **AIR Pageserver** (WAL + Layer Storage) | `ghcr.io/mahadi-rsio/air-pageserver` | [Dockerfile.pageserver](file:///workspaces/air/Dockerfile.pageserver) | `9091` (gRPC) |
 
 ### Fly.io Deployment ([fly.toml](file:///workspaces/air/fly.toml))
 
 - Uses `ghcr.io/mahadi-rsio/air` (published on `v*` tags by [.github/workflows/ghcr-publish.yml](file:///workspaces/air/.github/workflows/ghcr-publish.yml)) with a persistent `air_data` volume mounted at `/var/lib/air`.
 - Set `AIR_PAGESERVER_ENABLED = "true"` in `[env]` (along with `AIR_R2_*` credentials in Fly secrets) to enable the in-process Pageserver and CAU layer uploads to R2.
 
-### Control Plane HTTP API
+### Gateway Admin HTTP API (`:8081`)
 
-All `/v1/*` endpoints require `Authorization: Bearer <token>`:
+`air-gateway` is the single Admin HTTP API entrypoint and proxies control-plane operations to `air-server`, `air-pageserver`, and `air-read-engine` over gRPC. All `/v1/*` endpoints require `Authorization: Bearer <internal_token>` (or `X-Air-Internal-Token: <internal_token>`):
 
-- `GET /healthz` — Metadata DB health check (unauthenticated)
-- `POST /v1/databases` — Provision an isolated tenant database (`Idempotency-Key` required, body `{"tenant_id": "demo_db"}`)
-- `GET /v1/databases/{id}` — Inspect database metadata (account-scoped)
-- `DELETE /v1/databases/{id}` — Stop PG17, purge storage, shred DEK, and mark `PURGED` (account-scoped)
+- `GET /healthz` — Gateway health check (unauthenticated)
+- `POST /v1/databases` — Provision an isolated tenant database (`Idempotency-Key` optional on gateway, body `{"tenant_id": "demo_db"}`)
+- `GET /v1/databases` — List databases
+- `GET /v1/databases/{id}` — Inspect database metadata
+- `DELETE /v1/databases/{id}` — Drain pool, stop PG17, purge storage, shred DEK, and mark `PURGED`
+- `POST /v1/databases/{id}/suspend` / `start` / `wake` / `lock` / `unlock` — Lifecycle state transitions
+- `GET /v1/databases/{id}/offload` — Check latest R2 cold-offload status
 - `POST /v1/databases/{id}/backups` — Trigger an encrypted full, incremental, or WAL-only backup + WAL drain
 - `GET /v1/databases/{id}/backups` — List recorded backup operations and statuses for a tenant
 - `POST /v1/databases/{id}/backups/{backup_id}/verify` — Verify an immutable `BackupManifest`, WAL continuity, and R2 object/checksum integrity
 - `POST /v1/databases/{id}/restore` — Execute `StagePITRRestore` (validation restore or full restore into `new_tenant_id` with `backup_id`, `target_lsn`, `target_time`, or `latest`)
-- `DELETE /v1/api-keys/{id}` — Revoke an API key belonging to the authenticated account
+- `DELETE /v1/api-keys/{id}` — Revoke an API key
 
 ## Current Limitations & Known Issues
 
@@ -156,9 +159,9 @@ All `/v1/*` endpoints require `Authorization: Bearer <token>`:
 Example with `curl` and `psql`:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8080/v1/databases \
+curl -s -X POST http://127.0.0.1:8081/v1/databases \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer air_live_demo_secret_token_12345" \
+  -H "Authorization: Bearer air_internal_secret" \
   -H "Idempotency-Key: create-demo-1" \
   -d '{"tenant_id":"demo_db"}'
 
