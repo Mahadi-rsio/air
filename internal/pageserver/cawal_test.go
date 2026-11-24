@@ -365,9 +365,24 @@ func TestCAWAL_PageserverIntegrationAndBackwardCompat(t *testing.T) {
 		t.Fatalf("FlushInMemory legacy: %v", err)
 	}
 
-	// 2. Enable CA-WAL and flush non-FPI WAL records.
+	// 2a. Enable CA-WAL and flush a small WAL record (< 16 KB adaptive threshold -> inline).
 	ps1.Store().SetEnableCAWAL(true)
-	walPayload := bytes.Repeat([]byte("XLOG_HEAP_INSERT_RECORD_"), 64)
+	smallPayload := bytes.Repeat([]byte("XLOG_SMALL_"), 64)
+	tl1.inMem.Put(key1, WALDelta{
+		LSN:       150,
+		Flags:     EntryFlagWALRecord,
+		WALRecord: smallPayload,
+	})
+	metaInline, err := tl1.FlushInMemory(ctx)
+	if err != nil {
+		t.Fatalf("FlushInMemory CA-WAL small inline: %v", err)
+	}
+	if len(metaInline.CAWALBlobHashes) != 0 {
+		t.Fatalf("expected 0 CAWALBlobHashes for small inline payload, got %v", metaInline.CAWALBlobHashes)
+	}
+
+	// 2b. Flush a larger WAL record (>= 16 KB adaptive threshold -> external CA-WAL blob).
+	walPayload := bytes.Repeat([]byte("XLOG_HEAP_INSERT_RECORD_"), 1024) // 24 KiB
 	tl1.inMem.Put(key1, WALDelta{
 		LSN:       200,
 		Flags:     EntryFlagWALRecord,
@@ -375,7 +390,7 @@ func TestCAWAL_PageserverIntegrationAndBackwardCompat(t *testing.T) {
 	})
 	meta2, err := tl1.FlushInMemory(ctx)
 	if err != nil {
-		t.Fatalf("FlushInMemory CA-WAL: %v", err)
+		t.Fatalf("FlushInMemory CA-WAL external: %v", err)
 	}
 	if len(meta2.CAWALBlobHashes) != 1 {
 		t.Fatalf("expected 1 CAWALBlobHash on flushed layer, got %v", meta2.CAWALBlobHashes)
@@ -418,4 +433,147 @@ func TestCAWAL_PageserverIntegrationAndBackwardCompat(t *testing.T) {
 	if _, err := fmt.Fprintf(os.Stdout, ""); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestCAWAL_AdaptiveThresholdAndCompressionAware(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	cas := NewCAWALStore(dir)
+	cas.SetInlineThreshold(16 * 1024)
+
+	// 1. Pre-compressed and uncompressed paths must preserve identical SHA-256 content identity.
+	raw := bytes.Repeat([]byte("PG17_COMPRESSION_AWARE_WAL_"), 1024) // ~27 KiB
+	sum := sha256.Sum256(raw)
+	comp, codec, err := compressV2Payload(raw, false)
+	if err != nil || codec != LayerCodecZstd {
+		t.Fatalf("compressV2Payload failed: codec=%d err=%v", codec, err)
+	}
+	res1, err := cas.PutPrecompressedBlobIfAbsent(ctx, raw, sum, comp, codec)
+	if err != nil || res1.Deduplicated {
+		t.Fatalf("PutPrecompressedBlobIfAbsent failed: res=%+v err=%v", res1, err)
+	}
+
+	// Putting the same logical payload via PutBlobWithHashIfAbsent must deduplicate via cache/disk.
+	res2, err := cas.PutBlobWithHashIfAbsent(ctx, raw, sum)
+	if err != nil || !res2.Deduplicated || res2.Hash != res1.Hash {
+		t.Fatalf("expected dedup hit on PutBlobWithHashIfAbsent: res=%+v err=%v", res2, err)
+	}
+	got, err := cas.GetBlobVerified(ctx, res1.Hash)
+	if err != nil || !bytes.Equal(got, raw) {
+		t.Fatalf("GetBlobVerified mismatch: err=%v len=%d", err, len(got))
+	}
+
+	// 2. Boundary check on V2 encoder: threshold-1 inline vs threshold external.
+	var bufInline, bufExt bytes.Buffer
+	below := bytes.Repeat([]byte("A"), 16*1024-9) // +8 bytes WAL table framing = 16*1024-1 (< threshold)
+	atThresh := bytes.Repeat([]byte("B"), 16*1024)
+	rBelow := []LayerRecord{{Key: RelBlockKey(1663, 5, 16385, 0, 0), Delta: WALDelta{LSN: 10, Flags: EntryFlagWALRecord, WALRecord: below}}}
+	rAbove := []LayerRecord{{Key: RelBlockKey(1663, 5, 16385, 0, 0), Delta: WALDelta{LSN: 20, Flags: EntryFlagWALRecord, WALRecord: atThresh}}}
+
+	resBelow, err := EncodeLayerV2ToWriter(&bufInline, "t1", 1, "t1", LayerKindL0, 10, rBelow, nil, v2EncodeOptions{CAWAL: cas, Ctx: ctx})
+	if err != nil || len(resBelow.CAWALBlobHashes) != 0 {
+		t.Fatalf("expected below-threshold inline: res=%+v err=%v", resBelow, err)
+	}
+	resAbove, err := EncodeLayerV2ToWriter(&bufExt, "t1", 1, "t1", LayerKindL0, 20, rAbove, nil, v2EncodeOptions{CAWAL: cas, Ctx: ctx})
+	if err != nil || len(resAbove.CAWALBlobHashes) != 1 {
+		t.Fatalf("expected at-threshold external: res=%+v err=%v", resAbove, err)
+	}
+	cas.Unpin(resAbove.CAWALBlobHashes[0])
+	m := cas.Metrics()
+	if m.InlineSelections < 1 || m.ExternalSelections < 1 || m.CacheHits < 1 {
+		t.Fatalf("expected inline/external/cache metrics > 0, got %+v", m)
+	}
+}
+
+func TestCAWAL_ConcurrentMixedAndSingleflight(t *testing.T) {
+	ctx := context.Background()
+	cas := NewCAWALStore(t.TempDir())
+
+	sharedChunk := bytes.Repeat([]byte("SINGLEFLIGHT_SHARED_"), 1024)
+	const workers = 32
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*2)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			// Identical write
+			r1, err := cas.PutBlobIfAbsent(ctx, sharedChunk)
+			if err != nil {
+				errs <- err
+				return
+			}
+			cas.Pin(r1.Hash)
+			defer cas.Unpin(r1.Hash)
+
+			// Distinct write
+			uniq := bytes.Repeat([]byte(fmt.Sprintf("UNIQ_%03d_", id)), 2048)
+			r2, err := cas.PutBlobIfAbsent(ctx, uniq)
+			if err != nil {
+				errs <- err
+				return
+			}
+			cas.Pin(r2.Hash)
+			defer cas.Unpin(r2.Hash)
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent error: %v", err)
+	}
+
+	// Cancelled context must fail cleanly without hanging.
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := cas.PutBlobIfAbsent(cctx, sharedChunk); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestCAWAL_GC_DuringConcurrentReadsAndPinRace(t *testing.T) {
+	ctx := context.Background()
+	cas := NewCAWALStore(t.TempDir())
+	chunk := bytes.Repeat([]byte("PIN_RACE_CHUNK_"), 1024)
+	res, err := cas.PutBlobIfAbsent(ctx, chunk)
+	if err != nil {
+		t.Fatalf("PutBlobIfAbsent: %v", err)
+	}
+	cas.Pin(res.Hash)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 32)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				cas.Pin(res.Hash)
+				got, err := cas.GetBlobVerified(ctx, res.Hash)
+				cas.Unpin(res.Hash)
+				if err != nil || len(got) != len(chunk) {
+					errs <- fmt.Errorf("read failed: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := cas.GC(ctx, 0, nil); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent GC/read race error: %v", err)
+	}
+	if !cas.HasBlob(res.Hash) {
+		t.Fatalf("pinned blob was deleted during concurrent GC")
+	}
+	cas.Unpin(res.Hash)
 }

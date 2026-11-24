@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +22,10 @@ const (
 	CAWALBlobMagic   uint32 = 0x42574143 // "CAWB"
 	CAWALBlobVersion uint16 = 1
 	CAWALHeaderSize  int    = 48
+
+	DefaultCAWALInlineThresholdBytes = 16 * 1024
+	maxCAWALVerifiedCacheEntries     = 4096
+	cawalPinShardCount               = 16
 
 	maxCAWALBlobRawBytes  = 16 * 1024 * 1024
 	maxCAWALManifestBytes = 16 * 1024 * 1024
@@ -86,6 +91,15 @@ type CAWALMetrics struct {
 	OrphanBlobsCleaned   int64 `json:"orphan_blobs_cleaned"`
 	GCRuns               int64 `json:"gc_runs"`
 	GCBytesReclaimed     int64 `json:"gc_bytes_reclaimed"`
+	InlineSelections     int64 `json:"inline_selections"`
+	ExternalSelections   int64 `json:"external_selections"`
+	SingleflightHits     int64 `json:"singleflight_hits"`
+	CacheHits            int64 `json:"cache_hits"`
+	BlobWriteNanos       int64 `json:"blob_write_nanos"`
+	BlobWriteCount       int64 `json:"blob_write_count"`
+	ManifestWrites       int64 `json:"manifest_writes"`
+	ManifestWriteNanos   int64 `json:"manifest_write_nanos"`
+	IOSchedulerWaits     int64 `json:"io_scheduler_waits"`
 }
 
 // CAWALGCResult summarizes a single garbage collection pass.
@@ -98,14 +112,34 @@ type CAWALGCResult struct {
 	Aborted        bool  `json:"aborted"`
 }
 
+type cawalPinShard struct {
+	mu   sync.Mutex
+	pins map[string]int
+}
+
+type cawalFlight struct {
+	done chan struct{}
+	res  CAWALPutResult
+	err  error
+}
+
 // CAWALStore manages immutable SHA-256 content-addressed WAL chunk blobs,
 // active write pins, durable logical manifests, and crash-safe GC.
 type CAWALStore struct {
 	rootDir string // base LayerDir; blobs live under <rootDir>/_wal_cas/sha256/<hh>/<hash>.walb
 	casDir  string
 
-	pinMu sync.Mutex
-	pins  map[string]int
+	inlineThreshold atomic.Int64
+
+	pinShards [cawalPinShardCount]cawalPinShard
+
+	flightMu sync.Mutex
+	flights  map[string]*cawalFlight
+
+	cacheMu  sync.RWMutex
+	verified map[string]CAWALPutResult
+
+	ioSem chan struct{}
 
 	memMu    sync.RWMutex
 	memBlobs map[string][]byte // used when rootDir == ""
@@ -121,6 +155,15 @@ type CAWALStore struct {
 	orphanBlobsCleaned   atomic.Int64
 	gcRuns               atomic.Int64
 	gcBytesReclaimed     atomic.Int64
+	inlineSelections     atomic.Int64
+	externalSelections   atomic.Int64
+	singleflightHits     atomic.Int64
+	cacheHits            atomic.Int64
+	blobWriteNanos       atomic.Int64
+	blobWriteCount       atomic.Int64
+	manifestWrites       atomic.Int64
+	manifestWriteNanos   atomic.Int64
+	ioSchedulerWaits     atomic.Int64
 
 	// faultHook is for deterministic crash/fault-injection testing.
 	faultHook func(stage string) error
@@ -132,12 +175,49 @@ func NewCAWALStore(rootDir string) *CAWALStore {
 	if rootDir != "" {
 		casDir = filepath.Join(rootDir, "_wal_cas")
 	}
-	return &CAWALStore{
+	ioSlots := runtime.GOMAXPROCS(0) * 2
+	if ioSlots < 4 {
+		ioSlots = 4
+	}
+	if ioSlots > 16 {
+		ioSlots = 16
+	}
+	s := &CAWALStore{
 		rootDir:  rootDir,
 		casDir:   casDir,
-		pins:     make(map[string]int),
+		flights:  make(map[string]*cawalFlight),
+		verified: make(map[string]CAWALPutResult),
+		ioSem:    make(chan struct{}, ioSlots),
 		memBlobs: make(map[string][]byte),
 	}
+	s.inlineThreshold.Store(DefaultCAWALInlineThresholdBytes)
+	for i := range s.pinShards {
+		s.pinShards[i].pins = make(map[string]int)
+	}
+	return s
+}
+
+// SetInlineThreshold configures the minimum WAL table byte size routed to external CA-WAL storage.
+func (s *CAWALStore) SetInlineThreshold(bytes int) {
+	if bytes < 0 {
+		bytes = 0
+	}
+	s.inlineThreshold.Store(int64(bytes))
+}
+
+// InlineThreshold returns the configured adaptive inline-vs-external threshold in bytes.
+func (s *CAWALStore) InlineThreshold() int {
+	return int(s.inlineThreshold.Load())
+}
+
+// RecordInlineSelection records an adaptive inline WAL storage decision.
+func (s *CAWALStore) RecordInlineSelection() {
+	s.inlineSelections.Add(1)
+}
+
+// RecordExternalSelection records an adaptive external CA-WAL storage decision.
+func (s *CAWALStore) RecordExternalSelection() {
+	s.externalSelections.Add(1)
 }
 
 // Metrics returns a point-in-time snapshot of CAWALStore observability counters.
@@ -152,7 +232,23 @@ func (s *CAWALStore) Metrics() CAWALMetrics {
 		OrphanBlobsCleaned:   s.orphanBlobsCleaned.Load(),
 		GCRuns:               s.gcRuns.Load(),
 		GCBytesReclaimed:     s.gcBytesReclaimed.Load(),
+		InlineSelections:     s.inlineSelections.Load(),
+		ExternalSelections:   s.externalSelections.Load(),
+		SingleflightHits:     s.singleflightHits.Load(),
+		CacheHits:            s.cacheHits.Load(),
+		BlobWriteNanos:       s.blobWriteNanos.Load(),
+		BlobWriteCount:       s.blobWriteCount.Load(),
+		ManifestWrites:       s.manifestWrites.Load(),
+		ManifestWriteNanos:   s.manifestWriteNanos.Load(),
+		IOSchedulerWaits:     s.ioSchedulerWaits.Load(),
 	}
+}
+
+func pinShardIndex(hashHex string) int {
+	if len(hashHex) < 2 {
+		return 0
+	}
+	return int(hashHex[0]^hashHex[1]) & (cawalPinShardCount - 1)
 }
 
 // Pin prevents GC from deleting hashHex until a corresponding Unpin is called.
@@ -160,9 +256,10 @@ func (s *CAWALStore) Pin(hashHex string) {
 	if hashHex == "" {
 		return
 	}
-	s.pinMu.Lock()
-	s.pins[hashHex]++
-	s.pinMu.Unlock()
+	sh := &s.pinShards[pinShardIndex(hashHex)]
+	sh.mu.Lock()
+	sh.pins[hashHex]++
+	sh.mu.Unlock()
 }
 
 // Unpin releases a reference pin acquired via Pin.
@@ -170,24 +267,39 @@ func (s *CAWALStore) Unpin(hashHex string) {
 	if hashHex == "" {
 		return
 	}
-	s.pinMu.Lock()
-	if cur := s.pins[hashHex]; cur <= 1 {
-		delete(s.pins, hashHex)
+	sh := &s.pinShards[pinShardIndex(hashHex)]
+	sh.mu.Lock()
+	if cur := sh.pins[hashHex]; cur <= 1 {
+		delete(sh.pins, hashHex)
 	} else {
-		s.pins[hashHex] = cur - 1
+		sh.pins[hashHex] = cur - 1
 	}
-	s.pinMu.Unlock()
+	sh.mu.Unlock()
 }
 
 func (s *CAWALStore) isPinned(hashHex string) bool {
-	s.pinMu.Lock()
-	_, ok := s.pins[hashHex]
-	s.pinMu.Unlock()
+	sh := &s.pinShards[pinShardIndex(hashHex)]
+	sh.mu.Lock()
+	_, ok := sh.pins[hashHex]
+	sh.mu.Unlock()
 	return ok
 }
 
 func (s *CAWALStore) blobPath(hashHex string) string {
 	return filepath.Join(s.casDir, "sha256", hashHex[:2], hashHex+".walb")
+}
+
+func encodeCAWALBlobPrecompressed(rawLen uint32, sum [32]byte, payload []byte, codec uint8) []byte {
+	out := make([]byte, CAWALHeaderSize+len(payload))
+	binary.LittleEndian.PutUint32(out[0:4], CAWALBlobMagic)
+	binary.LittleEndian.PutUint16(out[4:6], CAWALBlobVersion)
+	out[6] = codec
+	out[7] = 0
+	binary.LittleEndian.PutUint32(out[8:12], rawLen)
+	binary.LittleEndian.PutUint32(out[12:16], uint32(len(payload)))
+	copy(out[16:48], sum[:])
+	copy(out[48:], payload)
+	return out
 }
 
 func encodeCAWALBlob(raw []byte, sum [32]byte) ([]byte, uint8, error) {
@@ -205,17 +317,7 @@ func encodeCAWALBlob(raw []byte, sum [32]byte) ([]byte, uint8, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-
-	out := make([]byte, CAWALHeaderSize+len(payload))
-	binary.LittleEndian.PutUint32(out[0:4], CAWALBlobMagic)
-	binary.LittleEndian.PutUint16(out[4:6], CAWALBlobVersion)
-	out[6] = codec
-	out[7] = 0
-	binary.LittleEndian.PutUint32(out[8:12], uint32(len(raw)))
-	binary.LittleEndian.PutUint32(out[12:16], uint32(len(payload)))
-	copy(out[16:48], sum[:])
-	copy(out[48:], payload)
-	return out, codec, nil
+	return encodeCAWALBlobPrecompressed(uint32(len(raw)), sum, payload, codec), codec, nil
 }
 
 func decodeAndVerifyCAWALBlob(blobBytes []byte, expectedSum [32]byte) ([]byte, uint8, error) {
@@ -259,10 +361,57 @@ func decodeAndVerifyCAWALBlob(blobBytes []byte, expectedSum [32]byte) ([]byte, u
 	return raw, codec, nil
 }
 
+func (s *CAWALStore) getVerified(hashHex string) (CAWALPutResult, bool) {
+	s.cacheMu.RLock()
+	res, ok := s.verified[hashHex]
+	s.cacheMu.RUnlock()
+	return res, ok
+}
+
+func (s *CAWALStore) putVerified(hashHex string, res CAWALPutResult) {
+	s.cacheMu.Lock()
+	if len(s.verified) >= maxCAWALVerifiedCacheEntries {
+		// Evict a small batch to keep map bounded without full flush.
+		evicted := 0
+		for k := range s.verified {
+			delete(s.verified, k)
+			evicted++
+			if evicted >= 256 {
+				break
+			}
+		}
+	}
+	res.Deduplicated = false
+	s.verified[hashHex] = res
+	s.cacheMu.Unlock()
+}
+
+func (s *CAWALStore) delVerified(hashHex string) {
+	s.cacheMu.Lock()
+	delete(s.verified, hashHex)
+	s.cacheMu.Unlock()
+}
+
+func (s *CAWALStore) acquireIOSlot(ctx context.Context) error {
+	select {
+	case s.ioSem <- struct{}{}:
+		return nil
+	default:
+		s.ioSchedulerWaits.Add(1)
+		select {
+		case s.ioSem <- struct{}{}:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (s *CAWALStore) releaseIOSlot() {
+	<-s.ioSem
+}
+
 // PutBlobIfAbsent atomically stores raw under its SHA-256 content address if not already present.
-// The caller should Pin(res.Hash) or keep it pinned until the referencing manifest is durable;
-// PutBlobIfAbsent itself pins during the write and leaves the caller to manage post-write pinning
-// if needed via Pin/Unpin.
 func (s *CAWALStore) PutBlobIfAbsent(ctx context.Context, raw []byte) (CAWALPutResult, error) {
 	if err := ctx.Err(); err != nil {
 		return CAWALPutResult{}, err
@@ -270,8 +419,25 @@ func (s *CAWALStore) PutBlobIfAbsent(ctx context.Context, raw []byte) (CAWALPutR
 	if len(raw) == 0 || len(raw) > maxCAWALBlobRawBytes {
 		return CAWALPutResult{}, fmt.Errorf("%w: invalid raw chunk size %d", ErrCAWALInvalidBlob, len(raw))
 	}
-
 	sum := sha256.Sum256(raw)
+	return s.PutBlobWithHashIfAbsent(ctx, raw, sum)
+}
+
+// PutBlobWithHashIfAbsent stores raw using a precomputed SHA-256 sum, avoiding repeated hashing.
+func (s *CAWALStore) PutBlobWithHashIfAbsent(ctx context.Context, raw []byte, sum [32]byte) (CAWALPutResult, error) {
+	return s.PutPrecompressedBlobIfAbsent(ctx, raw, sum, nil, 0)
+}
+
+// PutPrecompressedBlobIfAbsent stores raw under sum, reusing precompressed payload/codec if provided
+// (precompressed must be the V2-encoded form of raw under codec).
+func (s *CAWALStore) PutPrecompressedBlobIfAbsent(ctx context.Context, raw []byte, sum [32]byte, precompressed []byte, preCodec uint8) (CAWALPutResult, error) {
+	if err := ctx.Err(); err != nil {
+		return CAWALPutResult{}, err
+	}
+	if len(raw) == 0 || len(raw) > maxCAWALBlobRawBytes {
+		return CAWALPutResult{}, fmt.Errorf("%w: invalid raw chunk size %d", ErrCAWALInvalidBlob, len(raw))
+	}
+
 	hashHex := hex.EncodeToString(sum[:])
 	s.blobBytesLogical.Add(int64(len(raw)))
 
@@ -293,9 +459,17 @@ func (s *CAWALStore) PutBlobIfAbsent(ctx context.Context, raw []byte) (CAWALPutR
 				Deduplicated: true,
 			}, nil
 		}
-		encoded, codec, err := encodeCAWALBlob(raw, sum)
-		if err != nil {
-			return CAWALPutResult{}, err
+		var encoded []byte
+		var codec uint8
+		if precompressed != nil {
+			encoded = encodeCAWALBlobPrecompressed(uint32(len(raw)), sum, precompressed, preCodec)
+			codec = preCodec
+		} else {
+			var err error
+			encoded, codec, err = encodeCAWALBlob(raw, sum)
+			if err != nil {
+				return CAWALPutResult{}, err
+			}
 		}
 		s.memBlobs[hashHex] = encoded
 		s.blobWrites.Add(1)
@@ -309,7 +483,62 @@ func (s *CAWALStore) PutBlobIfAbsent(ctx context.Context, raw []byte) (CAWALPutR
 	}
 
 	finalPath := s.blobPath(hashHex)
+
+	// Fast path 1: verified-blob cache + single os.Stat confirmation (skips compression & file open/read).
+	if cached, ok := s.getVerified(hashHex); ok && cached.RawLen == uint32(len(raw)) {
+		if st, sErr := os.Stat(finalPath); sErr == nil && uint32(st.Size()) == cached.StoredLen {
+			s.cacheHits.Add(1)
+			s.dedupHits.Add(1)
+			cached.Deduplicated = true
+			return cached, nil
+		}
+		s.delVerified(hashHex)
+	}
+
+	// Fast path 2: per-hash singleflight so concurrent identical writes do not race on os.Link/fsync.
+	s.flightMu.Lock()
+	if fl, ok := s.flights[hashHex]; ok {
+		s.flightMu.Unlock()
+		select {
+		case <-fl.done:
+			if fl.err != nil {
+				return CAWALPutResult{}, fl.err
+			}
+			res := fl.res
+			res.Deduplicated = true
+			s.singleflightHits.Add(1)
+			s.dedupHits.Add(1)
+			return res, nil
+		case <-ctx.Done():
+			return CAWALPutResult{}, ctx.Err()
+		}
+	}
+	fl := &cawalFlight{done: make(chan struct{})}
+	s.flights[hashHex] = fl
+	s.flightMu.Unlock()
+
+	res, err := s.putBlobDiskLeader(ctx, finalPath, hashHex, raw, sum, precompressed, preCodec)
+	fl.res = res
+	fl.err = err
+	close(fl.done)
+
+	s.flightMu.Lock()
+	delete(s.flights, hashHex)
+	s.flightMu.Unlock()
+
+	return res, err
+}
+
+func (s *CAWALStore) putBlobDiskLeader(ctx context.Context, finalPath, hashHex string, raw []byte, sum [32]byte, precompressed []byte, preCodec uint8) (CAWALPutResult, error) {
+	start := time.Now()
+	defer func() {
+		s.blobWriteNanos.Add(time.Since(start).Nanoseconds())
+		s.blobWriteCount.Add(1)
+	}()
+
 	if existing, err := s.statAndVerifyHeader(finalPath, sum, uint32(len(raw))); err == nil {
+		existing.Hash = hashHex
+		s.putVerified(hashHex, existing)
 		s.dedupHits.Add(1)
 		return CAWALPutResult{
 			Hash:         hashHex,
@@ -324,12 +553,25 @@ func (s *CAWALStore) PutBlobIfAbsent(ctx context.Context, raw []byte) (CAWALPutR
 		return CAWALPutResult{}, err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
-		return CAWALPutResult{}, err
+	var encoded []byte
+	var codec uint8
+	if precompressed != nil {
+		encoded = encodeCAWALBlobPrecompressed(uint32(len(raw)), sum, precompressed, preCodec)
+		codec = preCodec
+	} else {
+		var err error
+		encoded, codec, err = encodeCAWALBlob(raw, sum)
+		if err != nil {
+			return CAWALPutResult{}, err
+		}
 	}
 
-	encoded, codec, err := encodeCAWALBlob(raw, sum)
-	if err != nil {
+	if err := s.acquireIOSlot(ctx); err != nil {
+		return CAWALPutResult{}, err
+	}
+	defer s.releaseIOSlot()
+
+	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
 		return CAWALPutResult{}, err
 	}
 
@@ -375,6 +617,8 @@ func (s *CAWALStore) PutBlobIfAbsent(ctx context.Context, raw []byte) (CAWALPutR
 				s.corruptBlobsDetected.Add(1)
 				return CAWALPutResult{}, vErr
 			}
+			existing.Hash = hashHex
+			s.putVerified(hashHex, existing)
 			s.dedupHits.Add(1)
 			return CAWALPutResult{
 				Hash:         hashHex,
@@ -389,14 +633,16 @@ func (s *CAWALStore) PutBlobIfAbsent(ctx context.Context, raw []byte) (CAWALPutR
 	cleanupTmp()
 	syncDirBestEffort(filepath.Dir(finalPath))
 
-	s.blobWrites.Add(1)
-	s.blobBytesWritten.Add(int64(len(encoded)))
-	return CAWALPutResult{
+	res := CAWALPutResult{
 		Hash:      hashHex,
 		RawLen:    uint32(len(raw)),
 		StoredLen: uint32(len(encoded)),
 		Codec:     codec,
-	}, nil
+	}
+	s.putVerified(hashHex, res)
+	s.blobWrites.Add(1)
+	s.blobBytesWritten.Add(int64(len(encoded)))
+	return res, nil
 }
 
 func (s *CAWALStore) verifyExistingHeaderOnly(blob []byte, expectedSum [32]byte, expectedRawLen uint32) error {
@@ -480,6 +726,7 @@ func (s *CAWALStore) GetBlobVerified(ctx context.Context, hashHex string) ([]byt
 
 	raw, _, err := decodeAndVerifyCAWALBlob(blobBytes, expectedSum)
 	if err != nil {
+		s.delVerified(norm)
 		s.hashFailures.Add(1)
 		s.corruptBlobsDetected.Add(1)
 		return nil, err
@@ -514,19 +761,26 @@ func (s *CAWALStore) ManifestPath(tenantID, generation string, epoch int64) stri
 
 // PublishManifest atomically persists m after verifying every referenced blob is present and valid.
 func (s *CAWALStore) PublishManifest(ctx context.Context, m *CAWALManifest) error {
+	start := time.Now()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if m == nil || m.TenantID == "" {
 		return fmt.Errorf("%w: empty tenant_id", ErrCAWALInvalidBlob)
 	}
+	checked := make(map[string]struct{}, len(m.Refs))
 	for _, ref := range m.Refs {
-		if _, err := ValidateSHA256Hex(ref.BlobHash); err != nil {
+		norm, err := ValidateSHA256Hex(ref.BlobHash)
+		if err != nil {
 			return err
 		}
-		if !s.HasBlob(ref.BlobHash) {
+		if _, ok := checked[norm]; ok {
+			continue
+		}
+		if !s.HasBlob(norm) {
 			return fmt.Errorf("%w: manifest references missing blob %s", ErrCAWALBlobMissing, ref.BlobHash)
 		}
+		checked[norm] = struct{}{}
 	}
 	if s.faultHook != nil {
 		if err := s.faultHook("before_manifest_commit"); err != nil {
@@ -535,7 +789,7 @@ func (s *CAWALStore) PublishManifest(ctx context.Context, m *CAWALManifest) erro
 	}
 	m.Version = 1
 	m.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	body, err := json.MarshalIndent(m, "", "  ")
+	body, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
@@ -577,6 +831,8 @@ func (s *CAWALStore) PublishManifest(ctx context.Context, m *CAWALManifest) erro
 		return err
 	}
 	syncDirBestEffort(filepath.Dir(path))
+	s.manifestWrites.Add(1)
+	s.manifestWriteNanos.Add(time.Since(start).Nanoseconds())
 	return nil
 }
 
@@ -617,12 +873,15 @@ func (s *CAWALStore) GC(ctx context.Context, minAge time.Duration, shouldAbort f
 	}
 
 	reachable := make(map[string]struct{})
-	// 1. Collect all active in-flight pins.
-	s.pinMu.Lock()
-	for h := range s.pins {
-		reachable[h] = struct{}{}
+	// 1. Collect all active in-flight pins across shards.
+	for i := range s.pinShards {
+		sh := &s.pinShards[i]
+		sh.mu.Lock()
+		for h := range sh.pins {
+			reachable[h] = struct{}{}
+		}
+		sh.mu.Unlock()
 	}
-	s.pinMu.Unlock()
 
 	// 2. Mark all blobs reachable from durable CAWAL manifests and V2 layer manifests.
 	if err := s.collectReachableFromDisk(ctx, reachable); err != nil {
@@ -693,6 +952,7 @@ func (s *CAWALStore) GC(ctx context.Context, minAge time.Duration, shouldAbort f
 				continue
 			}
 			if err := os.Remove(fullPath); err == nil {
+				s.delVerified(hashHex)
 				res.DeletedBlobs++
 				res.ReclaimedBytes += info.Size()
 				s.orphanBlobsCleaned.Add(1)

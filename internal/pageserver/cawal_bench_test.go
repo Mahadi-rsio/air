@@ -25,13 +25,18 @@ type benchProfileResult struct {
 	WriteLatP95Us     float64
 	WriteLatP99Us     float64
 	FlushLatAvgMs     float64
+	BlobWriteAvgUs    float64
 	HeapAllocMB       float64
+	PeakHeapSysMB     float64
 	TotalAllocMB      float64
 	NumGC             uint32
 	GCPauseTotalMs    float64
+	Goroutines        int
 	PhysicalStorageKB int64
 	LogicalWALKB      int64
 	DedupRatio        float64
+	InlineCount       int64
+	ExternalCount     int64
 	RecoveryDurMs     float64
 	RecoveryOK        bool
 }
@@ -84,12 +89,12 @@ func makeSyntheticWALRecords(tenantIdx, count, payloadSize int, sharedPattern bo
 	return recs
 }
 
-func runCAWALBenchmarkScenario(t *testing.T, mode string, memMB, tenants int, workload string, recsPerTenant, payloadSize int, shared bool) benchProfileResult {
+func runCAWALBenchmarkScenario(t *testing.T, mode string, memMB, tenants int, workload string, recsPerTenant, payloadSize int, shared bool, thresholdBytes int) benchProfileResult {
 	t.Helper()
 	ctx := context.Background()
 	layerDir := t.TempDir()
 
-	enableCAWAL := mode != "existing_wal"
+	enableCAWAL := mode != "A_disabled"
 	ps, err := New(Config{
 		DisableUnixSocket: true,
 		LayerDir:          layerDir,
@@ -101,6 +106,13 @@ func runCAWALBenchmarkScenario(t *testing.T, mode string, memMB, tenants int, wo
 	})
 	if err != nil {
 		t.Fatalf("New ps: %v", err)
+	}
+	if enableCAWAL && ps.Store().CAWALStore() != nil {
+		if mode == "B_unadaptive_cawal" {
+			ps.Store().CAWALStore().SetInlineThreshold(0)
+		} else if thresholdBytes >= 0 {
+			ps.Store().CAWALStore().SetInlineThreshold(thresholdBytes)
+		}
 	}
 
 	runtime.GC()
@@ -213,11 +225,18 @@ func runCAWALBenchmarkScenario(t *testing.T, mode string, memMB, tenants int, wo
 	logicalBytes := int64(tenants * recsPerTenant * payloadSize)
 	physBytes := dirSizeBytes(layerDir)
 	dedupRatio := 1.0
+	var blobWriteAvgUs float64
+	var inlineCnt, extCnt int64
 	if enableCAWAL && ps.Store().CAWALStore() != nil {
 		cm := ps.Store().CAWALStore().Metrics()
 		if cm.BlobBytesWritten > 0 {
 			dedupRatio = float64(cm.BlobBytesLogical) / float64(cm.BlobBytesWritten)
 		}
+		if cm.BlobWriteCount > 0 {
+			blobWriteAvgUs = float64(cm.BlobWriteNanos) / float64(cm.BlobWriteCount) / 1000.0
+		}
+		inlineCnt = cm.InlineSelections
+		extCnt = cm.ExternalSelections
 	}
 
 	return benchProfileResult{
@@ -230,15 +249,49 @@ func runCAWALBenchmarkScenario(t *testing.T, mode string, memMB, tenants int, wo
 		WriteLatP95Us:     pct(0.95),
 		WriteLatP99Us:     pct(0.99),
 		FlushLatAvgMs:     flushAvgMs,
+		BlobWriteAvgUs:    blobWriteAvgUs,
 		HeapAllocMB:       float64(mAfter.HeapAlloc) / (1024 * 1024),
+		PeakHeapSysMB:     float64(mAfter.HeapSys) / (1024 * 1024),
 		TotalAllocMB:      float64(mAfter.TotalAlloc-mBefore.TotalAlloc) / (1024 * 1024),
 		NumGC:             mAfter.NumGC - mBefore.NumGC,
 		GCPauseTotalMs:    float64(mAfter.PauseTotalNs-mBefore.PauseTotalNs) / 1e6,
+		Goroutines:        runtime.NumGoroutine(),
 		PhysicalStorageKB: physBytes / 1024,
 		LogicalWALKB:      logicalBytes / 1024,
 		DedupRatio:        dedupRatio,
+		InlineCount:       inlineCnt,
+		ExternalCount:     extCnt,
 		RecoveryDurMs:     float64(recDur.Microseconds()) / 1000.0,
 		RecoveryOK:        recOK,
+	}
+}
+
+func TestCAWAL_AdaptiveThresholdSweep(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping threshold sweep in -short mode")
+	}
+	thresholds := []int{4 * 1024, 8 * 1024, 16 * 1024, 32 * 1024, 64 * 1024}
+	type sweepCase struct {
+		name        string
+		recs        int
+		payloadSize int
+	}
+	cases := []sweepCase{
+		{"small_1KB", 32, 1024},
+		{"medium_8KB", 32, 8192},
+		{"large_24KB", 16, 24576},
+	}
+	t.Logf("\n| ThresholdKB | Case | MB/s | p99(us) | Flush(ms) | Disk(KB) | Dedup | Inline | External |")
+	for _, th := range thresholds {
+		for _, c := range cases {
+			r := runCAWALBenchmarkScenario(t, "C_adaptive_cawal", 256, 10, c.name, c.recs, c.payloadSize, true, th)
+			if !r.RecoveryOK {
+				t.Fatalf("recovery failed in sweep: %+v", r)
+			}
+			t.Logf("| %d | %s | %.2f | %.0f | %.2f | %d | %.2fx | %d | %d |",
+				th/1024, c.name, r.ThroughputMBps, r.WriteLatP99Us, r.FlushLatAvgMs,
+				r.PhysicalStorageKB, r.DedupRatio, r.InlineCount, r.ExternalCount)
+		}
 	}
 }
 
@@ -247,7 +300,7 @@ func TestCAWAL_BenchmarkMatrix(t *testing.T) {
 		t.Skip("skipping benchmark matrix in -short mode")
 	}
 
-	modes := []string{"existing_wal", "cawal_no_memopt", "cawal_memopt"}
+	modes := []string{"A_disabled", "B_unadaptive_cawal", "C_adaptive_cawal"}
 	type scenario struct {
 		memMB         int
 		tenants       int
@@ -258,16 +311,18 @@ func TestCAWAL_BenchmarkMatrix(t *testing.T) {
 	}
 	scenarios := []scenario{
 		{256, 1, "small_shared", 256, 256, true},
-		{256, 10, "small_shared", 128, 256, true},
+		{256, 8, "medium_shared", 64, 1024, true},
 		{256, 20, "large_shared", 64, 4096, true},
+		{512, 30, "sustained_shared", 64, 2048, true},
 		{512, 50, "concurrent_shared", 64, 1024, true},
+		{1024, 50, "concurrent_1gb", 64, 1024, true},
 		{256, 10, "unique_heavy_flush", 64, 2048, false},
 	}
 
 	var results []benchProfileResult
 	for _, sc := range scenarios {
 		for _, mode := range modes {
-			res := runCAWALBenchmarkScenario(t, mode, sc.memMB, sc.tenants, sc.workload, sc.recsPerTenant, sc.payloadSize, sc.shared)
+			res := runCAWALBenchmarkScenario(t, mode, sc.memMB, sc.tenants, sc.workload, sc.recsPerTenant, sc.payloadSize, sc.shared, DefaultCAWALInlineThresholdBytes)
 			if !res.RecoveryOK {
 				t.Fatalf("recovery failed for %+v", res)
 			}
@@ -275,12 +330,25 @@ func TestCAWAL_BenchmarkMatrix(t *testing.T) {
 		}
 	}
 
-	t.Logf("\n| Mode | MemMB | Tenants | Workload | MB/s | p50(us) | p95(us) | p99(us) | Flush(ms) | TotalAlloc(MB) | GC | Pause(ms) | Disk(KB) | Dedup | Rec(ms) |")
+	t.Logf("\n| Mode | MemMB | Tenants | Workload | MB/s | p50(us) | p95(us) | p99(us) | Flush(ms) | Blob(us) | TotalAlloc(MB) | HeapSys(MB) | GC | Pause(ms) | Goroutines | Disk(KB) | Dedup | Inl/Ext | Rec(ms) |")
 	for _, r := range results {
-		t.Logf("| %s | %d | %d | %s | %.2f | %.0f | %.0f | %.0f | %.2f | %.2f | %d | %.2f | %d | %.2fx | %.2f |",
+		t.Logf("| %s | %d | %d | %s | %.2f | %.0f | %.0f | %.0f | %.2f | %.1f | %.2f | %.1f | %d | %.2f | %d | %d | %.2fx | %d/%d | %.2f |",
 			r.Mode, r.MemProfileMB, r.Tenants, r.Workload, r.ThroughputMBps,
-			r.WriteLatP50Us, r.WriteLatP95Us, r.WriteLatP99Us, r.FlushLatAvgMs,
-			r.TotalAllocMB, r.NumGC, r.GCPauseTotalMs, r.PhysicalStorageKB, r.DedupRatio, r.RecoveryDurMs)
+			r.WriteLatP50Us, r.WriteLatP95Us, r.WriteLatP99Us, r.FlushLatAvgMs, r.BlobWriteAvgUs,
+			r.TotalAllocMB, r.PeakHeapSysMB, r.NumGC, r.GCPauseTotalMs, r.Goroutines,
+			r.PhysicalStorageKB, r.DedupRatio, r.InlineCount, r.ExternalCount, r.RecoveryDurMs)
+	}
+
+	// Repeated-run variance check for 50-tenant concurrent_shared (3 runs per mode).
+	t.Logf("\n| Mode (50T x3 runs) | p99_run1(us) | p99_run2(us) | p99_run3(us) | p99_mean(us) |")
+	for _, mode := range modes {
+		var p99s [3]float64
+		for run := 0; run < 3; run++ {
+			r := runCAWALBenchmarkScenario(t, mode, 512, 50, "concurrent_shared", 64, 1024, true, DefaultCAWALInlineThresholdBytes)
+			p99s[run] = r.WriteLatP99Us
+		}
+		mean := (p99s[0] + p99s[1] + p99s[2]) / 3.0
+		t.Logf("| %s | %.0f | %.0f | %.0f | %.0f |", mode, p99s[0], p99s[1], p99s[2], mean)
 	}
 }
 

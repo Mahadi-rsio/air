@@ -286,11 +286,20 @@ func (p *Pageserver) Store() *LayerStore {
 // SetTenantGeneration registers the active immutable generation for tenantID.
 // If an existing Timeline belongs to a different generation, it is detached.
 func (p *Pageserver) SetTenantGeneration(tenantID, generation string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if generation == "" {
 		return
 	}
+	p.mu.RLock()
+	if prev, ok := p.generations[tenantID]; ok && prev == generation {
+		if tl, exists := p.tenants[tenantID]; !exists || tl.Generation() == generation {
+			p.mu.RUnlock()
+			return
+		}
+	}
+	p.mu.RUnlock()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if prev, ok := p.generations[tenantID]; ok && prev != generation {
 		debugf("tenant", "SetTenantGeneration tenant=%s prev=%q new=%q (detaching old timeline)", tenantID, prev, generation)
 		if oldTL, exists := p.tenants[tenantID]; exists && p.budget != nil {
@@ -422,9 +431,17 @@ func (p *Pageserver) PurgeTenant(ctx context.Context, tenantID, generation strin
 
 // EnsureTenant returns an existing Timeline for tenantID or creates one at epoch.
 func (p *Pageserver) EnsureTenant(tenantID string, epoch int64) *Timeline {
+	p.mu.RLock()
+	gen := p.generations[tenantID]
+	if tl, ok := p.tenants[tenantID]; ok && (gen == "" || tl.Generation() == gen) {
+		p.mu.RUnlock()
+		return tl
+	}
+	p.mu.RUnlock()
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	gen := p.generations[tenantID]
+	gen = p.generations[tenantID]
 	if tl, ok := p.tenants[tenantID]; ok {
 		if gen == "" || tl.Generation() == gen {
 			debugf("tenant", "EnsureTenant reuse tenant=%s epoch=%d gen=%q last_lsn=%s layers=%d", tenantID, epoch, tl.Generation(), formatLSNHex(tl.LastLSN()), tl.LayerCount())

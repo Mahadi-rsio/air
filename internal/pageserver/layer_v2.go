@@ -159,9 +159,10 @@ type v2EncodeResult struct {
 }
 
 type v2EncodeOptions struct {
-	DisableCompression bool
-	CAWAL              *CAWALStore
-	Ctx                context.Context
+	DisableCompression   bool
+	CAWAL                *CAWALStore
+	CAWALInlineThreshold int
+	Ctx                  context.Context
 }
 
 func v2ChunkAAD(aadKey string, chunkIdx int, codec uint8, rawLen uint32) string {
@@ -373,7 +374,20 @@ func (sw *v2StreamWriter) Finish() (v2EncodeResult, error) {
 		walRawLen := uint32(len(walRaw))
 		var walPayload []byte
 		var walCodec uint8
+		useExternalCAWAL := false
 		if sw.opts.CAWAL != nil && !sw.encrypted {
+			threshold := sw.opts.CAWALInlineThreshold
+			if threshold <= 0 {
+				threshold = sw.opts.CAWAL.InlineThreshold()
+			}
+			if len(walRaw) >= threshold {
+				useExternalCAWAL = true
+				sw.opts.CAWAL.RecordExternalSelection()
+			} else {
+				sw.opts.CAWAL.RecordInlineSelection()
+			}
+		}
+		if useExternalCAWAL {
 			cctx := sw.opts.Ctx
 			if cctx == nil {
 				cctx = context.Background()
