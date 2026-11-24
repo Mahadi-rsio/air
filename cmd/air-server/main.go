@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -85,19 +84,6 @@ func main() {
 		}
 	}
 
-	var gwAdminClient control.GatewayAdminClient
-	if cfg.GatewayAdminGRPCAddr != "" {
-		var gwErr error
-		gwAdminClient, gwErr = control.NewGRPCGatewayAdminClient(cfg.GatewayAdminGRPCAddr, cfg.InternalToken)
-		if gwErr != nil {
-			log.Printf("[air-server] gateway admin gRPC dial warning (%s): %v", cfg.GatewayAdminGRPCAddr, gwErr)
-		} else {
-			cp.SetGatewayAdminClient(gwAdminClient)
-			defer func() { _ = gwAdminClient.Close() }()
-			log.Printf("[air-server] connected to air-gateway admin via gRPC (%s)", cfg.GatewayAdminGRPCAddr)
-		}
-	}
-
 	if cfg.BootstrapAPIKey != "" {
 		keyInfo, err := cp.SeedAPIKey(ctx, cfg.BootstrapAccountID, cfg.BootstrapAPIKey, "bootstrap")
 		if err != nil {
@@ -118,42 +104,10 @@ func main() {
 	log.Printf("[air-server] async R2 cold-offload queue started (workers=2, evict_on_suspend=%v)", cfg.EvictOnSuspend)
 
 	var poolDrainFn func(tenantID string, timeout time.Duration) error
-	var closePoolDrain func() error
-	if cfg.GatewayAdminGRPCAddr != "" {
-		var drainErr error
-		poolDrainFn, closePoolDrain, drainErr = control.NewGRPCPoolDrainFn(cfg.GatewayAdminGRPCAddr, cfg.InternalToken)
-		if drainErr != nil {
-			log.Fatalf("init gateway admin gRPC drain client: %v", drainErr)
-		}
-		defer func() { _ = closePoolDrain() }()
-		log.Printf("[air-server] cooperative gateway gRPC drain enabled (gateway_admin_grpc=%s)", cfg.GatewayAdminGRPCAddr)
-	} else if cfg.GatewayAdminURL != "" {
-		poolDrainFn = control.NewHTTPPoolDrainFn(cfg.GatewayAdminURL, cfg.InternalToken)
-		log.Printf("[air-server] cooperative gateway drain enabled (gateway_admin_url=%s)", cfg.GatewayAdminURL)
-	}
-
-	if cfg.GatewayAdminURL != "" {
-		telPub := cell.NewTelemetryPublisher(ag, cfg.GatewayAdminURL, cfg.InternalToken, "", time.Second)
-		telPub.Start(ctx)
-		log.Printf("[air-server] cell resource telemetry publisher enabled (gateway_admin_url=%s)", cfg.GatewayAdminURL)
-	}
-
 	if cfg.IdleTimeout > 0 {
 		cp.StartIdleReaper(ctx, cfg.IdleTimeout, 0, poolDrainFn)
 		log.Printf("[air-server] cooperative scale-to-zero enabled (idle_timeout=%s)", cfg.IdleTimeout)
 	}
-
-	srv := &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           cp.HTTPHandler(),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-	go func() {
-		log.Printf("[air-server] Control Plane HTTP listening on %s", cfg.HTTPAddr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http serve: %v", err)
-		}
-	}()
 
 	grpcLis, err := net.Listen("tcp", cfg.GRPCAddr)
 	if err != nil {
@@ -172,7 +126,6 @@ func main() {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	grpcSrv.GracefulStop()
-	_ = srv.Shutdown(shutCtx)
 	if err := cp.ShutdownActiveTenants(shutCtx); err != nil {
 		log.Printf("[air-server] shutdown active tenants error: %v", err)
 	}

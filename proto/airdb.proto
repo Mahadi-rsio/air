@@ -19,6 +19,13 @@ service AirDBControl {
   rpc StartDatabase(TenantRequest) returns (TenantRouteResponse);
   rpc LockDatabase(TenantRequest) returns (StatusResponse);
   rpc UnlockDatabase(TenantRequest) returns (StatusResponse);
+
+  rpc TriggerBackup(TriggerBackupRequest) returns (JsonResponse);
+  rpc ListBackups(TenantRequest) returns (JsonResponse);
+  rpc VerifyBackup(VerifyBackupRequest) returns (JsonResponse);
+  rpc RestoreDatabase(RestoreDatabaseRequest) returns (JsonResponse);
+  rpc GetOffloadStatus(TenantRequest) returns (JsonResponse);
+  rpc RevokeAPIKey(RevokeAPIKeyRequest) returns (StatusResponse);
 }
 
 message Empty {}
@@ -73,6 +80,35 @@ message ListDatabasesResponse {
 message StatusResponse {
   string status = 1;
   string tenant_id = 2;
+}
+
+message JsonResponse {
+  string json = 1;
+}
+
+message TriggerBackupRequest {
+  string tenant_id = 1;
+  string type = 2;
+}
+
+message VerifyBackupRequest {
+  string tenant_id = 1;
+  string backup_id = 2;
+  bool stream_hash = 3;
+  bool deep_restore = 4;
+}
+
+message RestoreDatabaseRequest {
+  string tenant_id = 1;
+  string backup_id = 2;
+  string target_lsn = 3;
+  string target_time = 4;
+  string new_tenant_id = 5;
+  string verify_query = 6;
+}
+
+message RevokeAPIKeyRequest {
+  string key_id = 1;
 }
 
 enum TenantEventType {

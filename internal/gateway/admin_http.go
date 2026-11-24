@@ -119,6 +119,20 @@ func (s *AdminHTTPServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.handleDatabasesRoute(w, r) {
 		return
 	}
+	if r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/api-keys/") {
+		if !s.isAuthorized(r) {
+			writeJSON(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
+			return
+		}
+		keyID := strings.TrimPrefix(r.URL.Path, "/v1/api-keys/")
+		if keyID == "" || strings.Contains(keyID, "/") {
+			writeJSON(w, http.StatusBadRequest, `{"error":"invalid key id"}`)
+			return
+		}
+		code, resp, _ := s.discovery.RevokeAPIKey(keyID)
+		writeJSON(w, code, resp)
+		return
+	}
 	if s.handleInternalRoute(w, r) {
 		return
 	}
@@ -404,6 +418,58 @@ func (s *AdminHTTPServer) handleDatabasesRoute(w http.ResponseWriter, r *http.Re
 		case "unlock":
 			code, resp, _ = s.discovery.UnlockDatabase(tid)
 		}
+		writeJSON(w, code, resp)
+		return true
+	}
+
+	if action == "backups" && (r.Method == http.MethodPost || r.Method == http.MethodGet) {
+		if r.Method == http.MethodPost {
+			var payload struct {
+				Type string `json:"type"`
+			}
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			_ = json.Unmarshal(body, &payload)
+			code, resp, _ := s.discovery.TriggerBackup(tid, payload.Type)
+			writeJSON(w, code, resp)
+			return true
+		}
+		code, resp, _ := s.discovery.ListBackups(tid)
+		writeJSON(w, code, resp)
+		return true
+	}
+
+	if r.Method == http.MethodPost && strings.HasPrefix(action, "backups/") && strings.HasSuffix(action, "/verify") {
+		backupID := strings.TrimSuffix(strings.TrimPrefix(action, "backups/"), "/verify")
+		if backupID != "" && !strings.Contains(backupID, "/") {
+			var payload struct {
+				StreamHash  bool `json:"stream_hash"`
+				DeepRestore bool `json:"deep_restore"`
+			}
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			_ = json.Unmarshal(body, &payload)
+			code, resp, _ := s.discovery.VerifyBackup(tid, backupID, payload.StreamHash, payload.DeepRestore)
+			writeJSON(w, code, resp)
+			return true
+		}
+	}
+
+	if r.Method == http.MethodPost && action == "restore" {
+		var payload struct {
+			BackupID    string `json:"backup_id"`
+			TargetLSN   string `json:"target_lsn"`
+			TargetTime  string `json:"target_time"`
+			NewTenantID string `json:"new_tenant_id"`
+			VerifyQuery string `json:"verify_query"`
+		}
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		_ = json.Unmarshal(body, &payload)
+		code, resp, _ := s.discovery.RestoreDatabase(tid, payload.BackupID, payload.TargetLSN, payload.TargetTime, payload.NewTenantID, payload.VerifyQuery)
+		writeJSON(w, code, resp)
+		return true
+	}
+
+	if r.Method == http.MethodGet && action == "offload" {
+		code, resp, _ := s.discovery.GetOffloadStatus(tid)
 		writeJSON(w, code, resp)
 		return true
 	}

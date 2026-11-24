@@ -25,8 +25,7 @@ COPY --from=builder /out-air-gateway /usr/local/bin/air-gateway
 USER airgw
 ENV AIR_GATEWAY_ADDR=0.0.0.0:5432 \
     AIR_GATEWAY_ADMIN_ADDR=0.0.0.0:8081 \
-    AIR_GATEWAY_ADMIN_GRPC_ADDR=0.0.0.0:9093 \
     AIR_POOL_MODE=true
 
-EXPOSE 5432 8081 9093
+EXPOSE 5432 8081
 ENTRYPOINT ["/usr/local/bin/air-gateway"]

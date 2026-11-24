@@ -32,6 +32,12 @@ const (
 	AirDBControl_StartDatabase_FullMethodName      = "/air.db.v1.AirDBControl/StartDatabase"
 	AirDBControl_LockDatabase_FullMethodName       = "/air.db.v1.AirDBControl/LockDatabase"
 	AirDBControl_UnlockDatabase_FullMethodName     = "/air.db.v1.AirDBControl/UnlockDatabase"
+	AirDBControl_TriggerBackup_FullMethodName      = "/air.db.v1.AirDBControl/TriggerBackup"
+	AirDBControl_ListBackups_FullMethodName        = "/air.db.v1.AirDBControl/ListBackups"
+	AirDBControl_VerifyBackup_FullMethodName       = "/air.db.v1.AirDBControl/VerifyBackup"
+	AirDBControl_RestoreDatabase_FullMethodName    = "/air.db.v1.AirDBControl/RestoreDatabase"
+	AirDBControl_GetOffloadStatus_FullMethodName   = "/air.db.v1.AirDBControl/GetOffloadStatus"
+	AirDBControl_RevokeAPIKey_FullMethodName       = "/air.db.v1.AirDBControl/RevokeAPIKey"
 )
 
 // AirDBControlClient is the client API for AirDBControl service.
@@ -51,6 +57,12 @@ type AirDBControlClient interface {
 	StartDatabase(ctx context.Context, in *TenantRequest, opts ...grpc.CallOption) (*TenantRouteResponse, error)
 	LockDatabase(ctx context.Context, in *TenantRequest, opts ...grpc.CallOption) (*StatusResponse, error)
 	UnlockDatabase(ctx context.Context, in *TenantRequest, opts ...grpc.CallOption) (*StatusResponse, error)
+	TriggerBackup(ctx context.Context, in *TriggerBackupRequest, opts ...grpc.CallOption) (*JsonResponse, error)
+	ListBackups(ctx context.Context, in *TenantRequest, opts ...grpc.CallOption) (*JsonResponse, error)
+	VerifyBackup(ctx context.Context, in *VerifyBackupRequest, opts ...grpc.CallOption) (*JsonResponse, error)
+	RestoreDatabase(ctx context.Context, in *RestoreDatabaseRequest, opts ...grpc.CallOption) (*JsonResponse, error)
+	GetOffloadStatus(ctx context.Context, in *TenantRequest, opts ...grpc.CallOption) (*JsonResponse, error)
+	RevokeAPIKey(ctx context.Context, in *RevokeAPIKeyRequest, opts ...grpc.CallOption) (*StatusResponse, error)
 }
 
 type airDBControlClient struct {
@@ -200,6 +212,66 @@ func (c *airDBControlClient) UnlockDatabase(ctx context.Context, in *TenantReque
 	return out, nil
 }
 
+func (c *airDBControlClient) TriggerBackup(ctx context.Context, in *TriggerBackupRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(JsonResponse)
+	err := c.cc.Invoke(ctx, AirDBControl_TriggerBackup_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *airDBControlClient) ListBackups(ctx context.Context, in *TenantRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(JsonResponse)
+	err := c.cc.Invoke(ctx, AirDBControl_ListBackups_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *airDBControlClient) VerifyBackup(ctx context.Context, in *VerifyBackupRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(JsonResponse)
+	err := c.cc.Invoke(ctx, AirDBControl_VerifyBackup_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *airDBControlClient) RestoreDatabase(ctx context.Context, in *RestoreDatabaseRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(JsonResponse)
+	err := c.cc.Invoke(ctx, AirDBControl_RestoreDatabase_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *airDBControlClient) GetOffloadStatus(ctx context.Context, in *TenantRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(JsonResponse)
+	err := c.cc.Invoke(ctx, AirDBControl_GetOffloadStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *airDBControlClient) RevokeAPIKey(ctx context.Context, in *RevokeAPIKeyRequest, opts ...grpc.CallOption) (*StatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StatusResponse)
+	err := c.cc.Invoke(ctx, AirDBControl_RevokeAPIKey_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AirDBControlServer is the server API for AirDBControl service.
 // All implementations must embed UnimplementedAirDBControlServer
 // for forward compatibility.
@@ -217,6 +289,12 @@ type AirDBControlServer interface {
 	StartDatabase(context.Context, *TenantRequest) (*TenantRouteResponse, error)
 	LockDatabase(context.Context, *TenantRequest) (*StatusResponse, error)
 	UnlockDatabase(context.Context, *TenantRequest) (*StatusResponse, error)
+	TriggerBackup(context.Context, *TriggerBackupRequest) (*JsonResponse, error)
+	ListBackups(context.Context, *TenantRequest) (*JsonResponse, error)
+	VerifyBackup(context.Context, *VerifyBackupRequest) (*JsonResponse, error)
+	RestoreDatabase(context.Context, *RestoreDatabaseRequest) (*JsonResponse, error)
+	GetOffloadStatus(context.Context, *TenantRequest) (*JsonResponse, error)
+	RevokeAPIKey(context.Context, *RevokeAPIKeyRequest) (*StatusResponse, error)
 	mustEmbedUnimplementedAirDBControlServer()
 }
 
@@ -265,6 +343,24 @@ func (UnimplementedAirDBControlServer) LockDatabase(context.Context, *TenantRequ
 }
 func (UnimplementedAirDBControlServer) UnlockDatabase(context.Context, *TenantRequest) (*StatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UnlockDatabase not implemented")
+}
+func (UnimplementedAirDBControlServer) TriggerBackup(context.Context, *TriggerBackupRequest) (*JsonResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method TriggerBackup not implemented")
+}
+func (UnimplementedAirDBControlServer) ListBackups(context.Context, *TenantRequest) (*JsonResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListBackups not implemented")
+}
+func (UnimplementedAirDBControlServer) VerifyBackup(context.Context, *VerifyBackupRequest) (*JsonResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method VerifyBackup not implemented")
+}
+func (UnimplementedAirDBControlServer) RestoreDatabase(context.Context, *RestoreDatabaseRequest) (*JsonResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RestoreDatabase not implemented")
+}
+func (UnimplementedAirDBControlServer) GetOffloadStatus(context.Context, *TenantRequest) (*JsonResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetOffloadStatus not implemented")
+}
+func (UnimplementedAirDBControlServer) RevokeAPIKey(context.Context, *RevokeAPIKeyRequest) (*StatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RevokeAPIKey not implemented")
 }
 func (UnimplementedAirDBControlServer) mustEmbedUnimplementedAirDBControlServer() {}
 func (UnimplementedAirDBControlServer) testEmbeddedByValue()                      {}
@@ -514,6 +610,114 @@ func _AirDBControl_UnlockDatabase_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AirDBControl_TriggerBackup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TriggerBackupRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AirDBControlServer).TriggerBackup(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AirDBControl_TriggerBackup_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AirDBControlServer).TriggerBackup(ctx, req.(*TriggerBackupRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AirDBControl_ListBackups_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TenantRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AirDBControlServer).ListBackups(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AirDBControl_ListBackups_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AirDBControlServer).ListBackups(ctx, req.(*TenantRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AirDBControl_VerifyBackup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VerifyBackupRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AirDBControlServer).VerifyBackup(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AirDBControl_VerifyBackup_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AirDBControlServer).VerifyBackup(ctx, req.(*VerifyBackupRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AirDBControl_RestoreDatabase_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RestoreDatabaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AirDBControlServer).RestoreDatabase(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AirDBControl_RestoreDatabase_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AirDBControlServer).RestoreDatabase(ctx, req.(*RestoreDatabaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AirDBControl_GetOffloadStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TenantRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AirDBControlServer).GetOffloadStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AirDBControl_GetOffloadStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AirDBControlServer).GetOffloadStatus(ctx, req.(*TenantRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AirDBControl_RevokeAPIKey_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RevokeAPIKeyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AirDBControlServer).RevokeAPIKey(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AirDBControl_RevokeAPIKey_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AirDBControlServer).RevokeAPIKey(ctx, req.(*RevokeAPIKeyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // AirDBControl_ServiceDesc is the grpc.ServiceDesc for AirDBControl service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -568,6 +772,30 @@ var AirDBControl_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UnlockDatabase",
 			Handler:    _AirDBControl_UnlockDatabase_Handler,
+		},
+		{
+			MethodName: "TriggerBackup",
+			Handler:    _AirDBControl_TriggerBackup_Handler,
+		},
+		{
+			MethodName: "ListBackups",
+			Handler:    _AirDBControl_ListBackups_Handler,
+		},
+		{
+			MethodName: "VerifyBackup",
+			Handler:    _AirDBControl_VerifyBackup_Handler,
+		},
+		{
+			MethodName: "RestoreDatabase",
+			Handler:    _AirDBControl_RestoreDatabase_Handler,
+		},
+		{
+			MethodName: "GetOffloadStatus",
+			Handler:    _AirDBControl_GetOffloadStatus_Handler,
+		},
+		{
+			MethodName: "RevokeAPIKey",
+			Handler:    _AirDBControl_RevokeAPIKey_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

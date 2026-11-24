@@ -64,8 +64,7 @@ COPY migrations/ /app/migrations/
 
 WORKDIR /app
 ENV AIR_DATA_DIR=/var/lib/air \
-    AIR_PG_BIN_DIR=/usr/lib/postgresql/17/bin \
-    AIR_HTTP_ADDR=0.0.0.0:8080
+    AIR_PG_BIN_DIR=/usr/lib/postgresql/17/bin
 
-EXPOSE 8080 9090
+EXPOSE 9090
 ENTRYPOINT ["/usr/local/bin/air-entrypoint.sh"]

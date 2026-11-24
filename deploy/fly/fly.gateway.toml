@@ -7,8 +7,6 @@ primary_region = "sin"
 [env]
   AIR_GATEWAY_ADDR = "[::]:5432"
   AIR_GATEWAY_ADMIN_ADDR = "[::]:8081"
-  AIR_GATEWAY_ADMIN_GRPC_ADDR = "[::]:9093"
-  AIR_CONTROL_PLANE_URL = "http://air-pg-server.internal:8080"
   AIR_DB_GRPC_ADDR = "air-pg-server.internal:9090"
   AIR_PAGESERVER_GRPC_ADDR = "air-pg-pageserver.internal:9091"
   AIR_READ_ENGINE_HOST = "air-pg-read-engine.internal"

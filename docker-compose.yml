@@ -27,7 +27,6 @@ services:
     environment:
       AIR_DATA_DIR: /var/lib/air-pageserver
       AIR_PAGESERVER_GRPC_ADDR: 0.0.0.0:9091
-      AIR_PAGESERVER_HTTP_ADDR: 0.0.0.0:8083
       AIR_PAGESERVER_CACHE_MB: ${AIR_PAGESERVER_CACHE_MB:-256}
       AIR_PAGESERVER_DEBUG: ${AIR_PAGESERVER_DEBUG:-true}
       AIR_INTERNAL_TOKEN: ${AIR_INTERNAL_TOKEN:-air-dev-internal-token}
@@ -39,11 +38,10 @@ services:
       AIR_R2_REGION: ${AIR_R2_REGION:-auto}
     ports:
       - "${AIR_PAGESERVER_GRPC_PORT:-9091}:9091"
-      - "${AIR_PAGESERVER_HTTP_PORT:-8083}:8083"
     volumes:
       - air_pageserver_data:/var/lib/air-pageserver
     healthcheck:
-      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8083'"]
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9091'"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -65,14 +63,12 @@ services:
       AIR_DATA_DIR: /var/lib/air
       AIR_META_DSN: ${AIR_META_DSN:-postgres://air_meta:air_meta_pass@air-meta-postgres:5432/air_meta?sslmode=disable}
       AIR_PG_BIN_DIR: /usr/lib/postgresql/17/bin
-      AIR_HTTP_ADDR: 0.0.0.0:8080
       AIR_GRPC_ADDR: 0.0.0.0:9090
       AIR_PAGESERVER_ENABLED: ${AIR_PAGESERVER_ENABLED:-true}
       AIR_PAGESERVER_SOCKET: /var/lib/air/pageserver.sock
       AIR_PAGESERVER_CACHE_MB: ${AIR_PAGESERVER_CACHE_MB:-128}
       AIR_PAGESERVER_GRPC_ADDR: air-pageserver:9091
       AIR_READ_ENGINE_GRPC_ADDR: air-read-engine:9092
-      AIR_GATEWAY_ADMIN_GRPC_ADDR: air-gateway:9093
       AIR_BACKEND_HOST: air-server
       AIR_PG_LISTEN_ADDRESSES: "*"
       AIR_INTERNAL_TOKEN: ${AIR_INTERNAL_TOKEN:-air-dev-internal-token}
@@ -87,7 +83,6 @@ services:
       AIR_IDLE_TIMEOUT: ${AIR_IDLE_TIMEOUT:-}
       AIR_EVICT_ON_SUSPEND: ${AIR_EVICT_ON_SUSPEND:-false}
     ports:
-      - "${AIR_HTTP_PORT:-8080}:8080"
       - "${AIR_GRPC_PORT:-9090}:9090"
     volumes:
       - air_server_data:/var/lib/air
@@ -113,14 +108,12 @@ services:
       AIR_READ_ENGINE_CACHE_DIR: /var/lib/air-read-engine/cache
       AIR_READ_ENGINE_LISTEN_HOST: 0.0.0.0
       AIR_READ_ENGINE_PG_PORT: 5433
-      AIR_READ_ENGINE_HTTP_ADDR: 0.0.0.0:8082
       AIR_READ_ENGINE_GRPC_ADDR: 0.0.0.0:9092
       AIR_READ_ENGINE_DEBUG: ${AIR_READ_ENGINE_DEBUG:-true}
       AIR_PAGESERVER_GRPC_ADDR: air-pageserver:9091
       AIR_INTERNAL_TOKEN: ${AIR_INTERNAL_TOKEN:-air-dev-internal-token}
     ports:
       - "${AIR_READ_ENGINE_PG_PORT:-5433}:5433"
-      - "${AIR_READ_ENGINE_HTTP_PORT:-8082}:8082"
       - "${AIR_READ_ENGINE_GRPC_PORT:-9092}:9092"
     volumes:
       - air_read_engine_data:/var/lib/air-read-engine
@@ -146,8 +139,6 @@ services:
     environment:
       AIR_GATEWAY_ADDR: 0.0.0.0:5432
       AIR_GATEWAY_ADMIN_ADDR: 0.0.0.0:8081
-      AIR_GATEWAY_ADMIN_GRPC_ADDR: 0.0.0.0:9093
-      AIR_CONTROL_PLANE_URL: http://air-server:8080
       AIR_META_DSN: ${AIR_META_DSN:-postgres://air_meta:air_meta_pass@air-meta-postgres:5432/air_meta?sslmode=disable}
       AIR_DB_GRPC_ADDR: air-server:9090
       AIR_PAGESERVER_GRPC_ADDR: air-pageserver:9091
@@ -160,7 +151,6 @@ services:
     ports:
       - "${AIR_GATEWAY_PORT:-5432}:5432"
       - "${AIR_GATEWAY_ADMIN_PORT:-8081}:8081"
-      - "${AIR_GATEWAY_ADMIN_GRPC_PORT:-9093}:9093"
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8081'"]
       interval: 5s

@@ -268,6 +268,8 @@ func grpcToHTTP(c codes.Code) int {
 		return http.StatusConflict
 	case codes.InvalidArgument:
 		return http.StatusBadRequest
+	case codes.OutOfRange:
+		return http.StatusUnprocessableEntity
 	case codes.Unavailable:
 		return http.StatusServiceUnavailable
 	default:
@@ -403,6 +405,77 @@ func (d *TenantDiscovery) UnlockDatabase(tenantID string) (int, string, bool) {
 	return d.callTenantStatusRPC(tenantID, 15*time.Second, "SUSPENDED", func(ctx context.Context, req *pb.TenantRequest) (*pb.StatusResponse, error) {
 		return d.client.UnlockDatabase(ctx, req)
 	})
+}
+
+func (d *TenantDiscovery) callJSONRPC(
+	timeout time.Duration,
+	successCode int,
+	rpcFn func(context.Context) (*pb.JsonResponse, error),
+) (int, string, bool) {
+	ctx, cancel := d.withCtx(context.Background(), timeout)
+	defer cancel()
+	resp, err := rpcFn(ctx)
+	if err != nil {
+		st := status.Convert(err)
+		return grpcToHTTP(st.Code()), makeErrorJSON(st.Message()), false
+	}
+	return successCode, resp.GetJson(), true
+}
+
+func (d *TenantDiscovery) TriggerBackup(tenantID, backupType string) (int, string, bool) {
+	return d.callJSONRPC(120*time.Second, http.StatusCreated, func(ctx context.Context) (*pb.JsonResponse, error) {
+		return d.client.TriggerBackup(ctx, &pb.TriggerBackupRequest{
+			TenantId: tenantID,
+			Type:     backupType,
+		})
+	})
+}
+
+func (d *TenantDiscovery) ListBackups(tenantID string) (int, string, bool) {
+	return d.callJSONRPC(15*time.Second, http.StatusOK, func(ctx context.Context) (*pb.JsonResponse, error) {
+		return d.client.ListBackups(ctx, &pb.TenantRequest{TenantId: tenantID})
+	})
+}
+
+func (d *TenantDiscovery) VerifyBackup(tenantID, backupID string, streamHash, deepRestore bool) (int, string, bool) {
+	return d.callJSONRPC(120*time.Second, http.StatusOK, func(ctx context.Context) (*pb.JsonResponse, error) {
+		return d.client.VerifyBackup(ctx, &pb.VerifyBackupRequest{
+			TenantId:    tenantID,
+			BackupId:    backupID,
+			StreamHash:  streamHash,
+			DeepRestore: deepRestore,
+		})
+	})
+}
+
+func (d *TenantDiscovery) RestoreDatabase(tenantID, backupID, targetLSN, targetTime, newTenantID, verifyQuery string) (int, string, bool) {
+	return d.callJSONRPC(120*time.Second, http.StatusOK, func(ctx context.Context) (*pb.JsonResponse, error) {
+		return d.client.RestoreDatabase(ctx, &pb.RestoreDatabaseRequest{
+			TenantId:    tenantID,
+			BackupId:    backupID,
+			TargetLsn:   targetLSN,
+			TargetTime:  targetTime,
+			NewTenantId: newTenantID,
+			VerifyQuery: verifyQuery,
+		})
+	})
+}
+
+func (d *TenantDiscovery) GetOffloadStatus(tenantID string) (int, string, bool) {
+	return d.callJSONRPC(15*time.Second, http.StatusOK, func(ctx context.Context) (*pb.JsonResponse, error) {
+		return d.client.GetOffloadStatus(ctx, &pb.TenantRequest{TenantId: tenantID})
+	})
+}
+
+func (d *TenantDiscovery) RevokeAPIKey(keyID string) (int, string, bool) {
+	ctx, cancel := d.withCtx(context.Background(), 15*time.Second)
+	defer cancel()
+	_, err := d.client.RevokeAPIKey(ctx, &pb.RevokeAPIKeyRequest{KeyId: keyID})
+	if err != nil {
+		st := status.Convert(err)
+		return grpcToHTTP(st.Code()), makeErrorJSON(st.Message()), false
+	}
+	return http.StatusOK, fmt.Sprintf(`{"status":"revoked","key_id":"%s"}`, JSONEscape(keyID)), true
 }
 
 func (d *TenantDiscovery) SetCachedState(tenantID, state string) {

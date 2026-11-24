@@ -30,8 +30,7 @@ RUN chmod +x /usr/local/bin/pageserver-entrypoint.sh
 
 ENV AIR_DATA_DIR=/var/lib/air-pageserver \
     AIR_PAGESERVER_GRPC_ADDR=0.0.0.0:9091 \
-    AIR_PAGESERVER_HTTP_ADDR=0.0.0.0:8083 \
     AIR_WALREDO_BIN=/usr/local/bin/air-walredo
 
-EXPOSE 9091 8083
+EXPOSE 9091
 ENTRYPOINT ["/usr/local/bin/pageserver-entrypoint.sh"]

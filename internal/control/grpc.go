@@ -3,11 +3,13 @@ package control
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/Mahadi-rsio/air/internal/backup"
 	"github.com/Mahadi-rsio/air/internal/cell"
 	"github.com/Mahadi-rsio/air/internal/pb"
 	"github.com/Mahadi-rsio/air/internal/tenant"
@@ -96,6 +98,12 @@ func mapGRPCError(err error) error {
 		return status.Error(codes.Unauthenticated, err.Error())
 	case errors.Is(err, ErrIdempotencyConflict):
 		return status.Error(codes.AlreadyExists, err.Error())
+	case errors.Is(err, ErrBackupNotConfigured):
+		return status.Error(codes.Unavailable, err.Error())
+	case errors.Is(err, backup.ErrTargetOutOfRange), errors.Is(err, backup.ErrInvalidRecoveryTarget):
+		return status.Error(codes.OutOfRange, err.Error())
+	case errors.Is(err, backup.ErrInvalidBackupManifest), errors.Is(err, backup.ErrObjectChecksum), errors.Is(err, backup.ErrObjectMissing), errors.Is(err, backup.ErrMissingWALSegment), errors.Is(err, backup.ErrWALDiscontinuity):
+		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, cell.ErrDrainVetoed):
 		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, context.DeadlineExceeded):
@@ -309,6 +317,67 @@ func (s *grpcServer) UnlockDatabase(ctx context.Context, req *pb.TenantRequest) 
 		return nil, mapGRPCError(err)
 	}
 	return &pb.StatusResponse{Status: "SUSPENDED", TenantId: req.GetTenantId()}, nil
+}
+
+func marshalGRPCJSON(v any) (*pb.JsonResponse, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return &pb.JsonResponse{Json: string(b)}, nil
+}
+
+func (s *grpcServer) TriggerBackup(ctx context.Context, req *pb.TriggerBackupRequest) (*pb.JsonResponse, error) {
+	resp, err := s.cp.TriggerBackup(ctx, "", req.GetTenantId(), req.GetType())
+	if err != nil {
+		return nil, mapGRPCError(err)
+	}
+	return marshalGRPCJSON(resp)
+}
+
+func (s *grpcServer) ListBackups(ctx context.Context, req *pb.TenantRequest) (*pb.JsonResponse, error) {
+	manifests, err := s.cp.ListBackups(ctx, "", req.GetTenantId())
+	if err != nil {
+		return nil, mapGRPCError(err)
+	}
+	return marshalGRPCJSON(map[string]any{"backups": manifests})
+}
+
+func (s *grpcServer) VerifyBackup(ctx context.Context, req *pb.VerifyBackupRequest) (*pb.JsonResponse, error) {
+	rep, err := s.cp.VerifyDatabaseBackup(ctx, "", req.GetTenantId(), req.GetBackupId(), req.GetStreamHash(), req.GetDeepRestore())
+	if err != nil {
+		return nil, mapGRPCError(err)
+	}
+	return marshalGRPCJSON(rep)
+}
+
+func (s *grpcServer) RestoreDatabase(ctx context.Context, req *pb.RestoreDatabaseRequest) (*pb.JsonResponse, error) {
+	resp, err := s.cp.RestoreDatabaseWithOptions(ctx, "", req.GetTenantId(), RestoreOptions{
+		BackupID:    req.GetBackupId(),
+		TargetLSN:   req.GetTargetLsn(),
+		TargetTime:  req.GetTargetTime(),
+		NewTenantID: req.GetNewTenantId(),
+		VerifyQuery: req.GetVerifyQuery(),
+	})
+	if err != nil {
+		return nil, mapGRPCError(err)
+	}
+	return marshalGRPCJSON(resp)
+}
+
+func (s *grpcServer) GetOffloadStatus(ctx context.Context, req *pb.TenantRequest) (*pb.JsonResponse, error) {
+	st, err := s.cp.GetLatestOffloadStatus(ctx, "", req.GetTenantId())
+	if err != nil {
+		return nil, mapGRPCError(err)
+	}
+	return marshalGRPCJSON(st)
+}
+
+func (s *grpcServer) RevokeAPIKey(ctx context.Context, req *pb.RevokeAPIKeyRequest) (*pb.StatusResponse, error) {
+	if err := s.cp.RevokeAPIKey(ctx, "", req.GetKeyId()); err != nil {
+		return nil, mapGRPCError(err)
+	}
+	return &pb.StatusResponse{Status: "revoked"}, nil
 }
 
 // NewGRPCPoolDrainFn returns a cooperative pool drain callback backed by a

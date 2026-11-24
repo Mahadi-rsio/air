@@ -110,28 +110,14 @@ func main() {
 		log.Fatalf("[air-gateway] failed to bind admin HTTP on %s: %v", cfg.AdminAddr, err)
 	}
 
-	adminGRPCSrv := gateway.NewAdminGRPCServer(cfg.AdminGRPCAddr, cfg.InternalToken, pools, metrics)
-	adminGRPCSrv.SetNamespaceBackends(discovery, reGRPC, psGRPC)
-	if cfg.AdminGRPCAddr != "" {
-		if _, err := adminGRPCSrv.Start(); err != nil {
-			adminSrv.Stop()
-			discovery.Stop()
-			log.Fatalf("[air-gateway] failed to bind admin gRPC on %s: %v", cfg.AdminGRPCAddr, err)
-		}
-	}
-
 	ln, err := net.Listen("tcp", cfg.GatewayAddr)
 	if err != nil {
-		adminGRPCSrv.Stop()
 		adminSrv.Stop()
 		discovery.Stop()
 		log.Fatalf("[air-gateway] failed to listen on %s: %v", cfg.GatewayAddr, err)
 	}
 
 	adminGRPCLabel := "disabled"
-	if cfg.AdminGRPCAddr != "" {
-		adminGRPCLabel = cfg.AdminGRPCAddr
-	}
 	readEngineLabel := "disabled"
 	if cfg.ReadEnginePort > 0 {
 		readEngineLabel = fmt.Sprintf("%s:%d", cfg.ReadEngineHost, cfg.ReadEnginePort)
@@ -201,7 +187,6 @@ func main() {
 	}
 	close(reaperStop)
 	reaperWG.Wait()
-	adminGRPCSrv.Stop()
 	adminSrv.Stop()
 	discovery.Stop()
 	if reGRPC != nil {

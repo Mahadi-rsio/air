@@ -582,27 +582,10 @@ func main() {
 			cfg.PrimaryConnInfo != "", cfg.PageserverInternalToken != "")
 	}
 
-	ln, err := net.Listen("tcp", cfg.HTTPAddr)
-	if err != nil {
-		_ = re.Stop()
-		log.Fatalf("listen %s: %v", cfg.HTTPAddr, err)
-	}
-	srv := &http.Server{
-		Handler:           re.HTTPHandler(),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-	go func() {
-		log.Printf("[air-read-engine] HTTP control listening on %s", cfg.HTTPAddr)
-		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http serve: %v", err)
-		}
-	}()
-
 	var grpcSrv *grpc.Server
 	if cfg.GRPCAddr != "" {
 		grpcLn, gErr := net.Listen("tcp", cfg.GRPCAddr)
 		if gErr != nil {
-			_ = srv.Close()
 			_ = re.Stop()
 			log.Fatalf("grpc listen %s: %v", cfg.GRPCAddr, gErr)
 		}
@@ -619,11 +602,8 @@ func main() {
 
 	<-ctx.Done()
 	log.Printf("[air-read-engine] shutting down...")
-	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	if grpcSrv != nil {
 		grpcSrv.GracefulStop()
 	}
-	_ = srv.Shutdown(shutCtx)
 	_ = re.Stop()
 }

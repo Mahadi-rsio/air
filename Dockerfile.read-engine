@@ -35,8 +35,7 @@ ENV AIR_READ_ENGINE_DATA_DIR=/var/lib/air-read-engine \
     AIR_READ_ENGINE_CACHE_DIR=/var/lib/air-read-engine/cache \
     AIR_READ_ENGINE_LISTEN_HOST=0.0.0.0 \
     AIR_READ_ENGINE_PG_PORT=5433 \
-    AIR_READ_ENGINE_HTTP_ADDR=0.0.0.0:8082 \
     AIR_READ_ENGINE_GRPC_ADDR=0.0.0.0:9092
 
-EXPOSE 5433 8082 9092
+EXPOSE 5433 9092
 ENTRYPOINT ["/usr/local/bin/read-engine-entrypoint.sh"]

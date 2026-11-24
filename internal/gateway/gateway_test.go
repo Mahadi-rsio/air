@@ -315,6 +315,30 @@ func (m *mockControlService) BatchTouchActivity(ctx context.Context, req *pb.Bat
 	return &pb.Empty{}, nil
 }
 
+func (m *mockControlService) TriggerBackup(_ context.Context, req *pb.TriggerBackupRequest) (*pb.JsonResponse, error) {
+	return &pb.JsonResponse{Json: fmt.Sprintf(`{"backup_id":"bkp_1","tenant_id":"%s","type":"%s"}`, req.TenantId, req.Type)}, nil
+}
+
+func (m *mockControlService) ListBackups(_ context.Context, req *pb.TenantRequest) (*pb.JsonResponse, error) {
+	return &pb.JsonResponse{Json: fmt.Sprintf(`{"backups":[{"backup_id":"bkp_1","tenant_id":"%s"}]}`, req.TenantId)}, nil
+}
+
+func (m *mockControlService) VerifyBackup(_ context.Context, req *pb.VerifyBackupRequest) (*pb.JsonResponse, error) {
+	return &pb.JsonResponse{Json: fmt.Sprintf(`{"backup_id":"%s","valid":true,"stream_hash":%v,"deep_restore":%v}`, req.BackupId, req.StreamHash, req.DeepRestore)}, nil
+}
+
+func (m *mockControlService) RestoreDatabase(_ context.Context, req *pb.RestoreDatabaseRequest) (*pb.JsonResponse, error) {
+	return &pb.JsonResponse{Json: fmt.Sprintf(`{"tenant_id":"%s","new_tenant_id":"%s","status":"restored"}`, req.TenantId, req.NewTenantId)}, nil
+}
+
+func (m *mockControlService) GetOffloadStatus(_ context.Context, req *pb.TenantRequest) (*pb.JsonResponse, error) {
+	return &pb.JsonResponse{Json: fmt.Sprintf(`{"tenant_id":"%s","state":"COMPLETED"}`, req.TenantId)}, nil
+}
+
+func (m *mockControlService) RevokeAPIKey(_ context.Context, _ *pb.RevokeAPIKeyRequest) (*pb.StatusResponse, error) {
+	return &pb.StatusResponse{Status: "revoked"}, nil
+}
+
 func TestTenantDiscoveryGRPC(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -789,5 +813,77 @@ func TestTLSUpgradeHandshake(t *testing.T) {
 	}
 	if sni := <-sniCh; sni != "t_tls.air.local" {
 		t.Fatalf("expected SNI t_tls.air.local, got %q", sni)
+	}
+}
+
+func TestAdminHTTPControlPlaneGRPCProxy(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := &mockControlService{}
+	srv := grpc.NewServer()
+	pb.RegisterAirDBControlServer(srv, svc)
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Stop()
+
+	cfg := DefaultConfig()
+	cfg.GRPCAddr = ln.Addr().String()
+	cfg.MetaDSN = ""
+
+	disc, err := NewTenantDiscovery(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disc.Start()
+	defer disc.Stop()
+
+	metrics := NewMetricsRegistry(100, 10, 10)
+	pools := NewPoolManager(4, 30)
+	defer pools.CloseAll()
+
+	adminSrv := NewAdminHTTPServer("127.0.0.1:0", "gw-secret", disc, pools, metrics)
+	if err := adminSrv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer adminSrv.Stop()
+
+	doReq := func(method, path, body string) (int, string) {
+		t.Helper()
+		var r io.Reader
+		if body != "" {
+			r = strings.NewReader(body)
+		}
+		req, err := http.NewRequest(method, "http://"+adminSrv.Addr()+path, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer gw-secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b)
+	}
+
+	if code, body := doReq(http.MethodPost, "/v1/databases/t1/backups", `{"type":"full"}`); code != http.StatusCreated || !strings.Contains(body, `"backup_id":"bkp_1"`) {
+		t.Fatalf("POST backups failed: code=%d body=%s", code, body)
+	}
+	if code, body := doReq(http.MethodGet, "/v1/databases/t1/backups", ""); code != http.StatusOK || !strings.Contains(body, `"bkp_1"`) {
+		t.Fatalf("GET backups failed: code=%d body=%s", code, body)
+	}
+	if code, body := doReq(http.MethodPost, "/v1/databases/t1/backups/bkp_1/verify", `{"stream_hash":true}`); code != http.StatusOK || !strings.Contains(body, `"valid":true`) {
+		t.Fatalf("POST verify failed: code=%d body=%s", code, body)
+	}
+	if code, body := doReq(http.MethodPost, "/v1/databases/t1/restore", `{"backup_id":"bkp_1","new_tenant_id":"t1_restored"}`); code != http.StatusOK || !strings.Contains(body, `"t1_restored"`) {
+		t.Fatalf("POST restore failed: code=%d body=%s", code, body)
+	}
+	if code, body := doReq(http.MethodGet, "/v1/databases/t1/offload", ""); code != http.StatusOK || !strings.Contains(body, `"COMPLETED"`) {
+		t.Fatalf("GET offload failed: code=%d body=%s", code, body)
+	}
+	if code, body := doReq(http.MethodDelete, "/v1/api-keys/key_123", ""); code != http.StatusOK || !strings.Contains(body, `"revoked"`) {
+		t.Fatalf("DELETE api-keys failed: code=%d body=%s", code, body)
 	}
 }
