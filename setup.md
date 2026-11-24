@@ -191,6 +191,8 @@ Pass `AIR_META_DSN` to both `air-server` and `air-gateway`. On startup, `air-ser
 | `AIR_BACKEND_HOST` | `air-server` | Hostname advertised to gateway for tenant PG backends |
 | `AIR_BOOTSTRAP_API_KEY` | `air_dev_bootstrap_key` | Initial Bearer API key seeded on startup |
 | `AIR_BOOTSTRAP_ACCOUNT_ID` | `acct_default` | Account ID for bootstrap API key |
+| `AIR_PAGESERVER_CACHE_MB` | `64` | Active per-tenant `air_smgr` LFC and Pageserver disk cache size (MB) |
+| `AIR_EVICT_ON_SUSPEND` | `true` | Delete local tenant cache (`pgdata`, `lfc`, `spool/wal`, `backups`, and Pageserver cache) on suspend |
 
 ### `air-pageserver`
 | Variable | Default (Compose) | Description |
@@ -198,7 +200,7 @@ Pass `AIR_META_DSN` to both `air-server` and `air-gateway`. On startup, `air-ser
 | `AIR_DATA_DIR` | `/var/lib/air-pageserver` | Layer and cache storage root |
 | `AIR_PAGESERVER_GRPC_ADDR` | `0.0.0.0:9091` | `PageserverService` gRPC listen address |
 | `AIR_PAGESERVER_HTTP_ADDR` | `0.0.0.0:8083` | Admin & health HTTP listen address |
-| `AIR_PAGESERVER_CACHE_MB` | `256` | Bounded LRU disk cache size (MB) |
+| `AIR_PAGESERVER_CACHE_MB` | `64` | Bounded LRU disk cache size (MB) |
 
 ### `air-read-engine`
 | Variable | Default (Compose) | Description |

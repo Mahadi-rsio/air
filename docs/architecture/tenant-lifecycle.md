@@ -81,4 +81,4 @@ To ensure R2 uploads never block concurrent API calls or tenant wakes, `offloadS
 3. **Phase 3 (Re-acquire `s.mu`)**:
    - Check `s.lifecycleSeq[tenantID] == startSeq` and `rec.State == StateSuspended`.
    - If a concurrent `WakeTenant` or `DeleteDatabase` occurred during Phase 2, abort local eviction cleanly (`ErrOffloadAbortedWake`).
-   - Otherwise, evict local `PGDATA` relation files and Pageserver cache files, update `clusters.state = 'OFFLOADED'`, and record `offloaded_at`.
+   - Otherwise, evict local `PGDATA`, `lfc/<tenant_id>` (64 MB hot cache), WAL spool, backup staging, and Pageserver `DiskCache`/local layer files (via `EvictTenantLocalData` and `EvictTenantCache`), leaving suspended tenants at zero local cache usage. On wake, only the metadata skeleton and layer manifest are restored—actual relation pages are fetched on demand as queries run.

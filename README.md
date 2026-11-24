@@ -68,11 +68,12 @@ AIR is a production-oriented, multi-tenant PostgreSQL 17 platform featuring a Go
    - Exposes Gateway Admin DB lifecycle endpoints (`POST /v1/databases`, `GET /v1/databases`, `GET/DELETE /v1/databases/{id}`, `POST /v1/databases/{id}/{suspend,start,lock,unlock}`) backed by `AirDBControl` gRPC calls.
 3. **Cooperative Scale-to-Zero & Warm `initdb` Pool ([agent.go](file:///workspaces/air/internal/cell/agent.go), [control.go](file:///workspaces/air/internal/control/control.go))**:
    - Suspends idle `ACTIVE` tenants after `--idle-timeout` (`AIR_IDLE_TIMEOUT`) only after cooperative drain guards pass (`ErrDrainVetoed` on active txns, prepared xacts, `LISTEN`, temp tables, or advisory locks).
+   - When `AIR_EVICT_ON_SUSPEND=true` (or `AIR_R2_PRIMARY=true`), cold offload flushes layers and the non-relation metadata skeleton to R2 and deletes all local tenant caches from disk (`tenants/active`, `lfc`, `spool/wal`, `backups`, and Pageserver disk/layer caches).
    - Coalesces concurrent wake-on-connect requests via `singleflight` and accelerates provisioning with a pre-warmed `initdb` pool.
 4. **AIR Pageserver, `air_smgr` & Content-Addressed Upload (CAU) ([pageserver.md](docs/architecture/pageserver.md), [pageserver-plan.md](docs/reports/plans/pageserver-plan.md), [smgr-plan.md](docs/reports/plans/smgr-plan.md))**:
-   - Enabled via `--pageserver` / `AIR_PAGESERVER_ENABLED=true` (serves `GetPage@LSN` over `--pageserver-socket` with a bounded `--pageserver-cache-mb` LRU disk cache).
+   - Enabled via `--pageserver` / `AIR_PAGESERVER_ENABLED=true` (serves `GetPage@LSN` over `--pageserver-socket` with a bounded `--pageserver-cache-mb` LRU disk cache and `air_smgr.lfc_max_mb` Local File Cache, both defaulting to **64 MB**).
    - Immutable layer files are uploaded to R2 using Content-Addressed Upload (`tenants/{tenant_id}/layers/sha256/{prefix}/{sha256}`) with `If-None-Match: *` deduplication, followed by ETag CAS publication of `tenants/{tenant_id}/timeline_{epoch}/layer_manifest.json`.
-   - Both `WakeTenant` and startup `Reconcile` preload tenant layers into the Pageserver before starting/adopting PostgreSQL so `air_smgr` can serve catalog blocks (e.g., `global/1260` / `pg_authid`) immediately.
+   - On `WakeTenant` after eviction, AIR restores only the non-relation metadata skeleton and layer manifest—relation pages are fetched on demand from R2 into the 64 MB hot cache only when queried.
 5. **Encrypted Backups, Fencing & `supautils` Hardening**:
    - Preloads `supautils` with `app_user` (`NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT`), `temp_file_limit = 32MB`, and `pg_hba.conf` rejection of TCP `postgres` logins.
    - Supports `EnvelopeKMS` (`AES-256-GCM`), R2 ETag CAS fencing manifests (`internal/fencing`), and encrypted full/incremental PITR backups (`internal/backup`).
