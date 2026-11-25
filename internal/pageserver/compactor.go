@@ -13,6 +13,7 @@ import (
 const (
 	DefaultL0CompactionThreshold = 4
 	compactV1BatchEntries        = 64
+	maxDeltaChainBeforeFPI       = 256
 )
 
 // CompactIfNeeded compacts L0 delta layers into an L1 (or Image) layer using a bounded-memory
@@ -117,27 +118,12 @@ func (t *Timeline) compactL0s(ctx context.Context, threshold, maxBatch int, mate
 
 	var kms = t.store.kms
 	written, err := t.store.writeLayerFromStream(ctx, meta, func(sw *v2StreamWriter) error {
-		if !materializeImage {
-			for {
-				rec, ok, err := merger.Next(ctx)
-				if err != nil {
-					return err
-				}
-				if !ok {
-					return nil
-				}
-				if err := sw.Add(rec); err != nil {
-					return err
-				}
-			}
-		}
-
 		var group []LayerRecord
 		flushGroup := func() error {
 			if len(group) == 0 {
 				return nil
 			}
-			outRecs := t.materializeKeyGroup(ctx, group, atLSN)
+			outRecs := t.compactKeyGroup(ctx, group, atLSN, materializeImage)
 			for _, r := range outRecs {
 				if err := sw.Add(r); err != nil {
 					return err
@@ -336,35 +322,92 @@ func (s *LayerStore) writeLayerFromStream(ctx context.Context, meta LayerMeta, f
 	return meta, nil
 }
 
-func (t *Timeline) materializeKeyGroup(ctx context.Context, group []LayerRecord, atLSN uint64) []LayerRecord {
+func (t *Timeline) compactKeyGroup(ctx context.Context, group []LayerRecord, atLSN uint64, materializeImage bool) []LayerRecord {
 	if len(group) == 0 {
 		return nil
 	}
 	k := group[0].Key
 	if k.Kind == KeyKindRelSize {
+		if !materializeImage {
+			return group
+		}
 		last := group[len(group)-1]
 		last.Delta.LSN = atLSN
 		return []LayerRecord{last}
 	}
-	if k.Kind == KeyKindRelBlock {
-		deltas := make([]WALDelta, len(group))
-		for idx, r := range group {
-			deltas[idx] = r.Delta
-		}
-		if page, err := t.redoer.Redo(ctx, k, nil, deltas); err == nil && len(page) == PageSize {
-			return []LayerRecord{{
-				Key: k,
-				Delta: WALDelta{
-					LSN:       atLSN,
-					Flags:     EntryFlagPageImage,
-					PageImage: page,
-				},
-			}}
-		}
-		// Keep raw deltas if base page is in an older layer.
+	if k.Kind != KeyKindRelBlock {
 		return group
 	}
+
+	if !materializeImage {
+		// Count trailing non-FPI deltas in this key group; materialize a checkpoint FPI
+		// when the chain exceeds maxDeltaChainBeforeFPI so read-path WAL redo stays bounded
+		// while preserving all historical deltas for MVCC snapshots.
+		pending := 0
+		for i := len(group) - 1; i >= 0; i-- {
+			d := group[i].Delta
+			if (d.Flags&EntryFlagPageImage) != 0 && len(d.PageImage) == PageSize {
+				break
+			}
+			pending++
+		}
+		if pending < maxDeltaChainBeforeFPI {
+			return group
+		}
+		page, ok := t.tryMaterializeGroupPage(ctx, k, group)
+		if !ok {
+			return group
+		}
+		lastLSN := group[len(group)-1].Delta.LSN
+		out := make([]LayerRecord, len(group)+1)
+		copy(out, group)
+		out[len(group)] = LayerRecord{
+			Key: k,
+			Delta: WALDelta{
+				LSN:       lastLSN,
+				Flags:     EntryFlagPageImage,
+				PageImage: page,
+			},
+		}
+		return out
+	}
+
+	if page, ok := t.tryMaterializeGroupPage(ctx, k, group); ok {
+		return []LayerRecord{{
+			Key: k,
+			Delta: WALDelta{
+				LSN:       atLSN,
+				Flags:     EntryFlagPageImage,
+				PageImage: page,
+			},
+		}}
+	}
+	// Keep raw deltas if base page is unavailable.
 	return group
+}
+
+func (t *Timeline) tryMaterializeGroupPage(ctx context.Context, k Key, group []LayerRecord) ([]byte, bool) {
+	deltas := make([]WALDelta, len(group))
+	for idx, r := range group {
+		deltas[idx] = r.Delta
+	}
+	basePage, tail := prepareCollectedForRedo(deltas)
+	if len(tail) == 0 && len(basePage) == PageSize {
+		return append([]byte(nil), basePage...), true
+	}
+	if len(basePage) != PageSize && len(tail) > 0 && (tail[0].Flags&EntryFlagWillInit) == 0 {
+		firstLSN := tail[0].LSN
+		if firstLSN > 1 {
+			if prev, err := t.GetPageAtLSN(ctx, k, firstLSN-1); err == nil && len(prev) == PageSize {
+				basePage = prev
+			}
+		}
+	}
+	page, err := t.redoer.Redo(ctx, k, basePage, tail)
+	if err != nil || len(page) != PageSize {
+		return nil, false
+	}
+	return page, true
 }
 
 // layerRecordIterator streams sorted records from a single V1 or V2 layer with bounded memory.

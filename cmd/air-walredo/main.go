@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime/debug"
 	"syscall"
 
 	"github.com/Mahadi-rsio/air/internal/pageserver"
@@ -25,8 +26,8 @@ func applySandbox() {
 	_ = syscall.Setrlimit(syscall.RLIMIT_FSIZE, &syscall.Rlimit{Cur: 0, Max: 0})
 	// Cap open file descriptors (stdin, stdout, stderr + runtime).
 	_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &syscall.Rlimit{Cur: 64, Max: 64})
-	// Cap virtual address space to 512 MiB.
-	_ = syscall.Setrlimit(syscall.RLIMIT_AS, &syscall.Rlimit{Cur: 512 * 1024 * 1024, Max: 512 * 1024 * 1024})
+	// Bound Go heap memory without breaking Go's virtual address space reservations (RLIMIT_AS).
+	debug.SetMemoryLimit(256 * 1024 * 1024)
 }
 
 func main() {

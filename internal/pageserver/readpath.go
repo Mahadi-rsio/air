@@ -298,11 +298,27 @@ func (t *Timeline) InMemBytes() int64 {
 	return total
 }
 
+func latestFPILSN(deltas []WALDelta) (uint64, bool) {
+	for i := len(deltas) - 1; i >= 0; i-- {
+		d := deltas[i]
+		if (d.Flags&EntryFlagPageImage) != 0 && len(d.PageImage) == PageSize {
+			return d.LSN, true
+		}
+	}
+	return 0, false
+}
+
 func (t *Timeline) lookupInMemLayersLocked(key Key, lsn uint64) ([]WALDelta, bool) {
 	deltas := t.inMem.Lookup(key, lsn)
-	if len(deltas) > 0 {
-		last := deltas[len(deltas)-1]
-		if (last.Flags&EntryFlagPageImage) != 0 && len(last.PageImage) == PageSize {
+	if fpiLSN, ok := latestFPILSN(deltas); ok {
+		hasOlderOverlap := false
+		for i := len(t.frozenMems) - 1; i >= 0; i-- {
+			if t.frozenMems[i].EndLSN > fpiLSN {
+				hasOlderOverlap = true
+				break
+			}
+		}
+		if !hasOlderOverlap {
 			return deltas, true
 		}
 	}
@@ -316,9 +332,17 @@ func (t *Timeline) lookupInMemLayersLocked(key Key, lsn uint64) ([]WALDelta, boo
 			continue
 		}
 		out = append(out, fd...)
-		last := fd[len(fd)-1]
-		if (last.Flags&EntryFlagPageImage) != 0 && len(last.PageImage) == PageSize {
-			return out, true
+		if fpiLSN, ok := latestFPILSN(fd); ok {
+			hasOlderOverlap := false
+			for j := i - 1; j >= 0; j-- {
+				if t.frozenMems[j].EndLSN > fpiLSN {
+					hasOlderOverlap = true
+					break
+				}
+			}
+			if !hasOlderOverlap {
+				return out, true
+			}
 		}
 	}
 	return out, false
@@ -866,13 +890,12 @@ func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byt
 			continue
 		}
 		collected = append(collected, deltas...)
-		// Check if the newest delta in this layer is a full page image.
-		last := deltas[len(deltas)-1]
-		if (last.Flags&EntryFlagPageImage) != 0 && len(last.PageImage) == PageSize {
+		// Check if any delta in this layer is a full page image.
+		if fpiLSN, ok := latestFPILSN(deltas); ok {
 			foundBase = true
 			hasOverlap := false
 			for j := i - 1; j >= 0; j-- {
-				if layersCopy[j].EndLSN > last.LSN {
+				if layersCopy[j].EndLSN > fpiLSN {
 					hasOverlap = true
 					break
 				}
@@ -997,10 +1020,21 @@ func (t *Timeline) GetPageBatch(ctx context.Context, spcOID, dbOID, relNumber ui
 				}
 				bi := queryIdx[qi]
 				collected[bi] = append(collected[bi], deltas...)
-				last := deltas[len(deltas)-1]
-				if ((last.Flags&EntryFlagPageImage) != 0 && len(last.PageImage) == PageSize) || lm.Kind == LayerKindImage {
+				if lm.Kind == LayerKindImage {
 					resolved[bi] = true
 					pendingCount--
+				} else if fpiLSN, ok := latestFPILSN(deltas); ok {
+					hasOverlap := false
+					for j := li - 1; j >= 0; j-- {
+						if layersCopy[j].EndLSN > fpiLSN {
+							hasOverlap = true
+							break
+						}
+					}
+					if !hasOverlap {
+						resolved[bi] = true
+						pendingCount--
+					}
 				}
 			}
 		}

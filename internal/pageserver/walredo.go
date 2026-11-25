@@ -9,6 +9,7 @@ import (
 	"io"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -298,6 +299,43 @@ func (r *DefaultWALRedoer) enqueueJob(ctx context.Context, key Key, basePage []b
 	}
 }
 
+type cappedStderr struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+}
+
+func (c *cappedStderr) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.max <= 0 {
+		c.max = 2048
+	}
+	if len(c.buf) < c.max {
+		rem := c.max - len(c.buf)
+		if len(p) > rem {
+			c.buf = append(c.buf, p[:rem]...)
+		} else {
+			c.buf = append(c.buf, p...)
+		}
+	}
+	return len(p), nil
+}
+
+func (c *cappedStderr) ResetAndString() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := strings.TrimSpace(string(c.buf))
+	c.buf = c.buf[:0]
+	return s
+}
+
+func (c *cappedStderr) Reset() {
+	c.mu.Lock()
+	c.buf = c.buf[:0]
+	c.mu.Unlock()
+}
+
 type persistentWorker struct {
 	bin    string
 	env    []string
@@ -305,6 +343,7 @@ type persistentWorker struct {
 	stdin  io.WriteCloser
 	bw     *bufio.Writer
 	stdout io.ReadCloser
+	stderr cappedStderr
 }
 
 func (w *persistentWorker) start() error {
@@ -312,6 +351,8 @@ func (w *persistentWorker) start() error {
 	if len(w.env) > 0 {
 		cmd.Env = append(cmd.Environ(), w.env...)
 	}
+	w.stderr.Reset()
+	cmd.Stderr = &w.stderr
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -390,6 +431,7 @@ func (w *persistentWorker) execJob(job *redoJob, defaultTimeout time.Duration) (
 		}
 	}()
 
+	w.stderr.Reset()
 	err := writeRedoFrame(w.bw, job.key, job.basePage, job.records)
 	if err == nil {
 		err = w.bw.Flush()
@@ -411,8 +453,12 @@ func (w *persistentWorker) execJob(job *redoJob, defaultTimeout time.Duration) (
 		waited = true
 		procMu.Unlock()
 		w.kill()
+		stderrMsg := w.stderr.ResetAndString()
 		if ctxErr := job.ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
+		}
+		if stderrMsg != "" {
+			return nil, fmt.Errorf("pageserver: walredo worker failed: %w (stderr: %s)", err, stderrMsg)
 		}
 		return nil, errors.Join(errors.New("pageserver: walredo worker failed"), err)
 	}

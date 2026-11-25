@@ -215,6 +215,21 @@ func applyHeapWALRecords(key Key, basePage []byte, records [][]byte) ([]byte, bo
 		if err != nil {
 			return nil, false
 		}
+		var ok bool
+		page, ok = applyDecodedHeapWALRecord(key, page, rec)
+		if !ok {
+			return nil, false
+		}
+	}
+	if len(page) != PageSize {
+		return nil, false
+	}
+	return page, true
+}
+
+// applyDecodedHeapWALRecord applies a single decoded Heap/Heap2/Btree record onto page in-place.
+func applyDecodedHeapWALRecord(key Key, page []byte, rec *DecodedWALRecord) ([]byte, bool) {
+	for once := true; once; once = false {
 		if rec.Rmid == RmHeapID {
 			op := rec.Info & XLogHeapOpMask
 			isInit := (rec.Info & XLogHeapInitPage) != 0
@@ -440,13 +455,10 @@ func applyHeapWALRecords(key Key, basePage []byte, records [][]byte) ([]byte, bo
 				return nil, false
 			}
 		} else if rec.Rmid == RmBtreeID {
-			page = applyBtreeWALRecords(key, page, [][]byte{raw})
+			page = applyBtreeWALRecords(key, page, [][]byte{rec.RawRecord})
 		} else {
 			return nil, false
 		}
-	}
-	if len(page) != PageSize {
-		return nil, false
 	}
 	return page, true
 }
@@ -489,11 +501,11 @@ func applyHeap2Prune(key Key, page []byte, rec *DecodedWALRecord) bool {
 	totalFrozen := 0
 
 	if (flags & xlhpHasFreezePlans) != 0 {
-		if off+4 > len(data) {
+		if off+2 > len(data) {
 			return false
 		}
 		nplans := int(binary.LittleEndian.Uint16(data[off : off+2]))
-		off += 4 // uint16 nplans + 2 bytes padding (4-byte alignment)
+		off += 2 // PG17 log_heap_prune_and_freeze: uint16 nplans (no alignment padding)
 		if off+nplans*12 > len(data) {
 			return false
 		}

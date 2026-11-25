@@ -6,9 +6,9 @@ import (
 )
 
 const (
-	// PostgreSQL 17 RmSequenceID (RM_SEQ_ID = 12) and RmGenericID (RM_GENERIC_ID = 17).
-	RmSequenceID uint8 = 12
-	RmGenericID  uint8 = 17
+	// PostgreSQL 17 RmSequenceID (RM_SEQ_ID = 15) and RmGenericID (RM_GENERIC_ID = 20).
+	RmSequenceID uint8 = 15
+	RmGenericID  uint8 = 20
 
 	XLogSeqLog     uint8 = 0x00
 	XLogXLogFPI    uint8 = 0xB0
@@ -26,11 +26,6 @@ func ApplyWALRecordsInGo(key Key, basePage []byte, records [][]byte) ([]byte, bo
 			return out, true
 		}
 		return nil, false
-	}
-
-	// Fast path: if all records are Heap/Heap2/Btree, use applyHeapWALRecords directly.
-	if out, ok := applyHeapWALRecords(key, basePage, records); ok && len(out) == PageSize {
-		return out, true
 	}
 
 	var cur []byte
@@ -54,6 +49,11 @@ func ApplyWALRecordsInGo(key Key, basePage []byte, records [][]byte) ([]byte, bo
 					if ierr != nil {
 						return nil, false
 					}
+					if blk.ImageApply && len(raw) > 0 {
+						if next, ok := applyDecodedHeapWALRecord(key, img, rec); ok && len(next) == PageSize {
+							img = next
+						}
+					}
 					cur = img
 					appliedFPI = true
 					break
@@ -64,14 +64,14 @@ func ApplyWALRecordsInGo(key Key, basePage []byte, records [][]byte) ([]byte, bo
 			continue
 		}
 
-		// Try single-record Heap/Heap2/Btree redo.
-		if next, ok := applyHeapWALRecords(key, cur, [][]byte{raw}); ok && len(next) == PageSize {
-			cur = next
-			continue
-		}
-
-		// Handle Sequence (RM_SEQ_ID = 12) and Generic (RM_GENERIC_ID = 17) records.
+		// Handle Heap, Heap2, Btree, Sequence, Generic, and XLog FPI records in a single pass.
 		switch rec.Rmid {
+		case RmHeapID, RmHeap2ID, RmBtreeID:
+			next, ok := applyDecodedHeapWALRecord(key, cur, rec)
+			if !ok || len(next) != PageSize {
+				return nil, false
+			}
+			cur = next
 		case RmSequenceID:
 			if (rec.Info & XLogInfoOpMask) != XLogSeqLog {
 				return nil, false
