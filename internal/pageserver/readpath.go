@@ -298,6 +298,17 @@ func (t *Timeline) InMemBytes() int64 {
 	return total
 }
 
+// PendingFlushBytes returns the approximate byte size of frozen InMemoryLayers pending flush.
+func (t *Timeline) PendingFlushBytes() int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var total int64
+	for _, fm := range t.frozenMems {
+		total += fm.ApproxBytes
+	}
+	return total
+}
+
 func latestFPILSN(deltas []WALDelta) (uint64, bool) {
 	for i := len(deltas) - 1; i >= 0; i-- {
 		d := deltas[i]
@@ -871,6 +882,7 @@ func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byt
 	collected = append(collected, inMemDeltas...)
 
 	// Walk layers from newest to oldest; stop once we hit an Image layer or FPI.
+	lookupStart := time.Now()
 	layersScanned := 0
 	for i := len(layersCopy) - 1; i >= 0; i-- {
 		lm := layersCopy[i]
@@ -909,12 +921,33 @@ func (t *Timeline) GetPageAtLSN(ctx context.Context, key Key, lsn uint64) ([]byt
 		}
 	}
 
+	if t.store != nil {
+		if t.store.getPageLookupHist != nil {
+			t.store.getPageLookupHist.Observe(time.Since(lookupStart))
+		}
+		if t.store.layerScansHist != nil {
+			t.store.layerScansHist.ObserveValue(float64(layersScanned))
+		}
+	}
+
 	if len(collected) == 0 && !foundBase {
+		if t.store != nil && t.store.getPageTotalHist != nil {
+			t.store.getPageTotalHist.Observe(time.Since(start))
+		}
 		debugf("readpath", "GetPageAtLSN tenant=%s key=%s lsn=%s inmem=%d layers_scanned=%d/%d result=NOT_FOUND dur=%s",
 			t.tenantID, key, formatLSNHex(lsn), len(inMemDeltas), layersScanned, len(layersCopy), time.Since(start))
 		return nil, ErrNotFound
 	}
+	redoStart := time.Now()
 	page, err := reconstructPage(ctx, t.redoer, key, collected)
+	if t.store != nil {
+		if t.store.getPageRedoHist != nil {
+			t.store.getPageRedoHist.Observe(time.Since(redoStart))
+		}
+		if t.store.getPageTotalHist != nil {
+			t.store.getPageTotalHist.Observe(time.Since(start))
+		}
+	}
 	debugf("readpath", "GetPageAtLSN tenant=%s key=%s lsn=%s inmem=%d layers_scanned=%d/%d total_deltas=%d base_fpi=%v err=%v dur=%s",
 		t.tenantID, key, formatLSNHex(lsn), len(inMemDeltas), layersScanned, len(layersCopy), len(collected), foundBase, err, time.Since(start))
 	return page, err

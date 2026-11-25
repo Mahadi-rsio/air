@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/Mahadi-rsio/air/internal/crypto"
+	"github.com/Mahadi-rsio/air/internal/prom"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -459,6 +460,14 @@ type LayerStore struct {
 	generationCheck    func(tenantID, generation string) bool
 	metricsMu          sync.Mutex
 	lastMetrics        UploadMetrics
+	readRangeHist      *prom.Histogram
+	layerLookupHist    *prom.Histogram
+	getPageLookupHist  *prom.Histogram
+	getPageRedoHist    *prom.Histogram
+	getPageTotalHist   *prom.Histogram
+	layerScansHist     *prom.Histogram
+	compactionsActive  atomic.Int64
+	compactionsTotal   atomic.Uint64
 }
 
 // SetCAWALStore attaches a Content-Addressed WAL blob store to LayerStore.
@@ -544,6 +553,12 @@ func NewLayerStore(localDir string, s3c *s3.Client, bucket string, kms *crypto.E
 		prefetchSem:        make(chan struct{}, 4),
 		readLimiter:        NewReadLimiter(ReadLimiterConfig{}),
 		decodedChunks:      dc,
+		readRangeHist:      prom.NewHistogram(nil),
+		layerLookupHist:    prom.NewHistogram(nil),
+		getPageLookupHist:  prom.NewHistogram(nil),
+		getPageRedoHist:    prom.NewHistogram(nil),
+		getPageTotalHist:   prom.NewHistogram(nil),
+		layerScansHist:     prom.NewHistogram([]float64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024}),
 	}
 }
 
@@ -1439,6 +1454,10 @@ func (s *LayerStore) ReadRange(ctx context.Context, meta LayerMeta, offset, leng
 	if length <= 0 {
 		return nil, nil
 	}
+	ioStart := time.Now()
+	if s.readRangeHist != nil {
+		defer func() { s.readRangeHist.Observe(time.Since(ioStart)) }()
+	}
 	if s.cache != nil {
 		if b, ok := s.cache.GetRange(meta.R2Key, offset, length); ok {
 			debugf("layer-io", "ReadRange source=disk_cache tenant=%s file=%s off=%d len=%d", meta.TenantID, meta.FileName, offset, length)
@@ -1619,6 +1638,10 @@ func (s *LayerStore) loadLayerIndexOnce(ctx context.Context, meta LayerMeta) (*l
 
 // LookupKeyInLayer reads only the footer, index (cached in bounded LRU), and matching entry ranges for key <= lsn.
 func (s *LayerStore) LookupKeyInLayer(ctx context.Context, meta LayerMeta, key Key, lsn uint64) ([]WALDelta, error) {
+	lookupStart := time.Now()
+	if s.layerLookupHist != nil {
+		defer func() { s.layerLookupHist.Observe(time.Since(lookupStart)) }()
+	}
 	res, err := s.LookupKeysInLayer(ctx, meta, []Key{key}, lsn)
 	if err != nil {
 		return nil, err

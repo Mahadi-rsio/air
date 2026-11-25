@@ -10,6 +10,8 @@ import (
 
 	"github.com/Mahadi-rsio/air/internal/pageserver"
 	"github.com/Mahadi-rsio/air/internal/pb"
+	"github.com/Mahadi-rsio/air/internal/prom"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -38,9 +40,11 @@ type PageserverGRPCBackend struct {
 	failuresTotal atomic.Uint64
 	timeoutsTotal atomic.Uint64
 	inFlight      atomic.Int64
+	latencyHist   *prom.Histogram
 
-	genMu    sync.RWMutex
-	genCache map[string]cachedTenantInfo
+	genMu        sync.RWMutex
+	genCache     map[string]cachedTenantInfo
+	tenantInfoSF singleflight.Group
 }
 
 // NewPageserverGRPCBackend dials a standalone AIR Pageserver over gRPC.
@@ -68,10 +72,11 @@ func NewPageserverGRPCBackend(cfg PageserverGRPCConfig) (*PageserverGRPCBackend,
 		return nil, fmt.Errorf("readadapter: dial pageserver gRPC %s: %w", cfg.Addr, err)
 	}
 	return &PageserverGRPCBackend{
-		cfg:      cfg,
-		conn:     conn,
-		client:   pb.NewPageserverServiceClient(conn),
-		genCache: make(map[string]cachedTenantInfo),
+		cfg:         cfg,
+		conn:        conn,
+		client:      pb.NewPageserverServiceClient(conn),
+		latencyHist: prom.NewHistogram(nil),
+		genCache:    make(map[string]cachedTenantInfo),
 	}, nil
 }
 
@@ -92,6 +97,14 @@ func (b *PageserverGRPCBackend) Stats() PageserverSocketStats {
 		FailuresTotal: b.failuresTotal.Load(),
 		TimeoutsTotal: b.timeoutsTotal.Load(),
 	}
+}
+
+// LatencyHistogram returns the RPC latency histogram.
+func (b *PageserverGRPCBackend) LatencyHistogram() *prom.Histogram {
+	if b == nil {
+		return nil
+	}
+	return b.latencyHist
 }
 
 func (b *PageserverGRPCBackend) withContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -123,35 +136,69 @@ func (b *PageserverGRPCBackend) mapErr(err error) error {
 	}
 }
 
-// GetTenantInfo queries the active generation and latest ingested WAL LSN for tenantID.
-func (b *PageserverGRPCBackend) GetTenantInfo(ctx context.Context, tenantID string) (string, uint64, error) {
-	start := time.Now()
-	b.requestsTotal.Add(1)
-	b.inFlight.Add(1)
-	defer b.inFlight.Add(-1)
+type tenantInfoResult struct {
+	gen     string
+	lastLSN uint64
+}
 
-	rctx, cancel := b.withContext(ctx)
-	defer cancel()
-	resp, err := b.client.GetTenantInfo(rctx, &pb.PageserverTenantRequest{TenantId: tenantID})
-	if err != nil {
-		mapped := b.mapErr(err)
-		debugf("ps-grpc", "GetTenantInfo tenant=%s err=%v dur=%s", tenantID, mapped, time.Since(start))
-		return "", 0, mapped
+// GetTenantInfo queries the active generation and latest ingested WAL LSN for tenantID.
+// Concurrent in-flight calls for the same tenant are coalesced via singleflight without
+// caching past RPC completion, preserving strict LSN freshness.
+func (b *PageserverGRPCBackend) GetTenantInfo(ctx context.Context, tenantID string) (string, uint64, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if !resp.GetExists() {
-		debugf("ps-grpc", "GetTenantInfo tenant=%s exists=false dur=%s", tenantID, time.Since(start))
-		return "", 0, ErrNotFound
+	if err := ctx.Err(); err != nil {
+		return "", 0, err
 	}
-	b.genMu.Lock()
-	b.genCache[tenantID] = cachedTenantInfo{
-		generation: resp.GetGeneration(),
-		lastLSN:    resp.GetLastLsn(),
-		fetchedAt:  time.Now(),
+	ch := b.tenantInfoSF.DoChan(tenantID, func() (any, error) {
+		start := time.Now()
+		b.requestsTotal.Add(1)
+		b.inFlight.Add(1)
+		defer func() {
+			b.inFlight.Add(-1)
+			b.latencyHist.Observe(time.Since(start))
+		}()
+
+		timeout := b.cfg.RequestTimeout
+		if timeout <= 0 {
+			timeout = 10 * time.Second
+		}
+		baseCtx, baseCancel := context.WithTimeout(context.Background(), timeout)
+		defer baseCancel()
+		rctx, rcancel := b.withContext(baseCtx)
+		defer rcancel()
+		resp, err := b.client.GetTenantInfo(rctx, &pb.PageserverTenantRequest{TenantId: tenantID})
+		if err != nil {
+			mapped := b.mapErr(err)
+			debugf("ps-grpc", "GetTenantInfo tenant=%s err=%v dur=%s", tenantID, mapped, time.Since(start))
+			return nil, mapped
+		}
+		if !resp.GetExists() {
+			debugf("ps-grpc", "GetTenantInfo tenant=%s exists=false dur=%s", tenantID, time.Since(start))
+			return nil, ErrNotFound
+		}
+		b.genMu.Lock()
+		b.genCache[tenantID] = cachedTenantInfo{
+			generation: resp.GetGeneration(),
+			lastLSN:    resp.GetLastLsn(),
+			fetchedAt:  time.Now(),
+		}
+		b.genMu.Unlock()
+		debugf("ps-grpc", "GetTenantInfo tenant=%s gen=%s last_lsn=%s dur=%s",
+			tenantID, resp.GetGeneration(), formatLSNHex(resp.GetLastLsn()), time.Since(start))
+		return tenantInfoResult{gen: resp.GetGeneration(), lastLSN: resp.GetLastLsn()}, nil
+	})
+	select {
+	case <-ctx.Done():
+		return "", 0, ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return "", 0, res.Err
+		}
+		out := res.Val.(tenantInfoResult)
+		return out.gen, out.lastLSN, nil
 	}
-	b.genMu.Unlock()
-	debugf("ps-grpc", "GetTenantInfo tenant=%s gen=%s last_lsn=%s dur=%s",
-		tenantID, resp.GetGeneration(), formatLSNHex(resp.GetLastLsn()), time.Since(start))
-	return resp.GetGeneration(), resp.GetLastLsn(), nil
 }
 
 // GetModifiedBlocksSince implements pageserver.ModifiedBlocksProvider over gRPC.
@@ -159,7 +206,10 @@ func (b *PageserverGRPCBackend) GetModifiedBlocksSince(ctx context.Context, tena
 	start := time.Now()
 	b.requestsTotal.Add(1)
 	b.inFlight.Add(1)
-	defer b.inFlight.Add(-1)
+	defer func() {
+		b.inFlight.Add(-1)
+		b.latencyHist.Observe(time.Since(start))
+	}()
 
 	rctx, cancel := b.withContext(ctx)
 	defer cancel()
@@ -239,7 +289,10 @@ func (b *PageserverGRPCBackend) GetPageAtLSN(ctx context.Context, tenantID strin
 	start := time.Now()
 	b.requestsTotal.Add(1)
 	b.inFlight.Add(1)
-	defer b.inFlight.Add(-1)
+	defer func() {
+		b.inFlight.Add(-1)
+		b.latencyHist.Observe(time.Since(start))
+	}()
 
 	rctx, cancel := b.withContext(ctx)
 	defer cancel()
@@ -302,7 +355,10 @@ func (b *PageserverGRPCBackend) GetPageBatch(ctx context.Context, tenantID strin
 	start := time.Now()
 	b.requestsTotal.Add(1)
 	b.inFlight.Add(1)
-	defer b.inFlight.Add(-1)
+	defer func() {
+		b.inFlight.Add(-1)
+		b.latencyHist.Observe(time.Since(start))
+	}()
 
 	rctx, cancel := b.withContext(ctx)
 	defer cancel()
@@ -332,7 +388,10 @@ func (b *PageserverGRPCBackend) GetRelSize(ctx context.Context, tenantID string,
 	start := time.Now()
 	b.requestsTotal.Add(1)
 	b.inFlight.Add(1)
-	defer b.inFlight.Add(-1)
+	defer func() {
+		b.inFlight.Add(-1)
+		b.latencyHist.Observe(time.Since(start))
+	}()
 
 	rctx, cancel := b.withContext(ctx)
 	defer cancel()
@@ -360,7 +419,10 @@ func (b *PageserverGRPCBackend) GetRelExists(ctx context.Context, tenantID strin
 	start := time.Now()
 	b.requestsTotal.Add(1)
 	b.inFlight.Add(1)
-	defer b.inFlight.Add(-1)
+	defer func() {
+		b.inFlight.Add(-1)
+		b.latencyHist.Observe(time.Since(start))
+	}()
 
 	rctx, cancel := b.withContext(ctx)
 	defer cancel()

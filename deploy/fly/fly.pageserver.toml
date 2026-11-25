@@ -8,7 +8,7 @@ primary_region = "sin"
   AIR_DATA_DIR = "/var/lib/air-pageserver"
   AIR_PAGESERVER_GRPC_ADDR = "[::]:9091"
   AIR_PAGESERVER_CACHE_MB = "64"
-  AIR_PAGESERVER_DEBUG = "true"
+  AIR_PAGESERVER_DEBUG = "false"
   AIR_R2_BUCKET = "air-pg-backups"
   AIR_R2_REGION = "auto"
 

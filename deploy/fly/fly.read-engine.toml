@@ -10,7 +10,7 @@ primary_region = "sin"
   AIR_READ_ENGINE_LISTEN_HOST = "[::]"
   AIR_READ_ENGINE_PG_PORT = "5433"
   AIR_READ_ENGINE_GRPC_ADDR = "[::]:9092"
-  AIR_READ_ENGINE_DEBUG = "true"
+  AIR_READ_ENGINE_DEBUG = "false"
   AIR_PAGESERVER_GRPC_ADDR = "air-pg-pageserver.internal:9091"
 
 [mounts]

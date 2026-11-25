@@ -5,8 +5,10 @@ import (
 	"crypto/subtle"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -34,6 +36,7 @@ type Config struct {
 	PageserverGRPCAddr      string
 	PageserverInternalToken string
 	CacheDir                string
+	MetricsAddr             string
 	Debug                   bool
 }
 
@@ -99,6 +102,7 @@ func loadConfig(args []string) Config {
 	fs.StringVar(&cfg.PageserverGRPCAddr, "pageserver-grpc-addr", envOr("AIR_PAGESERVER_GRPC_ADDR", ""), "Standalone AIR Pageserver gRPC address")
 	fs.StringVar(&cfg.PageserverInternalToken, "internal-token", envOr("AIR_INTERNAL_TOKEN", ""), "Shared internal token for Pageserver gRPC auth")
 	fs.StringVar(&cfg.CacheDir, "cache-dir", envOr("AIR_READ_ENGINE_CACHE_DIR", ""), "Optional local NVMe L2 page cache directory")
+	fs.StringVar(&cfg.MetricsAddr, "metrics-addr", envOr("AIR_READ_ENGINE_METRICS_ADDR", "[::]:9102"), "Optional HTTP /metrics listen address")
 	fs.BoolVar(&cfg.Debug, "debug", envBoolOr("AIR_READ_ENGINE_DEBUG", true), "Enable verbose debug logging")
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("parse flags: %v", err)
@@ -355,8 +359,48 @@ func main() {
 		}()
 	}
 
+	var metricsSrv *http.Server
+	if cfg.MetricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			if cfg.PageserverInternalToken != "" {
+				tok := strings.TrimSpace(r.Header.Get("X-Air-Internal-Token"))
+				if tok == "" {
+					tok = strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+				}
+				if subtle.ConstantTimeCompare([]byte(tok), []byte(cfg.PageserverInternalToken)) != 1 {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+			}
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+			w.Header().Set("Connection", "close")
+			_, _ = io.WriteString(w, re.sqliteRe.PrometheusMetrics())
+		})
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "ok\n")
+		})
+		metricsSrv = &http.Server{
+			Addr:              cfg.MetricsAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			log.Printf("[air-read-engine] HTTP /metrics listening on %s", cfg.MetricsAddr)
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("[air-read-engine] metrics server error: %v", err)
+			}
+		}()
+	}
+
 	<-ctx.Done()
 	log.Printf("[air-read-engine] shutting down...")
+	if metricsSrv != nil {
+		mctx, mcancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = metricsSrv.Shutdown(mctx)
+		mcancel()
+	}
 	if grpcSrv != nil {
 		grpcSrv.GracefulStop()
 	}

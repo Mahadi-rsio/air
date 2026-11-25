@@ -3,11 +3,18 @@ package readadapter
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Mahadi-rsio/air/internal/pageserver"
+	"github.com/Mahadi-rsio/air/internal/pb"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -90,5 +97,83 @@ func TestPageserverGRPCBackend_RoundTripAndAuth(t *testing.T) {
 	exists, err := client.GetRelExists(context.Background(), "tenant_1", 1663, 16384, 1001, 0, 0x2000)
 	if err != nil || !exists {
 		t.Fatalf("GetRelExists: exists=%v err=%v", exists, err)
+	}
+}
+
+type slowTenantInfoServer struct {
+	pb.UnimplementedPageserverServiceServer
+	calls atomic.Int64
+	gate  chan struct{}
+}
+
+func (s *slowTenantInfoServer) GetTenantInfo(ctx context.Context, req *pb.PageserverTenantRequest) (*pb.PageserverTenantInfoResponse, error) {
+	s.calls.Add(1)
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok || len(md.Get("x-air-internal-token")) == 0 || md.Get("x-air-internal-token")[0] != "tok-sf" {
+		return nil, status.Error(codes.Unauthenticated, "missing internal token")
+	}
+	<-s.gate
+	return &pb.PageserverTenantInfoResponse{
+		Exists:     true,
+		Generation: "gen_sf",
+		LastLsn:    0x4000,
+	}, nil
+}
+
+func TestPageserverGRPCBackend_GetTenantInfoSingleflight(t *testing.T) {
+	srv := &slowTenantInfoServer{gate: make(chan struct{})}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	gs := grpc.NewServer()
+	pb.RegisterPageserverServiceServer(gs, srv)
+	go func() { _ = gs.Serve(lis) }()
+	defer gs.Stop()
+
+	client, err := NewPageserverGRPCBackend(PageserverGRPCConfig{
+		Addr:           lis.Addr().String(),
+		InternalToken:  "tok-sf",
+		RequestTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewPageserverGRPCBackend: %v", err)
+	}
+	defer client.Close()
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	lsns := make([]uint64, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			ctx := context.Background()
+			if idx == 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, 20*time.Millisecond)
+				defer cancel()
+			}
+			_, lsn, err := client.GetTenantInfo(ctx, "t_sf")
+			lsns[idx] = lsn
+			errs[idx] = err
+		}(i)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	close(srv.gate)
+	wg.Wait()
+
+	if got := srv.calls.Load(); got != 1 {
+		t.Fatalf("expected 1 coalesced GetTenantInfo RPC, got %d", got)
+	}
+	if !errors.Is(errs[0], context.DeadlineExceeded) {
+		t.Fatalf("expected caller 0 to fail with DeadlineExceeded, got %v", errs[0])
+	}
+	for i := 1; i < n; i++ {
+		if errs[i] != nil || lsns[i] != 0x4000 {
+			t.Fatalf("caller %d: lsn=0x%x err=%v", i, lsns[i], errs[i])
+		}
 	}
 }

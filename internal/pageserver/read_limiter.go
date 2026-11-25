@@ -6,6 +6,9 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/Mahadi-rsio/air/internal/prom"
 )
 
 var (
@@ -65,6 +68,7 @@ type ReadLimiter struct {
 	admitted     atomic.Int64
 	rejectedFull atomic.Int64
 	cancelled    atomic.Int64
+	waitHist     *prom.Histogram
 }
 
 // NewReadLimiter creates a ReadLimiter with sensible defaults for zero-value fields.
@@ -93,6 +97,7 @@ func NewReadLimiter(cfg ReadLimiterConfig) *ReadLimiter {
 		drainedCh:       make(chan struct{}),
 		perTenantActive: make(map[string]int),
 		tenantQueues:    make(map[string][]*readWaiter),
+		waitHist:        prom.NewHistogram(nil),
 	}
 }
 
@@ -157,16 +162,20 @@ func (rl *ReadLimiter) Acquire(ctx context.Context, tenantID string) (func(), er
 	rl.pending++
 	rl.mu.Unlock()
 
+	waitStart := time.Now()
 	select {
 	case <-w.ready:
+		rl.waitHist.Observe(time.Since(waitStart))
 		rl.admitted.Add(1)
 		return rl.releaseFunc(tenantID), nil
 	case <-rl.shutdownCh:
+		rl.waitHist.Observe(time.Since(waitStart))
 		if rl.removeCancelledWaiter(w) {
 			rl.release(tenantID)
 		}
 		return nil, ErrReadLimiterClosed
 	case <-ctx.Done():
+		rl.waitHist.Observe(time.Since(waitStart))
 		granted := rl.removeCancelledWaiter(w)
 		if granted {
 			// Slot was granted concurrently with ctx cancellation; release it immediately.
@@ -335,4 +344,12 @@ func (rl *ReadLimiter) Stats() ReadLimiterStats {
 		RejectedFull: rl.rejectedFull.Load(),
 		Cancelled:    rl.cancelled.Load(),
 	}
+}
+
+// WaitHistogram returns the ReadLimiter wait duration histogram.
+func (rl *ReadLimiter) WaitHistogram() *prom.Histogram {
+	if rl == nil {
+		return nil
+	}
+	return rl.waitHist
 }

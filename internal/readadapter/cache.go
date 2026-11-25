@@ -20,6 +20,7 @@ import (
 	"unsafe"
 
 	"github.com/Mahadi-rsio/air/internal/pageserver"
+	"github.com/Mahadi-rsio/air/internal/prom"
 	"golang.org/x/sync/singleflight"
 	"golang.org/x/sys/unix"
 )
@@ -120,6 +121,10 @@ type CacheStats struct {
 	L2DirectIOOps       uint64
 	L2DirectIOFallbacks uint64
 	L3Fetches           uint64
+	L3Hits              uint64
+	L3Misses            uint64
+	TenantInvalidations uint64
+	ResetRequiredTotal  uint64
 	StampedesPrevented  uint64
 }
 
@@ -223,7 +228,12 @@ type TieredCacheBackend struct {
 	l2DirectIOOps       atomic.Uint64
 	l2DirectIOFallbacks atomic.Uint64
 	l3Fetches           atomic.Uint64
+	l3Hits              atomic.Uint64
+	l3Misses            atomic.Uint64
+	tenantInvalidations atomic.Uint64
+	resetRequiredTotal  atomic.Uint64
 	stampedesPrevented  atomic.Uint64
+	syncLatencyHist     *prom.Histogram
 }
 
 // NewTieredCacheBackend creates a multi-level L1+L2+L3 StorageBackend.
@@ -286,8 +296,9 @@ func NewTieredCacheBackend(l3 StorageBackend, cfg CacheConfig) (*TieredCacheBack
 				return make([]byte, directIOL2FileSize+directIOAlign)
 			},
 		},
-		syncState:  make(map[string]*tenantSyncState),
-		l1List:     list.New(),
+		syncState:       make(map[string]*tenantSyncState),
+		syncLatencyHist: prom.NewHistogram(nil),
+		l1List:          list.New(),
 		l1Map:      make(map[PageCacheKey]*list.Element),
 		l1Latest:   make(map[BlockCacheKey]*list.Element),
 		l2List:     list.New(),
@@ -387,6 +398,9 @@ func (c *TieredCacheBackend) ensureSynced(ctx context.Context, tenantID, generat
 		syncCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
 		res, gerr := mbp.GetModifiedBlocksSince(syncCtx, tenantID, since)
+		if c.syncLatencyHist != nil {
+			c.syncLatencyHist.Observe(time.Since(syncStart))
+		}
 		if gerr != nil {
 			debugf("cache-sync", "ensureSynced tenant=%s gen=%s since=%s target=%s err=%v dur=%s",
 				tenantID, generation, formatLSNHex(since), formatLSNHex(targetLSN), gerr, time.Since(syncStart))
@@ -394,6 +408,7 @@ func (c *TieredCacheBackend) ensureSynced(ctx context.Context, tenantID, generat
 		}
 
 		if res.ResetRequired {
+			c.resetRequiredTotal.Add(1)
 			debugf("cache-sync", "ensureSynced tenant=%s gen=%s RESET_REQUIRED -> invalidating tenant cache",
 				tenantID, generation)
 			c.InvalidateTenant(tenantID)
@@ -654,8 +669,10 @@ func (c *TieredCacheBackend) GetPageAtLSN(ctx context.Context, tenantID string, 
 		defer cancel()
 		pg, err := c.l3.GetPageAtLSN(fetchCtx, tenantID, key, lsn)
 		if err != nil {
+			c.l3Misses.Add(1)
 			return nil, err
 		}
+		c.l3Hits.Add(1)
 		if len(pg) == PGPageSize {
 			if c.l2Dir != "" {
 				c.putL2(ck, pg)
@@ -799,6 +816,7 @@ func (c *TieredCacheBackend) GetPageBatch(ctx context.Context, tenantID string, 
 
 // InvalidateTenant removes all L1 and L2 cached pages belonging to tenantID.
 func (c *TieredCacheBackend) InvalidateTenant(tenantID string) {
+	c.tenantInvalidations.Add(1)
 	c.invalidateWhere(func(k PageCacheKey) bool {
 		return k.TenantID == tenantID
 	})
@@ -930,8 +948,20 @@ func (c *TieredCacheBackend) Stats() CacheStats {
 		L2DirectIOOps:       c.l2DirectIOOps.Load(),
 		L2DirectIOFallbacks: c.l2DirectIOFallbacks.Load(),
 		L3Fetches:           c.l3Fetches.Load(),
+		L3Hits:              c.l3Hits.Load(),
+		L3Misses:            c.l3Misses.Load(),
+		TenantInvalidations: c.tenantInvalidations.Load(),
+		ResetRequiredTotal:  c.resetRequiredTotal.Load(),
 		StampedesPrevented:  c.stampedesPrevented.Load(),
 	}
+}
+
+// SyncLatencyHistogram returns the cache synchronization latency histogram.
+func (c *TieredCacheBackend) SyncLatencyHistogram() *prom.Histogram {
+	if c == nil {
+		return nil
+	}
+	return c.syncLatencyHist
 }
 
 func (c *TieredCacheBackend) getL1(k PageCacheKey, syncedLSN uint64) ([]byte, bool) {

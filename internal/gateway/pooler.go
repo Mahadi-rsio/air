@@ -220,7 +220,7 @@ func (p *TenantPool) recordReadEngineSuccess() {
 	p.readEngineHealthy.Store(true)
 }
 
-func (p *TenantPool) recordReadEngineFailure() {
+func (p *TenantPool) recordReadEngineFailure() bool {
 	p.readProbeInFlight.Store(false)
 	fails := p.readConsecFails.Add(1)
 	if fails >= readBreakerThreshold {
@@ -228,6 +228,7 @@ func (p *TenantPool) recordReadEngineFailure() {
 	}
 	p.readEngineHealthy.Store(false)
 	p.readEngineLSN.Store(0)
+	return fails == readBreakerThreshold
 }
 
 func (p *TenantPool) canAttemptReadEngine() (allowed bool, isProbe bool) {
@@ -418,6 +419,7 @@ func (p *TenantPool) Snapshot() PoolTenantSnapshot {
 		IdleBackends:       idle,
 		PinnedClients:      p.pinnedClients.Load(),
 		ActiveTransactions: p.activeTxCount.Load(),
+		ReadBreakerOpen:    p.readBreakerOpenUntil.Load() > time.Now().UnixNano(),
 	}
 }
 
@@ -690,6 +692,20 @@ func (p *TenantPool) executeSimpleAndRelay(ctx context.Context, st *clientSessio
 		return true, true, false
 	}
 	st.backendInFlight = true
+	p.mu.Lock()
+	whost, wsock, wport := p.host, p.sockDir, p.port
+	p.mu.Unlock()
+	b := st.currentBackend
+	stopWatch := watchClientDisconnect(ctx, st.client, func() {
+		if st.metrics != nil {
+			st.metrics.RecordClientDisconnect()
+			st.metrics.RecordQueryCancellation()
+		}
+		st.cancelActiveQuery()
+		sendBackendCancel(whost, wsock, wport, b.BackendPID, b.BackendSecret)
+		_ = b.Conn.Close()
+	})
+	defer stopWatch()
 	if _, err := st.currentBackend.Conn.Write(wireMsg); err != nil {
 		p.releaseCurrent(st, true)
 		return false, false, false
@@ -823,11 +839,24 @@ func (p *TenantPool) recordPrimaryWriteState(st *clientSessionState, targetB *Ba
 
 func (p *TenantPool) tryExecuteOnReadEngine(ctx context.Context, st *clientSessionState, wireMsg []byte, bytesIn uint64, qStart time.Time, queryType string) (executed bool, ioOK bool) {
 	ioOK = true
+	reStart := time.Now()
+	if st.metrics != nil {
+		st.metrics.IncReadEngineInFlight()
+		defer func() {
+			st.metrics.DecReadEngineInFlight()
+			st.metrics.RecordReadEngineRequest(time.Since(reStart))
+		}()
+	}
 	waitStart := time.Now()
 	rb, err := p.acquireReadBackend(ctx, st.clientID)
 	poolWaitUs := uint64(time.Since(waitStart).Microseconds())
 	if err != nil || rb == nil {
-		p.recordReadEngineFailure()
+		if p.recordReadEngineFailure() && st.metrics != nil {
+			st.metrics.RecordReadBreakerTrip()
+		}
+		if ctx.Err() != nil {
+			return true, false
+		}
 		if p.isSuspended() {
 			log.Printf("[air-gateway] read-engine acquire failed tenant=%s err=%v (tenant suspended; not waking primary for read query)", p.tenantID, err)
 			if _, werr := st.client.Write(BuildErrorResponse("ERROR", "57P03", "read engine unavailable while database is suspended")); werr != nil {
@@ -845,7 +874,9 @@ func (p *TenantPool) tryExecuteOnReadEngine(ctx context.Context, st *clientSessi
 	p.recordReadEngineSuccess()
 	if !p.ensureSessionAndStmts(rb, st) {
 		p.releaseReadBackend(rb, true)
-		p.recordReadEngineFailure()
+		if p.recordReadEngineFailure() && st.metrics != nil {
+			st.metrics.RecordReadBreakerTrip()
+		}
 		if p.isSuspended() {
 			if _, werr := st.client.Write(BuildErrorResponse("ERROR", "57P03", "read engine session init failed while database is suspended")); werr != nil {
 				return true, false
@@ -858,10 +889,10 @@ func (p *TenantPool) tryExecuteOnReadEngine(ctx context.Context, st *clientSessi
 		}
 		return false, true
 	}
+	p.mu.Lock()
+	rhost, rsock, rport := p.readHost, p.readSockDir, p.readPort
+	p.mu.Unlock()
 	if st.cancelReg != nil && rb.BackendPID != 0 {
-		p.mu.Lock()
-		rhost, rsock, rport := p.readHost, p.readSockDir, p.readPort
-		p.mu.Unlock()
 		st.cancelReg.Register(st.gwPID, st.gwSecret, CancelTarget{
 			Host:          rhost,
 			SockDir:       rsock,
@@ -871,8 +902,21 @@ func (p *TenantPool) tryExecuteOnReadEngine(ctx context.Context, st *clientSessi
 		})
 		defer st.cancelReg.Unregister(st.gwPID, st.gwSecret)
 	}
+	stopWatch := watchClientDisconnect(ctx, st.client, func() {
+		if st.metrics != nil {
+			st.metrics.RecordClientDisconnect()
+			st.metrics.RecordQueryCancellation()
+		}
+		st.cancelActiveQuery()
+		sendBackendCancel(rhost, rsock, rport, rb.BackendPID, rb.BackendSecret)
+		_ = rb.Conn.Close()
+	})
+	defer stopWatch()
 	if _, err := rb.Conn.Write(wireMsg); err != nil {
 		p.releaseReadBackend(rb, true)
+		if ctx.Err() != nil {
+			return true, false
+		}
 		if p.isSuspended() {
 			if _, werr := st.client.Write(BuildErrorResponse("ERROR", "57P03", "read engine write failed while database is suspended")); werr != nil {
 				return true, false
@@ -888,6 +932,9 @@ func (p *TenantPool) tryExecuteOnReadEngine(ctx context.Context, st *clientSessi
 	firstT, firstBody, err := ReadPGPacket(rb.Conn)
 	if err != nil {
 		p.releaseReadBackend(rb, true)
+		if ctx.Err() != nil {
+			return true, false
+		}
 		if p.isSuspended() {
 			if _, werr := st.client.Write(BuildErrorResponse("ERROR", "57P03", "read engine read failed while database is suspended")); werr != nil {
 				return true, false
@@ -1074,6 +1121,9 @@ func (p *TenantPool) handleSimpleQuery(st *clientSessionState, mbody []byte) boo
 				routedToRead = execOK
 				if !routedToRead {
 					RecordReadFallback(&p.routingMetrics)
+					if st.metrics != nil {
+						st.metrics.RecordReadEngineFallback()
+					}
 				}
 			}
 		}
@@ -1392,28 +1442,67 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 	}
 
 	if tryReadEngine {
+		reStart := time.Now()
+		if st.metrics != nil {
+			st.metrics.IncReadEngineInFlight()
+		}
 		waitStart := time.Now()
-		if rb, err := p.acquireReadBackend(qctx, st.clientID); err == nil && rb != nil {
+		rb, err := p.acquireReadBackend(qctx, st.clientID)
+		if err == nil && rb != nil {
 			rwaitUs := uint64(time.Since(waitStart).Microseconds())
 			p.recordReadEngineSuccess()
 			if p.ensureSessionAndStmts(rb, st) {
+				p.mu.Lock()
+				rhost, rsock, rport := p.readHost, p.readSockDir, p.readPort
+				p.mu.Unlock()
+				stopWatch := watchClientDisconnect(qctx, st.client, func() {
+					if st.metrics != nil {
+						st.metrics.RecordClientDisconnect()
+						st.metrics.RecordQueryCancellation()
+					}
+					st.cancelActiveQuery()
+					sendBackendCancel(rhost, rsock, rport, rb.BackendPID, rb.BackendSecret)
+					_ = rb.Conn.Close()
+				})
 				rc := runBatchOnBackend(rb, true, rwaitUs)
+				stopWatch()
+				if st.metrics != nil {
+					st.metrics.DecReadEngineInFlight()
+					st.metrics.RecordReadEngineRequest(time.Since(reStart))
+				}
 				if rc == 1 {
 					resetExtBatch()
 					p.releaseReadBackend(rb, st.txStatus != 'I')
 					return true
 				}
-				if rc == -1 {
+				if rc == -1 || qctx.Err() != nil {
 					resetExtBatch()
 					p.releaseReadBackend(rb, true)
-					p.recordReadEngineFailure()
+					if p.recordReadEngineFailure() && st.metrics != nil {
+						st.metrics.RecordReadBreakerTrip()
+					}
 					return false
 				}
+			} else if st.metrics != nil {
+				st.metrics.DecReadEngineInFlight()
+				st.metrics.RecordReadEngineRequest(time.Since(reStart))
 			}
 			p.releaseReadBackend(rb, true)
-			p.recordReadEngineFailure()
+			if p.recordReadEngineFailure() && st.metrics != nil {
+				st.metrics.RecordReadBreakerTrip()
+			}
 		} else {
-			p.recordReadEngineFailure()
+			if st.metrics != nil {
+				st.metrics.DecReadEngineInFlight()
+				st.metrics.RecordReadEngineRequest(time.Since(reStart))
+			}
+			if p.recordReadEngineFailure() && st.metrics != nil {
+				st.metrics.RecordReadBreakerTrip()
+			}
+			if qctx.Err() != nil {
+				resetExtBatch()
+				return false
+			}
 		}
 		if isSusp {
 			resetExtBatch()
@@ -1427,6 +1516,9 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 			return true
 		}
 		RecordReadFallback(&p.routingMetrics)
+		if st.metrics != nil {
+			st.metrics.RecordReadEngineFallback()
+		}
 	}
 
 	var permit *WritePermit
@@ -1455,7 +1547,21 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 	}
 
 	st.backendInFlight = true
+	p.mu.Lock()
+	whost, wsock, wport := p.host, p.sockDir, p.port
+	p.mu.Unlock()
+	b := st.currentBackend
+	stopWatch := watchClientDisconnect(qctx, st.client, func() {
+		if st.metrics != nil {
+			st.metrics.RecordClientDisconnect()
+			st.metrics.RecordQueryCancellation()
+		}
+		st.cancelActiveQuery()
+		sendBackendCancel(whost, wsock, wport, b.BackendPID, b.BackendSecret)
+		_ = b.Conn.Close()
+	})
 	rc := runBatchOnBackend(st.currentBackend, false, poolWaitUs)
+	stopWatch()
 	if permit != nil {
 		permit.Release(rc < 0)
 	}

@@ -6,6 +6,9 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/Mahadi-rsio/air/internal/prom"
 )
 
 // QueryPriority defines scheduling priority for multi-tenant admission control.
@@ -59,6 +62,9 @@ type SchedulerStats struct {
 	ActiveGlobal         int    `json:"active_global"`
 	QueuedGlobal         int    `json:"queued_global"`
 	MaxGlobalConcurrency int    `json:"max_global_concurrency"`
+	ActiveTenants        int    `json:"active_tenants"`
+	TenantActiveMax      int    `json:"tenant_active_max"`
+	TenantQueuedMax      int    `json:"tenant_queued_max"`
 	AdmittedTotal        uint64 `json:"admitted_total"`
 	BackpressureTotal    uint64 `json:"backpressure_total"`
 	CancelledWaitTotal   uint64 `json:"cancelled_wait_total"`
@@ -102,6 +108,7 @@ type TenantScheduler struct {
 	admittedTotal      atomic.Uint64
 	backpressureTotal  atomic.Uint64
 	cancelledWaitTotal atomic.Uint64
+	waitHist           *prom.Histogram
 }
 
 // NewTenantScheduler creates a shared TenantScheduler with bounded queues.
@@ -133,6 +140,7 @@ func NewTenantScheduler(cfg SchedulerConfig) *TenantScheduler {
 		tenantQueued:  make(map[string]int),
 		tenantAdmit:   make(map[string]uint64),
 		tenantReject:  make(map[string]uint64),
+		waitHist:      prom.NewHistogram(nil),
 	}
 }
 
@@ -225,13 +233,16 @@ func (s *TenantScheduler) Acquire(ctx context.Context, tenantID string) (func(),
 	s.tenantQueued[tenantID]++
 	s.mu.Unlock()
 
+	waitStart := time.Now()
 	select {
 	case err := <-w.ch:
+		s.waitHist.Observe(time.Since(waitStart))
 		if err != nil {
 			return nil, err
 		}
 		return s.releaseFunc(tenantID), nil
 	case <-ctx.Done():
+		s.waitHist.Observe(time.Since(waitStart))
 		s.mu.Lock()
 		if !w.cancelled {
 			w.cancelled = true
@@ -336,15 +347,40 @@ func (s *TenantScheduler) Stats() SchedulerStats {
 	s.mu.Lock()
 	act := s.activeGlobal
 	q := len(s.waiters)
+	var actTenants, tActMax, tQMax int
+	for _, v := range s.tenantActive {
+		if v > 0 {
+			actTenants++
+			if v > tActMax {
+				tActMax = v
+			}
+		}
+	}
+	for _, v := range s.tenantQueued {
+		if v > tQMax {
+			tQMax = v
+		}
+	}
 	s.mu.Unlock()
 	return SchedulerStats{
 		ActiveGlobal:         act,
 		QueuedGlobal:         q,
 		MaxGlobalConcurrency: s.maxGlobal,
+		ActiveTenants:        actTenants,
+		TenantActiveMax:      tActMax,
+		TenantQueuedMax:      tQMax,
 		AdmittedTotal:        s.admittedTotal.Load(),
 		BackpressureTotal:    s.backpressureTotal.Load(),
 		CancelledWaitTotal:   s.cancelledWaitTotal.Load(),
 	}
+}
+
+// WaitHistogram returns the scheduler wait duration histogram.
+func (s *TenantScheduler) WaitHistogram() *prom.Histogram {
+	if s == nil {
+		return nil
+	}
+	return s.waitHist
 }
 
 // TenantStats returns per-tenant scheduler metrics.

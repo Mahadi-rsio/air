@@ -11,7 +11,10 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/Mahadi-rsio/air/internal/prom"
 )
 
 const (
@@ -53,11 +56,12 @@ type WALRedoPoolConfig struct {
 }
 
 type redoJob struct {
-	ctx      context.Context
-	key      Key
-	basePage []byte
-	records  [][]byte
-	resCh    chan redoResult
+	ctx        context.Context
+	key        Key
+	basePage   []byte
+	records    [][]byte
+	resCh      chan redoResult
+	enqueuedAt time.Time
 }
 
 type redoResult struct {
@@ -68,13 +72,43 @@ type redoResult struct {
 // DefaultWALRedoer applies FPIs directly in Go and delegates non-FPI delta chains
 // to a bounded pool of persistent external PG17 walredo worker processes.
 type DefaultWALRedoer struct {
-	cfg      WALRedoPoolConfig
-	initOnce sync.Once
-	reqCh    chan *redoJob
-	closedCh chan struct{}
-	closeMu  sync.Mutex
-	closed   bool
-	wg       sync.WaitGroup
+	cfg           WALRedoPoolConfig
+	initOnce      sync.Once
+	reqCh         chan *redoJob
+	closedCh      chan struct{}
+	closeMu       sync.Mutex
+	closed        bool
+	wg            sync.WaitGroup
+	activeWorkers atomic.Int64
+	timeoutsTotal atomic.Uint64
+	failuresTotal atomic.Uint64
+	queueWaitHist *prom.Histogram
+	execHist      *prom.Histogram
+}
+
+// WALRedoStats captures WALRedoer worker pool metrics.
+type WALRedoStats struct {
+	ActiveWorkers int64
+	QueueDepth    int
+	TimeoutsTotal uint64
+	FailuresTotal uint64
+	QueueWaitHist *prom.Histogram
+	ExecHist      *prom.Histogram
+}
+
+// Stats returns a point-in-time snapshot of WALRedoer metrics.
+func (r *DefaultWALRedoer) Stats() WALRedoStats {
+	if r == nil {
+		return WALRedoStats{}
+	}
+	return WALRedoStats{
+		ActiveWorkers: r.activeWorkers.Load(),
+		QueueDepth:    len(r.reqCh),
+		TimeoutsTotal: r.timeoutsTotal.Load(),
+		FailuresTotal: r.failuresTotal.Load(),
+		QueueWaitHist: r.queueWaitHist,
+		ExecHist:      r.execHist,
+	}
 }
 
 // NewDefaultWALRedoer creates a WALRedoer with default bounded worker pool settings.
@@ -106,8 +140,10 @@ func NewWALRedoPool(cfg WALRedoPoolConfig) *DefaultWALRedoer {
 		cfg.RequestTimeout = defaultRedoRequestTimeout
 	}
 	return &DefaultWALRedoer{
-		cfg:      cfg,
-		closedCh: make(chan struct{}),
+		cfg:           cfg,
+		closedCh:      make(chan struct{}),
+		queueWaitHist: prom.NewHistogram(nil),
+		execHist:      prom.NewHistogram(nil),
 	}
 }
 
@@ -283,11 +319,12 @@ func (r *DefaultWALRedoer) enqueueJob(ctx context.Context, key Key, basePage []b
 	}
 
 	job := &redoJob{
-		ctx:      ctx,
-		key:      key,
-		basePage: basePage,
-		records:  records,
-		resCh:    make(chan redoResult, 1),
+		ctx:        ctx,
+		key:        key,
+		basePage:   basePage,
+		records:    records,
+		resCh:      make(chan redoResult, 1),
+		enqueuedAt: time.Now(),
 	}
 	select {
 	case r.reqCh <- job:
@@ -514,7 +551,18 @@ func (r *DefaultWALRedoer) workerLoop() {
 		case <-r.closedCh:
 			return
 		case job := <-r.reqCh:
+			r.queueWaitHist.Observe(time.Since(job.enqueuedAt))
+			r.activeWorkers.Add(1)
+			execStart := time.Now()
 			page, err := w.execJob(job, r.cfg.RequestTimeout)
+			r.execHist.Observe(time.Since(execStart))
+			r.activeWorkers.Add(-1)
+			if err != nil {
+				r.failuresTotal.Add(1)
+				if errors.Is(err, context.DeadlineExceeded) {
+					r.timeoutsTotal.Add(1)
+				}
+			}
 			job.resCh <- redoResult{page: page, err: err}
 		}
 	}

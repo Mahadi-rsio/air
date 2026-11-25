@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Mahadi-rsio/air/internal/prom"
 	"github.com/Mahadi-rsio/air/internal/tenant"
 	"github.com/jackc/pgx/v5"
 )
@@ -162,6 +163,9 @@ type SQLiteReadServer struct {
 	queriesFailed       atomic.Uint64
 	queriesCancelled    atomic.Uint64
 	activeQueries       atomic.Int64
+	readerPoolActive    atomic.Int64
+	readerPoolTimeouts  atomic.Uint64
+	readerPoolWaitHist  *prom.Histogram
 	writesBlocked            atomic.Uint64
 	snapshotAcqFailures      atomic.Uint64
 	toastFallbacks           atomic.Uint64
@@ -223,9 +227,10 @@ func NewSQLiteReadServer(cfg SQLiteServerConfig) (*SQLiteReadServer, error) {
 		dbDir:   dbDir,
 		sockDir: sockDir,
 		state:   "STOPPED",
-		tenants:  make(map[string]*SQLiteTenantStore),
-		sessions: make(map[uint32]context.CancelFunc),
-		stopCh:   make(chan struct{}),
+		tenants:            make(map[string]*SQLiteTenantStore),
+		sessions:           make(map[uint32]context.CancelFunc),
+		stopCh:             make(chan struct{}),
+		readerPoolWaitHist: prom.NewHistogram(nil),
 	}
 	if cfg.NativeBackend != nil || cfg.PageserverGRPCAddr != "" || cfg.PageserverSocket != "" {
 		backend := cfg.NativeBackend
@@ -480,6 +485,7 @@ func (s *SQLiteReadServer) PrometheusMetrics() string {
 	fmt.Fprintf(&b, "air_l2_cache_entries %d\n", cs.L2Entries)
 	fmt.Fprintf(&b, "air_tenant_memory_bytes %d\n", m.Memory.GlobalUsedBytes)
 	fmt.Fprintf(&b, "air_cgroup_memory_bytes %d\n", readCgroupMemoryCurrent())
+	s.appendPhase25PrometheusMetrics(&b)
 	return b.String()
 }
 
@@ -1717,10 +1723,20 @@ func (s *SQLiteReadServer) runReaderQueryWithPlanTyped(
 
 		if ts.readerPool != nil {
 			var slot *sqliteReaderSlot
+			poolWaitStart := time.Now()
 			select {
 			case slot = <-ts.readerPool:
-				defer func() { ts.readerPool <- slot }()
+				s.readerPoolWaitHist.Observe(time.Since(poolWaitStart))
+				s.readerPoolActive.Add(1)
+				defer func() {
+					s.readerPoolActive.Add(-1)
+					ts.readerPool <- slot
+				}()
 			case <-ctx.Done():
+				s.readerPoolWaitHist.Observe(time.Since(poolWaitStart))
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					s.readerPoolTimeouts.Add(1)
+				}
 				s.queriesCancelled.Add(1)
 				return nil, nil, ctx.Err()
 			}

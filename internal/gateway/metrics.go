@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Mahadi-rsio/air/internal/prom"
 )
 
 var latencyUpperBoundsUs = [12]uint64{
@@ -126,6 +128,7 @@ type PoolTenantSnapshot struct {
 	IdleBackends       int
 	PinnedClients      int64
 	ActiveTransactions int64
+	ReadBreakerOpen    bool
 }
 
 type TenantStats struct {
@@ -185,11 +188,18 @@ type MetricsRegistry struct {
 	maxUserConns   int
 	startedAt      time.Time
 
-	authFailures   atomic.Uint64
-	protocolErrors atomic.Uint64
-	rpcErrors      atomic.Uint64
-	timeouts       atomic.Uint64
-	poolExhausted  atomic.Uint64
+	authFailures       atomic.Uint64
+	protocolErrors     atomic.Uint64
+	rpcErrors          atomic.Uint64
+	timeouts           atomic.Uint64
+	poolExhausted      atomic.Uint64
+	readEngineRequests atomic.Uint64
+	readEngineInFlight atomic.Int64
+	readEngineFallback atomic.Uint64
+	readBreakerTrips   atomic.Uint64
+	clientDisconnects  atomic.Uint64
+	queryCancellations atomic.Uint64
+	readEngineLatency  *prom.Histogram
 
 	mu                   sync.Mutex
 	activeGlobalConns    int64
@@ -211,6 +221,7 @@ func NewMetricsRegistry(maxGlobalConns, maxTenantConns, maxUserConns int) *Metri
 		maxTenantConns:       maxTenantConns,
 		maxUserConns:         maxUserConns,
 		startedAt:            time.Now(),
+		readEngineLatency:    prom.NewHistogram(nil),
 		tenants:              make(map[string]*TenantStats),
 		users:                make(map[string]*UserStats),
 		tenantLimitOverrides: make(map[string]int),
@@ -251,6 +262,19 @@ func (m *MetricsRegistry) RecordProtocolError() { m.protocolErrors.Add(1) }
 func (m *MetricsRegistry) RecordRPCError()      { m.rpcErrors.Add(1) }
 func (m *MetricsRegistry) RecordTimeout()       { m.timeouts.Add(1) }
 func (m *MetricsRegistry) RecordPoolExhausted() { m.poolExhausted.Add(1) }
+
+func (m *MetricsRegistry) IncReadEngineInFlight()   { m.readEngineInFlight.Add(1) }
+func (m *MetricsRegistry) DecReadEngineInFlight()   { m.readEngineInFlight.Add(-1) }
+func (m *MetricsRegistry) RecordReadEngineRequest(d time.Duration) {
+	m.readEngineRequests.Add(1)
+	if m.readEngineLatency != nil {
+		m.readEngineLatency.Observe(d)
+	}
+}
+func (m *MetricsRegistry) RecordReadEngineFallback() { m.readEngineFallback.Add(1) }
+func (m *MetricsRegistry) RecordReadBreakerTrip()    { m.readBreakerTrips.Add(1) }
+func (m *MetricsRegistry) RecordClientDisconnect()   { m.clientDisconnects.Add(1) }
+func (m *MetricsRegistry) RecordQueryCancellation()  { m.queryCancellations.Add(1) }
 
 func userKey(tenantID, user string) string {
 	return tenantID + "\x00" + user
@@ -461,6 +485,31 @@ func (m *MetricsRegistry) ToPrometheus(poolSnaps []PoolTenantSnapshot) string {
 	fmt.Fprintf(&b, "# HELP air_gateway_rpc_errors_total Total Control Plane RPC failures\n# TYPE air_gateway_rpc_errors_total counter\nair_gateway_rpc_errors_total %d\n", m.rpcErrors.Load())
 	fmt.Fprintf(&b, "# HELP air_gateway_timeouts_total Total gateway timeouts\n# TYPE air_gateway_timeouts_total counter\nair_gateway_timeouts_total %d\n", m.timeouts.Load())
 	fmt.Fprintf(&b, "# HELP air_gateway_pool_exhausted_total Total backend pool saturation events\n# TYPE air_gateway_pool_exhausted_total counter\nair_gateway_pool_exhausted_total %d\n", m.poolExhausted.Load())
+
+	prom.WriteCounter(&b, "read_engine_requests_total", "Total read requests dispatched to Read Engine", m.readEngineRequests.Load())
+	prom.WriteGauge(&b, "read_engine_in_flight", "Current in-flight Read Engine requests", m.readEngineInFlight.Load())
+	if m.readEngineLatency != nil {
+		m.readEngineLatency.WritePrometheus(&b, "read_engine_latency_seconds", "Read Engine request execution latency in seconds")
+	}
+	prom.WriteCounter(&b, "read_engine_fallbacks_total", "Total Read Engine requests that fell back to PostgreSQL primary", m.readEngineFallback.Load())
+	var openBreakers int64
+	for _, ps := range poolSnaps {
+		if ps.ReadBreakerOpen {
+			openBreakers++
+		}
+	}
+	prom.WriteGauge(&b, "read_breaker_open", "Number of tenant pools with an open Read Engine circuit breaker", openBreakers)
+	prom.WriteCounter(&b, "read_breaker_trips_total", "Total Read Engine circuit breaker trip events", m.readBreakerTrips.Load())
+	b.WriteString("# HELP tenant_active_connections Active client connections per tenant\n# TYPE tenant_active_connections gauge\n")
+	for _, t := range m.tenants {
+		fmt.Fprintf(&b, `tenant_active_connections{tenant="%s"} %d`+"\n", JSONEscape(t.TenantID), t.ActiveConnections)
+	}
+	b.WriteString("# HELP tenant_connection_rejections_total Total rejected client connections per tenant\n# TYPE tenant_connection_rejections_total counter\n")
+	for _, t := range m.tenants {
+		fmt.Fprintf(&b, `tenant_connection_rejections_total{tenant="%s"} %d`+"\n", JSONEscape(t.TenantID), t.RejectedConnections)
+	}
+	prom.WriteCounter(&b, "client_disconnects_total", "Total client disconnects detected during query execution", m.clientDisconnects.Load())
+	prom.WriteCounter(&b, "query_cancellations_total", "Total query cancellations propagated to backends", m.queryCancellations.Load())
 
 	var totalActiveBackends, totalIdleBackends int
 	for _, ps := range poolSnaps {

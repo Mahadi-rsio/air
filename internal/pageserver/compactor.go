@@ -56,6 +56,11 @@ func (t *Timeline) compactL0s(ctx context.Context, threshold, maxBatch int, mate
 	if !materializeImage && maxBatch > 0 && len(l0s) > maxBatch {
 		l0s = l0s[:maxBatch]
 	}
+	if t.store != nil {
+		t.store.compactionsActive.Add(1)
+		t.store.compactionsTotal.Add(1)
+		defer t.store.compactionsActive.Add(-1)
+	}
 	start := time.Now()
 	debugf("compactor", "CompactIfNeeded start tenant=%s l0_count=%d threshold=%d materialize_image=%v", t.tenantID, len(l0s), threshold, materializeImage)
 

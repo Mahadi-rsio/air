@@ -169,7 +169,10 @@ func HandleClientConnection(
 		_, _ = conn.Write(BuildErrorResponse("FATAL", "53300", err.Error()))
 		return
 	}
-	defer metrics.ReleaseTenantUser(startupTenant, reqUser)
+	var releaseTenantOnce sync.Once
+	defer releaseTenantOnce.Do(func() {
+		metrics.ReleaseTenantUser(startupTenant, reqUser)
+	})
 
 	var route TenantRoute
 	var rpcCode codes.Code

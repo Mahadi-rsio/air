@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -25,6 +28,7 @@ type Config struct {
 	DataDir           string
 	MasterKeyPath     string
 	GRPCAddr          string
+	MetricsAddr       string
 	SocketPath        string
 	CacheMB           int
 	MemoryLimitMB     int
@@ -75,6 +79,7 @@ func loadConfig(args []string) Config {
 		DataDir:           dataDir,
 		MasterKeyPath:     envOr("AIR_MASTER_KEY_PATH", filepath.Join(dataDir, "master.key")),
 		GRPCAddr:          envOr("AIR_PAGESERVER_GRPC_ADDR", "0.0.0.0:9091"),
+		MetricsAddr:       envOr("AIR_PAGESERVER_METRICS_ADDR", "[::]:9101"),
 		SocketPath:        envOr("AIR_PAGESERVER_SOCKET", ""),
 		CacheMB:           envIntOr("AIR_PAGESERVER_CACHE_MB", 64),
 		MemoryLimitMB:     envIntOr("AIR_PAGESERVER_MEMORY_MB", 0),
@@ -92,6 +97,7 @@ func loadConfig(args []string) Config {
 	fs.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "Root directory for pageserver layers and cache")
 	fs.StringVar(&cfg.MasterKeyPath, "master-key-path", cfg.MasterKeyPath, "Path to 32-byte master KEK file")
 	fs.StringVar(&cfg.GRPCAddr, "grpc-addr", cfg.GRPCAddr, "Pageserver gRPC listen address")
+	fs.StringVar(&cfg.MetricsAddr, "metrics-addr", cfg.MetricsAddr, "Optional HTTP /metrics listen address")
 	fs.StringVar(&cfg.SocketPath, "socket-path", cfg.SocketPath, "Optional Unix socket path for co-located air_smgr/read-engine")
 	fs.IntVar(&cfg.CacheMB, "cache-mb", cfg.CacheMB, "Bounded LRU disk cache size in MB")
 	fs.IntVar(&cfg.MemoryLimitMB, "memory-mb", cfg.MemoryLimitMB, "Pageserver memory limit in MB (0 = auto-detect from cgroup v2)")
@@ -193,8 +199,48 @@ func main() {
 		}
 	}()
 
+	var metricsSrv *http.Server
+	if cfg.MetricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			if cfg.InternalToken != "" {
+				tok := strings.TrimSpace(r.Header.Get("X-Air-Internal-Token"))
+				if tok == "" {
+					tok = strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+				}
+				if subtle.ConstantTimeCompare([]byte(tok), []byte(cfg.InternalToken)) != 1 {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+			}
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+			w.Header().Set("Connection", "close")
+			_, _ = io.WriteString(w, ps.PrometheusMetrics())
+		})
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "ok\n")
+		})
+		metricsSrv = &http.Server{
+			Addr:              cfg.MetricsAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			log.Printf("[air-pageserver] HTTP /metrics listening on %s", cfg.MetricsAddr)
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("[air-pageserver] metrics server error: %v", err)
+			}
+		}()
+	}
+
 	<-ctx.Done()
 	log.Println("[air-pageserver] shutting down...")
+	if metricsSrv != nil {
+		mctx, mcancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = metricsSrv.Shutdown(mctx)
+		mcancel()
+	}
 	shutCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 

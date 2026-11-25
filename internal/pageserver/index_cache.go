@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -151,12 +152,15 @@ type layerIndexData struct {
 }
 
 type boundedIndexCache struct {
-	mu       sync.Mutex
-	maxBytes int64
-	curBytes int64
-	lru      *list.List
-	items    map[string]*list.Element
-	blooms   map[string]*layerBloom
+	mu        sync.Mutex
+	maxBytes  int64
+	curBytes  int64
+	lru       *list.List
+	items     map[string]*list.Element
+	blooms    map[string]*layerBloom
+	hits      atomic.Uint64
+	misses    atomic.Uint64
+	evictions atomic.Uint64
 }
 
 func newBoundedIndexCache(maxBytes int64) *boundedIndexCache {
@@ -176,9 +180,18 @@ func (c *boundedIndexCache) get(r2Key string) (*layerIndexData, bool) {
 	defer c.mu.Unlock()
 	if elem, ok := c.items[r2Key]; ok {
 		c.lru.MoveToFront(elem)
+		c.hits.Add(1)
 		return elem.Value.(*layerIndexData), true
 	}
+	c.misses.Add(1)
 	return nil, false
+}
+
+func (c *boundedIndexCache) Stats() (hits, misses, evictions uint64) {
+	if c == nil {
+		return 0, 0, 0
+	}
+	return c.hits.Load(), c.misses.Load(), c.evictions.Load()
 }
 
 func (c *boundedIndexCache) getBloom(r2Key string) (*layerBloom, bool) {
@@ -242,6 +255,7 @@ func (c *boundedIndexCache) putVersioned(r2Key string, version uint16, entries [
 		old := oldest.Value.(*layerIndexData)
 		delete(c.items, old.r2Key)
 		c.curBytes -= old.bytes
+		c.evictions.Add(1)
 	}
 	return data
 }
@@ -329,6 +343,7 @@ func (c *boundedIndexCache) trimToBytes(targetBytes int64) {
 		old := oldest.Value.(*layerIndexData)
 		delete(c.items, old.r2Key)
 		c.curBytes -= old.bytes
+		c.evictions.Add(1)
 	}
 	if targetBytes == 0 {
 		c.blooms = make(map[string]*layerBloom)
