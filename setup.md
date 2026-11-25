@@ -1,6 +1,9 @@
 # AIR Setup Guide
 
-This guide covers running the 4-service AIR stack (`air-server`, `air-pageserver`, `air-read-engine`, `air-gateway`) with an external PostgreSQL metadata database (`air-meta-postgres`), either locally with Docker Compose or from source.
+This guide covers running the 4-service AIR stack (`air-server`, `air-pageserver`, `air-read-engine`, `air-gateway`) with an external PostgreSQL metadata database (`air-meta-postgres`), either locally with Docker Compose or from source for development.
+
+> [!TIP]
+> If you are new to AIR and just want to run a quick test with step-by-step SQL operations, start with our beginner-focused [Quickstart Guide](quickstart.md).
 
 ---
 
@@ -25,6 +28,10 @@ Client (psql/SDK) ->|   air-gateway (:5432)  |<- Admin HTTP (:8081) / gRPC (:909
                         +-----------------------------------+
 ```
 
+- **Client Gateway (`air-gateway`)**: Listens on PostgreSQL wire port `5432`. Enforces SNI database binding, manages backend connection pools, performs transparent read/write query routing, and exposes Admin HTTP on `:8081`.
+- **Control Plane (`air-server`)**: Coordinates tenant lifecycles, provisions isolated PostgreSQL 17 clusters, manages envelope KMS keys, coordinates backups, and triggers background cold offload. Exposes HTTP REST on `:8080` and `AirDBControl` gRPC on `:9090`.
+- **Read Replica Engine (`air-read-engine`)**: Shared SQLite read replica reading PG17 pages directly from the Pageserver. Serves read queries on PG wire port `5433`, Admin HTTP on `:8082`, and gRPC on `:9092`.
+- **Pageserver (`air-pageserver`)**: Storage node intercepting relation page reads (`GetPage@LSN`), ingesting WAL records, generating L0/L1 layers, and synchronizing with Cloudflare R2 / S3 cold storage. Exposes Admin HTTP on `:8083` and gRPC on `:9091`.
 - **External Metadata PostgreSQL (`air-meta-postgres`)**: Stores control-plane metadata and query metering (`clusters`, `tenant_events`, `api_keys`, `provisioning_ops`, `idempotency_records`, `backup_ops`, `offload_ops`, `restore_ops`, `query_metering`, `schema_migrations`) via `AIR_META_DSN`.
 - **Shared Master KEK (`AIR_MASTER_KEY_HEX`)**: 32-byte (64 hex chars) key shared between `air-server` and `air-pageserver` so envelope-encrypted tenant DEKs can be unwrapped across separate containers/hosts.
 - **Internal Mesh Auth (`AIR_INTERNAL_TOKEN`)**: Shared secret authenticating all inter-service gRPC and Admin HTTP calls.
@@ -36,12 +43,12 @@ Client (psql/SDK) ->|   air-gateway (:5432)  |<- Admin HTTP (:8081) / gRPC (:909
 ### Docker Setup (Recommended)
 - Docker Engine 24+ with Docker Compose v2 (`docker compose`)
 - `curl` and `psql` (PostgreSQL client) for verification
-- ~4 GB free disk space if building `Dockerfile` (PostgreSQL 17.12 is compiled from source with the `smgr_hook` patch, `supautils`, and `air_smgr`)
+- ~4 GB free disk space if building `Dockerfile` from source (PostgreSQL 17 is compiled from source with the `smgr_hook` patch, `supautils`, and `air_smgr`)
 
 ### Bare-Metal / Development Setup
-- Go 1.26+
-- PostgreSQL 17 binaries (`/usr/lib/postgresql/17/bin`)
-- `gcc`, `libsqlite3-dev`, `pkg-config` (for `air-read-engine` CGo build)
+- Go 1.24+ (tested on Go 1.24 / 1.26)
+- PostgreSQL 17 binaries (`/usr/lib/postgresql/17/bin`: `initdb`, `pg_ctl`, `postgres`, `psql`)
+- `gcc`, `libsqlite3-dev`, `pkg-config` (for `air-read-engine` CGo virtual table build)
 - `protoc`, `protoc-gen-go`, `protoc-gen-go-grpc` (only if modifying `proto/*.proto`)
 
 ---
@@ -55,7 +62,7 @@ Client (psql/SDK) ->|   air-gateway (:5432)  |<- Admin HTTP (:8081) / gRPC (:909
    ```
 
 2. **(Optional) Configure secrets in `.env`**:
-   Defaults are provided for local dev, but for non-dev environments generate strong secrets:
+   Defaults are pre-configured in `docker-compose.yml` for local development, but for production or custom environments create a `.env` file:
    ```bash
    cat <<EOF > .env
    AIR_INTERNAL_TOKEN=$(openssl rand -hex 24)
@@ -68,7 +75,7 @@ Client (psql/SDK) ->|   air-gateway (:5432)  |<- Admin HTTP (:8081) / gRPC (:909
    EOF
    ```
 
-3. **Build all 4 service images locally and start the stack**:
+3. **Build service images locally and start the stack**:
    ```bash
    docker compose build
    docker compose up -d --wait
@@ -88,10 +95,10 @@ Client (psql/SDK) ->|   air-gateway (:5432)  |<- Admin HTTP (:8081) / gRPC (:909
 ## Option 2: Run with Prebuilt GHCR Images
 
 Prebuilt images are published to GitHub Container Registry:
-- `ghcr.io/mahadi-rsio/air:latest` (or `:v2.0.27`)
-- `ghcr.io/mahadi-rsio/air-pageserver:latest` (or `:v2.0.27`)
-- `ghcr.io/mahadi-rsio/air-read-engine:latest` (or `:v2.0.27`)
-- `ghcr.io/mahadi-rsio/air-gateway:latest` (or `:v2.0.28`)
+- `ghcr.io/mahadi-rsio/air:latest`
+- `ghcr.io/mahadi-rsio/air-pageserver:latest`
+- `ghcr.io/mahadi-rsio/air-read-engine:latest`
+- `ghcr.io/mahadi-rsio/air-gateway:latest`
 
 Create a `compose.ghcr.yml` override file:
 ```yaml
@@ -114,58 +121,93 @@ docker compose -f docker-compose.yml -f compose.ghcr.yml up -d --wait
 
 ---
 
-## Using Your Own External PostgreSQL Metadata Database
+## Using an External PostgreSQL Metadata Database
 
-Instead of the bundled `air-meta-postgres` container, point `AIR_META_DSN` to any PostgreSQL 15+ / 17 database (e.g., RDS, Cloud SQL, Neon, self-hosted HA Postgres):
+Instead of the bundled `air-meta-postgres` container, point `AIR_META_DSN` to any PostgreSQL 15+ / 17 database (e.g. AWS RDS, Google Cloud SQL, Neon, Supabase, or self-hosted HA PostgreSQL):
 
 ```bash
 export AIR_META_DSN="postgres://<user>:<password>@<pg-host>:5432/<db>?sslmode=require"
 ```
 
-Pass `AIR_META_DSN` to both `air-server` and `air-gateway`. On startup, `air-server` automatically runs schema migrations and creates the 10 control-plane tables (including `query_metering`), and `air-gateway` uses `AIR_META_DSN` to flush buffered query metering batches.
+Pass `AIR_META_DSN` to both `air-server` and `air-gateway`:
+- On startup, `air-server` runs schema migrations automatically and provisions control-plane metadata tables (`clusters`, `tenant_events`, `api_keys`, `query_metering`, etc.).
+- `air-gateway` uses `AIR_META_DSN` to flush buffered query metering records.
 
 ---
 
-## Create a Database & Test the Connection
+## Provisioning a Database & Running Operations
 
-1. **Provision a database (`demo_db`) across all 4 services**:
-   ```bash
-   curl -sS -X POST http://127.0.0.1:8080/v1/databases \
-     -H "Authorization: Bearer air_dev_bootstrap_key" \
-     -H "Idempotency-Key: idem-demo-db-001" \
-     -H "Content-Type: application/json" \
-     -d '{"tenant_id":"demo_db"}'
-   ```
-   Copy the returned `password` from the JSON response.
+### Step 1: Provision a Database via Control Plane
+Run the following `curl` command to provision a new tenant database `demo_db`:
 
-2. **Verify the namespace across all services**:
-   ```bash
-   # External metadata PostgreSQL
-   PGPASSWORD=air_meta_pass psql -h 127.0.0.1 -p 5435 -U air_meta -d air_meta \
-     -c "SELECT tenant_id, account_id, state, generation, direct_port FROM clusters;"
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/databases \
+  -H "Authorization: Bearer air_dev_bootstrap_key" \
+  -H "Idempotency-Key: idem-demo-db-001" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id":"demo_db"}'
+```
 
-   # Pageserver, Read Engine, and Gateway Admin APIs
-   curl -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8083/v1/namespaces
-   curl -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8082/v1/namespaces
-   curl -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8081/v1/namespaces/demo_db
-   ```
+Output:
+```json
+{
+  "account_id": "acct_default",
+  "tenant_id": "demo_db",
+  "database": "demo_db",
+  "username": "app_user",
+  "password": "<GENERATED_PASSWORD>",
+  "direct_port": 18021,
+  "system_identifier": "7711011875213824053",
+  "generation": "gen_380e33b412c1b70a",
+  "fencing_epoch": 1,
+  "state": "ACTIVE"
+}
+```
 
-3. **Connect through `air-gateway` (`:5432`) and run SQL**:
-   ```bash
-   psql "postgresql://app_user:<PASSWORD>@127.0.0.1:5432/demo_db?sslmode=disable" <<'SQL'
-   SELECT current_user, current_database(), version();
-   CREATE TABLE items (id serial PRIMARY KEY, label text NOT NULL);
-   INSERT INTO items (label) VALUES ('hello-air');
-   SELECT * FROM items;
-   SQL
-   ```
+### Step 2: Verify Registration Across the Mesh
+Inspect how the tenant is wired across all components:
 
-4. **Inspect Query Metering (`query_metering` in `air-meta-postgres`)**:
-   `air-gateway` buffers each query (`timestamp`, `db_id`, `bandwidth_bytes`, `query_time_us`, `query_type`) into `query_metering.log` and flushes to PostgreSQL via `COPY` whenever the log reaches 10 MB or every 2 minutes (deleting the rotated log file after persistence):
-   ```bash
-   PGPASSWORD=air_meta_pass psql -h 127.0.0.1 -p 5435 -U air_meta -d air_meta \
-     -c "SELECT id, recorded_at, db_id, bandwidth_bytes, query_time_us, query_type FROM query_metering ORDER BY id DESC LIMIT 20;"
-   ```
+```bash
+# Check Control Plane cluster metadata
+PGPASSWORD=air_meta_pass psql -h 127.0.0.1 -p 5435 -U air_meta -d air_meta \
+  -c "SELECT tenant_id, account_id, state, generation, direct_port FROM clusters;"
+
+# Check Pageserver registration
+curl -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8083/v1/namespaces
+
+# Check Read-Engine registration
+curl -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8082/v1/namespaces
+
+# Check Gateway routing and backend connectivity
+curl -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8081/v1/namespaces/demo_db
+```
+
+### Step 3: Connect and Execute SQL
+Connect through **`air-gateway` on port `5432`**:
+
+```bash
+psql "postgresql://app_user:<GENERATED_PASSWORD>@127.0.0.1:5432/demo_db?sslmode=disable" <<'SQL'
+SELECT current_user, current_database(), version();
+
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+INSERT INTO users (username) VALUES ('alice'), ('bob');
+
+SELECT * FROM users;
+SQL
+```
+
+### Step 4: Verify Query Metering
+AIR Gateway logs every tenant query and flushes to `query_metering` in `air-meta-postgres`:
+
+```bash
+PGPASSWORD=air_meta_pass psql -h 127.0.0.1 -p 5435 -U air_meta -d air_meta \
+  -c "SELECT id, recorded_at, db_id, bandwidth_bytes, query_time_us, query_type FROM query_metering ORDER BY id DESC LIMIT 10;"
+```
 
 ---
 
@@ -174,68 +216,73 @@ Pass `AIR_META_DSN` to both `air-server` and `air-gateway`. On startup, `air-ser
 ### Shared / Security
 | Variable | Services | Description |
 | :--- | :--- | :--- |
-| `AIR_INTERNAL_TOKEN` | All 4 | Shared secret for inter-service gRPC and Admin HTTP auth |
-| `AIR_MASTER_KEY_HEX` | `air-server`, `air-pageserver` | 64-char hex (32-byte) master KEK for envelope encryption |
-| `AIR_META_DSN` | `air-server`, `air-gateway` | External PostgreSQL DSN for control-plane metadata |
+| `AIR_INTERNAL_TOKEN` | All 4 | Shared secret for inter-service gRPC and Admin HTTP authentication |
+| `AIR_MASTER_KEY_HEX` | `air-server`, `air-pageserver` | 64-character hex (32-byte) master key encryption key (KEK) |
+| `AIR_META_DSN` | `air-server`, `air-gateway` | PostgreSQL connection string for platform metadata |
 
-### `air-server`
+### `air-server` (Control Plane)
 | Variable | Default (Compose) | Description |
 | :--- | :--- | :--- |
-| `AIR_DATA_DIR` | `/var/lib/air` | Persistent local tenant data directory |
-| `AIR_PG_BIN_DIR` | `/usr/lib/postgresql/17/bin` | Patched PostgreSQL 17 binary directory |
-| `AIR_HTTP_ADDR` | `0.0.0.0:8080` | Control Plane HTTP listen address |
+| `AIR_DATA_DIR` | `/var/lib/air` | Root directory for per-tenant clusters |
+| `AIR_PG_BIN_DIR` | `/usr/lib/postgresql/17/bin` | Path to PostgreSQL 17 binaries |
+| `AIR_HTTP_ADDR` | `0.0.0.0:8080` | Public Control Plane REST API listen address |
 | `AIR_GRPC_ADDR` | `0.0.0.0:9090` | `AirDBControl` gRPC listen address |
 | `AIR_PAGESERVER_GRPC_ADDR` | `air-pageserver:9091` | Pageserver gRPC endpoint |
 | `AIR_READ_ENGINE_GRPC_ADDR` | `air-read-engine:9092` | Read Engine gRPC endpoint |
 | `AIR_GATEWAY_ADMIN_GRPC_ADDR` | `air-gateway:9093` | Gateway Admin gRPC endpoint |
 | `AIR_BACKEND_HOST` | `air-server` | Hostname advertised to gateway for tenant PG backends |
-| `AIR_BOOTSTRAP_API_KEY` | `air_dev_bootstrap_key` | Initial Bearer API key seeded on startup |
-| `AIR_BOOTSTRAP_ACCOUNT_ID` | `acct_default` | Account ID for bootstrap API key |
-| `AIR_PAGESERVER_CACHE_MB` | `64` | Active per-tenant `air_smgr` LFC and Pageserver disk cache size (MB) |
-| `AIR_EVICT_ON_SUSPEND` | `true` | Delete local tenant cache (`pgdata`, `lfc`, `spool/wal`, `backups`, and Pageserver cache) on suspend |
+| `AIR_BOOTSTRAP_API_KEY` | `air_dev_bootstrap_key` | Initial Bearer API token seeded on startup |
+| `AIR_BOOTSTRAP_ACCOUNT_ID` | `acct_default` | Account ID associated with the bootstrap API key |
+| `AIR_PAGESERVER_CACHE_MB` | `64` | Pageserver disk cache and `air_smgr.lfc_max_mb` size (MB) |
+| `AIR_IDLE_TIMEOUT` | *(empty)* | Idle timeout (e.g., `10m`) for automatic scale-to-zero suspension |
+| `AIR_EVICT_ON_SUSPEND` | `true` | Delete local tenant cache on suspend |
 
-### `air-pageserver`
+### `air-pageserver` (Storage Engine)
 | Variable | Default (Compose) | Description |
 | :--- | :--- | :--- |
-| `AIR_DATA_DIR` | `/var/lib/air-pageserver` | Layer and cache storage root |
+| `AIR_DATA_DIR` | `/var/lib/air-pageserver` | Root directory for layers and disk cache |
 | `AIR_PAGESERVER_GRPC_ADDR` | `0.0.0.0:9091` | `PageserverService` gRPC listen address |
 | `AIR_PAGESERVER_HTTP_ADDR` | `0.0.0.0:8083` | Admin & health HTTP listen address |
-| `AIR_PAGESERVER_CACHE_MB` | `64` | Bounded LRU disk cache size (MB) |
+| `AIR_PAGESERVER_CACHE_MB` | `64` | Maximum size of local LRU layer cache (MB) |
 
-### `air-read-engine`
+### `air-read-engine` (Read Replica)
 | Variable | Default (Compose) | Description |
 | :--- | :--- | :--- |
-| `AIR_READ_ENGINE_DATA_DIR` | `/var/lib/air-read-engine` | Read engine storage root |
+| `AIR_READ_ENGINE_DATA_DIR` | `/var/lib/air-read-engine` | Read engine working directory |
 | `AIR_READ_ENGINE_CACHE_DIR` | `/var/lib/air-read-engine/cache` | Page cache directory |
-| `AIR_READ_ENGINE_PG_PORT` | `5433` | PostgreSQL wire-protocol read port |
+| `AIR_READ_ENGINE_PG_PORT` | `5433` | PostgreSQL wire protocol read port |
 | `AIR_READ_ENGINE_HTTP_ADDR` | `0.0.0.0:8082` | Admin & metrics HTTP listen address |
 | `AIR_READ_ENGINE_GRPC_ADDR` | `0.0.0.0:9092` | `ReadEngineService` gRPC listen address |
-| `AIR_PAGESERVER_GRPC_ADDR` | `air-pageserver:9091` | Upstream pageserver gRPC endpoint |
+| `AIR_PAGESERVER_GRPC_ADDR` | `air-pageserver:9091` | Upstream Pageserver gRPC address |
 
-### `air-gateway`
+### `air-gateway` (Client Router & Pooler)
 | Variable | Default (Compose) | Description |
 | :--- | :--- | :--- |
 | `AIR_GATEWAY_ADDR` | `0.0.0.0:5432` | Client PostgreSQL wire listen address |
-| `AIR_GATEWAY_ADMIN_ADDR` | `0.0.0.0:8081` | Admin HTTP & Prometheus metrics listen address |
+| `AIR_GATEWAY_ADMIN_ADDR` | `0.0.0.0:8081` | Admin HTTP & metrics listen address |
 | `AIR_GATEWAY_ADMIN_GRPC_ADDR` | `0.0.0.0:9093` | `GatewayAdmin` gRPC listen address |
-| `AIR_CONTROL_PLANE_URL` | `http://air-server:8080` | Control Plane HTTP URL |
 | `AIR_DB_GRPC_ADDR` | `air-server:9090` | `AirDBControl` gRPC endpoint |
-| `AIR_PAGESERVER_GRPC_ADDR` | `air-pageserver:9091` | `PageserverService` gRPC endpoint |
-| `AIR_READ_ENGINE_GRPC_ADDR` | `air-read-engine:9092` | `ReadEngineService` gRPC endpoint |
-| `AIR_READ_ENGINE_HOST` / `PORT` | `air-read-engine` / `5433` | Read engine PG wire endpoint |
-| `AIR_POOL_MODE` | `true` | Enable transaction-mode connection pooling |
-| `AIR_METERING_LOG_DIR` | `/tmp/air-gateway-metering` | Directory for buffered `query_metering.log` files |
-| `AIR_METERING_MAX_FILE_BYTES` | `10485760` (10 MB) | Rotate & flush log file to `query_metering` when size threshold is reached |
-| `AIR_METERING_FLUSH_INTERVAL_SEC` | `120` (2 min) | Periodic flush interval (in seconds) to persist metering logs to `AIR_META_DSN` |
+| `AIR_PAGESERVER_GRPC_ADDR` | `air-pageserver:9091` | Pageserver gRPC endpoint |
+| `AIR_READ_ENGINE_GRPC_ADDR` | `air-read-engine:9092` | Read Engine gRPC endpoint |
+| `AIR_READ_ENGINE_HOST` / `PORT` | `air-read-engine` / `5433` | Read Engine PG wire endpoint |
+| `AIR_POOL_MODE` | `true` | Enable transaction connection pooling |
+| `AIR_METERING_LOG_DIR` | `/tmp/air-gateway-metering` | Directory for query metering buffer files |
+| `AIR_METERING_MAX_FILE_BYTES` | `10485760` (10 MB) | File size threshold to trigger flush to database |
+| `AIR_METERING_FLUSH_INTERVAL_SEC` | `120` (2 min) | Flush interval in seconds |
 
-### Optional S3 / Cloudflare R2 Cold Storage
-Set on `air-server` and `air-pageserver`: `AIR_R2_ENDPOINT`, `AIR_R2_BUCKET`, `AIR_R2_ACCESS_KEY_ID`, `AIR_R2_SECRET_ACCESS_KEY`, `AIR_R2_REGION` (default `auto`).
+### Optional Cloudflare R2 / S3 Cold Storage
+Configure on `air-server` and `air-pageserver` for offload and backups:
+- `AIR_R2_ENDPOINT` (e.g., `https://<account_id>.r2.cloudflarestorage.com`)
+- `AIR_R2_BUCKET` (e.g., `air-backups`)
+- `AIR_R2_ACCESS_KEY_ID`
+- `AIR_R2_SECRET_ACCESS_KEY`
+- `AIR_R2_REGION` (default `auto`)
 
 ---
 
-## Development & Testing
+## Local Development & Testing
 
-### Build All 4 Binaries Locally
+### Compiling Binaries Locally
 ```bash
 go build -o bin/air-server ./cmd/air-server
 go build -o bin/air-pageserver ./cmd/air-pageserver
@@ -243,40 +290,23 @@ go build -o bin/air-read-engine ./cmd/air-read-engine
 go build -o bin/air-gateway ./cmd/air-gateway
 ```
 
-### Run Unit & 4-Service E2E Mesh Tests
+### Running Tests
 ```bash
 # Unit tests
 go test -short ./internal/...
 
-# Full 4-service gRPC mesh E2E test (launches all 4 binaries separately)
+# Full 4-service gRPC mesh end-to-end integration test
 go test -v ./tests/e2e/... -run TestE2E_FourServiceGRPCMesh_NamespaceProvisioningAndIsolation
-```
-
-### Publishing New GHCR Release Tags
-GitHub Actions skips tag push workflows when more than 3 tags are pushed in a single `git push`. Push each per-service tag individually:
-```bash
-VERSION=v2.0.28
-git tag -a "$VERSION" -m "Release $VERSION"
-git tag -a "server-$VERSION" -m "air-server $VERSION"
-git tag -a "pageserver-$VERSION" -m "air-pageserver $VERSION"
-git tag -a "read-engine-$VERSION" -m "air-read-engine $VERSION"
-git tag -a "gateway-$VERSION" -m "air-gateway $VERSION"
-
-git push origin "$VERSION"
-git push origin "server-$VERSION"
-git push origin "pageserver-$VERSION"
-git push origin "read-engine-$VERSION"
-git push origin "gateway-$VERSION"
 ```
 
 ---
 
-## Stopping & Cleanup
+## Stopping & Teardown
 
 ```bash
-# Stop containers (keep volumes/data)
+# Stop containers (preserves volumes and data)
 docker compose down
 
-# Stop containers and wipe all local volumes
+# Stop containers and delete all volumes
 docker compose down -v
 ```

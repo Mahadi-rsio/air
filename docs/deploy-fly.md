@@ -1,81 +1,99 @@
 # Deploying AIR to Fly.io
 
-This guide walks through deploying the full 4-service AIR mesh to [Fly.io](https://fly.io) using Fly's private 6PN IPv6 network, persistent volumes, an external PostgreSQL metadata database (e.g., Neon), and Cloudflare R2 for durable object storage.
+This comprehensive guide walks you through deploying the complete production 4-service AIR platform (`air-pg-gateway`, `air-pg-server`, `air-pg-read-engine`, and `air-pg-pageserver`) to [Fly.io](https://fly.io).
 
-## Architecture & Topology
+The deployment uses Fly's private 6PN IPv6 network for high-speed, secure inter-service communication, persistent NVMe volumes for storage, an external PostgreSQL metadata database (such as Neon, Supabase, or AWS RDS), and Cloudflare R2 / S3 for durable encrypted cold storage.
 
-All four services run in the same Fly region (default: `sin`) and communicate over Fly's private IPv6 6PN (`*.internal`). **Only `air-pg-gateway` has a public IP address** (a Dedicated IPv4 for raw TCP PostgreSQL traffic on `:5432` and HTTPS admin traffic on `:443`).
+---
+
+## 1. Architecture & Network Topology
+
+All four services run in the same Fly region (default: `sin` or `iad`) and communicate over Fly's private IPv6 6PN network (`*.internal`).
+
+> [!IMPORTANT]
+> **Only `air-pg-gateway` receives a public IP address (a Dedicated IPv4).** All internal services (`air-pg-server`, `air-pg-read-engine`, `air-pg-pageserver`) have no public IPs and are only reachable within the private 6PN network.
 
 ```text
-Internet (psql :5432 / HTTPS :443)
+Internet Client (psql / SDK on :5432 or Admin HTTPS on :443)
         │
-        ▼  Dedicated IPv4 (public)
-┌───────────────────────────┐
-│      air-pg-gateway       │  shared-cpu-1x · 256MB · no volume
-└──────┬──────────┬─────────┘
-       │ 6PN      │ 6PN (suspended reads)
-       ▼          ▼
-┌─────────────────────┐   6PN   ┌───────────────────────────┐
-│    air-pg-server    │◄───────►│    air-pg-read-engine     │
-│ shared-cpu-2x·512MB │         │  shared-cpu-1x · 256MB    │
-│  vol: 2GB (/var/lib │         │  vol: 1GB (/var/lib/      │
-│       /air)         │         │       air-read-engine)    │
-└──────────┬──────────┘         └─────────────┬─────────────┘
-           │ 6PN                              │ 6PN
-           ▼                                  ▼
-     ┌──────────────────────────────────────────────┐
-     │              air-pg-pageserver               │
-     │         shared-cpu-1x · 256MB                │
-     │     vol: 1GB (/var/lib/air-pageserver)       │
-     └──────────────────────┬───────────────────────┘
-                            │
-          ┌─────────────────┴─────────────────┐
-          ▼                                   ▼
-   Cloudflare R2                    External PostgreSQL
- (L0/L1, WAL, skeleton)          (Neon — AIR_META_DSN on
-                                  air-pg-server)
+        ▼  Dedicated IPv4 (Public)
+┌───────────────────────────────────────────┐
+│              air-pg-gateway               │  shared-cpu-1x · 256MB · (No Volume)
+└───────┬───────────────────────────┬───────┘
+        │ 6PN Private Mesh          │ 6PN Private Mesh (Zero-Sync Reads)
+        ▼                           ▼
+┌───────────────────────┐   6PN   ┌───────────────────────────┐
+│     air-pg-server     │◄───────►│    air-pg-read-engine     │
+│  shared-cpu-2x·512MB  │         │   shared-cpu-1x · 256MB   │
+│  vol: air_server_data │         │  vol: air_read_engine_data│
+│   (2GB -> /var/lib)   │         │    (1GB -> /var/lib)      │
+└───────────┬───────────┘         └─────────────┬─────────────┘
+            │ 6PN Private Mesh                  │ 6PN Private Mesh
+            ▼                                   ▼
+      ┌───────────────────────────────────────────────┐
+      │               air-pg-pageserver               │
+      │             shared-cpu-1x · 256MB             │
+      │      vol: air_pageserver_data (1GB)           │
+      └───────────────────────┬───────────────────────┘
+                              │
+            ┌─────────────────┴─────────────────┐
+            ▼                                   ▼
+     Cloudflare R2                     External Metadata DB
+   (Encrypted L0/L1 layers,             (Neon / RDS Postgres —
+    WAL archives, manifests)             AIR_META_DSN)
 ```
-
-### Service & Resource Sizing
-
-Configs live in [`deploy/fly/`](../deploy/fly/):
-
-| Service | Fly App Name | Config | VM Size | Volume | Public IP |
-| --- | --- | --- | --- | --- | --- |
-| Gateway | `air-pg-gateway` | [`deploy/fly/fly.gateway.toml`](../deploy/fly/fly.gateway.toml) | `shared-cpu-1x` / `256MB` | None | **Dedicated IPv4** (`:5432` TCP, `:443` → `:8081` HTTPS) |
-| Air DB / Control Plane | `air-pg-server` | [`deploy/fly/fly.server.toml`](../deploy/fly/fly.server.toml) | `shared-cpu-2x` / `512MB` | `air_server_data` (`2GB` → `/var/lib/air`) | None (6PN internal only) |
-| Read Engine | `air-pg-read-engine` | [`deploy/fly/fly.read-engine.toml`](../deploy/fly/fly.read-engine.toml) | `shared-cpu-1x` / `256MB` | `air_read_engine_data` (`1GB` → `/var/lib/air-read-engine`) | None (6PN internal only) |
-| Pageserver | `air-pg-pageserver` | [`deploy/fly/fly.pageserver.toml`](../deploy/fly/fly.pageserver.toml) | `shared-cpu-1x` / `256MB` | `air_pageserver_data` (`1GB` → `/var/lib/air-pageserver`) | None (6PN internal only) |
-
-> **Why Dedicated IPv4 on the gateway?** Fly's shared IPv4 only supports HTTP/TLS. Raw PostgreSQL TCP connections on port `5432` require a Dedicated IPv4 address.
 
 ---
 
-## Prerequisites
+## 2. Resource Specifications
 
-1. **`flyctl`** installed and authenticated (`fly auth login`).
-2. **External PostgreSQL metadata DB** (e.g., Neon) connection string for `AIR_META_DSN`. All schema migrations run automatically when `air-pg-server` starts.
-3. **Cloudflare R2 bucket** (e.g., `air-pg-backups`) with S3-compatible endpoint, access key, and secret key.
-4. **Generated secrets** for inter-service authentication and R2 encryption:
+Configuration files are located in [`deploy/fly/`](../deploy/fly/):
 
-```bash
-export AIR_INTERNAL_TOKEN="$(openssl rand -hex 32)"
-export AIR_BOOTSTRAP_API_KEY="air_live_$(openssl rand -hex 24)"
-export AIR_R2_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+| Service | Fly App Name | Config File | VM Size | Persistent Volume | Public Network Exposure |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Gateway** | `air-pg-gateway` | [`deploy/fly/fly.gateway.toml`](../deploy/fly/fly.gateway.toml) | `shared-cpu-1x` / `256MB` | *None* | **Dedicated IPv4** (`:5432` raw TCP, `:443` HTTPS Admin API) |
+| **Control Plane** | `air-pg-server` | [`deploy/fly/fly.server.toml`](../deploy/fly/fly.server.toml) | `shared-cpu-2x` / `512MB` | `air_server_data` (`2GB`) | *None* (internal 6PN IPv6) |
+| **Read Engine** | `air-pg-read-engine` | [`deploy/fly/fly.read-engine.toml`](../deploy/fly/fly.read-engine.toml) | `shared-cpu-1x` / `256MB` | `air_read_engine_data` (`1GB`) | *None* (internal 6PN IPv6) |
+| **Pageserver** | `air-pg-pageserver` | [`deploy/fly/fly.pageserver.toml`](../deploy/fly/fly.pageserver.toml) | `shared-cpu-1x` / `256MB` | `air_pageserver_data` (`1GB`) | *None* (internal 6PN IPv6) |
 
-export AIR_META_DSN="postgresql://<user>:<pass>@<host>/<db>?sslmode=require&channel_binding=require"
-export AIR_R2_ENDPOINT="https://<account-id>.r2.cloudflarestorage.com"
-export AIR_R2_ACCESS_KEY_ID="<r2-access-key>"
-export AIR_R2_SECRET_ACCESS_KEY="<r2-secret-key>"
-```
-
-> Save `AIR_INTERNAL_TOKEN` and `AIR_BOOTSTRAP_API_KEY` securely — you will need `AIR_BOOTSTRAP_API_KEY` to call the provisioning API.
+> [!NOTE]
+> Fly's shared IPv4 only supports HTTP/TLS proxying. Raw PostgreSQL TCP wire traffic on port `5432` requires a **Dedicated IPv4** address on `air-pg-gateway`.
 
 ---
 
-## Step 1: Create Fly Apps
+## 3. Prerequisites
 
-Create all four apps in your Fly organization (default `personal`):
+1. **`flyctl` CLI**: Installed and logged into your account:
+   ```bash
+   fly auth login
+   ```
+2. **External Metadata PostgreSQL Database**:
+   - Provider: [Neon](https://neon.tech), Supabase, AWS RDS, or self-hosted PostgreSQL 15+/17.
+   - Connection string format:
+     ```bash
+     export AIR_META_DSN="postgres://<user>:<password>@<neon-host>/<db>?sslmode=require"
+     ```
+   - Schema tables (`clusters`, `tenant_events`, `query_metering`, `api_keys`, etc.) migrate automatically when `air-pg-server` starts.
+3. **Cloudflare R2 Bucket**:
+   - Create a bucket in Cloudflare (e.g., `air-pg-backups`).
+   - S3-compatible endpoint: `https://<account_id>.r2.cloudflarestorage.com`
+   - Access Key ID and Secret Access Key.
+4. **Generate Deployment Secrets**:
+   ```bash
+   export AIR_INTERNAL_TOKEN="$(openssl rand -hex 32)"
+   export AIR_MASTER_KEY_HEX="$(openssl rand -hex 32)"
+   export AIR_BOOTSTRAP_API_KEY="air_live_$(openssl rand -hex 24)"
+   export AIR_R2_ENDPOINT="https://<account_id>.r2.cloudflarestorage.com"
+   export AIR_R2_ACCESS_KEY_ID="<your-access-key-id>"
+   export AIR_R2_SECRET_ACCESS_KEY="<your-secret-access-key>"
+   ```
+
+---
+
+## 4. Step-by-Step Deployment Procedure
+
+### Step 1: Create the Fly Apps
+Create the four application entries in your chosen region (e.g. `sin` or `iad`):
 
 ```bash
 fly apps create air-pg-pageserver
@@ -84,158 +102,168 @@ fly apps create air-pg-server
 fly apps create air-pg-gateway
 ```
 
----
-
-## Step 2: Allocate Dedicated IPv4 (Gateway Only)
-
-Allocate a Dedicated IPv4 **only** for `air-pg-gateway`:
+### Step 2: Allocate Dedicated IPv4 for Gateway
+Allocate a Dedicated IPv4 **only** to the gateway app:
 
 ```bash
 fly ips allocate-v4 --app air-pg-gateway --yes
 ```
 
-Verify the allocated IP:
-
+Check the allocated IP:
 ```bash
 fly ips list --app air-pg-gateway
 ```
 
-Do **not** allocate public IPs for `air-pg-pageserver`, `air-pg-read-engine`, or `air-pg-server`.
-
----
-
-## Step 3: Create Persistent Volumes
-
-Create encrypted volumes in the same region as `primary_region` (`sin`):
+### Step 3: Create Persistent Volumes
+Create encrypted volumes in your target region (example uses `sin`):
 
 ```bash
-fly volumes create air_pageserver_data  --app air-pg-pageserver  --region sin --size 1 --yes
+# 1. Pageserver storage volume (1 GB)
+fly volumes create air_pageserver_data --app air-pg-pageserver --region sin --size 1 --yes
+
+# 2. Read Engine cache volume (1 GB)
 fly volumes create air_read_engine_data --app air-pg-read-engine --region sin --size 1 --yes
-fly volumes create air_server_data      --app air-pg-server      --region sin --size 2 --yes
+
+# 3. Control Plane tenant storage volume (2 GB)
+fly volumes create air_server_data --app air-pg-server --region sin --size 2 --yes
 ```
 
----
-
-## Step 4: Set Secrets
-
-Stage secrets for each app (they take effect on deploy):
+### Step 4: Configure App Secrets
+Stage the environment secrets across all apps:
 
 ```bash
-# 1. Pageserver (R2 + internal mesh auth)
+# 1. Pageserver secrets
 fly secrets set --app air-pg-pageserver --stage \
   AIR_INTERNAL_TOKEN="$AIR_INTERNAL_TOKEN" \
+  AIR_MASTER_KEY_HEX="$AIR_MASTER_KEY_HEX" \
   AIR_R2_ENDPOINT="$AIR_R2_ENDPOINT" \
   AIR_R2_ACCESS_KEY_ID="$AIR_R2_ACCESS_KEY_ID" \
-  AIR_R2_SECRET_ACCESS_KEY="$AIR_R2_SECRET_ACCESS_KEY" \
-  AIR_R2_ENCRYPTION_KEY="$AIR_R2_ENCRYPTION_KEY"
+  AIR_R2_SECRET_ACCESS_KEY="$AIR_R2_SECRET_ACCESS_KEY"
 
-# 2. Read Engine (internal mesh auth)
+# 2. Read Engine secrets
 fly secrets set --app air-pg-read-engine --stage \
   AIR_INTERNAL_TOKEN="$AIR_INTERNAL_TOKEN"
 
-# 3. Air Server (Neon metadata DB + R2 + bootstrap API key + internal mesh auth)
+# 3. Air Server (Control Plane) secrets
 fly secrets set --app air-pg-server --stage \
   AIR_META_DSN="$AIR_META_DSN" \
   AIR_INTERNAL_TOKEN="$AIR_INTERNAL_TOKEN" \
+  AIR_MASTER_KEY_HEX="$AIR_MASTER_KEY_HEX" \
   AIR_BOOTSTRAP_API_KEY="$AIR_BOOTSTRAP_API_KEY" \
   AIR_R2_ENDPOINT="$AIR_R2_ENDPOINT" \
   AIR_R2_ACCESS_KEY_ID="$AIR_R2_ACCESS_KEY_ID" \
-  AIR_R2_SECRET_ACCESS_KEY="$AIR_R2_SECRET_ACCESS_KEY" \
-  AIR_R2_ENCRYPTION_KEY="$AIR_R2_ENCRYPTION_KEY"
+  AIR_R2_SECRET_ACCESS_KEY="$AIR_R2_SECRET_ACCESS_KEY"
 
-# 4. Gateway (internal mesh auth)
+# 4. Gateway secrets
 fly secrets set --app air-pg-gateway --stage \
-  AIR_INTERNAL_TOKEN="$AIR_INTERNAL_TOKEN"
+  AIR_INTERNAL_TOKEN="$AIR_INTERNAL_TOKEN" \
+  AIR_META_DSN="$AIR_META_DSN"
 ```
 
----
-
-## Step 5: Deploy Services in Order
-
-Deploy from the repository root in dependency order (`pageserver` → `read-engine` → `server` → `gateway`).
-
-> **Note:** Pass `--ha=false` to keep a single machine per app (matching the single volume), `--no-public-ips` for the three internal services, and `--depot=false --remote-only` if Fly's Depot builder stalls.
+### Step 5: Deploy Services in Order
+Deploy the services from repository root in strict dependency order:
 
 ```bash
-# 1. Pageserver (internal only)
+# 1. Deploy air-pg-pageserver (Internal 6PN)
 fly deploy . \
   -c deploy/fly/fly.pageserver.toml \
   --dockerfile Dockerfile.pageserver \
   --depot=false --remote-only --ha=false --no-public-ips --yes
 
-# 2. Read Engine (internal only)
+# 2. Deploy air-pg-read-engine (Internal 6PN)
 fly deploy . \
   -c deploy/fly/fly.read-engine.toml \
   --dockerfile Dockerfile.read-engine \
   --depot=false --remote-only --ha=false --no-public-ips --yes
 
-# 3. Air Server (internal only — uses Dockerfile.server-fly fast Go overlay)
+# 3. Deploy air-pg-server (Internal 6PN — uses Dockerfile.server-fly fast Go overlay)
 fly deploy . \
   -c deploy/fly/fly.server.toml \
   --dockerfile deploy/fly/Dockerfile.server-fly \
   --depot=false --remote-only --ha=false --no-public-ips --yes
 
-# 4. Gateway (public Dedicated IPv4 + HTTPS)
+# 4. Deploy air-pg-gateway (Public Dedicated IPv4 + HTTPS)
 fly deploy . \
   -c deploy/fly/fly.gateway.toml \
   --dockerfile gateway/Dockerfile \
   --depot=false --remote-only --ha=false --yes
 ```
 
-### About `deploy/fly/Dockerfile.server-fly`
-
-Compiling PostgreSQL 17 and `air_smgr` from source takes several minutes and significant disk space. [`deploy/fly/Dockerfile.server-fly`](../deploy/fly/Dockerfile.server-fly) builds only the Go `air-server` binary and overlays it onto the prebuilt GHCR base image (`ghcr.io/mahadi-rsio/air:server-v2.0.28`), reducing server deploys to ~30 seconds. If you modify C code (`air_smgr` or Postgres patches), build against the root [`Dockerfile`](../Dockerfile) instead.
-
 ---
 
-## Step 6: Verify the Deployment
+## 5. Verifying the Deployment
 
-### 1. Check Machine Health & IPs
+### Check Service Status
+Confirm all 4 apps are running:
 
 ```bash
 for app in air-pg-pageserver air-pg-read-engine air-pg-server air-pg-gateway; do
   echo "=== $app ==="
   fly status --app "$app"
-  fly ips list --app "$app"
 done
 ```
 
-Confirm:
-- All 4 apps have 1 `started` machine in `sin`.
-- Only `air-pg-gateway` lists a public Dedicated IPv4.
-- `curl -sS https://air-pg-gateway.fly.dev/healthz` returns HTTP `200`.
+Check the gateway health endpoint:
+```bash
+curl -fsS https://air-pg-gateway.fly.dev/healthz
+# Expected output: {"status":"ok"}
+```
 
-### 2. Provision a Test Database & Run Lifecycle Checks
+---
+
+## 6. End-to-End Database Operations on Fly.io
+
+### Step 1: Provision a New Database
+Call the Gateway Admin HTTP API using `AIR_INTERNAL_TOKEN` (which securely proxies to `air-pg-server` over 6PN):
+
+```bash
+curl -sS -X POST https://air-pg-gateway.fly.dev/v1/databases \
+  -H "Authorization: Bearer $AIR_INTERNAL_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id": "production_app"}' | jq .
+```
+
+Save the `password` returned in the response!
+
+### Step 2: Connect via `psql` to Gateway Dedicated IPv4
+Retrieve the public IP and connect:
 
 ```bash
 GATEWAY_IP="$(fly ips list --app air-pg-gateway --json | jq -r '.[] | select(.Type=="v4") | .Address')"
 
-# Create a tenant database via the gateway Admin HTTP API
-curl -sS -X POST https://air-pg-gateway.fly.dev/v1/databases \
-  -H "Authorization: Bearer $AIR_INTERNAL_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"tenant_id":"fly_smoke_test"}' | jq .
+psql "postgresql://app_user:<GENERATED_PASSWORD>@${GATEWAY_IP}:5432/production_app?sslmode=disable"
 ```
 
-Connect with `psql` using the returned password:
+### Step 3: Run SQL Workloads
+```sql
+-- Create table and insert records
+CREATE TABLE accounts (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    balance NUMERIC(12, 2) NOT NULL DEFAULT 0.00
+);
 
-```bash
-psql "postgresql://app_user:<password>@${GATEWAY_IP}:5432/fly_smoke_test?sslmode=disable"
+INSERT INTO accounts (name, balance) VALUES ('Company Alpha', 10000.00), ('Company Beta', 5000.00);
+
+-- Read queries are seamlessly routed to the SQLite read engine
+SELECT * FROM accounts;
 ```
 
-Verify the full serverless lifecycle:
-1. **Active write/read**: `CREATE TABLE items (id serial primary key, name text); INSERT INTO items (name) VALUES ('hello'); SELECT * FROM items;`
-2. **Auto-suspend**: Wait `30s` (`AIR_IDLE_TIMEOUT = "30s"` in `fly.server.toml`) and check `GET https://air-pg-gateway.fly.dev/v1/databases/fly_smoke_test` → `state: "SUSPENDED"`.
-3. **Suspended read**: Run `SELECT * FROM items;` → served by `air-pg-read-engine.internal`, database stays `SUSPENDED`.
-4. **Suspended write**: Run `INSERT INTO items (name) VALUES ('wake');` → gateway holds the connection, wakes `air-pg-server`, replays the write, and database transitions back to `ACTIVE`.
+### Step 4: Verify Serverless Scale-to-Zero & Auto-Wake
+1. **Auto-Suspend**: `air-pg-server` idle timer suspends inactive databases after 30 seconds (`AIR_IDLE_TIMEOUT = "30s"`).
+2. **Inspect state**:
+   ```bash
+   curl -sS https://air-pg-gateway.fly.dev/v1/namespaces/production_app \
+     -H "Authorization: Bearer $AIR_INTERNAL_TOKEN" | jq .state
+   ```
+3. **Transparent Wake**: Running any query or write against `production_app` via port `5432` causes the gateway to hold the query, wake `air-pg-server`, replay the command, and resume normal execution without error.
 
 ---
 
-## Important Implementation Notes & Troubleshooting
+## 7. Troubleshooting & Operational Tips
 
-- **IPv6 Dual-Stack Listeners (6PN)**: Fly's private network (`*.internal`) routes over IPv6 (`fdaa:...`). All four services bind `[::]:<port>` (`AIR_READ_ENGINE_LISTEN_HOST = "[::]"`), and `air-pg-server` configures tenant Postgres with `AIR_PG_LISTEN_ADDRESSES = "*"` plus IPv6 `::/0` (`::1/128`) entries in `pg_hba.conf`.
-- **Volume Permissions**: Fly mounts new volumes owned by `root:root`. Both [`Dockerfile.pageserver`](../Dockerfile.pageserver) and [`Dockerfile.read-engine`](../Dockerfile.read-engine) use `gosu` entrypoint scripts ([`scripts/pageserver-entrypoint.sh`](../scripts/pageserver-entrypoint.sh), [`scripts/read-engine-entrypoint.sh`](../scripts/read-engine-entrypoint.sh)) that `chown` the mounted data directory before dropping privileges to `airps` / `airread`.
-- **Pageserver Memory Budget**: On a `256MB` VM, `AIR_PAGESERVER_CACHE_MB = "64"` keeps the in-memory page cache safely below the OOM ceiling.
-- **Neon Migrations**: `air-pg-server` runs embedded SQL migrations against `AIR_META_DSN` automatically on boot (no manual migration step required).
-- **Local `.env` vs Fly Secret Names**: If you keep R2 keys in a local `.env` as `ACCESS_KEY`, `SECRET_KEY`, and `ENDPOINT`, remember to map them to `AIR_R2_ACCESS_KEY_ID`, `AIR_R2_SECRET_ACCESS_KEY`, and `AIR_R2_ENDPOINT` when setting Fly secrets.
-- **Updating a Single Service**: Re-run only that service's `fly deploy` command from Step 5. Existing secrets and volumes are preserved automatically.
+- **Fast Deployments with `Dockerfile.server-fly`**: Full compilation of patched PostgreSQL 17 and `air_smgr.so` takes ~8 minutes. `deploy/fly/Dockerfile.server-fly` compiles only Go binaries and overlays them on top of `ghcr.io/mahadi-rsio/air:server-v2.0.28`, deploying updates in under 45 seconds.
+- **Volume Permissions**: Volumes mounted by Fly are initially owned by `root`. The startup entrypoint scripts ([`scripts/pageserver-entrypoint.sh`](../scripts/pageserver-entrypoint.sh) and [`scripts/read-engine-entrypoint.sh`](../scripts/read-engine-entrypoint.sh)) automatically `chown` the data directories before switching to unprivileged users.
+- **Monitoring & Metrics**:
+  - Prometheus metrics: `https://air-pg-gateway.fly.dev/metrics` (Requires `Authorization: Bearer $AIR_INTERNAL_TOKEN`).
+  - Real-time JSON pool and query stats: `https://air-pg-gateway.fly.dev/internal/v1/metrics`.

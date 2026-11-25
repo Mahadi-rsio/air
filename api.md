@@ -1,289 +1,326 @@
 # AIR API Reference
 
-AIR is composed of **4 decoupled services** connected over an authenticated gRPC mesh, backed by an external PostgreSQL metadata database (`AIR_META_DSN`):
+AIR provides a unified multi-tenant database platform built with 4 interconnected services communicating over an authenticated gRPC mesh, with state recorded in an external PostgreSQL metadata database (`AIR_META_DSN`).
 
-| Service | Default HTTP Admin/API Port | Default gRPC Port | Data / Wire Port | Purpose |
+---
+
+## Service Overview & Ports
+
+| Service | HTTP Admin / REST Port | gRPC Port | Client Wire Port | Primary Role |
 | :--- | :--- | :--- | :--- | :--- |
-| **`air-server`** | `:8080` | `:9090` | dynamic tenant PG ports | Control Plane & PostgreSQL 17 compute manager |
-| **`air-pageserver`** | `:8083` | `:9091` | Unix socket (optional) | Multi-tenant storage engine, WAL ingestion & page service |
-| **`air-read-engine`** | `:8082` | `:9092` | `:5433` (PG wire) | Shared SQLite read-replica engine |
-| **`air-gateway`** | `:8081` | `:9093` | `:5432` (PG wire) | Client PostgreSQL wire gateway, connection pooler & router |
+| **`air-server`** | `:8080` | `:9090` | Dynamic (tenant PG) | Control Plane, tenant orchestration, KMS & backup coordinator |
+| **`air-gateway`** | `:8081` | `:9093` | `:5432` (PG wire) | Client connection entrypoint, transaction pooler, intelligent query router |
+| **`air-read-engine`** | `:8082` | `:9092` | `:5433` (PG wire) | High-speed SQLite read replica for `SELECT` queries |
+| **`air-pageserver`** | `:8083` | `:9091` | IPC socket (optional)| Pageserver storage engine, `GetPage@LSN` provider & R2/S3 sync |
 
 ---
 
-## Authentication
+## Authentication Model
 
-### 1. Public Control Plane API (`air-server` `/v1/*`)
-- Header: `Authorization: Bearer <API_KEY>` (seeded on startup via `AIR_BOOTSTRAP_API_KEY`, default `air_dev_bootstrap_key` in Docker Compose).
-- Database creation also requires an `Idempotency-Key: <unique-key>` header.
+### 1. Public Control Plane Endpoints (`air-server` `/v1/*`)
+Public management APIs require a Bearer token:
+- **Header**: `Authorization: Bearer <API_KEY>`
+- Bootstrap key configured via `AIR_BOOTSTRAP_API_KEY` (default in Compose: `air_dev_bootstrap_key`).
+- Revoke existing keys via `DELETE /v1/api-keys/{key_id}`.
+- Creation requests require an `Idempotency-Key: <unique-uuid-or-slug>` header to prevent duplicate provisioning.
 
-### 2. Service-to-Service & Admin APIs (HTTP & gRPC)
-Protected by `AIR_INTERNAL_TOKEN` (default `air-dev-internal-token` in Docker Compose) using constant-time comparison:
-- **HTTP headers** (either is accepted):
-  - `X-Air-Internal-Token: <AIR_INTERNAL_TOKEN>`
-  - `Authorization: Bearer <AIR_INTERNAL_TOKEN>`
-- **gRPC metadata** (either is accepted):
+### 2. Internal Mesh & Admin Endpoints
+All inter-service gRPC calls and Admin HTTP endpoints require the shared `AIR_INTERNAL_TOKEN` (default: `air-dev-internal-token`).
+
+- **HTTP Requests**:
+  - `X-Air-Internal-Token: <AIR_INTERNAL_TOKEN>` (recommended)
+  - *or* `Authorization: Bearer <AIR_INTERNAL_TOKEN>`
+- **gRPC Metadata**:
   - `x-air-internal-token: <AIR_INTERNAL_TOKEN>`
-  - `x-internal-token: <AIR_INTERNAL_TOKEN>`
+  - *or* `x-internal-token: <AIR_INTERNAL_TOKEN>`
 
 ---
 
-## Ordered Provisioning & Teardown Flow
-
-When `POST /v1/databases` (or `POST /v1/namespaces`) is called on `air-server`, provisioning executes in strict order across all 4 services:
-
-1. **`air-server`** — Initializes tenant PostgreSQL 17 instance, generates & wraps tenant DEK (using `AIR_MASTER_KEY_HEX`), records metadata in external PostgreSQL (`clusters`, `tenant_events`).
-2. **`air-pageserver`** — Calls `PageserverService.EnsureTenant` (with wrapped DEK & generation) and `BootstrapTenantFromPGData`.
-3. **`air-read-engine`** — Calls `ReadEngineService.EnsureTenant` to register the tenant namespace.
-4. **`air-gateway`** — Calls `GatewayAdmin.RegisterNamespace` to wire the user namespace to `air-server`, `air-read-engine`, and `air-pageserver`.
-
-`DELETE /v1/databases/:id` cascades teardown in reverse order: `air-gateway` → `air-read-engine` → `air-pageserver` → `air-server` compute & metadata.
-
----
-
-## 1. `air-server` HTTP API (`:8080`)
+## 1. `air-server` Control Plane REST API (`:8080`)
 
 ### Health Check
 ```http
 GET /healthz
 ```
-Response `200 OK`:
-```json
-{"status":"ok"}
-```
+- **Auth**: None
+- **Response `200 OK`**: `{"status":"ok"}`
 
-### Create Database (Provision Across All 4 Services)
+---
+
+### Provision a Database
+Provisions a new isolated PostgreSQL 17 tenant database across all 4 services (PostgreSQL 17 cluster, Pageserver namespace, Read Engine registration, and Gateway route).
+
 ```http
 POST /v1/databases
 POST /v1/namespaces
 Authorization: Bearer <API_KEY>
-Idempotency-Key: <unique-idempotency-key>
+Idempotency-Key: <unique-key>
 Content-Type: application/json
 ```
-Body (`tenant_id` or `namespace`, matching `^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$`):
+
+**Request Body**:
 ```json
 {
-  "tenant_id": "demo_db"
+  "tenant_id": "analytics_db"
 }
 ```
-Example:
-```bash
-curl -X POST http://127.0.0.1:8080/v1/databases \
-  -H "Authorization: Bearer air_dev_bootstrap_key" \
-  -H "Idempotency-Key: idem-demo-db-001" \
-  -H "Content-Type: application/json" \
-  -d '{"tenant_id":"demo_db"}'
-```
-Response `201 Created`:
+*(Optionally use `"namespace": "analytics_db"`)*
+
+**Response `201 Created`**:
 ```json
 {
   "account_id": "acct_default",
-  "tenant_id": "demo_db",
-  "generation": "gen_380e33b412c1b70a",
-  "database": "demo_db",
+  "tenant_id": "analytics_db",
+  "database": "analytics_db",
   "username": "app_user",
-  "password": "<generated-password>",
+  "password": "<GENERATED_PASSWORD>",
   "direct_port": 18021,
   "system_identifier": "7711011875213824053",
+  "generation": "gen_380e33b412c1b70a",
   "fencing_epoch": 1,
   "state": "ACTIVE"
 }
 ```
 
-### Get Database / Namespace
+---
+
+### Get Database Metadata
 ```http
 GET /v1/databases/:id
 GET /v1/namespaces/:id
 Authorization: Bearer <API_KEY>
 ```
-Response `200 OK`:
+
+**Response `200 OK`**:
 ```json
 {
   "account_id": "acct_default",
-  "tenant_id": "demo_db",
-  "generation": "gen_380e33b412c1b70a",
+  "tenant_id": "analytics_db",
   "direct_port": 18021,
   "system_identifier": "7711011875213824053",
   "fencing_epoch": 1,
+  "generation": "gen_380e33b412c1b70a",
   "state": "ACTIVE"
 }
 ```
 
-### Delete Database / Namespace (Cascading Teardown)
+---
+
+### Delete / Purge Database
+Cascades teardown in safe reverse order: drains gateway poolers → unregisters from read-engine → purges pageserver layers → stops PostgreSQL process and purges local storage.
+
 ```http
 DELETE /v1/databases/:id
 DELETE /v1/namespaces/:id
 Authorization: Bearer <API_KEY>
 ```
-Response `200 OK`:
-```json
-{"status":"purged","tenant_id":"demo_db"}
-```
 
-### Backups, Verification, Restore & Cold Offload
-| Method | Path | Body | Description |
-| :--- | :--- | :--- | :--- |
-| `POST` | `/v1/databases/:id/backups` | `{"type":"full"}` | Trigger encrypted backup to S3/R2 |
-| `GET` | `/v1/databases/:id/backups` | — | List backup manifests for tenant |
-| `POST` | `/v1/databases/:id/backups/:backup_id/verify` | `{"stream_hash":true,"deep_restore":false}` | Verify backup integrity |
-| `POST` | `/v1/databases/:id/restore` | `{"backup_id":"...","target_lsn":"...","target_time":"...","new_tenant_id":"..."}` | Point-in-time / backup restore |
-| `GET` | `/v1/databases/:id/offload` | — | Get latest R2 cold-offload status |
-| `DELETE` | `/v1/api-keys/:id` | — | Revoke an API key |
+**Response `200 OK`**:
+```json
+{
+  "status": "purged",
+  "tenant_id": "analytics_db"
+}
+```
 
 ---
 
-## 2. `air-pageserver` Admin HTTP API (`:8083`)
+### Backups & Point-in-Time Recovery (PITR)
 
-All `/v1/namespaces*` routes require `X-Air-Internal-Token` (or `Authorization: Bearer <AIR_INTERNAL_TOKEN>`).
+#### Trigger Backup
+```http
+POST /v1/databases/:id/backups
+Authorization: Bearer <API_KEY>
+Content-Type: application/json
 
-| Method | Path | Description |
-| :--- | :--- | :--- |
-| `GET` | `/healthz` | Health & active tenant count (no auth) |
-| `GET` | `/v1/namespaces` | List all registered tenant namespaces, generations & LSNs |
-| `POST` | `/v1/namespaces` | Create/ensure a tenant namespace (`{"tenant_id":"...","generation":"...","epoch":1,"wrapped_dek":"...","load_from_r2":false}`) |
-| `POST` | `/v1/namespaces/:id` | Same as above with tenant ID in path |
-| `DELETE` | `/v1/namespaces/:id` | Purge tenant namespace from pageserver |
-
-Example:
-```bash
-curl -H "X-Air-Internal-Token: air-dev-internal-token" \
-  http://127.0.0.1:8083/v1/namespaces
+{"type": "FULL"}
 ```
-Response:
-```json
+*(Types: `"FULL"` or `"INCR"`)*
+
+#### List Backups
+```http
+GET /v1/databases/:id/backups
+Authorization: Bearer <API_KEY>
+```
+
+#### Verify Backup
+```http
+POST /v1/databases/:id/backups/:backup_id/verify
+Authorization: Bearer <API_KEY>
+Content-Type: application/json
+
 {
-  "service": "air-pageserver",
-  "namespaces": [
-    {"tenant_id": "demo_db", "generation": "gen_380e33b412c1b70a", "last_lsn": 28811018}
-  ]
+  "stream_hash": true,
+  "deep_restore": false
 }
 ```
+
+#### Restore Database / PITR
+```http
+POST /v1/databases/:id/restore
+Authorization: Bearer <API_KEY>
+Content-Type: application/json
+
+{
+  "backup_id": "bkp_20261125_001",
+  "target_lsn": "0/16B2300",
+  "target_time": "2026-11-25T01:00:00Z",
+  "new_tenant_id": "restored_analytics_db",
+  "verify_query": "SELECT COUNT(*) FROM users;"
+}
+```
+
+#### Check Cold Offload Status
+```http
+GET /v1/databases/:id/offload
+Authorization: Bearer <API_KEY>
+```
+
+#### Revoke API Key
+```http
+DELETE /v1/api-keys/:id
+Authorization: Bearer <API_KEY>
+```
+
+---
+
+## 2. `air-gateway` Admin HTTP API (`:8081`)
+
+Protected by `AIR_INTERNAL_TOKEN` (via `X-Air-Internal-Token` or `Authorization: Bearer <token>`).
+
+### Tenant & Namespace Inspection
+```http
+# Check gateway health (No Auth)
+GET /healthz
+
+# List all discovered namespaces
+GET /v1/namespaces
+
+# Inspect tenant connectivity to all 3 backends
+GET /v1/namespaces/:id
+```
+
+**Response `GET /v1/namespaces/analytics_db`**:
+```json
+{
+  "service": "air-gateway",
+  "tenant_id": "analytics_db",
+  "namespace": "analytics_db",
+  "state": "ACTIVE",
+  "air_connected": true,
+  "air_host": "air-server",
+  "air_port": 18021,
+  "read_engine_connected": true,
+  "read_engine_host": "air-read-engine",
+  "read_engine_port": 5433,
+  "pageserver_connected": true,
+  "pageserver_exists": true,
+  "pageserver_generation": "gen_380e33b412c1b70a",
+  "pageserver_last_lsn": 28811018
+}
+```
+
+### Tenant Lifecycle Controls (Proxy via gRPC)
+```http
+# Suspend idle database (drain connections and scale to zero)
+POST /v1/databases/:id/suspend
+
+# Wake / start suspended database
+POST /v1/databases/:id/start
+POST /v1/databases/:id/wake
+
+# Lock / unlock tenant access
+POST /v1/databases/:id/lock
+POST /v1/databases/:id/unlock
+```
+
+### Metrics & Connection Governance
+- `GET /metrics`: Standard Prometheus metrics endpoint.
+- `GET /internal/v1/metrics`: Detailed JSON metrics breakdown (supports `?tenant_id=...&user=...`).
+- `GET /internal/v1/write-governor`: Snapshot of adaptive write governor, active leases, and token bucket status.
+- `POST /internal/v1/tenants/:id/limits`: Dynamically set tenant connection limits:
+  ```json
+  {"max_client_conns": 50, "max_backends": 10}
+  ```
+- `POST /internal/v1/tenants/:id/drain?timeout=3s`: Force connection drain.
 
 ---
 
 ## 3. `air-read-engine` Admin HTTP API (`:8082`)
 
-All `/v1/namespaces*` routes require `X-Air-Internal-Token`.
+Protected by `AIR_INTERNAL_TOKEN`.
 
 | Method | Path | Description |
 | :--- | :--- | :--- |
-| `GET` | `/healthz` | Health, SQLite version, PG wire port & query stats |
-| `GET` | `/v1/status` | Engine status & registered tenants |
-| `GET` | `/metrics` | Detailed JSON metrics |
-| `GET` | `/v1/namespaces` | List all tenant namespaces |
-| `POST` | `/v1/namespaces` | Create/ensure tenant namespace (`{"tenant_id":"..."}`) |
-| `POST` | `/v1/namespaces/:id` | Same as above with tenant ID in path |
-| `DELETE` | `/v1/namespaces/:id` | Remove tenant namespace |
-| `POST` | `/v1/tenants/:id/start` | Register/start tenant DB |
-| `POST` | `/v1/tenants/:id/sync` | Sync tenant from primary (`{"primary_conninfo":"..."}` or `{"sql":"...","lsn":"..."}`) |
-
-Example:
-```bash
-curl -H "X-Air-Internal-Token: air-dev-internal-token" \
-  http://127.0.0.1:8082/v1/namespaces
-```
-Response:
-```json
-{
-  "service": "air-read-engine",
-  "namespaces": ["postgres", "demo_db"]
-}
-```
+| `GET` | `/healthz` | Health, SQLite version, PG wire port (`5433`), query statistics |
+| `GET` | `/v1/status` | Read-engine status and active tenant list |
+| `GET` | `/metrics` | Read engine query, cache, and latency metrics |
+| `GET` | `/v1/namespaces` | List registered read tenants |
+| `POST` | `/v1/namespaces` | Ensure a tenant is registered (`{"tenant_id":"..."}`) |
+| `DELETE` | `/v1/namespaces/:id` | Evict tenant and its cached SQLite state |
+| `POST` | `/v1/tenants/:id/sync` | Manually sync tenant LSN or apply SQL update |
 
 ---
 
-## 4. `air-gateway` Admin HTTP API (`:8081`)
+## 4. `air-pageserver` Admin HTTP API (`:8083`)
 
-All `/v1/*`, `/metrics`, and `/internal/v1/*` routes require `X-Air-Internal-Token`.
+Protected by `AIR_INTERNAL_TOKEN`.
 
-### Namespace Management
 | Method | Path | Description |
 | :--- | :--- | :--- |
-| `GET` | `/healthz` | Health check (no auth) |
-| `GET` | `/v1/namespaces` | List all cached tenant namespaces |
-| `POST` | `/v1/namespaces` | Register & connect namespace to `air-server`, `air-read-engine`, and `air-pageserver` |
-| `GET` | `/v1/namespaces/:id` | Inspect namespace connectivity across all 3 backends |
-| `DELETE` | `/v1/namespaces/:id` | Drain pool & unregister namespace |
+| `GET` | `/healthz` | Health check & active tenant count |
+| `GET` | `/v1/namespaces` | List registered tenants, generations, and last LSN |
+| `POST` | `/v1/namespaces` | Register/ensure tenant storage layer |
+| `DELETE` | `/v1/namespaces/:id` | Purge tenant storage and delete local cache |
 
-Example (`GET /v1/namespaces/demo_db`):
-```bash
-curl -H "X-Air-Internal-Token: air-dev-internal-token" \
-  http://127.0.0.1:8081/v1/namespaces/demo_db
-```
-Response:
-```json
-{
-  "air_connected": true,
-  "air_host": "air-server",
-  "air_port": 18021,
-  "namespace": "demo_db",
-  "pageserver_connected": true,
-  "pageserver_exists": true,
-  "pageserver_generation": "gen_380e33b412c1b70a",
-  "pageserver_last_lsn": 28811018,
-  "read_engine_connected": true,
-  "read_engine_host": "0.0.0.0",
-  "read_engine_port": 5433,
-  "service": "air-gateway",
-  "state": "ACTIVE",
-  "tenant_id": "demo_db"
-}
-```
+---
 
-### Database Lifecycle Proxy & Pool Controls
-| Method | Path | Description |
-| :--- | :--- | :--- |
-| `GET` | `/v1/databases` | List databases via `air-server` gRPC (`?account_id=...`) |
-| `POST` | `/v1/databases` | Create database via `air-server` gRPC |
-| `GET` | `/v1/databases/:id` | Get database info |
-| `DELETE` | `/v1/databases/:id` | Drain pool & delete database |
-| `POST` | `/v1/databases/:id/suspend` | Drain pool & suspend tenant |
-| `POST` | `/v1/databases/:id/start` (or `/wake`) | Start/wake suspended tenant |
-| `POST` | `/v1/databases/:id/lock` | Drain pool & lock tenant |
-| `POST` | `/v1/databases/:id/unlock` | Unlock tenant |
-| `GET` | `/metrics` | Prometheus metrics |
-| `GET` | `/internal/v1/metrics` | JSON metrics (`?tenant_id=...&user=...`) |
-| `GET` | `/internal/v1/tenants` | List cached tenant routes |
-| `POST` | `/internal/v1/tenants/:id/limits` | Update `{"max_client_conns":N,"max_backends":M}` |
-| `POST` | `/internal/v1/tenants/:id/drain` | Cooperatively drain tenant connections (`?timeout=2s`) |
+## 5. gRPC Protobuf Services
 
-### Query Metering (`query_metering`)
-`air-gateway` records every executed tenant query (both Simple and Extended Query Protocol) to a local tab-separated buffer (`<AIR_METERING_LOG_DIR>/query_metering.log`, default `/tmp/air-gateway-metering/query_metering.log`):
+For microservices, Kubernetes operators, and internal mesh communication, AIR exposes gRPC services:
+
+### 1. `AirDBControl` (`proto/airdb.proto` - Port `:9090`)
+Implemented by `air-server`:
+- `CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse)`
+- `GetDatabase(TenantRequest) returns (DatabaseInfo)`
+- `ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse)`
+- `DeleteDatabase(TenantRequest) returns (StatusResponse)`
+- `SuspendDatabase(TenantRequest) returns (StatusResponse)`
+- `StartDatabase(TenantRequest) returns (TenantRouteResponse)`
+- `LockDatabase(TenantRequest) returns (StatusResponse)`
+- `UnlockDatabase(TenantRequest) returns (StatusResponse)`
+- `WatchTenantChanges(WatchTenantsRequest) returns (stream TenantChangeEvent)`
+- `TriggerBackup`, `ListBackups`, `VerifyBackup`, `RestoreDatabase`
+
+### 2. `GatewayAdmin` (`proto/airdb.proto` - Port `:9093`)
+Implemented by `air-gateway`:
+- `RegisterNamespace(RegisterNamespaceRequest) returns (NamespaceStatusResponse)`
+- `DeleteNamespace(TenantRequest) returns (StatusResponse)`
+- `GetNamespace(TenantRequest) returns (NamespaceInfoResponse)`
+- `DrainTenant(DrainTenantRequest) returns (StatusResponse)`
+- `SetTenantLimits(SetTenantLimitsRequest) returns (StatusResponse)`
+
+### 3. `PageserverService` (`proto/pageserver.proto` - Port `:9091`)
+Implemented by `air-pageserver`:
+- Data plane: `GetPageAtLSN`, `GetPageBatch`, `GetRelSize`, `GetRelExists`, `GetDBSize`, `PutPageBatch`
+- Control plane: `EnsureTenant`, `BootstrapTenantFromPGData`, `IngestWALRecords`, `FlushTenant`, `PurgeTenant`
+
+### 4. `ReadEngineService` (`proto/readengine.proto` - Port `:9092`)
+Implemented by `air-read-engine`:
+- `EnsureTenant`, `GetTenantRoute`, `DeleteTenant`, `ListTenants`, `SyncTenant`
+
+---
+
+## 6. Client Database Connection (PostgreSQL Wire Protocol)
+
+Applications connect to **`air-gateway` on port `5432`**:
 
 ```text
-<RFC3339Nano UTC>	<db_id>	<bandwidth_bytes>	<query_time_us>	<query_type>
+postgresql://app_user:<PASSWORD>@<GATEWAY_HOST>:5432/<TENANT_ID>?sslmode=disable
 ```
 
-- **Flush triggers**: Automatically rotates and persists to `AIR_META_DSN` via PostgreSQL `COPY` when the log reaches `AIR_METERING_MAX_FILE_BYTES` (default `10485760` / 10 MB), every `AIR_METERING_FLUSH_INTERVAL_SEC` (default `120`s), and on graceful shutdown. Rotated log files are deleted immediately after successful DB persistence.
-- **Query types**: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `DDL`, `TX`, `PREPARE`, `EXECUTE`, `DEALLOCATE`, `COPY`, `EXPLAIN`, `SHOW`, `SET`, `RESET`, `LISTEN`, `UNLISTEN`, `NOTIFY`, `EXTENDED`, `OTHER`.
-- **Database table (`query_metering` in `AIR_META_DSN`)**:
-  - Columns: `id BIGSERIAL PRIMARY KEY`, `recorded_at TIMESTAMPTZ`, `db_id TEXT`, `bandwidth_bytes BIGINT`, `query_time_us BIGINT`, `query_type TEXT`, `created_at TIMESTAMPTZ`
-  - Indexes: `idx_query_metering_db_recorded (db_id, recorded_at DESC)`, `idx_query_metering_recorded (recorded_at DESC)`
-
----
-
-## 5. gRPC Services
-
-Proto definitions live in `proto/`:
-
-| Service | Proto File | Default Port | Key RPCs |
-| :--- | :--- | :--- | :--- |
-| `air.db.v1.AirDBControl` | `proto/airdb.proto` | `air-server:9090` | `GetTenantRoute`, `WakeTenant`, `WatchTenantChanges`, `CreateDatabase`, `ListDatabases`, `GetDatabase`, `DeleteDatabase`, `SuspendDatabase`, `StartDatabase`, `LockDatabase`, `UnlockDatabase` |
-| `air.db.v1.GatewayAdmin` | `proto/airdb.proto` | `air-gateway:9093` | `RegisterNamespace`, `DeleteNamespace`, `GetNamespace`, `DrainTenant`, `SetTenantLimits` |
-| `air.pageserver.v1.PageserverService` | `proto/pageserver.proto` | `air-pageserver:9091` | `Health`, `EnsureTenant`, `GetTenantInfo`, `ListTenants`, `PurgeTenant`, `BootstrapTenantFromPGData`, `IngestWALRecords`, `GetPageAtLSN`, `GetPageBatch`, `PutPageBatch` |
-| `air.readengine.v1.ReadEngineService` | `proto/readengine.proto` | `air-read-engine:9092` | `Health`, `EnsureTenant`, `GetTenantRoute`, `DeleteTenant`, `ListTenants`, `SyncTenant` |
-
----
-
-## 6. Connecting to a Tenant Database (PostgreSQL Wire Protocol)
-
-Connect standard PostgreSQL clients (`psql`, `pgx`, `psycopg`, `node-postgres`, Prisma, etc.) to **`air-gateway`** on port `5432` using the `username`, `password`, and `database` (tenant namespace) returned by `POST /v1/databases`:
-
-```text
-postgresql://<username>:<password>@<gateway-host>:5432/<tenant_id>?sslmode=disable
-```
-
-Example:
-```bash
-psql "postgresql://app_user:<password>@127.0.0.1:5432/demo_db?sslmode=disable" -c "SELECT current_user, current_database(), version();"
-```
+### Connection Characteristics
+- **Read/Write Query Routing**: `SELECT` queries without volatile functions are transparently routed to `air-read-engine` (`:5433`). Write operations (`INSERT`, `UPDATE`, `DELETE`, `CREATE`, `ALTER`) and transactions with writes are routed to the primary PostgreSQL compute node.
+- **Scale-to-Zero Auto-Wake**: If a tenant database was suspended, connecting or issuing a query to `air-gateway` automatically wakes the tenant compute and resumes execution transparently.
+- **Connection Pooling**: Supports transaction-mode connection pooling (`AIR_POOL_MODE=true`).
+- **TLS Security**: Enforces cryptographic SNI database name binding when TLS is enabled.

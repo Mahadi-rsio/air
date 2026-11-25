@@ -2,7 +2,7 @@
 
 AIR is a production-oriented, multi-tenant PostgreSQL 17 platform featuring a Go database engine and control plane (`air-server`), a standalone **Go PG gateway & transaction pooler** (`air-gateway`) communicating over **gRPC**, a **default SQLite read engine** (`air-read-engine`) that reads PostgreSQL 17 pages natively from AIR's Pageserver via the Cgo `air_pg` virtual table (zero `/sync` required), cooperative scale-to-zero, generation-fenced cold offload, encrypted Cloudflare R2 backups/PITR, and a custom Neon-style Pageserver (`air_smgr`) with Content-Addressed Upload (CAU).
 
-> **Quick Docs:** [Setup Guide](setup.md) · [API Reference](api.md) · [Docs Index](docs/README.md) · [Contributing](CONTRIBUTING.md) · [Known Issues](docs/development/known-issues.md)
+> **Quick Docs:** [Beginner's Quickstart](quickstart.md) · [Setup Guide](setup.md) · [API Reference](api.md) · [Docs Index](docs/README.md) · [Contributing](CONTRIBUTING.md) · [Known Issues](docs/development/known-issues.md)
 >
 > **Architecture & Subsystem Docs:** [Overview](docs/architecture/overview.md) · [Codebase Map](docs/architecture/codebase-map.md) · [Pageserver](docs/architecture/pageserver.md) · [Read Engine](docs/architecture/read-engine.md) · [Storage](docs/architecture/storage.md) · [Tenant Lifecycle](docs/architecture/tenant-lifecycle.md) · [WAL & Recovery](docs/architecture/wal-and-recovery.md) · [Backup & Restore](docs/architecture/backup-and-restore.md) · [Developer Guide](docs/development/DEVELOPMENT.md)
 
