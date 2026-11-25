@@ -710,11 +710,14 @@ func (cp *ControlPlane) activateRestoredTenant(ctx context.Context, accountID, n
 		return "", 0, fmt.Errorf("start restored tenant %s: %w", newTenantID, err)
 	}
 
-	// Ensure app_user password and database matching newTenantID are configured on the promoted instance.
+	// Ensure tenant role (<newTenantID>) password and database ownership are configured on the promoted instance.
+	escapedRole := strings.ReplaceAll(newTenantID, "'", "''")
+	escapedPW := strings.ReplaceAll(appPW, "'", "''")
+	quotedRole := pgx.Identifier{newTenantID}.Sanitize()
 	_, _ = cp.agent.RunPostgresCmd(
 		filepath.Join(cp.agent.PGBin(), "psql"),
 		"-h", rt.SockDir, "-p", strconv.Itoa(rt.Port), "-U", "postgres", "-d", "postgres",
-		"-c", fmt.Sprintf("DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_user') THEN CREATE ROLE app_user LOGIN PASSWORD '%s'; ELSE ALTER ROLE app_user WITH LOGIN PASSWORD '%s'; END IF; END $$;", appPW, appPW),
+		"-c", fmt.Sprintf("DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '%s') THEN CREATE ROLE %s LOGIN PASSWORD '%s'; ELSE ALTER ROLE %s WITH LOGIN PASSWORD '%s'; END IF; END $$;", escapedRole, quotedRole, escapedPW, quotedRole, escapedPW),
 	)
 
 	if cp.faultHook != nil {

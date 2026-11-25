@@ -67,7 +67,7 @@ The command returns a JSON response containing connection credentials:
   "account_id": "acct_default",
   "tenant_id": "my_first_db",
   "database": "my_first_db",
-  "username": "app_user",
+  "username": "my_first_db",
   "password": "GENERATED_PASSWORD_HERE",
   "direct_port": 18021,
   "system_identifier": "7711011875213824053",
@@ -78,7 +78,7 @@ The command returns a JSON response containing connection credentials:
 ```
 
 > [!IMPORTANT]
-> Save the `password` from the JSON response! AIR creates an isolated non-superuser `app_user` for this database.
+> Save the `password` from the JSON response! AIR creates an isolated non-superuser role matching your database name (`my_first_db`) for authentication and routing.
 
 ---
 
@@ -88,14 +88,14 @@ Always connect through the **AIR Gateway on port `5432`**. The gateway automatic
 
 ### Connection String Format
 ```text
-postgresql://app_user:<PASSWORD>@127.0.0.1:5432/<TENANT_ID>?sslmode=disable
+postgresql://<TENANT_ID>:<PASSWORD>@127.0.0.1:5432?sslmode=disable
 ```
 
 ### Using `psql` Command Line
 Replace `<PASSWORD>` with the password received during database creation:
 
 ```bash
-PGPASSWORD='<PASSWORD>' psql -h 127.0.0.1 -p 5432 -U app_user -d my_first_db
+PGPASSWORD='<PASSWORD>' psql "postgresql://my_first_db@127.0.0.1:5432?sslmode=disable"
 ```
 
 ### Running CRUD Operations
@@ -141,9 +141,8 @@ const { Client } = require('pg');
 const client = new Client({
   host: '127.0.0.1',
   port: 5432,
-  user: 'app_user',
+  user: 'my_first_db',
   password: process.env.DB_PASSWORD,
-  database: 'my_first_db',
   ssl: false,
 });
 
@@ -172,7 +171,7 @@ main().catch(console.error);
 import psycopg
 
 conn = psycopg.connect(
-    "host=127.0.0.1 port=5432 user=app_user password=YOUR_PASSWORD dbname=my_first_db"
+    "postgresql://my_first_db:YOUR_PASSWORD@127.0.0.1:5432?sslmode=disable"
 )
 
 with conn.cursor() as cur:
@@ -200,7 +199,7 @@ import (
 
 func main() {
 	ctx := context.Background()
-	dsn := "postgres://app_user:YOUR_PASSWORD@127.0.0.1:5432/my_first_db?sslmode=disable"
+	dsn := "postgres://my_first_db:YOUR_PASSWORD@127.0.0.1:5432?sslmode=disable"
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		log.Fatalf("unable to connect: %v", err)

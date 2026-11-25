@@ -1856,7 +1856,7 @@ func (p *TenantPool) dialAndStartupCtx(ctx context.Context, host, sockDir string
 	}
 
 	startup := BuildStartupMessage(map[string]string{
-		"user":             "app_user",
+		"user":             p.tenantID,
 		"database":         p.tenantID,
 		"application_name": "air-pooler",
 	})
@@ -1887,7 +1887,7 @@ func (p *TenantPool) dialAndStartupCtx(ctx context.Context, host, sockDir string
 					return nil, fmt.Errorf("failed to send cleartext password to backend: %w", err)
 				}
 			case 10:
-				if err := SCRAMSHA256ClientAuth(b.Conn, "app_user", appPass); err != nil {
+				if err := SCRAMSHA256ClientAuth(b.Conn, p.tenantID, appPass); err != nil {
 					b.Close()
 					return nil, err
 				}

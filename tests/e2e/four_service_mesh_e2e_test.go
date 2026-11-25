@@ -214,6 +214,9 @@ func TestE2E_FourServiceGRPCMesh_NamespaceProvisioningAndIsolation(t *testing.T)
 	}
 	username, _ := prov["user"].(string)
 	password, _ := prov["password"].(string)
+	if username != tenantID {
+		t.Fatalf("expected tenant-scoped username %q, got %q", tenantID, username)
+	}
 
 	// Verify namespace exists on pageserver & read-engine via gateway control plane
 	code, psNS := doAdminJSON(t, http.MethodGet, "http://"+gwAdminHTTPAddr+"/v1/pageserver/tenants/"+tenantID, internalToken, nil)
@@ -229,10 +232,10 @@ func TestE2E_FourServiceGRPCMesh_NamespaceProvisioningAndIsolation(t *testing.T)
 		t.Fatalf("gateway namespace %s not connected to all services: status=%d body=%+v", tenantID, code, gwNS)
 	}
 
-	// 7. Connect through air-gateway using the user namespace and execute SQL end-to-end
+	// 7. Connect through air-gateway using [tenant_db]:password URL (without /db path) and execute SQL end-to-end
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	dsn := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", username, password, gwPGAddr, tenantID)
+	dsn := fmt.Sprintf("postgres://%s:%s@%s?sslmode=disable", username, password, gwPGAddr)
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		t.Fatalf("pgx.Connect through air-gateway failed: %v", err)

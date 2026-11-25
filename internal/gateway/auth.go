@@ -51,12 +51,19 @@ func ParseSNITenant(sniHost string) string {
 	return trimmed[:dot]
 }
 
-// ExtractTenant resolves the tenant from explicit database startup parameter (if non-"postgres") or SNI subdomain.
+// ExtractTenant resolves the tenant from explicit database startup parameter (if non-"postgres"),
+// the tenant-scoped username ([tenant_db]:password URLs), or the SNI subdomain.
 func ExtractTenant(sniHost string, params map[string]string) string {
 	if db, ok := params["database"]; ok {
 		db = strings.TrimSpace(db)
 		if db != "" && db != "postgres" {
 			return db
+		}
+	}
+	if user, ok := params["user"]; ok {
+		user = strings.TrimSpace(user)
+		if user != "" && !strings.EqualFold(user, "postgres") && user != "app_user" {
+			return user
 		}
 	}
 	return ParseSNITenant(sniHost)

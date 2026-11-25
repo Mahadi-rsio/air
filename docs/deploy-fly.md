@@ -231,7 +231,7 @@ Retrieve the public IP and connect:
 ```bash
 GATEWAY_IP="$(fly ips list --app air-pg-gateway --json | jq -r '.[] | select(.Type=="v4") | .Address')"
 
-psql "postgresql://app_user:<GENERATED_PASSWORD>@${GATEWAY_IP}:5432/production_app?sslmode=disable"
+psql "postgresql://production_app:<GENERATED_PASSWORD>@${GATEWAY_IP}:5432?sslmode=disable"
 ```
 
 ### Step 3: Run SQL Workloads

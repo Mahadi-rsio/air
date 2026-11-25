@@ -70,6 +70,13 @@ func TestTenantIDSNIAuthCancel(t *testing.T) {
 	if got := ExtractTenant("t_demo.air.local", params); got != "t_explicit" {
 		t.Fatalf("expected t_explicit, got %q", got)
 	}
+	// [tenant_db]:password URL routing (no /database or /postgres)
+	if got := ExtractTenant("", map[string]string{"user": "t_user_db"}); got != "t_user_db" {
+		t.Fatalf("expected t_user_db, got %q", got)
+	}
+	if got := ExtractTenant("", map[string]string{"user": "t_user_db", "database": "postgres"}); got != "t_user_db" {
+		t.Fatalf("expected t_user_db, got %q", got)
+	}
 
 	if !ConstantTimeEquals("secret123", "secret123") {
 		t.Fatal("expected equal")

@@ -301,7 +301,7 @@ func (a *Agent) ClaimCluster(tenantID string) (string, error) {
 	return sysID, nil
 }
 
-// ActivateCluster promotes claiming -> active, writes hardened config, starts PG17, and provisions app_user + tenant DB.
+// ActivateCluster promotes claiming -> active, writes hardened config, starts PG17, and provisions tenant role + DB.
 func (a *Agent) ActivateCluster(tenantID, appPassword string, epoch int64) (*TenantRuntime, error) {
 	claimDir, err := tenant.SafeSubpath(a.volDir, "tenants/claiming", tenantID)
 	if err != nil {
@@ -333,7 +333,7 @@ func (a *Agent) ActivateCluster(tenantID, appPassword string, epoch int64) (*Ten
 		return nil, err
 	}
 
-	// Provision least-privilege app_user and tenant database via Unix socket as superuser postgres.
+	// Provision least-privilege tenant role (<tenantID>) and tenant database via Unix socket as superuser postgres.
 	connStr := fmt.Sprintf("host=%s port=%d user=postgres dbname=postgres", sockDir, rt.Port)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -344,22 +344,24 @@ func (a *Agent) ActivateCluster(tenantID, appPassword string, epoch int64) (*Ten
 	defer conn.Close(ctx)
 
 	escapedPW := strings.ReplaceAll(appPassword, "'", "''")
+	escapedRole := strings.ReplaceAll(tenantID, "'", "''")
+	quotedRole := pgx.Identifier{tenantID}.Sanitize()
 	quotedDB := pgx.Identifier{tenantID}.Sanitize()
 	sqlStmts := []string{
 		`SET password_encryption = 'scram-sha-256'`,
 		fmt.Sprintf(`DO $$ BEGIN
-			IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_user') THEN
-				CREATE ROLE app_user WITH LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+			IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '%s') THEN
+				CREATE ROLE %s WITH LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
 			ELSE
-				ALTER ROLE app_user WITH LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+				ALTER ROLE %s WITH LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
 			END IF;
-		END $$;`, escapedPW, escapedPW),
+		END $$;`, escapedRole, quotedRole, escapedPW, quotedRole, escapedPW),
 		`REVOKE CONNECT ON DATABASE template1 FROM PUBLIC`,
 		`REVOKE ALL ON DATABASE postgres FROM PUBLIC`,
 	}
 	for _, s := range sqlStmts {
 		if _, err := conn.Exec(ctx, s); err != nil {
-			return nil, fmt.Errorf("provision app_user: %w", err)
+			return nil, fmt.Errorf("provision tenant role %s: %w", tenantID, err)
 		}
 	}
 
@@ -368,14 +370,14 @@ func (a *Agent) ActivateCluster(tenantID, appPassword string, epoch int64) (*Ten
 		return nil, err
 	}
 	if !dbExists {
-		if _, err := conn.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %s OWNER app_user`, quotedDB)); err != nil {
+		if _, err := conn.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %s OWNER %s`, quotedDB, quotedRole)); err != nil {
 			return nil, fmt.Errorf("create tenant db %s: %w", tenantID, err)
 		}
 	}
 	if _, err := conn.Exec(ctx, fmt.Sprintf(`REVOKE ALL ON DATABASE %s FROM PUBLIC`, quotedDB)); err != nil {
 		return nil, err
 	}
-	if _, err := conn.Exec(ctx, fmt.Sprintf(`GRANT ALL ON DATABASE %s TO app_user`, quotedDB)); err != nil {
+	if _, err := conn.Exec(ctx, fmt.Sprintf(`GRANT ALL ON DATABASE %s TO %s`, quotedDB, quotedRole)); err != nil {
 		return nil, err
 	}
 	return rt, nil
@@ -473,14 +475,14 @@ func (a *Agent) WriteTenantConfigs(tenantID string) error {
 	}
 	supautilsConf := ""
 	if hasSupautils {
-		supautilsConf = `supautils.superuser = 'postgres'
-supautils.privileged_role = 'app_user'
+		supautilsConf = fmt.Sprintf(`supautils.superuser = 'postgres'
+supautils.privileged_role = '%s'
 supautils.privileged_extensions = 'pg_stat_statements,pg_trgm'
 supautils.privileged_role_allowed_configs = 'session_replication_role'
 supautils.reserved_roles = 'postgres'
 supautils.reserved_memberships = 'pg_read_server_files,pg_write_server_files,pg_execute_server_program,postgres'
 supautils.restrict_extension_versions = 'error'
-`
+`, tenantID)
 	}
 
 	listenAddr := strings.TrimSpace(os.Getenv("AIR_PG_LISTEN_ADDRESSES"))
@@ -518,7 +520,7 @@ shared_preload_libraries = '%s'
 	hba := fmt.Sprintf(`
 local   all             postgres                                trust
 local   replication     postgres                                trust
-local   all             app_user                                password
+local   all             %s                                      password
 host    all             postgres        %s            reject
 host    all             postgres        %s            reject
 host    all             all             %s            scram-sha-256
@@ -527,7 +529,7 @@ host    replication     postgres        %s            reject
 host    replication     postgres        %s            reject
 host    replication     all             %s            scram-sha-256
 host    replication     all             %s            scram-sha-256
-`, hbaHost4, hbaHost6, hbaHost4, hbaHost6, hbaHost4, hbaHost6, hbaHost4, hbaHost6)
+`, tenantID, hbaHost4, hbaHost6, hbaHost4, hbaHost6, hbaHost4, hbaHost6, hbaHost4, hbaHost6)
 	if err := os.WriteFile(filepath.Join(pgData, "pg_hba.conf"), []byte(strings.TrimSpace(hba)+"\n"), 0o600); err != nil {
 		return err
 	}

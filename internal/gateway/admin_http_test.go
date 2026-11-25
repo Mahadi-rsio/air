@@ -27,7 +27,7 @@ func (m *mockAirDBControl) CreateDatabase(_ context.Context, req *pb.CreateDatab
 		State:      "ACTIVE",
 		DirectPort: 18001,
 		Host:       "127.0.0.1",
-		User:       "app_user",
+		User:       req.GetTenantId(),
 		Password:   "pw",
 	}, nil
 }

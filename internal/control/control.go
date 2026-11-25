@@ -692,7 +692,7 @@ func (cp *ControlPlane) ProvisionDatabase(ctx context.Context, accountID, idempo
 		TenantID:         tenantID,
 		Generation:       gen,
 		Database:         tenantID,
-		Username:         "app_user",
+		Username:         tenantID,
 		DirectPort:       rt.Port,
 		SystemIdentifier: sysID,
 		FencingEpoch:     rt.FencingEpoch,

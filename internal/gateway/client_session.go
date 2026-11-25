@@ -148,7 +148,7 @@ func HandleClientConnection(
 	}
 
 	reqUser := strings.TrimSpace(params["user"])
-	if reqUser == "" || strings.EqualFold(reqUser, "postgres") || (cfg.PoolMode && reqUser != "app_user") {
+	if reqUser == "" || strings.EqualFold(reqUser, "postgres") || (cfg.PoolMode && reqUser != startupTenant && reqUser != "app_user") {
 		metrics.RecordAuthFailure()
 		_, _ = conn.Write(BuildErrorResponse("FATAL", "28000", fmt.Sprintf("user %q is not permitted through tenant gateway", reqUser)))
 		return

@@ -152,7 +152,7 @@ Output:
   "account_id": "acct_default",
   "tenant_id": "demo_db",
   "database": "demo_db",
-  "username": "app_user",
+  "username": "demo_db",
   "password": "<GENERATED_PASSWORD>",
   "direct_port": 18021,
   "system_identifier": "7711011875213824053",
@@ -184,7 +184,7 @@ curl -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8081/v1/
 Connect through **`air-gateway` on port `5432`**:
 
 ```bash
-psql "postgresql://app_user:<GENERATED_PASSWORD>@127.0.0.1:5432/demo_db?sslmode=disable" <<'SQL'
+psql "postgresql://demo_db:<GENERATED_PASSWORD>@127.0.0.1:5432?sslmode=disable" <<'SQL'
 SELECT current_user, current_database(), version();
 
 CREATE TABLE users (

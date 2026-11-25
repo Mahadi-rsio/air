@@ -71,7 +71,7 @@ Content-Type: application/json
   "state": "ACTIVE",
   "direct_port": 18021,
   "host": "air-server",
-  "user": "app_user",
+  "user": "analytics_db",
   "password": "<GENERATED_PASSWORD>"
 }
 ```
@@ -292,7 +292,7 @@ Implemented by `air-read-engine`:
 Applications connect to **`air-gateway` on port `5432`**:
 
 ```text
-postgresql://app_user:<PASSWORD>@<GATEWAY_HOST>:5432/<TENANT_ID>?sslmode=disable
+postgresql://<TENANT_ID>:<PASSWORD>@<GATEWAY_HOST>:5432?sslmode=disable
 ```
 
 ### Connection Characteristics

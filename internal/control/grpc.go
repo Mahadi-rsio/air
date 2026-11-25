@@ -236,8 +236,8 @@ func (s *grpcServer) CreateDatabase(ctx context.Context, req *pb.CreateDatabaseR
 		if host == "" {
 			host = "127.0.0.1"
 		}
-		dsn = fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
-			resp.Username, resp.Password, host, resp.DirectPort, resp.TenantID)
+		dsn = fmt.Sprintf("postgres://%s:%s@%s:%d?sslmode=disable",
+			resp.Username, resp.Password, host, resp.DirectPort)
 	}
 	return &pb.CreateDatabaseResponse{
 		TenantId:   resp.TenantID,
