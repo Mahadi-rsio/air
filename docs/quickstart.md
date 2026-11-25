@@ -7,10 +7,10 @@ Welcome to **AIR**! This step-by-step guide is designed to take you from zero to
 ## 1. What is AIR in Simple Terms?
 
 Think of AIR as a self-hosted, cloud-native database platform (similar to Neon or Supabase) built with:
-- **`air-gateway` (Port `5432`)**: The front door for your applications. Connect with standard `psql`, Python, Node.js, Go, or any PostgreSQL client.
-- **`air-server` (Port `8080` / `9090`)**: The control brain. It creates databases, issues credentials, handles backups, and manages instances.
-- **`air-read-engine` (Port `5433` / `8082`)**: A blazing fast SQLite-backed read engine that handles `SELECT` queries without waking full PostgreSQL compute.
-- **`air-pageserver` (Port `8083` / `9091`)**: Storage layer managing relation pages and Cloudflare R2 / S3 cold storage.
+- **`air-gateway` (Port `5432` / `8081`)**: **The single Control Plane & front door.** Exposes the unified HTTP Control Plane (`:8081`) to manage all services, plus PostgreSQL wire port (`:5432`) for `psql`, Python, Node.js, Go, or any PG client.
+- **`air-server` (gRPC `:9090`)**: Primary PostgreSQL 17 compute manager, KMS, and backup coordinator (internal gRPC only).
+- **`air-read-engine` (Port `5433` / gRPC `:9092`)**: A fast SQLite-backed read engine that handles `SELECT` queries without waking full PostgreSQL compute (internal gRPC + PG wire only).
+- **`air-pageserver` (gRPC `:9091`)**: Storage layer managing relation pages and Cloudflare R2 / S3 cold storage (internal gRPC only).
 - **`air-meta-postgres` (Port `5435`)**: External PostgreSQL database storing platform configuration and tenant catalogs.
 
 ---
@@ -30,27 +30,18 @@ docker compose up -d --wait
 ```
 
 ### Step 2: Check Service Health
-Verify that all services are online:
+Verify that `air-gateway` and all backend gRPC services are online:
 
 ```bash
-# air-server (Control Plane)
-curl -fsS http://127.0.0.1:8080/healthz
-# Expected: {"status":"ok"}
-
-# air-gateway (Client Gateway & Pooler)
+# Gateway liveness
 curl -fsS http://127.0.0.1:8081/healthz
 # Expected: {"status":"ok"}
 
-# air-read-engine (Read Replica)
-curl -fsS http://127.0.0.1:8082/healthz
-# Expected: {"status":"ok"}
-
-# air-pageserver (Storage Engine)
-curl -fsS http://127.0.0.1:8083/healthz
-# Expected: {"status":"ok"}
+# Aggregated 4-service cluster health (air-gateway, air-server, air-read-engine, air-pageserver)
+curl -fsS -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8081/v1/cluster/health
 ```
 
-If all 4 endpoints return `{"status":"ok"}`, your AIR platform is ready!
+If all services report `"status":"ok"`, your AIR platform is ready!
 
 ---
 
@@ -58,14 +49,14 @@ If all 4 endpoints return `{"status":"ok"}`, your AIR platform is ready!
 
 In AIR, databases are multi-tenant isolated environments (also called **tenants** or **namespaces**).
 
-To create a new database named `my_first_db`:
+To create a new database named `my_first_db` (via `air-gateway`, which orchestrates `air-server`, `air-read-engine`, and `air-pageserver` over gRPC):
 
 ```bash
-curl -s -X POST http://127.0.0.1:8080/v1/databases \
-  -H "Authorization: Bearer air_dev_bootstrap_key" \
+curl -s -X POST http://127.0.0.1:8081/v1/databases \
+  -H "X-Air-Internal-Token: air-dev-internal-token" \
   -H "Idempotency-Key: first-run-001" \
   -H "Content-Type: application/json" \
-  -d '{"tenant_id": "my_first_db"}'
+  -d '{"tenant_id": "my_first_db", "account_id": "acct_default"}'
 ```
 
 ### Response Breakdown
@@ -233,22 +224,22 @@ AIR lets you inspect, suspend, wake, backup, and delete databases via HTTP REST 
 
 ### 1. Inspect Database Status
 ```bash
-curl -s http://127.0.0.1:8080/v1/databases/my_first_db \
-  -H "Authorization: Bearer air_dev_bootstrap_key"
+curl -s http://127.0.0.1:8081/v1/databases/my_first_db \
+  -H "X-Air-Internal-Token: air-dev-internal-token"
 ```
 
 ### 2. Trigger an Immediate Backup
 ```bash
-curl -s -X POST http://127.0.0.1:8080/v1/databases/my_first_db/backups \
-  -H "Authorization: Bearer air_dev_bootstrap_key" \
+curl -s -X POST http://127.0.0.1:8081/v1/databases/my_first_db/backups \
+  -H "X-Air-Internal-Token: air-dev-internal-token" \
   -H "Content-Type: application/json" \
   -d '{"type": "FULL"}'
 ```
 
 ### 3. List Backups
 ```bash
-curl -s http://127.0.0.1:8080/v1/databases/my_first_db/backups \
-  -H "Authorization: Bearer air_dev_bootstrap_key"
+curl -s http://127.0.0.1:8081/v1/databases/my_first_db/backups \
+  -H "X-Air-Internal-Token: air-dev-internal-token"
 ```
 
 ### 4. Suspend an Idle Database (Scale-to-Zero)
@@ -267,8 +258,8 @@ curl -s -X POST http://127.0.0.1:8081/v1/databases/my_first_db/start \
 ### 6. Delete / Teardown Database
 When you are done with the database:
 ```bash
-curl -s -X DELETE http://127.0.0.1:8080/v1/databases/my_first_db \
-  -H "Authorization: Bearer air_dev_bootstrap_key"
+curl -s -X DELETE http://127.0.0.1:8081/v1/databases/my_first_db \
+  -H "X-Air-Internal-Token: air-dev-internal-token"
 ```
 
 ---
@@ -276,6 +267,6 @@ curl -s -X DELETE http://127.0.0.1:8080/v1/databases/my_first_db \
 ## 7. Next Steps & Advanced Topics
 
 Now that you've got your first database running:
-- Read the [Setup Guide](../setup.md) for production deployments with Cloudflare R2 and external HA PostgreSQL.
-- Check the [API Reference](../api.md) for full HTTP REST and gRPC endpoint specifications.
-- Explore [Architecture Documentation](architecture/overview.md) to learn how pageserver disaggregation, query routing, and cold offload work under the hood.
+- Read the [Setup Guide](setup.md) for production deployments with Cloudflare R2 and external HA PostgreSQL.
+- Check the [API Reference](api.md) for full HTTP REST and gRPC endpoint specifications.
+- Explore [Architecture Documentation](docs/architecture/overview.md) to learn how pageserver disaggregation, query routing, and cold offload work under the hood.

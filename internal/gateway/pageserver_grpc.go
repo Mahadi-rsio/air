@@ -68,6 +68,37 @@ func (c *PageserverGRPCClient) EnsureTenant(ctx context.Context, tenantID, gener
 	})
 }
 
+// ListTenants lists all tenants known to air-pageserver.
+func (c *PageserverGRPCClient) ListTenants(ctx context.Context) (*pb.PageserverListTenantsResponse, error) {
+	rctx, cancel := context.WithTimeout(c.withAuth(ctx), 5*time.Second)
+	defer cancel()
+	return c.client.ListTenants(rctx, &pb.PageserverEmpty{})
+}
+
+// FlushTenant flushes pending WAL/layers for a tenant on air-pageserver.
+func (c *PageserverGRPCClient) FlushTenant(ctx context.Context, tenantID string) (*pb.FlushTenantResponse, error) {
+	rctx, cancel := context.WithTimeout(c.withAuth(ctx), 30*time.Second)
+	defer cancel()
+	return c.client.FlushTenant(rctx, &pb.PageserverTenantRequest{TenantId: tenantID})
+}
+
+// FlushAll flushes all tenants on air-pageserver.
+func (c *PageserverGRPCClient) FlushAll(ctx context.Context) (*pb.PageserverStatusResponse, error) {
+	rctx, cancel := context.WithTimeout(c.withAuth(ctx), 60*time.Second)
+	defer cancel()
+	return c.client.FlushAll(rctx, &pb.PageserverEmpty{})
+}
+
+// PurgeTenant purges a tenant namespace from air-pageserver.
+func (c *PageserverGRPCClient) PurgeTenant(ctx context.Context, tenantID, generation string) (*pb.PageserverStatusResponse, error) {
+	rctx, cancel := context.WithTimeout(c.withAuth(ctx), 15*time.Second)
+	defer cancel()
+	return c.client.PurgeTenant(rctx, &pb.PurgeTenantRequest{
+		TenantId:   tenantID,
+		Generation: generation,
+	})
+}
+
 // Addr returns the configured pageserver gRPC address.
 func (c *PageserverGRPCClient) Addr() string {
 	return c.addr

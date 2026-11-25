@@ -16,22 +16,22 @@ Client (psql/SDK) ->|   air-gateway (:5432)  |<- Admin HTTP (:8081) / gRPC (:909
                         |        |       |
             gRPC (:9090)|   gRPC |       | gRPC (:9091)
                         v (:9092)|       v
-+-------------------+   +--------+-------+   +------------------------+
++-------------------+   +----------------+   +------------------------+
 | air-meta-postgres |<--|   air-server   |-->|     air-pageserver     |
-|  (PG 17 :5435)    |   | (:8080 / :9090)|   |    (:8083 / :9091)     |
+|  (PG 17 :5435)    |   |  (gRPC :9090)  |   |     (gRPC :9091)       |
 +-------------------+   +--------+-------+   +-----------+------------+
                                  |                       ^
                                  | gRPC (:9092)          | gRPC (:9091)
                                  v                       |
                         +--------+-----------------------+--+
-                        |  air-read-engine (:5433/:8082/:9092) |
+                        |   air-read-engine (:5433 / :9092) |
                         +-----------------------------------+
 ```
 
-- **Client Gateway (`air-gateway`)**: Listens on PostgreSQL wire port `5432`. Enforces SNI database binding, manages backend connection pools, performs transparent read/write query routing, and exposes Admin HTTP on `:8081`.
-- **Control Plane (`air-server`)**: Coordinates tenant lifecycles, provisions isolated PostgreSQL 17 clusters, manages envelope KMS keys, coordinates backups, and triggers background cold offload. Exposes HTTP REST on `:8080` and `AirDBControl` gRPC on `:9090`.
-- **Read Replica Engine (`air-read-engine`)**: Shared SQLite read replica reading PG17 pages directly from the Pageserver. Serves read queries on PG wire port `5433`, Admin HTTP on `:8082`, and gRPC on `:9092`.
-- **Pageserver (`air-pageserver`)**: Storage node intercepting relation page reads (`GetPage@LSN`), ingesting WAL records, generating L0/L1 layers, and synchronizing with Cloudflare R2 / S3 cold storage. Exposes Admin HTTP on `:8083` and gRPC on `:9091`.
+- **Single Control Plane & Client Gateway (`air-gateway`)**: Listens on HTTP Control Plane port `8081` and PostgreSQL wire port `5432`. Orchestrates `air-server`, `air-read-engine`, and `air-pageserver` over gRPC, enforces SNI database binding, manages backend connection pools, and performs transparent read/write query routing.
+- **Primary Compute Engine (`air-server`)**: Coordinates tenant lifecycles, provisions isolated PostgreSQL 17 clusters, manages envelope KMS keys, coordinates backups, and triggers background cold offload. Exposes `AirDBControl` gRPC on `:9090` (no HTTP admin API).
+- **Read Replica Engine (`air-read-engine`)**: Shared SQLite read replica reading PG17 pages directly from the Pageserver. Serves read queries on PG wire port `5433` and `ReadEngineService` gRPC on `:9092` (no HTTP admin API).
+- **Pageserver (`air-pageserver`)**: Storage node intercepting relation page reads (`GetPage@LSN`), ingesting WAL records, generating L0/L1 layers, and synchronizing with Cloudflare R2 / S3 cold storage. Exposes `PageserverService` gRPC on `:9091` (no HTTP admin API).
 - **External Metadata PostgreSQL (`air-meta-postgres`)**: Stores control-plane metadata and query metering (`clusters`, `tenant_events`, `api_keys`, `provisioning_ops`, `idempotency_records`, `backup_ops`, `offload_ops`, `restore_ops`, `query_metering`, `schema_migrations`) via `AIR_META_DSN`.
 - **Shared Master KEK (`AIR_MASTER_KEY_HEX`)**: 32-byte (64 hex chars) key shared between `air-server` and `air-pageserver` so envelope-encrypted tenant DEKs can be unwrapped across separate containers/hosts.
 - **Internal Mesh Auth (`AIR_INTERNAL_TOKEN`)**: Shared secret authenticating all inter-service gRPC and Admin HTTP calls.
@@ -82,12 +82,10 @@ Client (psql/SDK) ->|   air-gateway (:5432)  |<- Admin HTTP (:8081) / gRPC (:909
    docker compose ps
    ```
 
-4. **Verify health of all 4 services**:
+4. **Verify health of all 4 services via `air-gateway`**:
    ```bash
-   curl -fsS http://127.0.0.1:8080/healthz   # air-server
-   curl -fsS http://127.0.0.1:8081/healthz   # air-gateway
-   curl -fsS http://127.0.0.1:8082/healthz   # air-read-engine
-   curl -fsS http://127.0.0.1:8083/healthz   # air-pageserver
+   curl -fsS http://127.0.0.1:8081/healthz
+   curl -fsS -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8081/v1/cluster/health
    ```
 
 ---
@@ -137,15 +135,15 @@ Pass `AIR_META_DSN` to both `air-server` and `air-gateway`:
 
 ## Provisioning a Database & Running Operations
 
-### Step 1: Provision a Database via Control Plane
-Run the following `curl` command to provision a new tenant database `demo_db`:
+### Step 1: Provision a Database via `air-gateway`
+Run the following `curl` command to provision a new tenant database `demo_db` across `air-server`, `air-read-engine`, and `air-pageserver`:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8080/v1/databases \
-  -H "Authorization: Bearer air_dev_bootstrap_key" \
+curl -sS -X POST http://127.0.0.1:8081/v1/databases \
+  -H "X-Air-Internal-Token: air-dev-internal-token" \
   -H "Idempotency-Key: idem-demo-db-001" \
   -H "Content-Type: application/json" \
-  -d '{"tenant_id":"demo_db"}'
+  -d '{"tenant_id":"demo_db","account_id":"acct_default"}'
 ```
 
 Output:
@@ -172,11 +170,11 @@ Inspect how the tenant is wired across all components:
 PGPASSWORD=air_meta_pass psql -h 127.0.0.1 -p 5435 -U air_meta -d air_meta \
   -c "SELECT tenant_id, account_id, state, generation, direct_port FROM clusters;"
 
-# Check Pageserver registration
-curl -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8083/v1/namespaces
+# Check Pageserver registration (via gateway gRPC proxy)
+curl -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8081/v1/pageserver/tenants
 
-# Check Read-Engine registration
-curl -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8082/v1/namespaces
+# Check Read-Engine registration (via gateway gRPC proxy)
+curl -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8081/v1/read-engine/tenants
 
 # Check Gateway routing and backend connectivity
 curl -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8081/v1/namespaces/demo_db
@@ -220,12 +218,11 @@ PGPASSWORD=air_meta_pass psql -h 127.0.0.1 -p 5435 -U air_meta -d air_meta \
 | `AIR_MASTER_KEY_HEX` | `air-server`, `air-pageserver` | 64-character hex (32-byte) master key encryption key (KEK) |
 | `AIR_META_DSN` | `air-server`, `air-gateway` | PostgreSQL connection string for platform metadata |
 
-### `air-server` (Control Plane)
+### `air-server` (Primary Compute & Control Backend)
 | Variable | Default (Compose) | Description |
 | :--- | :--- | :--- |
 | `AIR_DATA_DIR` | `/var/lib/air` | Root directory for per-tenant clusters |
 | `AIR_PG_BIN_DIR` | `/usr/lib/postgresql/17/bin` | Path to PostgreSQL 17 binaries |
-| `AIR_HTTP_ADDR` | `0.0.0.0:8080` | Public Control Plane REST API listen address |
 | `AIR_GRPC_ADDR` | `0.0.0.0:9090` | `AirDBControl` gRPC listen address |
 | `AIR_PAGESERVER_GRPC_ADDR` | `air-pageserver:9091` | Pageserver gRPC endpoint |
 | `AIR_READ_ENGINE_GRPC_ADDR` | `air-read-engine:9092` | Read Engine gRPC endpoint |
@@ -242,7 +239,6 @@ PGPASSWORD=air_meta_pass psql -h 127.0.0.1 -p 5435 -U air_meta -d air_meta \
 | :--- | :--- | :--- |
 | `AIR_DATA_DIR` | `/var/lib/air-pageserver` | Root directory for layers and disk cache |
 | `AIR_PAGESERVER_GRPC_ADDR` | `0.0.0.0:9091` | `PageserverService` gRPC listen address |
-| `AIR_PAGESERVER_HTTP_ADDR` | `0.0.0.0:8083` | Admin & health HTTP listen address |
 | `AIR_PAGESERVER_CACHE_MB` | `64` | Maximum size of local LRU layer cache (MB) |
 
 ### `air-read-engine` (Read Replica)
@@ -251,7 +247,6 @@ PGPASSWORD=air_meta_pass psql -h 127.0.0.1 -p 5435 -U air_meta -d air_meta \
 | `AIR_READ_ENGINE_DATA_DIR` | `/var/lib/air-read-engine` | Read engine working directory |
 | `AIR_READ_ENGINE_CACHE_DIR` | `/var/lib/air-read-engine/cache` | Page cache directory |
 | `AIR_READ_ENGINE_PG_PORT` | `5433` | PostgreSQL wire protocol read port |
-| `AIR_READ_ENGINE_HTTP_ADDR` | `0.0.0.0:8082` | Admin & metrics HTTP listen address |
 | `AIR_READ_ENGINE_GRPC_ADDR` | `0.0.0.0:9092` | `ReadEngineService` gRPC listen address |
 | `AIR_PAGESERVER_GRPC_ADDR` | `air-pageserver:9091` | Upstream Pageserver gRPC address |
 

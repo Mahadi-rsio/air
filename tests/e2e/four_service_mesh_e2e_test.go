@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -48,6 +49,21 @@ func doAdminJSON(t *testing.T, method, url, token string, body any) (int, map[st
 	return resp.StatusCode, out
 }
 
+func waitForTCP(t *testing.T, addr, logPath string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 250*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	raw, _ := os.ReadFile(logPath)
+	t.Fatalf("timed out waiting for TCP %s; log:\n%s", addr, string(raw))
+}
+
 func TestE2E_FourServiceGRPCMesh_NamespaceProvisioningAndIsolation(t *testing.T) {
 	if _, err := os.Stat("/usr/lib/postgresql/17/bin/initdb"); err != nil {
 		t.Skipf("PostgreSQL 17 is required: %v", err)
@@ -78,18 +94,15 @@ func TestE2E_FourServiceGRPCMesh_NamespaceProvisioningAndIsolation(t *testing.T)
 	apiKey := "air_mesh_bootstrap_key"
 
 	psGRPCAddr := freeTCPAddr(t)
-	psHTTPAddr := freeTCPAddr(t)
-	airHTTPAddr := freeTCPAddr(t)
 	airGRPCAddr := freeTCPAddr(t)
 	airMetaPort := strings.Split(freeTCPAddr(t), ":")[1]
-	reHTTPAddr := freeTCPAddr(t)
 	reGRPCAddr := freeTCPAddr(t)
 	rePGPort := strings.Split(freeTCPAddr(t), ":")[1]
 	gwPGAddr := freeTCPAddr(t)
 	gwAdminHTTPAddr := freeTCPAddr(t)
 	gwAdminGRPCAddr := freeTCPAddr(t)
 
-	// 1. Start air-pageserver
+	// 1. Start air-pageserver (gRPC only)
 	psLogPath := filepath.Join(rootDir, "pageserver.log")
 	psLog, _ := os.Create(psLogPath)
 	defer psLog.Close()
@@ -97,7 +110,6 @@ func TestE2E_FourServiceGRPCMesh_NamespaceProvisioningAndIsolation(t *testing.T)
 	psCmd.Env = append(os.Environ(),
 		"AIR_DATA_DIR="+filepath.Join(rootDir, "ps-data"),
 		"AIR_PAGESERVER_GRPC_ADDR="+psGRPCAddr,
-		"AIR_PAGESERVER_HTTP_ADDR="+psHTTPAddr,
 		"AIR_INTERNAL_TOKEN="+internalToken,
 		"AIR_MASTER_KEY_HEX="+masterKeyHex,
 	)
@@ -107,9 +119,9 @@ func TestE2E_FourServiceGRPCMesh_NamespaceProvisioningAndIsolation(t *testing.T)
 		t.Fatalf("start air-pageserver: %v", err)
 	}
 	defer stopCmd(psCmd)
-	waitForHTTP200(t, "http://"+psHTTPAddr+"/healthz", psLogPath, 15*time.Second)
+	waitForTCP(t, psGRPCAddr, psLogPath, 15*time.Second)
 
-	// 2. Start air-read-engine (connected to air-pageserver via gRPC)
+	// 2. Start air-read-engine (gRPC + PG wire only, connected to air-pageserver via gRPC)
 	reLogPath := filepath.Join(rootDir, "read-engine.log")
 	reLog, _ := os.Create(reLogPath)
 	defer reLog.Close()
@@ -118,7 +130,6 @@ func TestE2E_FourServiceGRPCMesh_NamespaceProvisioningAndIsolation(t *testing.T)
 		"AIR_READ_ENGINE_DATA_DIR="+filepath.Join(rootDir, "re-data"),
 		"AIR_READ_ENGINE_LISTEN_HOST=127.0.0.1",
 		"AIR_READ_ENGINE_PG_PORT="+rePGPort,
-		"AIR_READ_ENGINE_HTTP_ADDR="+reHTTPAddr,
 		"AIR_READ_ENGINE_GRPC_ADDR="+reGRPCAddr,
 		"AIR_PAGESERVER_GRPC_ADDR="+psGRPCAddr,
 		"AIR_INTERNAL_TOKEN="+internalToken,
@@ -129,9 +140,9 @@ func TestE2E_FourServiceGRPCMesh_NamespaceProvisioningAndIsolation(t *testing.T)
 		t.Fatalf("start air-read-engine: %v", err)
 	}
 	defer stopCmd(reCmd)
-	waitForHTTP200(t, "http://"+reHTTPAddr+"/healthz", reLogPath, 15*time.Second)
+	waitForTCP(t, reGRPCAddr, reLogPath, 15*time.Second)
 
-	// 3. Start air-server (connected to pageserver, read-engine, and gateway admin via gRPC)
+	// 3. Start air-server (gRPC only, connected to pageserver, read-engine, and gateway admin via gRPC)
 	airLogPath := filepath.Join(rootDir, "air-server.log")
 	airLog, _ := os.Create(airLogPath)
 	defer airLog.Close()
@@ -140,7 +151,6 @@ func TestE2E_FourServiceGRPCMesh_NamespaceProvisioningAndIsolation(t *testing.T)
 		"AIR_DATA_DIR="+filepath.Join(rootDir, "air-data"),
 		"AIR_PG_BIN_DIR=/usr/lib/postgresql/17/bin",
 		"AIR_META_PORT="+airMetaPort,
-		"AIR_HTTP_ADDR="+airHTTPAddr,
 		"AIR_GRPC_ADDR="+airGRPCAddr,
 		"AIR_PAGESERVER_GRPC_ADDR="+psGRPCAddr,
 		"AIR_READ_ENGINE_GRPC_ADDR="+reGRPCAddr,
@@ -157,9 +167,9 @@ func TestE2E_FourServiceGRPCMesh_NamespaceProvisioningAndIsolation(t *testing.T)
 		t.Fatalf("start air-server: %v", err)
 	}
 	defer stopCmd(airCmd)
-	waitForHTTP200(t, "http://"+airHTTPAddr+"/healthz", airLogPath, 20*time.Second)
+	waitForTCP(t, airGRPCAddr, airLogPath, 20*time.Second)
 
-	// 4. Start air-gateway (connected to air-server, air-read-engine, and air-pageserver via gRPC)
+	// 4. Start air-gateway (single HTTP Control Plane + PG wire, connected to all 3 backends via gRPC)
 	gwLogPath := filepath.Join(rootDir, "gateway.log")
 	gwLog, _ := os.Create(gwLogPath)
 	defer gwLog.Close()
@@ -168,7 +178,6 @@ func TestE2E_FourServiceGRPCMesh_NamespaceProvisioningAndIsolation(t *testing.T)
 		"AIR_GATEWAY_ADDR="+gwPGAddr,
 		"AIR_GATEWAY_ADMIN_ADDR="+gwAdminHTTPAddr,
 		"AIR_GATEWAY_ADMIN_GRPC_ADDR="+gwAdminGRPCAddr,
-		"AIR_CONTROL_PLANE_URL=http://"+airHTTPAddr,
 		"AIR_DB_GRPC_ADDR="+airGRPCAddr,
 		"AIR_PAGESERVER_GRPC_ADDR="+psGRPCAddr,
 		"AIR_READ_ENGINE_HOST=127.0.0.1",
@@ -186,38 +195,35 @@ func TestE2E_FourServiceGRPCMesh_NamespaceProvisioningAndIsolation(t *testing.T)
 	defer stopCmd(gwCmd)
 	waitForHTTP200(t, "http://"+gwAdminHTTPAddr+"/healthz", gwLogPath, 15*time.Second)
 
-	// 5. Verify internal token auth is enforced on all Admin namespace APIs
-	for name, url := range map[string]string{
-		"pageserver":  "http://" + psHTTPAddr + "/v1/namespaces",
-		"read-engine": "http://" + reHTTPAddr + "/v1/namespaces",
-		"gateway":     "http://" + gwAdminHTTPAddr + "/v1/namespaces",
-	} {
-		code, _ := doAdminJSON(t, http.MethodGet, url, "", nil)
+	// 5. Verify internal token auth is enforced on air-gateway Control Plane APIs
+	for _, path := range []string{"/v1/namespaces", "/v1/cluster/health", "/v1/pageserver/tenants", "/v1/read-engine/tenants"} {
+		code, _ := doAdminJSON(t, http.MethodGet, "http://"+gwAdminHTTPAddr+path, "", nil)
 		if code != http.StatusUnauthorized {
-			t.Fatalf("%s /v1/namespaces without token: expected 401, got %d", name, code)
+			t.Fatalf("gateway %s without token: expected 401, got %d", path, code)
 		}
 	}
 
-	// 6. Provision DB via air-server -> orchestrates air-server -> pageserver -> read-engine -> gateway
+	// 6. Provision DB via air-gateway -> orchestrates air-server -> pageserver -> read-engine via gRPC
 	tenantID := "mesh_ns_alpha"
-	prov := httpCreateDatabase(t, "http://"+airHTTPAddr, apiKey, "idem-"+tenantID, tenantID)
-	if prov.State != "ACTIVE" || prov.Password == "" {
-		t.Fatalf("unexpected provision response: %+v", prov)
+	code, prov := doAdminJSON(t, http.MethodPost, "http://"+gwAdminHTTPAddr+"/v1/databases", internalToken, map[string]any{
+		"tenant_id":  tenantID,
+		"account_id": "acct_mesh",
+	})
+	if code != http.StatusCreated || prov["state"] != "ACTIVE" || prov["password"] == "" {
+		t.Fatalf("unexpected provision response: code=%d body=%+v", code, prov)
 	}
+	username, _ := prov["user"].(string)
+	password, _ := prov["password"].(string)
 
-	// Verify namespace exists on pageserver
-	code, psNS := doAdminJSON(t, http.MethodGet, "http://"+psHTTPAddr+"/v1/namespaces/"+tenantID, internalToken, nil)
+	// Verify namespace exists on pageserver & read-engine via gateway control plane
+	code, psNS := doAdminJSON(t, http.MethodGet, "http://"+gwAdminHTTPAddr+"/v1/pageserver/tenants/"+tenantID, internalToken, nil)
 	if code != http.StatusOK || psNS["exists"] != true {
 		t.Fatalf("pageserver namespace %s missing: status=%d body=%+v", tenantID, code, psNS)
 	}
-
-	// Verify namespace exists on read-engine
-	code, reNS := doAdminJSON(t, http.MethodGet, "http://"+reHTTPAddr+"/v1/namespaces/"+tenantID, internalToken, nil)
+	code, reNS := doAdminJSON(t, http.MethodGet, "http://"+gwAdminHTTPAddr+"/v1/read-engine/tenants/"+tenantID, internalToken, nil)
 	if code != http.StatusOK || reNS["tenant_id"] != tenantID {
 		t.Fatalf("read-engine namespace %s missing: status=%d body=%+v", tenantID, code, reNS)
 	}
-
-	// Verify namespace is registered on gateway and connected to all 3 services
 	code, gwNS := doAdminJSON(t, http.MethodGet, "http://"+gwAdminHTTPAddr+"/v1/namespaces/"+tenantID, internalToken, nil)
 	if code != http.StatusOK || gwNS["air_connected"] != true || gwNS["read_engine_connected"] != true || gwNS["pageserver_connected"] != true {
 		t.Fatalf("gateway namespace %s not connected to all services: status=%d body=%+v", tenantID, code, gwNS)
@@ -226,7 +232,7 @@ func TestE2E_FourServiceGRPCMesh_NamespaceProvisioningAndIsolation(t *testing.T)
 	// 7. Connect through air-gateway using the user namespace and execute SQL end-to-end
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	dsn := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", prov.Username, prov.Password, gwPGAddr, prov.Database)
+	dsn := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", username, password, gwPGAddr, tenantID)
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		t.Fatalf("pgx.Connect through air-gateway failed: %v", err)
@@ -246,37 +252,19 @@ func TestE2E_FourServiceGRPCMesh_NamespaceProvisioningAndIsolation(t *testing.T)
 	}
 	_ = conn.Close(ctx)
 
-	// 8. Verify standalone Admin API namespace creation works on each service
+	// 8. Verify gateway namespace creation orchestrates read-engine + pageserver over gRPC
 	manualNS := "manual_ns_beta"
-	code, _ = doAdminJSON(t, http.MethodPost, "http://"+psHTTPAddr+"/v1/namespaces", internalToken, map[string]any{"namespace": manualNS})
-	if code != http.StatusCreated {
-		t.Fatalf("pageserver POST /v1/namespaces: expected 201, got %d", code)
-	}
-	code, _ = doAdminJSON(t, http.MethodPost, "http://"+reHTTPAddr+"/v1/namespaces", internalToken, map[string]any{"namespace": manualNS})
-	if code != http.StatusCreated {
-		t.Fatalf("read-engine POST /v1/namespaces: expected 201, got %d", code)
-	}
 	code, gwManual := doAdminJSON(t, http.MethodPost, "http://"+gwAdminHTTPAddr+"/v1/namespaces", internalToken, map[string]any{"namespace": manualNS})
 	if code != http.StatusCreated || gwManual["read_engine_connected"] != true || gwManual["pageserver_connected"] != true {
 		t.Fatalf("gateway POST /v1/namespaces: status=%d body=%+v", code, gwManual)
 	}
 
-	// 9. Delete DB via air-server and verify cascade across gateway, read-engine, and pageserver
-	delReq, _ := http.NewRequest(http.MethodDelete, "http://"+airHTTPAddr+"/v1/databases/"+tenantID, nil)
-	delReq.Header.Set("Authorization", "Bearer "+apiKey)
-	delResp, err := http.DefaultClient.Do(delReq)
-	if err != nil {
-		t.Fatalf("DELETE /v1/databases/%s: %v", tenantID, err)
+	// 9. Delete DB via air-gateway and verify cascade across gateway, read-engine, and pageserver
+	code, _ = doAdminJSON(t, http.MethodDelete, "http://"+gwAdminHTTPAddr+"/v1/databases/"+tenantID, internalToken, nil)
+	if code != http.StatusOK {
+		t.Fatalf("DELETE /v1/databases/%s: expected 200, got %d", tenantID, code)
 	}
-	_ = delResp.Body.Close()
-	if delResp.StatusCode != http.StatusOK {
-		t.Fatalf("DELETE /v1/databases/%s: expected 200, got %d", tenantID, delResp.StatusCode)
-	}
-
-	if code, _ := doAdminJSON(t, http.MethodGet, "http://"+reHTTPAddr+"/v1/namespaces/"+tenantID, internalToken, nil); code != http.StatusNotFound {
-		t.Fatalf("expected read-engine namespace %s to be deleted (404), got %d", tenantID, code)
-	}
-	if code, _ := doAdminJSON(t, http.MethodGet, "http://"+psHTTPAddr+"/v1/namespaces/"+tenantID, internalToken, nil); code != http.StatusNotFound {
+	if code, _ := doAdminJSON(t, http.MethodGet, "http://"+gwAdminHTTPAddr+"/v1/pageserver/tenants/"+tenantID, internalToken, nil); code != http.StatusNotFound {
 		t.Fatalf("expected pageserver namespace %s to be deleted (404), got %d", tenantID, code)
 	}
 }

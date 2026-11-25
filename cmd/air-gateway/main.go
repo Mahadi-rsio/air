@@ -118,6 +118,19 @@ func main() {
 	}
 
 	adminGRPCLabel := "disabled"
+	var adminGRPCSrv *gateway.AdminGRPCServer
+	if cfg.AdminGRPCAddr != "" {
+		adminGRPCSrv = gateway.NewAdminGRPCServer(cfg.AdminGRPCAddr, cfg.InternalToken, pools, metrics)
+		adminGRPCSrv.SetNamespaceBackends(discovery, reGRPC, psGRPC)
+		if _, gErr := adminGRPCSrv.Start(); gErr != nil {
+			adminSrv.Stop()
+			discovery.Stop()
+			_ = ln.Close()
+			log.Fatalf("[air-gateway] failed to bind admin gRPC on %s: %v", cfg.AdminGRPCAddr, gErr)
+		}
+		adminGRPCLabel = cfg.AdminGRPCAddr
+		defer adminGRPCSrv.Stop()
+	}
 	readEngineLabel := "disabled"
 	if cfg.ReadEnginePort > 0 {
 		readEngineLabel = fmt.Sprintf("%s:%d", cfg.ReadEngineHost, cfg.ReadEnginePort)

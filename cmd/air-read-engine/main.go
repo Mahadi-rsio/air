@@ -3,12 +3,10 @@ package main
 import (
 	"context"
 	"crypto/subtle"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -26,7 +24,6 @@ import (
 )
 
 type Config struct {
-	HTTPAddr                string
 	GRPCAddr                string
 	ListenHost              string
 	PGPort                  int
@@ -92,7 +89,6 @@ func loadConfig(args []string) Config {
 	fs := flag.NewFlagSet("air-read-engine", flag.ContinueOnError)
 	cfg := Config{}
 	defaultHost := envOr("AIR_READ_ENGINE_HOST", envOr("AIR_READ_ENGINE_LISTEN_HOST", "127.0.0.1"))
-	fs.StringVar(&cfg.HTTPAddr, "http-addr", envOr("AIR_READ_ENGINE_HTTP_ADDR", "127.0.0.1:8082"), "HTTP admin/health listen address")
 	fs.StringVar(&cfg.GRPCAddr, "grpc-addr", envOr("AIR_READ_ENGINE_GRPC_ADDR", "127.0.0.1:9092"), "ReadEngineService gRPC listen address")
 	fs.StringVar(&cfg.ListenHost, "listen-host", defaultHost, "Shared SQLite PG-wire listen address")
 	fs.IntVar(&cfg.PGPort, "pg-port", envIntOr("AIR_READ_ENGINE_PG_PORT", 5433), "Shared SQLite PG-wire port for all tenants")
@@ -182,247 +178,6 @@ func (re *SharedReadEngine) DeleteTenantDB(tenantID string) error {
 		return fmt.Errorf("tenant_id is required")
 	}
 	return re.sqliteRe.DeleteTenantDB(tenantID)
-}
-
-func (re *SharedReadEngine) isAuthorizedHTTP(r *http.Request) bool {
-	tok := re.cfg.PageserverInternalToken
-	if tok == "" {
-		return true
-	}
-	if h := strings.TrimSpace(r.Header.Get("X-Air-Internal-Token")); h != "" {
-		if subtle.ConstantTimeCompare([]byte(h), []byte(tok)) == 1 {
-			return true
-		}
-	}
-	if auth := r.Header.Get("Authorization"); len(auth) > 7 && strings.EqualFold(auth[:7], "Bearer ") {
-		if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(auth[7:])), []byte(tok)) == 1 {
-			return true
-		}
-	}
-	return false
-}
-
-func (re *SharedReadEngine) HTTPHandler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		re.mu.Lock()
-		state := re.state
-		port := re.cfg.PGPort
-		sockDir := re.sockDir
-		re.mu.Unlock()
-		allowed, blocked := re.sqliteRe.Stats()
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":          "ok",
-			"service":         "air-read-engine",
-			"engine":          "sqlite",
-			"mode":            "shared",
-			"state":           state,
-			"host":            re.cfg.ListenHost,
-			"pg_port":         port,
-			"sock_dir":        sockDir,
-			"sqlite_version":  readadapter.SQLiteVersion(),
-			"queries_allowed": allowed,
-			"writes_blocked":  blocked,
-		})
-	})
-	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
-		re.mu.Lock()
-		state := re.state
-		port := re.cfg.PGPort
-		sockDir := re.sockDir
-		re.mu.Unlock()
-		allowed, blocked := re.sqliteRe.Stats()
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"engine":          "sqlite",
-			"mode":            "shared",
-			"state":           state,
-			"host":            re.cfg.ListenHost,
-			"pg_port":         port,
-			"sock_dir":        sockDir,
-			"tenants":         re.sqliteRe.Tenants(),
-			"sqlite_version":  readadapter.SQLiteVersion(),
-			"queries_allowed": allowed,
-			"writes_blocked":  blocked,
-		})
-	})
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(re.sqliteRe.DetailedMetrics())
-	})
-	mux.HandleFunc("/v1/tenants/", func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		path := strings.TrimPrefix(r.URL.Path, "/v1/tenants/")
-		parts := strings.Split(strings.Trim(path, "/"), "/")
-		if len(parts) < 2 {
-			http.Error(w, "invalid path", http.StatusBadRequest)
-			return
-		}
-		tenantID, action := parts[0], parts[1]
-		if re.cfg.Debug {
-			log.Printf("[air-read-engine][DEBUG][http] %s %s tenant=%s action=%s remote=%s",
-				r.Method, r.URL.Path, tenantID, action, r.RemoteAddr)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case r.Method == http.MethodPost && (action == "start" || action == "register"):
-			if err := re.EnsureTenantDB(tenantID); err != nil {
-				if re.cfg.Debug {
-					log.Printf("[air-read-engine][DEBUG][http] %s %s tenant=%s err=%v dur=%s",
-						r.Method, r.URL.Path, tenantID, err, time.Since(start))
-				}
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			if re.cfg.Debug {
-				log.Printf("[air-read-engine][DEBUG][http] %s %s tenant=%s -> ACTIVE dur=%s",
-					r.Method, r.URL.Path, tenantID, time.Since(start))
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"tenant_id": tenantID,
-				"engine":    "sqlite",
-				"host":      re.cfg.ListenHost,
-				"port":      re.cfg.PGPort,
-				"sock_dir":  re.sockDir,
-				"state":     "ACTIVE",
-				"mode":      "shared",
-			})
-		case r.Method == http.MethodPost && action == "sync":
-			var req struct {
-				SQL         string `json:"sql"`
-				LSN         string `json:"lsn"`
-				PrimaryConn string `json:"primary_conninfo"`
-			}
-			_ = json.NewDecoder(r.Body).Decode(&req)
-			if req.PrimaryConn != "" {
-				if err := re.sqliteRe.SyncFromPrimary(r.Context(), tenantID, req.PrimaryConn); err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-			} else if req.SQL != "" {
-				lsn := readadapter.ParsePGLSN(req.LSN)
-				if err := re.sqliteRe.ExecInternal(tenantID, req.SQL, lsn); err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"tenant_id": tenantID,
-				"engine":    "sqlite",
-				"status":    "synced",
-			})
-		case r.Method == http.MethodGet && action == "route":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"tenant_id": tenantID,
-				"engine":    "sqlite",
-				"host":      re.cfg.ListenHost,
-				"port":      re.cfg.PGPort,
-				"sock_dir":  re.sockDir,
-				"state":     re.state,
-				"mode":      "shared",
-			})
-		default:
-			http.Error(w, "not found", http.StatusNotFound)
-		}
-	})
-	handleNamespaces := func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		w.Header().Set("Content-Type", "application/json")
-		if !re.isAuthorizedHTTP(r) {
-			if re.cfg.Debug {
-				log.Printf("[air-read-engine][DEBUG][http] %s %s remote=%s status=401 unauthorized dur=%s",
-					r.Method, r.URL.Path, r.RemoteAddr, time.Since(start))
-			}
-			w.WriteHeader(http.StatusUnauthorized)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
-			return
-		}
-		suffix := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/namespaces"), "/")
-		if re.cfg.Debug {
-			log.Printf("[air-read-engine][DEBUG][http] %s %s suffix=%q remote=%s",
-				r.Method, r.URL.Path, suffix, r.RemoteAddr)
-		}
-		switch {
-		case suffix == "" && r.Method == http.MethodGet:
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"service":    "air-read-engine",
-				"namespaces": re.sqliteRe.Tenants(),
-			})
-		case r.Method == http.MethodPost:
-			var req struct {
-				TenantID  string `json:"tenant_id"`
-				Namespace string `json:"namespace"`
-			}
-			_ = json.NewDecoder(r.Body).Decode(&req)
-			tid := strings.TrimSpace(suffix)
-			if tid == "" {
-				tid = strings.TrimSpace(req.TenantID)
-			}
-			if tid == "" {
-				tid = strings.TrimSpace(req.Namespace)
-			}
-			if tid == "" {
-				w.WriteHeader(http.StatusBadRequest)
-				_ = json.NewEncoder(w).Encode(map[string]string{"error": "tenant_id or namespace is required"})
-				return
-			}
-			if err := re.EnsureTenantDB(tid); err != nil {
-				w.WriteHeader(http.StatusBadRequest)
-				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-				return
-			}
-			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status":    "active",
-				"service":   "air-read-engine",
-				"tenant_id": tid,
-				"namespace": tid,
-				"engine":    "sqlite",
-				"host":      re.cfg.ListenHost,
-				"pg_port":   re.cfg.PGPort,
-			})
-		case suffix != "" && r.Method == http.MethodGet:
-			found := false
-			for _, t := range re.sqliteRe.Tenants() {
-				if t == suffix {
-					found = true
-					break
-				}
-			}
-			if !found {
-				w.WriteHeader(http.StatusNotFound)
-				_ = json.NewEncoder(w).Encode(map[string]string{"error": "namespace not found"})
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"service":   "air-read-engine",
-				"tenant_id": suffix,
-				"namespace": suffix,
-				"engine":    "sqlite",
-				"host":      re.cfg.ListenHost,
-				"pg_port":   re.cfg.PGPort,
-				"state":     re.state,
-			})
-		case suffix != "" && r.Method == http.MethodDelete:
-			if err := re.DeleteTenantDB(suffix); err != nil {
-				w.WriteHeader(http.StatusBadRequest)
-				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status":    "deleted",
-				"service":   "air-read-engine",
-				"tenant_id": suffix,
-			})
-		default:
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
-		}
-	}
-	mux.HandleFunc("/v1/namespaces", handleNamespaces)
-	mux.HandleFunc("/v1/namespaces/", handleNamespaces)
-	return mux
 }
 
 type readEngineGRPCServer struct {
@@ -577,8 +332,8 @@ func main() {
 	log.Printf("[air-read-engine] shared read-only SQLite %s engine listening on %s:%d (sock=%s, cache=%s, pageserver_grpc=%q, debug=%v)",
 		readadapter.SQLiteVersion(), cfg.ListenHost, re.cfg.PGPort, re.sockDir, cfg.SharedBuffers, cfg.PageserverGRPCAddr, cfg.Debug)
 	if cfg.Debug {
-		log.Printf("[air-read-engine][DEBUG][startup] http=%s grpc=%s data_dir=%s cache_dir=%q pageserver_socket=%q pageserver_grpc=%q primary_conninfo_set=%v internal_token_set=%v",
-			cfg.HTTPAddr, cfg.GRPCAddr, cfg.DataDir, cfg.CacheDir, cfg.PageserverSocket, cfg.PageserverGRPCAddr,
+		log.Printf("[air-read-engine][DEBUG][startup] grpc=%s data_dir=%s cache_dir=%q pageserver_socket=%q pageserver_grpc=%q primary_conninfo_set=%v internal_token_set=%v",
+			cfg.GRPCAddr, cfg.DataDir, cfg.CacheDir, cfg.PageserverSocket, cfg.PageserverGRPCAddr,
 			cfg.PrimaryConnInfo != "", cfg.PageserverInternalToken != "")
 	}
 

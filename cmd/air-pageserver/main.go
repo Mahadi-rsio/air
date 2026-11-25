@@ -25,7 +25,6 @@ type Config struct {
 	DataDir           string
 	MasterKeyPath     string
 	GRPCAddr          string
-	HTTPAddr          string
 	SocketPath        string
 	CacheMB           int
 	MemoryLimitMB     int
@@ -76,7 +75,6 @@ func loadConfig(args []string) Config {
 		DataDir:           dataDir,
 		MasterKeyPath:     envOr("AIR_MASTER_KEY_PATH", filepath.Join(dataDir, "master.key")),
 		GRPCAddr:          envOr("AIR_PAGESERVER_GRPC_ADDR", "0.0.0.0:9091"),
-		HTTPAddr:          envOr("AIR_PAGESERVER_HTTP_ADDR", "0.0.0.0:8083"),
 		SocketPath:        envOr("AIR_PAGESERVER_SOCKET", ""),
 		CacheMB:           envIntOr("AIR_PAGESERVER_CACHE_MB", 64),
 		MemoryLimitMB:     envIntOr("AIR_PAGESERVER_MEMORY_MB", 0),
@@ -94,7 +92,6 @@ func loadConfig(args []string) Config {
 	fs.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "Root directory for pageserver layers and cache")
 	fs.StringVar(&cfg.MasterKeyPath, "master-key-path", cfg.MasterKeyPath, "Path to 32-byte master KEK file")
 	fs.StringVar(&cfg.GRPCAddr, "grpc-addr", cfg.GRPCAddr, "Pageserver gRPC listen address")
-	fs.StringVar(&cfg.HTTPAddr, "http-addr", cfg.HTTPAddr, "Pageserver HTTP health/status listen address")
 	fs.StringVar(&cfg.SocketPath, "socket-path", cfg.SocketPath, "Optional Unix socket path for co-located air_smgr/read-engine")
 	fs.IntVar(&cfg.CacheMB, "cache-mb", cfg.CacheMB, "Bounded LRU disk cache size in MB")
 	fs.IntVar(&cfg.MemoryLimitMB, "memory-mb", cfg.MemoryLimitMB, "Pageserver memory limit in MB (0 = auto-detect from cgroup v2)")

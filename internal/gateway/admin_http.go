@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"google.golang.org/grpc/status"
 )
 
 // AdminHTTPServer exposes health, Prometheus/JSON metrics, tenant limits/drain,
@@ -131,6 +133,9 @@ func (s *AdminHTTPServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		code, resp, _ := s.discovery.RevokeAPIKey(keyID)
 		writeJSON(w, code, resp)
+		return
+	}
+	if s.handleClusterAndBackendRoutes(w, r) {
 		return
 	}
 	if s.handleInternalRoute(w, r) {
@@ -310,16 +315,31 @@ func (s *AdminHTTPServer) handleNamespacesRoute(w http.ResponseWriter, r *http.R
 		return true
 
 	case suffix != "" && r.Method == http.MethodDelete:
+		if s.pools != nil {
+			_ = s.pools.RequestDrain(suffix, 2000*time.Millisecond)
+			s.pools.RemoveTenant(suffix)
+		}
 		if s.discovery != nil {
 			s.discovery.EvictCache(suffix)
 		}
-		if s.pools != nil {
-			s.pools.RemoveTenant(suffix)
+		reDeleted := false
+		if s.reGRPC != nil {
+			if _, err := s.reGRPC.DeleteTenant(r.Context(), suffix); err == nil {
+				reDeleted = true
+			}
+		}
+		psPurged := false
+		if s.psGRPC != nil {
+			if _, err := s.psGRPC.PurgeTenant(r.Context(), suffix, ""); err == nil {
+				psPurged = true
+			}
 		}
 		b, _ := json.Marshal(map[string]any{
-			"status":    "deleted",
-			"service":   "air-gateway",
-			"tenant_id": suffix,
+			"status":             "deleted",
+			"service":            "air-gateway",
+			"tenant_id":          suffix,
+			"read_engine_purged": reDeleted,
+			"pageserver_purged":  psPurged,
 		})
 		writeJSON(w, http.StatusOK, string(b))
 		return true
@@ -342,11 +362,19 @@ func (s *AdminHTTPServer) handleDatabasesRoute(w http.ResponseWriter, r *http.Re
 		if r.Method == http.MethodPost {
 			var payload struct {
 				TenantID  string `json:"tenant_id"`
+				Namespace string `json:"namespace"`
 				AccountID string `json:"account_id"`
 			}
 			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 			_ = json.Unmarshal(body, &payload)
-			code, resp, _ := s.discovery.CreateDatabase(payload.TenantID, payload.AccountID, r.Header.Get("Idempotency-Key"))
+			tid := strings.TrimSpace(payload.TenantID)
+			if tid == "" {
+				tid = strings.TrimSpace(payload.Namespace)
+			}
+			code, resp, ok := s.discovery.CreateDatabase(tid, payload.AccountID, r.Header.Get("Idempotency-Key"))
+			if ok && tid != "" {
+				s.ensureNamespaceBackends(r.Context(), tid)
+			}
 			writeJSON(w, code, resp)
 			return true
 		}
@@ -384,7 +412,15 @@ func (s *AdminHTTPServer) handleDatabasesRoute(w http.ResponseWriter, r *http.Re
 			}
 			s.pools.RemoveTenant(tid)
 			s.discovery.EvictCache(tid)
-			code, resp, _ := s.discovery.DeleteDatabase(tid)
+			code, resp, ok := s.discovery.DeleteDatabase(tid)
+			if ok {
+				if s.reGRPC != nil {
+					_, _ = s.reGRPC.DeleteTenant(r.Context(), tid)
+				}
+				if s.psGRPC != nil {
+					_, _ = s.psGRPC.PurgeTenant(r.Context(), tid, "")
+				}
+			}
 			writeJSON(w, code, resp)
 			return true
 		}
@@ -412,7 +448,11 @@ func (s *AdminHTTPServer) handleDatabasesRoute(w http.ResponseWriter, r *http.Re
 		case "suspend":
 			code, resp, _ = s.discovery.SuspendDatabase(tid)
 		case "start":
-			code, resp, _ = s.discovery.StartDatabase(tid)
+			var ok bool
+			code, resp, ok = s.discovery.StartDatabase(tid)
+			if ok && s.reGRPC != nil {
+				_, _ = s.reGRPC.EnsureTenant(r.Context(), tid)
+			}
 		case "lock":
 			code, resp, _ = s.discovery.LockDatabase(tid)
 		case "unlock":
@@ -611,5 +651,276 @@ func (s *AdminHTTPServer) handleInternalRoute(w http.ResponseWriter, r *http.Req
 		return true
 	}
 
+	return false
+}
+
+func (s *AdminHTTPServer) ensureNamespaceBackends(ctx context.Context, tid string) {
+	if s.reGRPC != nil {
+		_, _ = s.reGRPC.EnsureTenant(ctx, tid)
+	}
+	if s.psGRPC != nil {
+		if info, err := s.psGRPC.GetTenantInfo(ctx, tid); err != nil || !info.GetExists() {
+			_, _ = s.psGRPC.EnsureTenant(ctx, tid, "")
+		}
+	}
+}
+
+func (s *AdminHTTPServer) handleClusterAndBackendRoutes(w http.ResponseWriter, r *http.Request) bool {
+	path := r.URL.Path
+	switch {
+	case (path == "/v1/cluster/health" || path == "/v1/status") && r.Method == http.MethodGet:
+		if !s.isAuthorized(r) {
+			writeJSON(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
+			return true
+		}
+		services := map[string]any{
+			"air-gateway": map[string]any{
+				"status":  "ok",
+				"tenants": len(s.discovery.ListCached()),
+			},
+		}
+		if s.discovery != nil {
+			code, _, ok := s.discovery.ListDatabases("")
+			if ok {
+				services["air-server"] = map[string]any{"status": "ok"}
+			} else {
+				services["air-server"] = map[string]any{"status": "degraded", "http_code": code}
+			}
+		}
+		if s.reGRPC != nil {
+			if h, err := s.reGRPC.Health(r.Context()); err == nil {
+				services["air-read-engine"] = map[string]any{
+					"status":          h.GetStatus(),
+					"state":           h.GetState(),
+					"pg_port":         h.GetPgPort(),
+					"queries_allowed": h.GetQueriesAllowed(),
+					"writes_blocked":  h.GetWritesBlocked(),
+				}
+			} else {
+				services["air-read-engine"] = map[string]any{"status": "unavailable", "error": err.Error()}
+			}
+		}
+		if s.psGRPC != nil {
+			if h, err := s.psGRPC.Health(r.Context()); err == nil {
+				services["air-pageserver"] = map[string]any{
+					"status":         h.GetStatus(),
+					"active_tenants": h.GetActiveTenants(),
+				}
+			} else {
+				services["air-pageserver"] = map[string]any{"status": "unavailable", "error": err.Error()}
+			}
+		}
+		b, _ := json.Marshal(map[string]any{
+			"status":   "ok",
+			"services": services,
+		})
+		writeJSON(w, http.StatusOK, string(b))
+		return true
+
+	case path == "/v1/pageserver/flush" && r.Method == http.MethodPost:
+		if !s.isAuthorized(r) {
+			writeJSON(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
+			return true
+		}
+		if s.psGRPC == nil {
+			writeJSON(w, http.StatusServiceUnavailable, `{"error":"pageserver gRPC not configured"}`)
+			return true
+		}
+		resp, err := s.psGRPC.FlushAll(r.Context())
+		if err != nil {
+			st := status.Convert(err)
+			writeJSON(w, grpcToHTTP(st.Code()), makeErrorJSON(st.Message()))
+			return true
+		}
+		b, _ := json.Marshal(map[string]any{"status": resp.GetStatus()})
+		writeJSON(w, http.StatusOK, string(b))
+		return true
+
+	case path == "/v1/pageserver/tenants" && r.Method == http.MethodGet:
+		if !s.isAuthorized(r) {
+			writeJSON(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
+			return true
+		}
+		if s.psGRPC == nil {
+			writeJSON(w, http.StatusServiceUnavailable, `{"error":"pageserver gRPC not configured"}`)
+			return true
+		}
+		resp, err := s.psGRPC.ListTenants(r.Context())
+		if err != nil {
+			st := status.Convert(err)
+			writeJSON(w, grpcToHTTP(st.Code()), makeErrorJSON(st.Message()))
+			return true
+		}
+		items := make([]map[string]any, 0, len(resp.GetTenants()))
+		for _, t := range resp.GetTenants() {
+			items = append(items, map[string]any{
+				"tenant_id":  t.GetTenantId(),
+				"generation": t.GetGeneration(),
+				"last_lsn":   t.GetLastLsn(),
+				"exists":     t.GetExists(),
+			})
+		}
+		b, _ := json.Marshal(map[string]any{"tenants": items})
+		writeJSON(w, http.StatusOK, string(b))
+		return true
+
+	case strings.HasPrefix(path, "/v1/pageserver/tenants/"):
+		if !s.isAuthorized(r) {
+			writeJSON(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
+			return true
+		}
+		if s.psGRPC == nil {
+			writeJSON(w, http.StatusServiceUnavailable, `{"error":"pageserver gRPC not configured"}`)
+			return true
+		}
+		rest := strings.Trim(strings.TrimPrefix(path, "/v1/pageserver/tenants/"), "/")
+		parts := strings.Split(rest, "/")
+		tid := parts[0]
+		if !ValidateTenantID(tid) {
+			writeJSON(w, http.StatusBadRequest, `{"error":"invalid tenant id"}`)
+			return true
+		}
+		if len(parts) == 1 && r.Method == http.MethodGet {
+			info, err := s.psGRPC.GetTenantInfo(r.Context(), tid)
+			if err != nil {
+				st := status.Convert(err)
+				writeJSON(w, grpcToHTTP(st.Code()), makeErrorJSON(st.Message()))
+				return true
+			}
+			if !info.GetExists() {
+				writeJSON(w, http.StatusNotFound, `{"error":"tenant not found"}`)
+				return true
+			}
+			b, _ := json.Marshal(map[string]any{
+				"tenant_id":  info.GetTenantId(),
+				"generation": info.GetGeneration(),
+				"last_lsn":   info.GetLastLsn(),
+				"exists":     info.GetExists(),
+			})
+			writeJSON(w, http.StatusOK, string(b))
+			return true
+		}
+		if len(parts) == 2 && parts[1] == "flush" && r.Method == http.MethodPost {
+			resp, err := s.psGRPC.FlushTenant(r.Context(), tid)
+			if err != nil {
+				st := status.Convert(err)
+				writeJSON(w, grpcToHTTP(st.Code()), makeErrorJSON(st.Message()))
+				return true
+			}
+			b, _ := json.Marshal(map[string]any{
+				"tenant_id": resp.GetTenantId(),
+				"flushed":   resp.GetFlushed(),
+				"file_name": resp.GetFileName(),
+				"start_lsn": resp.GetStartLsn(),
+				"end_lsn":   resp.GetEndLsn(),
+			})
+			writeJSON(w, http.StatusOK, string(b))
+			return true
+		}
+		if len(parts) == 1 && r.Method == http.MethodDelete {
+			resp, err := s.psGRPC.PurgeTenant(r.Context(), tid, r.URL.Query().Get("generation"))
+			if err != nil {
+				st := status.Convert(err)
+				writeJSON(w, grpcToHTTP(st.Code()), makeErrorJSON(st.Message()))
+				return true
+			}
+			b, _ := json.Marshal(map[string]any{
+				"status":    resp.GetStatus(),
+				"tenant_id": resp.GetTenantId(),
+			})
+			writeJSON(w, http.StatusOK, string(b))
+			return true
+		}
+		return false
+
+	case path == "/v1/read-engine/tenants" && r.Method == http.MethodGet:
+		if !s.isAuthorized(r) {
+			writeJSON(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
+			return true
+		}
+		if s.reGRPC == nil {
+			writeJSON(w, http.StatusServiceUnavailable, `{"error":"read-engine gRPC not configured"}`)
+			return true
+		}
+		resp, err := s.reGRPC.ListTenants(r.Context())
+		if err != nil {
+			st := status.Convert(err)
+			writeJSON(w, grpcToHTTP(st.Code()), makeErrorJSON(st.Message()))
+			return true
+		}
+		b, _ := json.Marshal(map[string]any{"tenants": resp.GetTenantIds()})
+		writeJSON(w, http.StatusOK, string(b))
+		return true
+
+	case strings.HasPrefix(path, "/v1/read-engine/tenants/"):
+		if !s.isAuthorized(r) {
+			writeJSON(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
+			return true
+		}
+		if s.reGRPC == nil {
+			writeJSON(w, http.StatusServiceUnavailable, `{"error":"read-engine gRPC not configured"}`)
+			return true
+		}
+		rest := strings.Trim(strings.TrimPrefix(path, "/v1/read-engine/tenants/"), "/")
+		parts := strings.Split(rest, "/")
+		tid := parts[0]
+		if !ValidateTenantID(tid) {
+			writeJSON(w, http.StatusBadRequest, `{"error":"invalid tenant id"}`)
+			return true
+		}
+		if len(parts) == 1 && r.Method == http.MethodGet {
+			route, err := s.reGRPC.GetTenantRoute(r.Context(), tid)
+			if err != nil {
+				st := status.Convert(err)
+				writeJSON(w, grpcToHTTP(st.Code()), makeErrorJSON(st.Message()))
+				return true
+			}
+			b, _ := json.Marshal(map[string]any{
+				"tenant_id": route.GetTenantId(),
+				"engine":    route.GetEngine(),
+				"host":      route.GetHost(),
+				"pg_port":   route.GetPgPort(),
+				"state":     route.GetState(),
+			})
+			writeJSON(w, http.StatusOK, string(b))
+			return true
+		}
+		if len(parts) == 2 && parts[1] == "sync" && r.Method == http.MethodPost {
+			var payload struct {
+				SQL             string `json:"sql"`
+				LSN             string `json:"lsn"`
+				PrimaryConninfo string `json:"primary_conninfo"`
+			}
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			_ = json.Unmarshal(body, &payload)
+			resp, err := s.reGRPC.SyncTenant(r.Context(), tid, payload.SQL, payload.LSN, payload.PrimaryConninfo)
+			if err != nil {
+				st := status.Convert(err)
+				writeJSON(w, grpcToHTTP(st.Code()), makeErrorJSON(st.Message()))
+				return true
+			}
+			b, _ := json.Marshal(map[string]any{
+				"tenant_id": resp.GetTenantId(),
+				"status":    resp.GetStatus(),
+			})
+			writeJSON(w, http.StatusOK, string(b))
+			return true
+		}
+		if len(parts) == 1 && r.Method == http.MethodDelete {
+			resp, err := s.reGRPC.DeleteTenant(r.Context(), tid)
+			if err != nil {
+				st := status.Convert(err)
+				writeJSON(w, grpcToHTTP(st.Code()), makeErrorJSON(st.Message()))
+				return true
+			}
+			b, _ := json.Marshal(map[string]any{
+				"tenant_id": resp.GetTenantId(),
+				"status":    resp.GetStatus(),
+			})
+			writeJSON(w, http.StatusOK, string(b))
+			return true
+		}
+		return false
+	}
 	return false
 }

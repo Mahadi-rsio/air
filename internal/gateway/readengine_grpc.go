@@ -75,6 +75,25 @@ func (c *ReadEngineGRPCClient) DeleteTenant(ctx context.Context, tenantID string
 	return c.client.DeleteTenant(rctx, &pb.ReadEngineTenantRequest{TenantId: tenantID})
 }
 
+// ListTenants lists all tenant IDs registered on air-read-engine.
+func (c *ReadEngineGRPCClient) ListTenants(ctx context.Context) (*pb.ReadEngineListTenantsResponse, error) {
+	rctx, cancel := context.WithTimeout(c.withAuth(ctx), 5*time.Second)
+	defer cancel()
+	return c.client.ListTenants(rctx, &pb.ReadEngineEmpty{})
+}
+
+// SyncTenant triggers SQL or primary_conninfo sync for a tenant on air-read-engine.
+func (c *ReadEngineGRPCClient) SyncTenant(ctx context.Context, tenantID, sql, lsn, primaryConninfo string) (*pb.ReadEngineStatusResponse, error) {
+	rctx, cancel := context.WithTimeout(c.withAuth(ctx), 30*time.Second)
+	defer cancel()
+	return c.client.SyncTenant(rctx, &pb.SyncTenantRequest{
+		TenantId:        tenantID,
+		Sql:             sql,
+		Lsn:             lsn,
+		PrimaryConninfo: primaryConninfo,
+	})
+}
+
 // Close closes the gRPC client connection.
 func (c *ReadEngineGRPCClient) Close() error {
 	if c.conn == nil {
