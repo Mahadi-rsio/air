@@ -39,17 +39,97 @@ type MeteringSaver interface {
 	SaveMeteringBatch(ctx context.Context, entries []MeteringEntry) error
 }
 
-// PGMeteringSaver persists metering batches to the PostgreSQL metadata database.
+// TenantStorageProvider returns the current storage usage in bytes for a tenant.
+type TenantStorageProvider interface {
+	GetTenantStorageBytes(ctx context.Context, tenantID string) (uint64, error)
+}
+
+// TenantUsageDelta represents aggregated metering increments for a single tenant.
+type TenantUsageDelta struct {
+	TenantID       string
+	BandwidthBytes uint64
+	ReadQueries    uint64
+	WriteQueries   uint64
+}
+
+// IsWriteQueryType returns true if a normalized QueryType represents a mutating/write query.
+func IsWriteQueryType(queryType string) bool {
+	switch strings.ToUpper(strings.TrimSpace(queryType)) {
+	case "INSERT", "UPDATE", "DELETE", "MERGE", "DDL", "COPY":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsReadQueryType returns true if a normalized QueryType represents a read query.
+func IsReadQueryType(queryType string) bool {
+	switch strings.ToUpper(strings.TrimSpace(queryType)) {
+	case "SELECT", "EXPLAIN", "SHOW", "EXECUTE", "EXTENDED", "OTHER":
+		return true
+	default:
+		return false
+	}
+}
+
+// AggregateMeteringEntries aggregates raw MeteringEntry records per tenant (DBID)
+// into bandwidth, read query count, and write query count deltas, sorted by TenantID.
+func AggregateMeteringEntries(entries []MeteringEntry) []TenantUsageDelta {
+	if len(entries) == 0 {
+		return nil
+	}
+	byTenant := make(map[string]*TenantUsageDelta)
+	for _, e := range entries {
+		tid := strings.TrimSpace(e.DBID)
+		if tid == "" || tid == "unknown" {
+			continue
+		}
+		d, ok := byTenant[tid]
+		if !ok {
+			d = &TenantUsageDelta{TenantID: tid}
+			byTenant[tid] = d
+		}
+		d.BandwidthBytes += e.BandwidthBytes
+		if IsWriteQueryType(e.QueryType) {
+			d.WriteQueries++
+		} else if IsReadQueryType(e.QueryType) {
+			d.ReadQueries++
+		}
+	}
+	if len(byTenant) == 0 {
+		return nil
+	}
+	out := make([]TenantUsageDelta, 0, len(byTenant))
+	for _, d := range byTenant {
+		out = append(out, *d)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].TenantID < out[j].TenantID
+	})
+	return out
+}
+
+// PGMeteringSaver aggregates parsed metering batches per tenant and updates
+// tenant_usage in the PostgreSQL metadata database.
 type PGMeteringSaver struct {
-	dsn           string
-	mu            sync.Mutex
-	conn          *pgx.Conn
-	schemaEnsured bool
+	dsn             string
+	mu              sync.Mutex
+	conn            *pgx.Conn
+	schemaEnsured   bool
+	storageProvider TenantStorageProvider
 }
 
 // NewPGMeteringSaver creates a PostgreSQL-backed MeteringSaver for metaDSN.
 func NewPGMeteringSaver(metaDSN string) *PGMeteringSaver {
 	return &PGMeteringSaver{dsn: metaDSN}
+}
+
+// SetStorageProvider configures an optional TenantStorageProvider (e.g. PageserverGRPCClient)
+// used to refresh each tenant's storage_bytes when flushing usage updates.
+func (s *PGMeteringSaver) SetStorageProvider(p TenantStorageProvider) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.storageProvider = p
 }
 
 func (s *PGMeteringSaver) ensureConnLocked(ctx context.Context) (*pgx.Conn, error) {
@@ -71,23 +151,20 @@ func (s *PGMeteringSaver) ensureConnLocked(ctx context.Context) (*pgx.Conn, erro
 	s.conn = conn
 	if !s.schemaEnsured {
 		stmts := []string{
-			`CREATE TABLE IF NOT EXISTS query_metering (
-				id BIGSERIAL PRIMARY KEY,
-				recorded_at TIMESTAMPTZ NOT NULL,
-				db_id TEXT NOT NULL,
-				bandwidth_bytes BIGINT NOT NULL,
-				query_time_us BIGINT NOT NULL,
-				query_type TEXT NOT NULL,
-				created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			`CREATE TABLE IF NOT EXISTS tenant_usage (
+				tenant_id TEXT PRIMARY KEY,
+				bandwidth_bytes BIGINT NOT NULL DEFAULT 0,
+				read_queries BIGINT NOT NULL DEFAULT 0,
+				write_queries BIGINT NOT NULL DEFAULT 0,
+				storage_bytes BIGINT NOT NULL DEFAULT 0,
+				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 			)`,
-			`CREATE INDEX IF NOT EXISTS idx_query_metering_db_recorded ON query_metering(db_id, recorded_at DESC)`,
-			`CREATE INDEX IF NOT EXISTS idx_query_metering_recorded ON query_metering(recorded_at DESC)`,
 		}
 		for _, stmt := range stmts {
 			if _, err := conn.Exec(ctx, stmt); err != nil {
 				_ = conn.Close(context.Background())
 				s.conn = nil
-				return nil, fmt.Errorf("ensure query_metering schema failed: %w", err)
+				return nil, fmt.Errorf("ensure tenant_usage schema failed: %w", err)
 			}
 		}
 		s.schemaEnsured = true
@@ -95,11 +172,38 @@ func (s *PGMeteringSaver) ensureConnLocked(ctx context.Context) (*pgx.Conn, erro
 	return s.conn, nil
 }
 
-// SaveMeteringBatch inserts a batch of MeteringEntry rows using PostgreSQL COPY.
+// SaveMeteringBatch aggregates parsed MeteringEntry rows per tenant and updates
+// bandwidth_bytes, read_queries, write_queries, and storage_bytes in tenant_usage.
 func (s *PGMeteringSaver) SaveMeteringBatch(ctx context.Context, entries []MeteringEntry) error {
-	if len(entries) == 0 {
+	deltas := AggregateMeteringEntries(entries)
+	if len(deltas) == 0 {
 		return nil
 	}
+
+	s.mu.Lock()
+	storageProvider := s.storageProvider
+	s.mu.Unlock()
+
+	type tenantUpdate struct {
+		delta      TenantUsageDelta
+		storage    uint64
+		hasStorage bool
+	}
+	updates := make([]tenantUpdate, len(deltas))
+	for i, d := range deltas {
+		u := tenantUpdate{delta: d}
+		if storageProvider != nil {
+			sz, err := storageProvider.GetTenantStorageBytes(ctx, d.TenantID)
+			if err != nil {
+				log.Printf("[air-gateway] metering storage lookup failed for %s: %v", d.TenantID, err)
+			} else {
+				u.storage = sz
+				u.hasStorage = true
+			}
+		}
+		updates[i] = u
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -116,28 +220,32 @@ func (s *PGMeteringSaver) SaveMeteringBatch(ctx context.Context, entries []Meter
 	}
 	defer tx.Rollback(ctx)
 
-	rows := make([][]any, 0, len(entries))
-	for _, e := range entries {
-		rows = append(rows, []any{
-			e.Date.UTC(),
-			e.DBID,
-			int64(e.BandwidthBytes),
-			int64(e.QueryTimeUs),
-			e.QueryType,
-		})
-	}
-
-	_, err = tx.CopyFrom(
-		ctx,
-		pgx.Identifier{"query_metering"},
-		[]string{"recorded_at", "db_id", "bandwidth_bytes", "query_time_us", "query_type"},
-		pgx.CopyFromRows(rows),
-	)
-	if err != nil {
-		return fmt.Errorf("copy query_metering failed: %w", err)
+	const upsertSQL = `
+		INSERT INTO tenant_usage (tenant_id, bandwidth_bytes, read_queries, write_queries, storage_bytes, updated_at)
+		VALUES ($1, $2, $3, $4, $5, now())
+		ON CONFLICT (tenant_id) DO UPDATE SET
+			bandwidth_bytes = tenant_usage.bandwidth_bytes + EXCLUDED.bandwidth_bytes,
+			read_queries    = tenant_usage.read_queries + EXCLUDED.read_queries,
+			write_queries   = tenant_usage.write_queries + EXCLUDED.write_queries,
+			storage_bytes   = CASE WHEN $6 THEN EXCLUDED.storage_bytes ELSE tenant_usage.storage_bytes END,
+			updated_at      = now()
+	`
+	for _, u := range updates {
+		if _, err := tx.Exec(
+			ctx,
+			upsertSQL,
+			u.delta.TenantID,
+			int64(u.delta.BandwidthBytes),
+			int64(u.delta.ReadQueries),
+			int64(u.delta.WriteQueries),
+			int64(u.storage),
+			u.hasStorage,
+		); err != nil {
+			return fmt.Errorf("upsert tenant_usage (%s) failed: %w", u.delta.TenantID, err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit query_metering failed: %w", err)
+		return fmt.Errorf("commit tenant_usage failed: %w", err)
 	}
 	return nil
 }

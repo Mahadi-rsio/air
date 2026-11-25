@@ -99,6 +99,22 @@ func (c *PageserverGRPCClient) PurgeTenant(ctx context.Context, tenantID, genera
 	})
 }
 
+// GetTenantStorageBytes returns the total logical storage bytes tracked for tenantID on air-pageserver.
+func (c *PageserverGRPCClient) GetTenantStorageBytes(ctx context.Context, tenantID string) (uint64, error) {
+	rctx, cancel := context.WithTimeout(c.withAuth(ctx), 5*time.Second)
+	defer cancel()
+	resp, err := c.client.GetDBSize(rctx, &pb.GetDBSizeRequest{
+		TenantId: tenantID,
+		SpcOid:   0,
+		DbOid:    0,
+		Lsn:      0,
+	})
+	if err != nil {
+		return 0, err
+	}
+	return resp.GetSizeBytes(), nil
+}
+
 // Addr returns the configured pageserver gRPC address.
 func (c *PageserverGRPCClient) Addr() string {
 	return c.addr

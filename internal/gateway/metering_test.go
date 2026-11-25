@@ -263,3 +263,31 @@ func TestMeteringLogger_TenantPoolIntegration(t *testing.T) {
 		t.Fatalf("unexpected TenantPool metering entry: %+v", got[0])
 	}
 }
+
+func TestAggregateMeteringEntries(t *testing.T) {
+	entries := []MeteringEntry{
+		{DBID: "tenant_b", BandwidthBytes: 100, QueryType: "SELECT"},
+		{DBID: "tenant_a", BandwidthBytes: 250, QueryType: "INSERT"},
+		{DBID: "tenant_a", BandwidthBytes: 150, QueryType: "SELECT"},
+		{DBID: "tenant_a", BandwidthBytes: 50, QueryType: "DDL"},
+		{DBID: "tenant_a", BandwidthBytes: 20, QueryType: "TX"},
+		{DBID: "tenant_a", BandwidthBytes: 30, QueryType: "SET"},
+		{DBID: "tenant_b", BandwidthBytes: 400, QueryType: "UPDATE"},
+		{DBID: "tenant_b", BandwidthBytes: 200, QueryType: "EXPLAIN"},
+		{DBID: "unknown", BandwidthBytes: 999, QueryType: "SELECT"},
+		{DBID: "", BandwidthBytes: 999, QueryType: "INSERT"},
+	}
+
+	deltas := AggregateMeteringEntries(entries)
+	if len(deltas) != 2 {
+		t.Fatalf("expected 2 tenant deltas, got %d: %+v", len(deltas), deltas)
+	}
+
+	// Sorted by TenantID: tenant_a, then tenant_b.
+	if deltas[0].TenantID != "tenant_a" || deltas[0].BandwidthBytes != 500 || deltas[0].ReadQueries != 1 || deltas[0].WriteQueries != 2 {
+		t.Fatalf("unexpected tenant_a delta: %+v", deltas[0])
+	}
+	if deltas[1].TenantID != "tenant_b" || deltas[1].BandwidthBytes != 700 || deltas[1].ReadQueries != 2 || deltas[1].WriteQueries != 1 {
+		t.Fatalf("unexpected tenant_b delta: %+v", deltas[1])
+	}
+}

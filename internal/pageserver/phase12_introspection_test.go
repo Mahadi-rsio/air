@@ -117,6 +117,13 @@ func TestPhase12StorageIntrospectionSizesAcrossForksDropsTruncateAndRestart(t *t
 	if gotDB2Bytes != uint64(3*PageSize) {
 		t.Fatalf("GetDBSize(db2) = %d, want %d", gotDB2Bytes, 3*PageSize)
 	}
+	gotTenantTotalBytes, err := tl.GetDBSize(ctx, 0, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotTenantTotalBytes != wantDB1Bytes+uint64(3*PageSize) {
+		t.Fatalf("GetDBSize(0, 0) = %d, want %d", gotTenantTotalBytes, wantDB1Bytes+uint64(3*PageSize))
+	}
 
 	// Truncate relHeap main fork from 8 blocks -> 3 blocks via XLogSmgrTruncate WAL record.
 	truncData := make([]byte, 20)

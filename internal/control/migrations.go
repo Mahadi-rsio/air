@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-const currentSchemaVersion = 6
+const currentSchemaVersion = 7
 
 func (cp *ControlPlane) runMigrations(ctx context.Context) error {
 	if _, err := cp.db.Exec(ctx, `
@@ -235,6 +235,32 @@ func (cp *ControlPlane) runMigrations(ctx context.Context) error {
 		for _, s := range stmts {
 			if _, err := tx.Exec(ctx, s); err != nil {
 				return fmt.Errorf("migration v6 failed: %w", err)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+	}
+	if current < 7 {
+		tx, err := cp.db.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		stmts := []string{
+			`CREATE TABLE IF NOT EXISTS tenant_usage (
+				tenant_id TEXT PRIMARY KEY,
+				bandwidth_bytes BIGINT NOT NULL DEFAULT 0,
+				read_queries BIGINT NOT NULL DEFAULT 0,
+				write_queries BIGINT NOT NULL DEFAULT 0,
+				storage_bytes BIGINT NOT NULL DEFAULT 0,
+				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			)`,
+			`INSERT INTO schema_migrations(version) VALUES (7) ON CONFLICT DO NOTHING`,
+		}
+		for _, s := range stmts {
+			if _, err := tx.Exec(ctx, s); err != nil {
+				return fmt.Errorf("migration v7 failed: %w", err)
 			}
 		}
 		if err := tx.Commit(ctx); err != nil {

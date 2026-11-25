@@ -1366,13 +1366,15 @@ func (t *Timeline) GetRelExists(ctx context.Context, spcOID, dbOID, relNumber ui
 }
 
 // GetDBSize returns the byte size of a database across all its live tracked relation forks.
+// When both spcOID and dbOID are 0, it returns the total byte size across all relations for the tenant.
 func (t *Timeline) GetDBSize(ctx context.Context, spcOID, dbOID uint32, _ uint64) (uint64, error) {
 	t.seedAllRelSizes(ctx)
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	var total uint64
+	all := spcOID == 0 && dbOID == 0
 	for k, nblocks := range t.relSizes {
-		if k.SpcOID == spcOID && k.DbOID == dbOID {
+		if all || (k.SpcOID == spcOID && k.DbOID == dbOID) {
 			total += uint64(nblocks) * uint64(PageSize)
 		}
 	}

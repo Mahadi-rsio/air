@@ -42,9 +42,11 @@ func main() {
 		adaptiveCtrl = gateway.NewAdaptiveController(writeGov, telStore, cfg.WriteControllerInterval)
 		adaptiveCtrl.Start()
 	}
+	var pgMeteringSaver *gateway.PGMeteringSaver
 	var meteringSaver gateway.MeteringSaver
 	if cfg.MetaDSN != "" {
-		meteringSaver = gateway.NewPGMeteringSaver(cfg.MetaDSN)
+		pgMeteringSaver = gateway.NewPGMeteringSaver(cfg.MetaDSN)
+		meteringSaver = pgMeteringSaver
 	}
 	meteringLogger, err := gateway.NewMeteringLogger(cfg.MeteringLogDir, cfg.MeteringMaxFileBytes, cfg.MeteringFlushInterval, meteringSaver)
 	if err != nil {
@@ -79,6 +81,9 @@ func main() {
 		if psErr != nil {
 			log.Printf("[air-gateway] pageserver gRPC dial warning (%s): %v", cfg.PageserverGRPCAddr, psErr)
 		} else {
+			if pgMeteringSaver != nil {
+				pgMeteringSaver.SetStorageProvider(psGRPC)
+			}
 			log.Printf("[air-gateway] connected to air-pageserver via gRPC (%s)", cfg.PageserverGRPCAddr)
 		}
 	}
