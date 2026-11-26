@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Mahadi-rsio/air/internal/backup"
@@ -419,4 +421,106 @@ func NewGRPCPoolDrainFn(gatewayAdminGRPCAddr, internalToken string) (func(tenant
 		return nil
 	}
 	return drainFn, conn.Close, nil
+}
+
+// NewCoordinatedGRPCPoolDrainFn fans out DrainTenant across all resolved Gateway
+// instances (static addresses and/or DNS discovery). Suspension is deferred if
+// Gateway membership cannot be verified or any Gateway fails to acknowledge.
+func NewCoordinatedGRPCPoolDrainFn(
+	staticAddrs []string,
+	discoveryHost string,
+	discoveryPort int,
+	internalToken string,
+	requireMembership bool,
+) func(tenantID string, timeout time.Duration) error {
+	if discoveryPort <= 0 {
+		discoveryPort = 9093
+	}
+	return func(tenantID string, timeout time.Duration) error {
+		if timeout <= 0 {
+			timeout = 3 * time.Second
+		}
+		targetSet := make(map[string]struct{})
+		for _, a := range staticAddrs {
+			if a = strings.TrimSpace(a); a != "" {
+				targetSet[a] = struct{}{}
+			}
+		}
+		if host := strings.TrimSpace(discoveryHost); host != "" {
+			rCtx, rCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			ips, err := net.DefaultResolver.LookupHost(rCtx, host)
+			rCancel()
+			if err != nil {
+				return fmt.Errorf("%w: gateway membership lookup failed for %s: %v", cell.ErrDrainVetoed, host, err)
+			}
+			for _, ip := range ips {
+				targetSet[net.JoinHostPort(ip, fmt.Sprintf("%d", discoveryPort))] = struct{}{}
+			}
+		}
+		if len(targetSet) == 0 {
+			if requireMembership {
+				return fmt.Errorf("%w: no gateway instances available to acknowledge drain", cell.ErrDrainVetoed)
+			}
+			return nil
+		}
+
+		targets := make([]string, 0, len(targetSet))
+		for t := range targetSet {
+			targets = append(targets, t)
+		}
+
+		var (
+			wg       sync.WaitGroup
+			errMu    sync.Mutex
+			firstErr error
+		)
+		for _, addr := range targets {
+			wg.Add(1)
+			go func(targetAddr string) {
+				defer wg.Done()
+				dialOpt, err := meshtransport.DialOption(targetAddr)
+				if err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("%w: gateway %s dial option: %v", cell.ErrDrainVetoed, targetAddr, err)
+					}
+					errMu.Unlock()
+					return
+				}
+				conn, err := grpc.NewClient(targetAddr, dialOpt)
+				if err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("%w: gateway %s unreachable: %v", cell.ErrDrainVetoed, targetAddr, err)
+					}
+					errMu.Unlock()
+					return
+				}
+				defer conn.Close()
+
+				client := pb.NewGatewayAdminClient(conn)
+				ctx, cancel := context.WithTimeout(context.Background(), timeout+2*time.Second)
+				defer cancel()
+				if internalToken != "" {
+					ctx = metadata.AppendToOutgoingContext(ctx, "x-air-internal-token", internalToken)
+				}
+				if _, err := client.DrainTenant(ctx, &pb.DrainTenantRequest{
+					TenantId:  tenantID,
+					TimeoutMs: int32(timeout.Milliseconds()),
+				}); err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						if st, ok := status.FromError(err); ok && st.Code() == codes.FailedPrecondition {
+							firstErr = fmt.Errorf("%w: gateway %s: %s", cell.ErrDrainVetoed, targetAddr, st.Message())
+						} else {
+							firstErr = fmt.Errorf("%w: gateway %s drain failed: %v", cell.ErrDrainVetoed, targetAddr, err)
+						}
+					}
+					errMu.Unlock()
+				}
+			}(addr)
+		}
+		wg.Wait()
+		return firstErr
+	}
 }

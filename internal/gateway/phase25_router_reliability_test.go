@@ -211,7 +211,7 @@ func TestPhase25_CancelRequest_UnblocksQueuedWriteGovernor(t *testing.T) {
 		// Strip 8-byte header? forwardCancelRequest reads the 8-byte (pid, secret) payload after reading header.
 		_, _ = cClient.Write(creq[8:])
 	}()
-	forwardCancelRequest(cServer, cancelReg)
+	forwardCancelRequest(cServer, cancelReg, nil)
 	_ = cServer.Close()
 
 	select {

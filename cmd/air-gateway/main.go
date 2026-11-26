@@ -37,6 +37,13 @@ func isLoopbackListenAddr(addr string) bool {
 }
 
 func main() {
+	for _, a := range os.Args[1:] {
+		if a == "--metering-reconcile" {
+			runMeteringReconcileCLI(os.Args[1:])
+			return
+		}
+	}
+
 	cfg := gateway.LoadConfig(os.Args[1:])
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("[air-gateway] invalid config: %v", err)
@@ -82,14 +89,31 @@ func main() {
 		pgMeteringSaver = gateway.NewPGMeteringSaver(cfg.MetaDSN)
 		meteringSaver = pgMeteringSaver
 	}
-	meteringLogger, err := gateway.NewMeteringLogger(cfg.MeteringLogDir, cfg.MeteringMaxFileBytes, cfg.MeteringFlushInterval, meteringSaver)
+	meteringLogDir := cfg.MeteringLogDir
+	if cfg.BillingEnabled && !cfg.MeteringDirExplicit {
+		meteringLogDir = ""
+	}
+	meteringLogger, err := gateway.NewMeteringLoggerWithOptions(gateway.MeteringLoggerOptions{
+		LogDir:          meteringLogDir,
+		GatewayID:       cfg.GatewayID,
+		BillingEnabled:  cfg.BillingEnabled,
+		MaxFileBytes:    cfg.MeteringMaxFileBytes,
+		MaxSpoolBytes:   cfg.MeteringMaxSpoolBytes,
+		FlushInterval:   cfg.MeteringFlushInterval,
+		SyncOnWrite:     cfg.MeteringSyncOnWrite,
+		Saver:           meteringSaver,
+		RequireWritable: true,
+	})
 	if err != nil {
-		log.Printf("[air-gateway] metering logger disabled: %v", err)
+		log.Printf("[air-gateway] metering logger unavailable (readiness will fail if billing enabled): %v", err)
 	} else {
 		meteringLogger.Start()
 		pools.SetMeteringLogger(meteringLogger)
-		log.Printf("[air-gateway] query metering enabled (dir=%s, max_file_bytes=%d, flush_interval=%s)",
-			cfg.MeteringLogDir, cfg.MeteringMaxFileBytes, cfg.MeteringFlushInterval)
+		log.Printf("[air-gateway] query metering enabled (dir=%s, max_file_bytes=%d, max_spool_bytes=%d, flush_interval=%s, billing=%v)",
+			meteringLogDir, cfg.MeteringMaxFileBytes, cfg.MeteringMaxSpoolBytes, cfg.MeteringFlushInterval, cfg.BillingEnabled)
+	}
+	if cfg.MaxAggregateBackends > 0 {
+		pools.SetAggregateMaxBackends(cfg.MaxAggregateBackends)
 	}
 	if cfg.ReadEnginePort > 0 || cfg.ReadEngineSockDir != "" {
 		pools.SetReadEngineEndpoint(cfg.ReadEngineHost, cfg.ReadEngineSockDir, cfg.ReadEnginePort)
@@ -122,6 +146,8 @@ func main() {
 		}
 	}
 	cancelReg := gateway.NewCancelRegistry()
+	cancelRouter := gateway.NewCancelRouter(cancelReg, cfg.InternalToken, cfg.GatewayPeers, cfg.GatewayDiscoveryHost, cfg.PeerAdminPort)
+	defer cancelRouter.Close()
 
 	discovery, err := gateway.NewTenantDiscovery(cfg)
 	if err != nil {
@@ -141,12 +167,36 @@ func main() {
 	)
 	discovery.Start()
 
+	lifecycle := gateway.NewGatewayLifecycle(cfg.GatewayID, cfg.RequireTLS, &tlsCtx, discovery, pools, metrics, meteringLogger, reGRPC, psGRPC)
+	if cfg.CordonedOnStart {
+		lifecycle.Cordon()
+	}
+
 	adminSrv := gateway.NewAdminHTTPServer(cfg.AdminAddr, cfg.InternalToken, discovery, pools, metrics)
 	adminSrv.SetNamespaceBackends(reGRPC, psGRPC)
 	adminSrv.SetTelemetryStore(telStore)
+	adminSrv.SetLifecycle(lifecycle, meteringLogger)
 	if err := adminSrv.Start(); err != nil {
 		discovery.Stop()
 		log.Fatalf("[air-gateway] failed to bind admin HTTP on %s: %v", cfg.AdminAddr, err)
+	}
+
+	var privateAdminSrv *gateway.AdminHTTPServer
+	if cfg.PrivateHTTPAddr != "" {
+		if cfg.InternalToken == "" {
+			adminSrv.Stop()
+			discovery.Stop()
+			log.Fatalf("[air-gateway] AIR_INTERNAL_TOKEN must be set when AIR_GATEWAY_PRIVATE_HTTP_ADDR is configured (%s)", cfg.PrivateHTTPAddr)
+		}
+		privateAdminSrv = gateway.NewAdminHTTPServer(cfg.PrivateHTTPAddr, cfg.InternalToken, discovery, pools, metrics)
+		privateAdminSrv.SetNamespaceBackends(reGRPC, psGRPC)
+		privateAdminSrv.SetTelemetryStore(telStore)
+		privateAdminSrv.SetLifecycle(lifecycle, meteringLogger)
+		if err := privateAdminSrv.Start(); err != nil {
+			adminSrv.Stop()
+			discovery.Stop()
+			log.Fatalf("[air-gateway] failed to bind private admin HTTP on %s: %v", cfg.PrivateHTTPAddr, err)
+		}
 	}
 
 	ln, err := net.Listen("tcp", cfg.GatewayAddr)
@@ -161,14 +211,17 @@ func main() {
 	if cfg.AdminGRPCAddr != "" {
 		adminGRPCSrv = gateway.NewAdminGRPCServer(cfg.AdminGRPCAddr, cfg.InternalToken, pools, metrics)
 		adminGRPCSrv.SetNamespaceBackends(discovery, reGRPC, psGRPC)
+		adminGRPCSrv.SetMeshHandlers(cancelReg, lifecycle)
 		if _, gErr := adminGRPCSrv.Start(); gErr != nil {
 			adminSrv.Stop()
+			if privateAdminSrv != nil {
+				privateAdminSrv.Stop()
+			}
 			discovery.Stop()
 			_ = ln.Close()
 			log.Fatalf("[air-gateway] failed to bind admin gRPC on %s: %v", cfg.AdminGRPCAddr, gErr)
 		}
 		adminGRPCLabel = cfg.AdminGRPCAddr
-		defer adminGRPCSrv.Stop()
 	}
 	readEngineLabel := "disabled"
 	if cfg.ReadEnginePort > 0 {
@@ -204,6 +257,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
+		lifecycle.MarkShuttingDown()
 		running.Store(false)
 		_ = ln.Close()
 	}()
@@ -229,16 +283,32 @@ func main() {
 		clientsWG.Add(1)
 		go func(c net.Conn) {
 			defer clientsWG.Done()
-			gateway.HandleClientConnection(c, cfg, &tlsCtx, discovery, pools, metrics, cancelReg)
+			gateway.HandleClientConnectionWithCancelRouter(c, cfg, &tlsCtx, discovery, pools, metrics, cancelReg, cancelRouter)
 		}(conn)
 	}
 
-	log.Println("[air-gateway] shutting down...")
+	log.Println("[air-gateway] shutting down, draining active client sessions...")
+	done := make(chan struct{})
+	go func() {
+		clientsWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+	}
+
 	if adaptiveCtrl != nil {
 		adaptiveCtrl.Stop()
 	}
 	close(reaperStop)
 	reaperWG.Wait()
+	if adminGRPCSrv != nil {
+		adminGRPCSrv.Stop()
+	}
+	if privateAdminSrv != nil {
+		privateAdminSrv.Stop()
+	}
 	adminSrv.Stop()
 	discovery.Stop()
 	if reGRPC != nil {
@@ -251,14 +321,21 @@ func main() {
 	if meteringLogger != nil {
 		meteringLogger.Stop()
 	}
+}
 
-	done := make(chan struct{})
-	go func() {
-		clientsWG.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
+func runMeteringReconcileCLI(args []string) {
+	cfg := gateway.LoadConfig(args)
+	apply := false
+	for _, a := range args {
+		if a == "--apply" {
+			apply = true
+		}
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	reports, err := gateway.ReconcileLegacySpool(ctx, cfg.MeteringLogDir, cfg.MetaDSN, apply)
+	if err != nil {
+		log.Fatalf("[air-gateway] metering reconcile failed: %v", err)
+	}
+	fmt.Println(gateway.MarshalLegacyReport(reports))
 }

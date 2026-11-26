@@ -39,8 +39,19 @@ type Config struct {
 	ReadEngineGRPCAddr    string
 	PageserverGRPCAddr    string
 	MeteringLogDir        string
+	MeteringDirExplicit   bool
+	BillingEnabled        bool
+	GatewayID             string
 	MeteringMaxFileBytes  int64
+	MeteringMaxSpoolBytes int64
 	MeteringFlushInterval time.Duration
+	MeteringSyncOnWrite   bool
+	CordonedOnStart       bool
+	GatewayPeers          []string
+	GatewayDiscoveryHost  string
+	PeerAdminPort         int
+	PrivateHTTPAddr       string
+	MaxAggregateBackends  int
 
 	// Phase 20: Resource-Aware Write Governor
 	WriteGovernorEnabled    bool
@@ -78,7 +89,9 @@ func DefaultConfig() Config {
 		ReadEnginePort:          5433,
 		MeteringLogDir:          filepath.Join(os.TempDir(), "air-gateway-metering"),
 		MeteringMaxFileBytes:    10 * 1024 * 1024,
+		MeteringMaxSpoolBytes:   256 * 1024 * 1024,
 		MeteringFlushInterval:   2 * time.Minute,
+		PeerAdminPort:           9093,
 		WriteGovernorEnabled:    true,
 		WriteMaxGlobal:          32,
 		WriteMinGlobal:          2,
@@ -150,15 +163,43 @@ func LoadConfig(args []string) Config {
 	c.ReadEnginePort = envIntMin("AIR_READ_ENGINE_PORT", c.ReadEnginePort, 0)
 	c.ReadEngineGRPCAddr = envOr("AIR_READ_ENGINE_GRPC_ADDR", "")
 	c.PageserverGRPCAddr = envOr("AIR_PAGESERVER_GRPC_ADDR", "")
-	c.MeteringLogDir = envOr("AIR_METERING_LOG_DIR", c.MeteringLogDir)
+	if v := strings.TrimSpace(os.Getenv("AIR_METERING_LOG_DIR")); v != "" {
+		c.MeteringLogDir = v
+		c.MeteringDirExplicit = true
+	}
+	c.BillingEnabled = envBool("AIR_BILLING_ENABLED", false)
+	c.GatewayID = envOr("AIR_GATEWAY_ID", envOr("FLY_MACHINE_ID", ""))
+	if c.GatewayID == "" {
+		if hn, err := os.Hostname(); err == nil && hn != "" {
+			c.GatewayID = hn
+		}
+	}
 	if v := os.Getenv("AIR_METERING_MAX_FILE_BYTES"); v != "" {
 		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
 			c.MeteringMaxFileBytes = parsed
 		}
 	}
+	if v := os.Getenv("AIR_METERING_MAX_SPOOL_BYTES"); v != "" {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed >= 0 {
+			c.MeteringMaxSpoolBytes = parsed
+		}
+	}
 	if sec := envInt("AIR_METERING_FLUSH_INTERVAL_SEC", int(c.MeteringFlushInterval.Seconds())); sec > 0 {
 		c.MeteringFlushInterval = time.Duration(sec) * time.Second
 	}
+	c.MeteringSyncOnWrite = envBool("AIR_METERING_SYNC_ON_WRITE", false)
+	c.CordonedOnStart = envBool("AIR_GATEWAY_CORDONED", false)
+	if peers := strings.TrimSpace(os.Getenv("AIR_GATEWAY_PEERS")); peers != "" {
+		for _, p := range strings.Split(peers, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				c.GatewayPeers = append(c.GatewayPeers, p)
+			}
+		}
+	}
+	c.GatewayDiscoveryHost = envOr("AIR_GATEWAY_DISCOVERY_HOST", "")
+	c.PeerAdminPort = envInt("AIR_GATEWAY_PEER_ADMIN_PORT", c.PeerAdminPort)
+	c.PrivateHTTPAddr = envOr("AIR_GATEWAY_PRIVATE_HTTP_ADDR", "")
+	c.MaxAggregateBackends = envIntMin("AIR_MAX_AGGREGATE_BACKENDS", 0, 0)
 
 	c.WriteGovernorEnabled = envBool("AIR_WRITE_GOVERNOR_ENABLED", c.WriteGovernorEnabled)
 	c.WriteMaxGlobal = envInt("AIR_WRITE_MAX_GLOBAL", c.WriteMaxGlobal)
@@ -262,6 +303,13 @@ func LoadConfig(args []string) Config {
 			nextStr(&c.PageserverGRPCAddr)
 		case "--metering-log-dir":
 			nextStr(&c.MeteringLogDir)
+			c.MeteringDirExplicit = true
+		case "--billing-enabled":
+			c.BillingEnabled = true
+		case "--gateway-id":
+			nextStr(&c.GatewayID)
+		case "--cordoned":
+			c.CordonedOnStart = true
 		case "--metering-max-file-bytes":
 			if i+1 < len(args) {
 				i++

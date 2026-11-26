@@ -219,6 +219,7 @@ func (s *AdminGRPCServer) SetNamespaceBackends(discovery *TenantDiscovery, reGRP
 type AdminGRPCServer struct {
 	listenAddr string
 	svc        *gatewayAdminService
+	meshSvc    *gatewayMeshService
 	srv        *grpc.Server
 	ln         net.Listener
 }
@@ -231,6 +232,17 @@ func NewAdminGRPCServer(listenAddr, internalToken string, pools *PoolManager, me
 			pools:         pools,
 			metrics:       metrics,
 		},
+		meshSvc: &gatewayMeshService{
+			internalToken: internalToken,
+		},
+	}
+}
+
+// SetMeshHandlers wires CancelRegistry and GatewayLifecycle for cross-Gateway mesh RPCs.
+func (s *AdminGRPCServer) SetMeshHandlers(cancelReg *CancelRegistry, lifecycle *GatewayLifecycle) {
+	if s.meshSvc != nil {
+		s.meshSvc.cancelReg = cancelReg
+		s.meshSvc.lifecycle = lifecycle
 	}
 }
 
@@ -252,6 +264,9 @@ func (s *AdminGRPCServer) Start() (int, error) {
 	s.ln = ln
 	s.srv = grpc.NewServer(meshtransport.ServerOptions(meshTLS)...)
 	pb.RegisterGatewayAdminServer(s.srv, s.svc)
+	if s.meshSvc != nil {
+		registerGatewayMeshService(s.srv, s.meshSvc)
+	}
 	go func() {
 		_ = s.srv.Serve(ln)
 	}()

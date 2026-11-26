@@ -110,6 +110,7 @@ type ControlPlane struct {
 	pageserver           PageserverClient
 	readEngine           ReadEngineClient
 	gatewayAdmin         GatewayAdminClient
+	poolDrainFn          func(tenantID string, timeout time.Duration) error
 	psMu                 sync.RWMutex
 	wakeGroup            singleflight.Group
 	tenantLocksMu        sync.Mutex
@@ -324,6 +325,19 @@ func (cp *ControlPlane) getGatewayAdmin() GatewayAdminClient {
 	cp.psMu.RLock()
 	defer cp.psMu.RUnlock()
 	return cp.gatewayAdmin
+}
+
+// SetPoolDrainFn configures the default coordinated Gateway drain function used by SuspendTenant.
+func (cp *ControlPlane) SetPoolDrainFn(fn func(tenantID string, timeout time.Duration) error) {
+	cp.psMu.Lock()
+	cp.poolDrainFn = fn
+	cp.psMu.Unlock()
+}
+
+func (cp *ControlPlane) getPoolDrainFn() func(tenantID string, timeout time.Duration) error {
+	cp.psMu.RLock()
+	defer cp.psMu.RUnlock()
+	return cp.poolDrainFn
 }
 
 func parsePGLSN(s string) (uint64, error) {
@@ -1206,6 +1220,9 @@ func (cp *ControlPlane) SuspendTenant(ctx context.Context, tenantID string, drai
 		return fmt.Errorf("%w: tenant %s is in state %s", cell.ErrDrainVetoed, tenantID, state)
 	}
 
+	if poolDrainFn == nil {
+		poolDrainFn = cp.getPoolDrainFn()
+	}
 	if poolDrainFn != nil {
 		if err := poolDrainFn(tenantID, drainTimeout); err != nil {
 			return err

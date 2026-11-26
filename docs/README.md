@@ -69,6 +69,7 @@ Explore the internal design and mechanics of the AIR platform:
   - [Phase 21 Multitenant Stability & Final Audit](reports/phase21-final-summary.md)
   - [Phase 22–29 Reports](reports/): Memory forensics, CAWAL performance, scheduler stability, and streaming validation.
   - [Phase 25 Read Path Stability & Observability](reports/phase-25-read-path-stability.md): Root cause analysis of the minute-3 stall, `/metrics` observability ([docs/metrics.md](metrics.md)), and Gateway disconnect fix.
+  - [Phase 26 Sustained CPU Capacity](reports/phase-26-sustained-cpu-capacity.md): 5-minute CPU tier isolation experiments (`baseline`, `gw_only`, `re_only`, `gw_re`, `gw_re_ps`) with `0–120s` vs `120–300s` burst/sustained analysis.
 - **Design Plans (`docs/reports/plans/`)**:
   - [Pageserver Plan](reports/plans/pageserver-plan.md)
   - [SMGR Plan](reports/plans/smgr-plan.md)

@@ -138,6 +138,27 @@ func main() {
 	log.Printf("[air-server] async R2 cold-offload queue started (workers=2, evict_on_suspend=%v)", cfg.EvictOnSuspend)
 
 	var poolDrainFn func(tenantID string, timeout time.Duration) error
+	if cfg.GatewayAdminGRPCAddr != "" {
+		var staticAddrs []string
+		var discHost string
+		discPort := 9093
+		for _, part := range strings.Split(cfg.GatewayAdminGRPCAddr, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if h, p, err := net.SplitHostPort(part); err == nil && strings.HasSuffix(h, ".internal") {
+				discHost = h
+				if parsed, perr := fmt.Sscanf(p, "%d", &discPort); parsed != 1 || perr != nil {
+					discPort = 9093
+				}
+			} else {
+				staticAddrs = append(staticAddrs, part)
+			}
+		}
+		poolDrainFn = control.NewCoordinatedGRPCPoolDrainFn(staticAddrs, discHost, discPort, cfg.InternalToken, true)
+		cp.SetPoolDrainFn(poolDrainFn)
+	}
 	if cfg.IdleTimeout > 0 {
 		cp.StartIdleReaper(ctx, cfg.IdleTimeout, 0, poolDrainFn)
 		log.Printf("[air-server] cooperative scale-to-zero enabled (idle_timeout=%s)", cfg.IdleTimeout)

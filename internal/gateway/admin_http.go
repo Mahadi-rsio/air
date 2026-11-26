@@ -24,6 +24,8 @@ type AdminHTTPServer struct {
 	reGRPC        *ReadEngineGRPCClient
 	psGRPC        *PageserverGRPCClient
 	telemetry     *TelemetryStore
+	lifecycle     *GatewayLifecycle
+	metering      *MeteringLogger
 
 	ln  net.Listener
 	srv *http.Server
@@ -48,6 +50,12 @@ func (s *AdminHTTPServer) SetNamespaceBackends(reGRPC *ReadEngineGRPCClient, psG
 // SetTelemetryStore attaches the CellTelemetry store for /internal/v1/telemetry ingestion.
 func (s *AdminHTTPServer) SetTelemetryStore(tel *TelemetryStore) {
 	s.telemetry = tel
+}
+
+// SetLifecycle attaches GatewayLifecycle and MeteringLogger for readiness, cordoning, and drain endpoints.
+func (s *AdminHTTPServer) SetLifecycle(lifecycle *GatewayLifecycle, metering *MeteringLogger) {
+	s.lifecycle = lifecycle
+	s.metering = metering
 }
 
 func (s *AdminHTTPServer) Start() error {
@@ -115,6 +123,20 @@ func (s *AdminHTTPServer) isAuthorized(r *http.Request) bool {
 func (s *AdminHTTPServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet && r.URL.Path == "/healthz" {
 		writeJSON(w, http.StatusOK, `{"status":"ok"}`)
+		return
+	}
+	if r.Method == http.MethodGet && r.URL.Path == "/readyz" {
+		if s.lifecycle == nil {
+			writeJSON(w, http.StatusOK, `{"ready":true,"status":"ok"}`)
+			return
+		}
+		rep := s.lifecycle.Readiness(r.Context())
+		b, _ := json.Marshal(rep)
+		code := http.StatusOK
+		if !rep.Ready {
+			code = http.StatusServiceUnavailable
+		}
+		writeJSON(w, code, string(b))
 		return
 	}
 	if s.handleNamespacesRoute(w, r) {
@@ -668,6 +690,76 @@ func (s *AdminHTTPServer) handleInternalRoute(w http.ResponseWriter, r *http.Req
 			return true
 		}
 		writeJSON(w, http.StatusOK, fmt.Sprintf(`{"status":"drained","tenant_id":"%s"}`, JSONEscape(tid)))
+		return true
+	}
+
+	if r.Method == http.MethodGet && r.URL.Path == "/internal/v1/metering/status" {
+		if !s.isAuthorized(r) {
+			writeJSON(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
+			return true
+		}
+		if s.metering == nil {
+			writeJSON(w, http.StatusServiceUnavailable, `{"error":"metering not initialized"}`)
+			return true
+		}
+		b, _ := json.Marshal(s.metering.Status(r.Context()))
+		writeJSON(w, http.StatusOK, string(b))
+		return true
+	}
+
+	if r.Method == http.MethodPost && r.URL.Path == "/internal/v1/cordon" {
+		if !s.isAuthorized(r) {
+			writeJSON(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
+			return true
+		}
+		if s.lifecycle != nil {
+			s.lifecycle.Cordon()
+		}
+		writeJSON(w, http.StatusOK, `{"status":"cordoned"}`)
+		return true
+	}
+
+	if r.Method == http.MethodPost && r.URL.Path == "/internal/v1/uncordon" {
+		if !s.isAuthorized(r) {
+			writeJSON(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
+			return true
+		}
+		if s.lifecycle != nil {
+			if err := s.lifecycle.Uncordon(r.Context()); err != nil {
+				writeJSON(w, http.StatusConflict, makeErrorJSON(err.Error()))
+				return true
+			}
+		}
+		writeJSON(w, http.StatusOK, `{"status":"uncordoned"}`)
+		return true
+	}
+
+	if r.Method == http.MethodPost && r.URL.Path == "/internal/v1/drain" {
+		if !s.isAuthorized(r) {
+			writeJSON(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
+			return true
+		}
+		if s.lifecycle == nil {
+			writeJSON(w, http.StatusServiceUnavailable, `{"error":"lifecycle not initialized"}`)
+			return true
+		}
+		var payload struct {
+			OpID      string `json:"op_id"`
+			TimeoutMS int    `json:"timeout_ms"`
+		}
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		_ = json.Unmarshal(body, &payload)
+		timeout := 30 * time.Second
+		if payload.TimeoutMS > 0 {
+			timeout = time.Duration(payload.TimeoutMS) * time.Millisecond
+		}
+		res := s.lifecycle.DrainInstance(r.Context(), payload.OpID, timeout)
+		b, _ := json.Marshal(res)
+		code := http.StatusOK
+		if !res.Drained || !res.MeteringConfirmed {
+			code = http.StatusConflict
+		}
+		writeJSON(w, code, string(b))
 		return true
 	}
 

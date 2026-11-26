@@ -161,9 +161,14 @@ services:
       AIR_BACKEND_HOST: air-server
       AIR_INTERNAL_TOKEN: ${AIR_INTERNAL_TOKEN:?Set a unique internal token}
       AIR_POOL_MODE: "true"
+      AIR_BILLING_ENABLED: ${AIR_BILLING_ENABLED:-true}
+      AIR_METERING_LOG_DIR: /var/lib/air-gateway/metering
+      AIR_GATEWAY_PRIVATE_HTTP_ADDR: 0.0.0.0:8082
+      AIR_MAX_AGGREGATE_BACKENDS: ${AIR_MAX_AGGREGATE_BACKENDS:-12}
     ports:
       - "${AIR_GATEWAY_PORT:-5432}:5432"
     volumes:
+      - air_gateway_metering:/var/lib/air-gateway
       - "${AIR_GATEWAY_TLS_DIR:?Set the gateway certificate directory}:/run/air-tls:ro"
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8081'"]
@@ -179,6 +184,7 @@ volumes:
   air_pageserver_data:
   air_server_data:
   air_read_engine_data:
+  air_gateway_metering:
 
 networks:
   air-net:

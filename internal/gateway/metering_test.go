@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -146,6 +147,9 @@ func TestMeteringLogger_FlushOnSizeLimit(t *testing.T) {
 		t.Fatalf("ReadDir failed: %v", err)
 	}
 	for _, ent := range entries {
+		if ent.IsDir() || ent.Name() == gatewayIDFileName {
+			continue
+		}
 		if ent.Name() != activeMeteringLogName {
 			t.Fatalf("expected rotated log file %q to be deleted after flush", ent.Name())
 		}
@@ -216,8 +220,17 @@ func TestMeteringLogger_RetainsFileOnSaveError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDir failed: %v", err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 retained rotated log file on error, got %d", len(entries))
+	countBatches := func(ents []os.DirEntry) int {
+		n := 0
+		for _, e := range ents {
+			if !e.IsDir() && (strings.HasPrefix(e.Name(), sealedBatchPrefix) || strings.HasPrefix(e.Name(), rotatedMeteringLogPrefix)) {
+				n++
+			}
+		}
+		return n
+	}
+	if n := countBatches(entries); n != 1 {
+		t.Fatalf("expected 1 retained rotated log file on error, got %d", n)
 	}
 
 	// Recover DB and retry flush -> file should now be saved and deleted.
@@ -232,8 +245,8 @@ func TestMeteringLogger_RetainsFileOnSaveError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDir failed: %v", err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("expected all log files deleted after successful retry, got %d", len(entries))
+	if n := countBatches(entries); n != 0 {
+		t.Fatalf("expected 0 batch files after retry, got %d", n)
 	}
 }
 

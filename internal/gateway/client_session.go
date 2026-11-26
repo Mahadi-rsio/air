@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -28,13 +29,19 @@ func proxyBidirectional(client, backend net.Conn) {
 	wg.Wait()
 }
 
-func forwardCancelRequest(client net.Conn, cancelReg *CancelRegistry) {
+func forwardCancelRequest(client net.Conn, cancelReg *CancelRegistry, cancelRouter *CancelRouter) {
 	var cancelPayload [8]byte
 	if _, err := io.ReadFull(client, cancelPayload[:]); err != nil {
 		return
 	}
 	gwPID := binary.BigEndian.Uint32(cancelPayload[0:4])
 	gwSecret := binary.BigEndian.Uint32(cancelPayload[4:8])
+	if cancelRouter != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		cancelRouter.ForwardCancel(ctx, gwPID, gwSecret)
+		return
+	}
 	cancelReg.CancelSession(gwPID, gwSecret)
 	target, ok := cancelReg.Lookup(gwPID, gwSecret)
 	if !ok || target.Port <= 0 {
@@ -57,6 +64,20 @@ func HandleClientConnection(
 	pools *PoolManager,
 	metrics *MetricsRegistry,
 	cancelReg *CancelRegistry,
+) {
+	HandleClientConnectionWithCancelRouter(conn, cfg, tlsCtx, discovery, pools, metrics, cancelReg, nil)
+}
+
+// HandleClientConnectionWithCancelRouter handles a client connection with optional cross-Gateway CancelRequest routing.
+func HandleClientConnectionWithCancelRouter(
+	conn net.Conn,
+	cfg Config,
+	tlsCtx *TLSContext,
+	discovery *TenantDiscovery,
+	pools *PoolManager,
+	metrics *MetricsRegistry,
+	cancelReg *CancelRegistry,
+	cancelRouter *CancelRouter,
 ) {
 	defer metrics.ReleaseGlobal()
 	defer conn.Close()
@@ -105,7 +126,7 @@ func HandleClientConnection(
 	}
 
 	if msgLen == 16 && code == CancelRequestCode {
-		forwardCancelRequest(conn, cancelReg)
+		forwardCancelRequest(conn, cancelReg, cancelRouter)
 		return
 	}
 

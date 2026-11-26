@@ -257,6 +257,16 @@ func (m *MetricsRegistry) ReleaseGlobal() {
 	}
 }
 
+// ActiveClients returns the current number of active client connections.
+func (m *MetricsRegistry) ActiveClients() int64 {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.activeGlobalConns
+}
+
 func (m *MetricsRegistry) RecordAuthFailure()   { m.authFailures.Add(1) }
 func (m *MetricsRegistry) RecordProtocolError() { m.protocolErrors.Add(1) }
 func (m *MetricsRegistry) RecordRPCError()      { m.rpcErrors.Add(1) }

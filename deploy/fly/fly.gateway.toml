@@ -22,17 +22,29 @@ primary_region = "sin"
   AIR_POOL_MODE = "true"
   AIR_REQUIRE_TLS = "true"
   AIR_POOL_MAX_BACKENDS = "8"
+  AIR_MAX_AGGREGATE_BACKENDS = "12"
+  AIR_BILLING_ENABLED = "true"
+  AIR_METERING_LOG_DIR = "/var/lib/air-gateway/metering"
+  AIR_METERING_MAX_SPOOL_BYTES = "268435456"
+  AIR_GATEWAY_DISCOVERY_HOST = "air-pg-gateway.internal"
+  AIR_GATEWAY_PEER_ADMIN_PORT = "9093"
+  AIR_GATEWAY_PRIVATE_HTTP_ADDR = "[::]:8082"
   AIR_WRITE_BUFFER_GLOBAL_MAX = "16777216"
   AIR_WRITE_QUEUE_MAX_BYTES = "16777216"
   AIR_WRITE_BUFFER_SESSION_MAX = "2097152"
   GOMEMLIMIT = "180MiB"
 
+[mounts]
+  source = "air_gateway_metering"
+  destination = "/var/lib/air-gateway"
+  initial_size = "1gb"
+
 [[services]]
   protocol = "tcp"
   internal_port = 5432
-  auto_stop_machines = "stop"
-  auto_start_machines = true
-  min_machines_running = 0
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
 
   [[services.tcp_checks]]
     interval = "15s"

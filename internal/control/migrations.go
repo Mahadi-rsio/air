@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-const currentSchemaVersion = 7
+const currentSchemaVersion = 8
 
 func (cp *ControlPlane) runMigrations(ctx context.Context) error {
 	if _, err := cp.db.Exec(ctx, `
@@ -261,6 +261,33 @@ func (cp *ControlPlane) runMigrations(ctx context.Context) error {
 		for _, s := range stmts {
 			if _, err := tx.Exec(ctx, s); err != nil {
 				return fmt.Errorf("migration v7 failed: %w", err)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+	}
+	if current < 8 {
+		tx, err := cp.db.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		stmts := []string{
+			`CREATE TABLE IF NOT EXISTS metering_batch_receipts (
+				batch_id TEXT PRIMARY KEY,
+				gateway_id TEXT NOT NULL,
+				payload_sha256 TEXT NOT NULL,
+				entry_count BIGINT NOT NULL,
+				tenant_count INT NOT NULL,
+				committed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_metering_batch_receipts_gateway ON metering_batch_receipts(gateway_id, committed_at DESC)`,
+			`INSERT INTO schema_migrations(version) VALUES (8) ON CONFLICT DO NOTHING`,
+		}
+		for _, s := range stmts {
+			if _, err := tx.Exec(ctx, s); err != nil {
+				return fmt.Errorf("migration v8 failed: %w", err)
 			}
 		}
 		if err := tx.Commit(ctx); err != nil {

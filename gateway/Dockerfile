@@ -18,7 +18,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --no-create-home --uid 10001 airgw
+    && useradd --system --no-create-home --uid 10001 airgw \
+    && mkdir -p /var/lib/air-gateway/metering \
+    && chown -R airgw:airgw /var/lib/air-gateway
 
 COPY --from=builder /out-air-gateway /usr/local/bin/air-gateway
 

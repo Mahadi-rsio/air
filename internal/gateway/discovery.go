@@ -40,6 +40,7 @@ type TenantDiscovery struct {
 	metrics *MetricsRegistry
 
 	running atomic.Bool
+	synced  atomic.Bool
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 
@@ -91,6 +92,21 @@ func NewTenantDiscovery(cfg Config) (*TenantDiscovery, error) {
 
 func (d *TenantDiscovery) SetMetrics(m *MetricsRegistry) {
 	d.metrics = m
+}
+
+// Synced returns true once initial tenant discovery has succeeded.
+func (d *TenantDiscovery) Synced() bool {
+	if d == nil {
+		return false
+	}
+	return d.synced.Load()
+}
+
+// MarkSynced marks discovery as synced (useful for tests or manual namespace registration).
+func (d *TenantDiscovery) MarkSynced() {
+	if d != nil {
+		d.synced.Store(true)
+	}
 }
 
 func (d *TenantDiscovery) SetCallbacks(onUpsert func(TenantRoute), onRemove func(string)) {
@@ -594,6 +610,7 @@ func (d *TenantDiscovery) syncDatabasesGRPC(parent context.Context) bool {
 			break
 		}
 	}
+	d.synced.Store(true)
 	return true
 }
 

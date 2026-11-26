@@ -199,6 +199,8 @@ type TenantPool struct {
 	clientSeq            atomic.Uint64
 	pinnedClients        atomic.Int64
 	activeTxCount        atomic.Int64
+	draining             atomic.Bool
+	manager              *PoolManager
 	readEngineLSN        atomic.Uint64
 	readEngineHealthy    atomic.Bool
 	readConsecFails      atomic.Int32
@@ -348,6 +350,7 @@ func (p *TenantPool) UpdateEndpoint(host, sockDir string, port int, appPassword 
 	}
 	if port > 0 {
 		p.suspended = false
+		p.draining.Store(false)
 		if p.host != host || p.port != port || p.sockDir != sockDir {
 			for _, b := range p.idlePool {
 				if b != nil {
@@ -475,21 +478,44 @@ func (p *TenantPool) Close() {
 }
 
 func (p *TenantPool) RequestDrain(timeout time.Duration) error {
+	p.draining.Store(true)
 	if n := p.pinnedClients.Load(); n > 0 {
+		p.draining.Store(false)
 		return fmt.Errorf("drain vetoed: %d pinned client session(s)", n)
 	}
+	hasActiveWork := func() bool {
+		if p.activeTxCount.Load() > 0 {
+			return true
+		}
+		p.semMu.Lock()
+		ab := p.activeBackends
+		p.semMu.Unlock()
+		return ab > 0
+	}
 	deadline := time.Now().Add(timeout)
-	for p.activeTxCount.Load() > 0 {
+	for hasActiveWork() {
 		if time.Now().After(deadline) {
+			p.draining.Store(false)
 			return fmt.Errorf("drain vetoed: %d active transaction(s) exceeded drain timeout", p.activeTxCount.Load())
 		}
 		time.Sleep(15 * time.Millisecond)
 	}
 	if n := p.pinnedClients.Load(); n > 0 {
+		p.draining.Store(false)
 		return fmt.Errorf("drain vetoed: %d pinned client session(s)", n)
 	}
 	p.CloseAllIdle()
 	return nil
+}
+
+// CancelDrain clears a tenant's draining flag (e.g. when tenant is woken or activated).
+func (p *TenantPool) CancelDrain() {
+	p.draining.Store(false)
+}
+
+// IsDraining returns true if the tenant pool is currently draining and blocking new checkouts.
+func (p *TenantPool) IsDraining() bool {
+	return p.draining.Load()
 }
 
 func (p *TenantPool) authenticateClient(client net.Conn, startupUser, expectedPass string, gwPID, gwSecret uint32, metrics *MetricsRegistry) bool {
@@ -1742,8 +1768,16 @@ func (p *TenantPool) acquireSlot(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if p.draining.Load() {
+		return fmt.Errorf("tenant %s is draining", p.tenantID)
+	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if p.manager != nil {
+		if err := p.manager.acquireGlobalBackendSlot(ctx); err != nil {
+			return err
+		}
 	}
 	stopAfter := context.AfterFunc(ctx, func() {
 		p.semMu.Lock()
@@ -1757,11 +1791,23 @@ func (p *TenantPool) acquireSlot(ctx context.Context) error {
 	defer p.semMu.Unlock()
 
 	for p.activeBackends >= p.maxBackends {
+		if p.draining.Load() {
+			if p.manager != nil {
+				p.manager.releaseGlobalBackendSlot()
+			}
+			return fmt.Errorf("tenant %s is draining", p.tenantID)
+		}
 		if err := ctx.Err(); err != nil {
+			if p.manager != nil {
+				p.manager.releaseGlobalBackendSlot()
+			}
 			return err
 		}
 		rem := time.Until(deadline)
 		if rem <= 0 {
+			if p.manager != nil {
+				p.manager.releaseGlobalBackendSlot()
+			}
 			return fmt.Errorf("backend connection pool saturated for tenant %s", p.tenantID)
 		}
 		timer := time.AfterFunc(rem, func() {
@@ -1769,6 +1815,12 @@ func (p *TenantPool) acquireSlot(ctx context.Context) error {
 		})
 		p.semCond.Wait()
 		timer.Stop()
+	}
+	if p.draining.Load() {
+		if p.manager != nil {
+			p.manager.releaseGlobalBackendSlot()
+		}
+		return fmt.Errorf("tenant %s is draining", p.tenantID)
 	}
 	p.activeBackends++
 	return nil
@@ -1781,6 +1833,9 @@ func (p *TenantPool) releaseSlot() {
 	}
 	p.semMu.Unlock()
 	p.semCond.Signal()
+	if p.manager != nil {
+		p.manager.releaseGlobalBackendSlot()
+	}
 }
 
 func (p *TenantPool) acquireBackend(ctx context.Context, clientID uint64) (*BackendConn, error) {
@@ -2234,17 +2289,22 @@ type PoolManager struct {
 	maxBackends    int
 	idleTimeoutSec int
 
-	mu                 sync.Mutex
-	readHost           string
-	readSockDir        string
-	readPort           int
-	metering           *MeteringLogger
-	writeGov           *WriteGovernor
-	bufBudget          *BufferBudget
-	sessionBufMaxBytes int64
-	sessionBufMaxMsgs  int
-	lazyLSN            bool
-	pools              map[string]*TenantPool
+	mu                   sync.Mutex
+	readHost             string
+	readSockDir          string
+	readPort             int
+	metering             *MeteringLogger
+	writeGov             *WriteGovernor
+	bufBudget            *BufferBudget
+	sessionBufMaxBytes   int64
+	sessionBufMaxMsgs    int
+	lazyLSN              bool
+	pools                map[string]*TenantPool
+	maxAggregateBackends int
+	peerCount            atomic.Int32
+	globalSemMu          sync.Mutex
+	globalSemCond        *sync.Cond
+	activeGlobalBackends int
 }
 
 func NewPoolManager(maxBackends, idleTimeoutSec int, readTLS ...*tls.Config) *PoolManager {
@@ -2256,10 +2316,129 @@ func NewPoolManager(maxBackends, idleTimeoutSec int, readTLS ...*tls.Config) *Po
 		idleTimeoutSec: idleTimeoutSec,
 		pools:          make(map[string]*TenantPool),
 	}
+	manager.peerCount.Store(1)
+	manager.globalSemCond = sync.NewCond(&manager.globalSemMu)
 	if len(readTLS) > 0 {
 		manager.readTLS = readTLS[0]
 	}
 	return manager
+}
+
+// SetAggregateMaxBackends configures the cluster-wide writer backend connection cap.
+func (pm *PoolManager) SetAggregateMaxBackends(limit int) {
+	pm.globalSemMu.Lock()
+	pm.maxAggregateBackends = limit
+	pm.globalSemMu.Unlock()
+	if pm.globalSemCond != nil {
+		pm.globalSemCond.Broadcast()
+	}
+}
+
+// SetPeerCount updates the active Gateway instance count used to share the aggregate writer limit.
+func (pm *PoolManager) SetPeerCount(n int) {
+	if n < 1 {
+		n = 1
+	}
+	pm.peerCount.Store(int32(n))
+	if pm.globalSemCond != nil {
+		pm.globalSemCond.Broadcast()
+	}
+}
+
+// EffectiveMaxWriterBackends returns this Gateway's share of the aggregate writer backend limit (0 = unlimited).
+func (pm *PoolManager) EffectiveMaxWriterBackends() int {
+	pm.globalSemMu.Lock()
+	agg := pm.maxAggregateBackends
+	pm.globalSemMu.Unlock()
+	if agg <= 0 {
+		return 0
+	}
+	peers := int(pm.peerCount.Load())
+	if peers < 1 {
+		peers = 1
+	}
+	share := agg / peers
+	if share < 1 {
+		share = 1
+	}
+	return share
+}
+
+// ActiveWriterBackends returns the number of currently checked-out writer backends on this Gateway.
+func (pm *PoolManager) ActiveWriterBackends() int {
+	pm.globalSemMu.Lock()
+	defer pm.globalSemMu.Unlock()
+	return pm.activeGlobalBackends
+}
+
+func (pm *PoolManager) acquireGlobalBackendSlot(ctx context.Context) error {
+	limit := pm.EffectiveMaxWriterBackends()
+	if limit <= 0 {
+		pm.globalSemMu.Lock()
+		pm.activeGlobalBackends++
+		pm.globalSemMu.Unlock()
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stopAfter := context.AfterFunc(ctx, func() {
+		pm.globalSemMu.Lock()
+		if pm.globalSemCond != nil {
+			pm.globalSemCond.Broadcast()
+		}
+		pm.globalSemMu.Unlock()
+	})
+	defer stopAfter()
+
+	deadline := time.Now().Add(10 * time.Second)
+	pm.globalSemMu.Lock()
+	defer pm.globalSemMu.Unlock()
+	if pm.globalSemCond == nil {
+		pm.globalSemCond = sync.NewCond(&pm.globalSemMu)
+	}
+	for {
+		peers := int(pm.peerCount.Load())
+		if peers < 1 {
+			peers = 1
+		}
+		if pm.maxAggregateBackends <= 0 {
+			break
+		}
+		curLimit := pm.maxAggregateBackends / peers
+		if curLimit < 1 {
+			curLimit = 1
+		}
+		if pm.activeGlobalBackends < curLimit {
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rem := time.Until(deadline)
+		if rem <= 0 {
+			return fmt.Errorf("aggregate writer backend connection limit reached (%d/%d across %d gateway(s))", pm.activeGlobalBackends, pm.maxAggregateBackends, peers)
+		}
+		timer := time.AfterFunc(rem, func() {
+			pm.globalSemCond.Broadcast()
+		})
+		pm.globalSemCond.Wait()
+		timer.Stop()
+	}
+	pm.activeGlobalBackends++
+	return nil
+}
+
+func (pm *PoolManager) releaseGlobalBackendSlot() {
+	pm.globalSemMu.Lock()
+	if pm.activeGlobalBackends > 0 {
+		pm.activeGlobalBackends--
+	}
+	cond := pm.globalSemCond
+	pm.globalSemMu.Unlock()
+	if cond != nil {
+		cond.Signal()
+	}
 }
 
 func (pm *PoolManager) SetWriteGovernor(g *WriteGovernor) {
@@ -2353,6 +2532,7 @@ func (pm *PoolManager) GetOrCreate(route TenantRoute, wakeFn WakeFn) *TenantPool
 		return p
 	}
 	p := NewTenantPool(route.TenantID, route.Host, route.SockDir, route.Port, route.AppPassword, pm.maxBackends, pm.idleTimeoutSec)
+	p.manager = pm
 	p.readTLS = pm.readTLS
 	if route.State == "SUSPENDED" {
 		p.MarkSuspended()

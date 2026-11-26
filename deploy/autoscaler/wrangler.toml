@@ -1,0 +1,35 @@
+name = "air-gateway-autoscaler"
+main = "src/index.mjs"
+compatibility_date = "2025-05-01"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[durable_objects.bindings]]
+name = "AUTOSCALER_DO"
+class_name = "GatewayAutoscalerDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GatewayAutoscalerDO"]
+
+[vars]
+FLY_APP_NAME = "air-pg-gateway"
+FLY_API_BASE = "https://api.machines.dev/v1"
+FLY_REGION = "sin"
+AUTOSCALER_MODE = "decision_only"
+AUTO_ADD_ENABLED = "true"
+AUTO_REMOVE_ENABLED = "false"
+MAX_GATEWAY_REPLICAS = "2"
+SUSTAINED_HIGH_TICKS = "3"
+SUSTAINED_LOW_TICKS = "5"
+SCALE_OUT_COOLDOWN_SEC = "300"
+SCALE_IN_COOLDOWN_SEC = "600"
+HIGH_CONN_UTIL_PCT = "75"
+LOW_CONN_UTIL_PCT = "25"
+MIN_SPARE_CONNS = "64"
+BURST_CPU_KIND = "shared"
+BURST_CPUS = "4"
+BURST_MEMORY_MB = "1024"
+BURST_VOLUME_SIZE_GB = "1"
+DRAIN_TIMEOUT_MS = "30000"
