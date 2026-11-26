@@ -60,9 +60,11 @@ func (s *AdminHTTPServer) Start() error {
 	}
 	s.ln = ln
 	s.srv = &http.Server{
-		Handler:      http.HandlerFunc(s.serveHTTP),
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 65 * time.Second,
+		Handler:           http.HandlerFunc(s.serveHTTP),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      65 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	go func() {
 		_ = s.srv.Serve(ln)
@@ -100,11 +102,11 @@ func (s *AdminHTTPServer) isAuthorized(r *http.Request) bool {
 	if s.internalToken == "" {
 		return true
 	}
-	if r.Header.Get("X-Air-Internal-Token") == s.internalToken {
+	if ConstantTimeEquals(strings.TrimSpace(r.Header.Get("X-Air-Internal-Token")), s.internalToken) {
 		return true
 	}
 	auth := r.Header.Get("Authorization")
-	if len(auth) > 7 && strings.EqualFold(auth[:7], "Bearer ") && strings.TrimSpace(auth[7:]) == s.internalToken {
+	if len(auth) > 7 && strings.EqualFold(auth[:7], "Bearer ") && ConstantTimeEquals(strings.TrimSpace(auth[7:]), s.internalToken) {
 		return true
 	}
 	return false
@@ -127,7 +129,7 @@ func (s *AdminHTTPServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		keyID := strings.TrimPrefix(r.URL.Path, "/v1/api-keys/")
-		if keyID == "" || strings.Contains(keyID, "/") {
+		if !ValidateTenantID(keyID) {
 			writeJSON(w, http.StatusBadRequest, `{"error":"invalid key id"}`)
 			return
 		}
@@ -189,7 +191,12 @@ func (s *AdminHTTPServer) handleNamespacesRoute(w http.ResponseWriter, r *http.R
 			ReadEnginePort int    `json:"read_engine_port"`
 			Generation     string `json:"generation"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		if body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)); err == nil && len(body) > 0 {
+			if err := json.Unmarshal(body, &req); err != nil {
+				writeJSON(w, http.StatusBadRequest, `{"error":"invalid JSON body"}`)
+				return true
+			}
+		}
 		tid := strings.TrimSpace(suffix)
 		if tid == "" {
 			tid = strings.TrimSpace(req.TenantID)
@@ -197,8 +204,12 @@ func (s *AdminHTTPServer) handleNamespacesRoute(w http.ResponseWriter, r *http.R
 		if tid == "" {
 			tid = strings.TrimSpace(req.Namespace)
 		}
-		if tid == "" {
-			writeJSON(w, http.StatusBadRequest, `{"error":"tenant_id or namespace is required"}`)
+		if !ValidateTenantID(tid) {
+			writeJSON(w, http.StatusBadRequest, `{"error":"invalid tenant_id or namespace"}`)
+			return true
+		}
+		if req.Generation != "" && !ValidateTenantID(req.Generation) {
+			writeJSON(w, http.StatusBadRequest, `{"error":"invalid generation"}`)
 			return true
 		}
 		route := TenantRoute{
@@ -270,6 +281,10 @@ func (s *AdminHTTPServer) handleNamespacesRoute(w http.ResponseWriter, r *http.R
 		return true
 
 	case suffix != "" && r.Method == http.MethodGet:
+		if !ValidateTenantID(suffix) {
+			writeJSON(w, http.StatusBadRequest, `{"error":"invalid namespace"}`)
+			return true
+		}
 		var foundRoute *TenantRoute
 		if s.discovery != nil {
 			for _, rt := range s.discovery.ListCached() {
@@ -315,6 +330,10 @@ func (s *AdminHTTPServer) handleNamespacesRoute(w http.ResponseWriter, r *http.R
 		return true
 
 	case suffix != "" && r.Method == http.MethodDelete:
+		if !ValidateTenantID(suffix) {
+			writeJSON(w, http.StatusBadRequest, `{"error":"invalid namespace"}`)
+			return true
+		}
 		if s.pools != nil {
 			_ = s.pools.RequestDrain(suffix, 2000*time.Millisecond)
 			s.pools.RemoveTenant(suffix)
@@ -480,17 +499,19 @@ func (s *AdminHTTPServer) handleDatabasesRoute(w http.ResponseWriter, r *http.Re
 
 	if r.Method == http.MethodPost && strings.HasPrefix(action, "backups/") && strings.HasSuffix(action, "/verify") {
 		backupID := strings.TrimSuffix(strings.TrimPrefix(action, "backups/"), "/verify")
-		if backupID != "" && !strings.Contains(backupID, "/") {
-			var payload struct {
-				StreamHash  bool `json:"stream_hash"`
-				DeepRestore bool `json:"deep_restore"`
-			}
-			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-			_ = json.Unmarshal(body, &payload)
-			code, resp, _ := s.discovery.VerifyBackup(tid, backupID, payload.StreamHash, payload.DeepRestore)
-			writeJSON(w, code, resp)
+		if !ValidateTenantID(backupID) {
+			writeJSON(w, http.StatusBadRequest, `{"error":"invalid backup id"}`)
 			return true
 		}
+		var payload struct {
+			StreamHash  bool `json:"stream_hash"`
+			DeepRestore bool `json:"deep_restore"`
+		}
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		_ = json.Unmarshal(body, &payload)
+		code, resp, _ := s.discovery.VerifyBackup(tid, backupID, payload.StreamHash, payload.DeepRestore)
+		writeJSON(w, code, resp)
+		return true
 	}
 
 	if r.Method == http.MethodPost && action == "restore" {
@@ -818,7 +839,12 @@ func (s *AdminHTTPServer) handleClusterAndBackendRoutes(w http.ResponseWriter, r
 			return true
 		}
 		if len(parts) == 1 && r.Method == http.MethodDelete {
-			resp, err := s.psGRPC.PurgeTenant(r.Context(), tid, r.URL.Query().Get("generation"))
+			gen := strings.TrimSpace(r.URL.Query().Get("generation"))
+			if gen != "" && !ValidateTenantID(gen) {
+				writeJSON(w, http.StatusBadRequest, `{"error":"invalid generation"}`)
+				return true
+			}
+			resp, err := s.psGRPC.PurgeTenant(r.Context(), tid, gen)
 			if err != nil {
 				st := status.Convert(err)
 				writeJSON(w, grpcToHTTP(st.Code()), makeErrorJSON(st.Message()))

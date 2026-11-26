@@ -138,8 +138,33 @@ func buildS3Client(cfg Config) (*s3.Client, error) {
 	return s3c, nil
 }
 
+func isLoopbackListenAddr(addr string) bool {
+	if addr == "" {
+		return true
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func main() {
 	cfg := loadConfig(os.Args[1:])
+	if cfg.InternalToken == "" && (!isLoopbackListenAddr(cfg.GRPCAddr) || !isLoopbackListenAddr(cfg.MetricsAddr)) {
+		log.Fatalf("[air-pageserver] AIR_INTERNAL_TOKEN must be set when listening on non-loopback addresses (grpc=%q metrics=%q)", cfg.GRPCAddr, cfg.MetricsAddr)
+	}
+	if strings.TrimSpace(os.Getenv("AIR_MASTER_KEY_HEX")) == "" {
+		log.Printf("[air-pageserver] WARNING: AIR_MASTER_KEY_HEX is not set; using local master key file %s", cfg.MasterKeyPath)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

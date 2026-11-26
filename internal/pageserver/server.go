@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Mahadi-rsio/air/internal/crypto"
+	"github.com/Mahadi-rsio/air/internal/tenant"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
@@ -359,6 +360,14 @@ func (p *Pageserver) isGenerationActive(tenantID, generation string) bool {
 // PurgeTenant removes in-memory timelines, local layer/cache files, decoded/index/disk cache entries,
 // and best-effort R2 objects for (tenantID, generation).
 func (p *Pageserver) PurgeTenant(ctx context.Context, tenantID, generation string) error {
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return err
+	}
+	if generation != "" {
+		if err := tenant.ValidateID(generation); err != nil {
+			return err
+		}
+	}
 	start := time.Now()
 	debugf("tenant", "PurgeTenant start tenant=%s gen=%q", tenantID, generation)
 	p.mu.Lock()
@@ -419,10 +428,14 @@ func (p *Pageserver) PurgeTenant(ctx context.Context, tenantID, generation strin
 	}
 
 	if p.cfg.LayerDir != "" {
-		if generation != "" {
-			_ = os.RemoveAll(filepath.Join(p.cfg.LayerDir, tenantID, generation))
-		} else {
-			_ = os.RemoveAll(filepath.Join(p.cfg.LayerDir, tenantID))
+		if baseAbs, bErr := filepath.Abs(p.cfg.LayerDir); bErr == nil {
+			target := filepath.Join(baseAbs, tenantID)
+			if generation != "" {
+				target = filepath.Join(target, generation)
+			}
+			if rel, rErr := filepath.Rel(baseAbs, target); rErr == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				_ = os.RemoveAll(target)
+			}
 		}
 	}
 	debugf("tenant", "PurgeTenant done tenant=%s gen=%q cur_gen=%q deleted_r2=%d dur=%s", tenantID, generation, curGen, deletedR2, time.Since(start))
@@ -437,8 +450,16 @@ func (p *Pageserver) EvictTenantCache(ctx context.Context, tenantID, generation 
 	if tenantID == "" {
 		return nil
 	}
+	if err := tenant.ValidateID(tenantID); err != nil {
+		return err
+	}
 	if generation == "" {
 		generation = p.GetTenantGeneration(tenantID)
+	}
+	if generation != "" {
+		if err := tenant.ValidateID(generation); err != nil {
+			return err
+		}
 	}
 	if p.store != nil {
 		if p.store.decodedChunks != nil {
@@ -466,10 +487,14 @@ func (p *Pageserver) EvictTenantCache(ctx context.Context, tenantID, generation 
 		p.mu.Unlock()
 
 		if p.cfg.LayerDir != "" {
-			if generation != "" {
-				_ = os.RemoveAll(filepath.Join(p.cfg.LayerDir, tenantID, generation))
-			} else {
-				_ = os.RemoveAll(filepath.Join(p.cfg.LayerDir, tenantID))
+			if baseAbs, bErr := filepath.Abs(p.cfg.LayerDir); bErr == nil {
+				target := filepath.Join(baseAbs, tenantID)
+				if generation != "" {
+					target = filepath.Join(target, generation)
+				}
+				if rel, rErr := filepath.Rel(baseAbs, target); rErr == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+					_ = os.RemoveAll(target)
+				}
 			}
 		}
 	}

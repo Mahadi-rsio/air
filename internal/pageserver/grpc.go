@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Mahadi-rsio/air/internal/pb"
+	"github.com/Mahadi-rsio/air/internal/tenant"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -472,8 +473,13 @@ func (s *grpcServer) SetTenantGeneration(_ context.Context, req *pb.SetTenantGen
 }
 
 func (s *grpcServer) EnsureTenant(ctx context.Context, req *pb.EnsureTenantRequest) (*pb.EnsureTenantResponse, error) {
-	if req.GetTenantId() == "" {
-		return nil, status.Error(codes.InvalidArgument, "tenant_id is required")
+	if err := tenant.ValidateID(req.GetTenantId()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if req.GetGeneration() != "" {
+		if err := tenant.ValidateID(req.GetGeneration()); err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
 	}
 	if s.ps.store != nil && s.ps.store.kms != nil {
 		var wrappedDEK string
@@ -536,6 +542,14 @@ func (s *grpcServer) FlushAll(ctx context.Context, _ *pb.PageserverEmpty) (*pb.P
 }
 
 func (s *grpcServer) PurgeTenant(ctx context.Context, req *pb.PurgeTenantRequest) (*pb.PageserverStatusResponse, error) {
+	if err := tenant.ValidateID(req.GetTenantId()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if req.GetGeneration() != "" {
+		if err := tenant.ValidateID(req.GetGeneration()); err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+	}
 	if err := s.ps.PurgeTenant(ctx, req.GetTenantId(), req.GetGeneration()); err != nil {
 		return nil, mapPageserverGRPCError(err)
 	}

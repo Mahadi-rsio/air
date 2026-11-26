@@ -320,3 +320,39 @@ func TestDiskCacheEvictPrefix(t *testing.T) {
 		t.Fatalf("expected t_b layer to remain, got=%q ok=%v", string(got), ok)
 	}
 }
+
+func TestPageserverRejectsTraversalInPurgeAndEvict(t *testing.T) {
+	root := t.TempDir()
+	layerDir := filepath.Join(root, "layers")
+	victimDir := filepath.Join(root, "victim")
+	if err := os.MkdirAll(layerDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(victimDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ps, err := New(Config{
+		DisableUnixSocket: true,
+		LayerDir:          layerDir,
+	})
+	if err != nil {
+		t.Fatalf("New pageserver: %v", err)
+	}
+	defer ps.Close()
+
+	if err := ps.PurgeTenant(context.Background(), "../victim", ""); err == nil {
+		t.Fatalf("expected PurgeTenant to reject traversal tenantID")
+	}
+	if err := ps.PurgeTenant(context.Background(), "t_valid", "../../victim"); err == nil {
+		t.Fatalf("expected PurgeTenant to reject traversal generation")
+	}
+	if err := ps.EvictTenantCache(context.Background(), "../victim", ""); err == nil {
+		t.Fatalf("expected EvictTenantCache to reject traversal tenantID")
+	}
+	if err := ps.EvictTenantCache(context.Background(), "t_valid", "../../victim"); err == nil {
+		t.Fatalf("expected EvictTenantCache to reject traversal generation")
+	}
+	if _, err := os.Stat(victimDir); err != nil {
+		t.Fatalf("victimDir should still exist, got err=%v", err)
+	}
+}

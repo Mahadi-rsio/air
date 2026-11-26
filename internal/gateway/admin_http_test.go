@@ -250,4 +250,23 @@ func TestAdminHTTPServer_UnifiedControlPlane(t *testing.T) {
 	if len(airMock.deleted) != 1 || len(reMock.deleted) != 1 || len(psMock.purged) != 1 {
 		t.Fatalf("expected all 3 backends cleaned up on delete: air=%v re=%v ps=%v", airMock.deleted, reMock.deleted, psMock.purged)
 	}
+
+	// 5. Security: reject traversal / invalid tenant & generation IDs and oversized/malformed bodies
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   any
+	}{
+		{http.MethodPost, "/v1/namespaces", map[string]string{"tenant_id": "../escape"}},
+		{http.MethodGet, "/v1/namespaces/..%2Fescape", nil},
+		{http.MethodDelete, "/v1/namespaces/..%2Fescape", nil},
+		{http.MethodDelete, "/v1/pageserver/tenants/t_unified?generation=../escape", nil},
+		{http.MethodPost, "/v1/databases/t_unified/backups/..%2Fescape/verify", nil},
+		{http.MethodDelete, "/v1/api-keys/..%2Fescape", nil},
+	} {
+		code, _ := doTestHTTP(t, tc.method, ts.URL+tc.path, cfg.InternalToken, tc.body)
+		if code != http.StatusBadRequest {
+			t.Fatalf("%s %s: expected 400 Bad Request, got %d", tc.method, tc.path, code)
+		}
+	}
 }

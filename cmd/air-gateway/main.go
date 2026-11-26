@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -15,10 +16,32 @@ import (
 	"github.com/Mahadi-rsio/air/internal/gateway"
 )
 
+func isLoopbackListenAddr(addr string) bool {
+	if addr == "" {
+		return true
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func main() {
 	cfg := gateway.LoadConfig(os.Args[1:])
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("[air-gateway] invalid config: %v", err)
+	}
+	if cfg.InternalToken == "" && (!isLoopbackListenAddr(cfg.AdminAddr) || !isLoopbackListenAddr(cfg.AdminGRPCAddr)) {
+		log.Fatalf("[air-gateway] AIR_INTERNAL_TOKEN must be set when admin endpoints listen on non-loopback addresses (admin=%q admin_grpc=%q)", cfg.AdminAddr, cfg.AdminGRPCAddr)
 	}
 
 	var tlsCtx gateway.TLSContext

@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -413,7 +414,7 @@ func (cp *ControlPlane) internalAuthMiddleware() gin.HandlerFunc {
 				tok = strings.TrimSpace(authHeader[7:])
 			}
 		}
-		if tok != cp.internalToken {
+		if subtle.ConstantTimeCompare([]byte(tok), []byte(cp.internalToken)) != 1 {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": ErrUnauthorized.Error()})
 			return
 		}

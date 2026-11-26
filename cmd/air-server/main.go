@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,10 +22,35 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
+func isLoopbackListenAddr(addr string) bool {
+	if addr == "" {
+		return true
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func main() {
 	cfg, err := config.Load(os.Args[1:])
 	if err != nil {
 		log.Fatalf("load config: %v", err)
+	}
+	if cfg.InternalToken == "" && (!isLoopbackListenAddr(cfg.GRPCAddr) || !isLoopbackListenAddr(cfg.HTTPAddr)) {
+		log.Fatalf("[air-server] AIR_INTERNAL_TOKEN must be set when listening on non-loopback addresses (grpc=%q http=%q)", cfg.GRPCAddr, cfg.HTTPAddr)
+	}
+	if strings.TrimSpace(os.Getenv("AIR_MASTER_KEY_HEX")) == "" {
+		log.Printf("[air-server] WARNING: AIR_MASTER_KEY_HEX is not set; using local master key file %s", cfg.MasterKeyPath)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

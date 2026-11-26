@@ -61,8 +61,13 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 		return tls.Certificate{}, fmt.Errorf("ECDSA P-256 keygen failed: %w", err)
 	}
 	now := time.Now()
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialLimit)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("serial number generation failed: %w", err)
+	}
 	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
+		SerialNumber: serialNumber,
 		Subject:      pkix.Name{CommonName: "*.air.local"},
 		NotBefore:    now.Add(-1 * time.Hour),
 		NotAfter:     now.Add(365 * 24 * time.Hour),

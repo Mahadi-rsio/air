@@ -20,6 +20,8 @@ primary_region = "sin"
   AIR_EVICT_ON_SUSPEND = "true"
   AIR_R2_BUCKET = "air-pg-backups"
   AIR_R2_REGION = "auto"
+  AIR_POOL_MAX_BACKENDS = "8"
+  GOMEMLIMIT = "160MiB"
 
 [mounts]
   source = "air_server_data"

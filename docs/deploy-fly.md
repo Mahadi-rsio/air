@@ -51,10 +51,10 @@ Configuration files are located in [`deploy/fly/`](../deploy/fly/):
 
 | Service | Fly App Name | Config File | VM Size | Persistent Volume | Public Network Exposure |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Gateway** | `air-pg-gateway` | [`deploy/fly/fly.gateway.toml`](../deploy/fly/fly.gateway.toml) | `shared-cpu-1x` / `256MB` | *None* | **Dedicated IPv4** (`:5432` raw TCP, `:443` HTTPS Admin API) |
+| **Gateway** | `air-pg-gateway` | [`deploy/fly/fly.gateway.toml`](../deploy/fly/fly.gateway.toml) | `shared-cpu-2x` / `256MB` | *None* | **Dedicated IPv4** (`:5432` raw TCP+TLS, `:443` HTTPS Admin API) |
 | **Control Plane** | `air-pg-server` | [`deploy/fly/fly.server.toml`](../deploy/fly/fly.server.toml) | `shared-cpu-2x` / `512MB` | `air_server_data` (`2GB`) | *None* (internal 6PN IPv6) |
-| **Read Engine** | `air-pg-read-engine` | [`deploy/fly/fly.read-engine.toml`](../deploy/fly/fly.read-engine.toml) | `shared-cpu-1x` / `256MB` | `air_read_engine_data` (`1GB`) | *None* (internal 6PN IPv6) |
-| **Pageserver** | `air-pg-pageserver` | [`deploy/fly/fly.pageserver.toml`](../deploy/fly/fly.pageserver.toml) | `shared-cpu-1x` / `256MB` | `air_pageserver_data` (`1GB`) | *None* (internal 6PN IPv6) |
+| **Read Engine** | `air-pg-read-engine` | [`deploy/fly/fly.read-engine.toml`](../deploy/fly/fly.read-engine.toml) | `shared-cpu-2x` / `256MB` | `air_read_engine_data` (`1GB`) | *None* (internal 6PN IPv6) |
+| **Pageserver** | `air-pg-pageserver` | [`deploy/fly/fly.pageserver.toml`](../deploy/fly/fly.pageserver.toml) | `shared-cpu-2x` / `256MB` | `air_pageserver_data` (`1GB`) | *None* (internal 6PN IPv6) |
 
 > [!NOTE]
 > Fly's shared IPv4 only supports HTTP/TLS proxying. Raw PostgreSQL TCP wire traffic on port `5432` requires a **Dedicated IPv4** address on `air-pg-gateway`.
@@ -231,7 +231,7 @@ Retrieve the public IP and connect:
 ```bash
 GATEWAY_IP="$(fly ips list --app air-pg-gateway --json | jq -r '.[] | select(.Type=="v4") | .Address')"
 
-psql "postgresql://production_app:<GENERATED_PASSWORD>@${GATEWAY_IP}:5432?sslmode=disable"
+psql "postgresql://production_app:<GENERATED_PASSWORD>@${GATEWAY_IP}:5432?sslmode=require"
 ```
 
 ### Step 3: Run SQL Workloads

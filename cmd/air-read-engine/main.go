@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -118,8 +119,56 @@ type SharedReadEngine struct {
 	sqliteRe *readadapter.SQLiteReadServer
 }
 
+func isLoopbackListenAddr(addr string) bool {
+	if addr == "" {
+		return true
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func detectReadEngineMemoryBytes() int64 {
+	if mb := envIntOr("AIR_READ_ENGINE_MEMORY_MB", 0); mb > 0 {
+		return int64(mb) * 1024 * 1024
+	}
+	if raw, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
+		s := strings.TrimSpace(string(raw))
+		if s != "" && s != "max" {
+			if b, err := strconv.ParseInt(s, 10, 64); err == nil && b > 0 && b <= 64*1024*1024*1024 {
+				return b
+			}
+		}
+	}
+	return 256 * 1024 * 1024
+}
+
 func NewSharedReadEngine(cfg Config) (*SharedReadEngine, error) {
 	readadapter.SetDebugLogging(cfg.Debug)
+	memLimitBytes := detectReadEngineMemoryBytes()
+	if memLimitBytes < 64*1024*1024 {
+		memLimitBytes = 64 * 1024 * 1024
+	}
+	debug.SetMemoryLimit((memLimitBytes * 55) / 100)
+	globalExecLimit := (memLimitBytes * 35) / 100
+	tenantExecLimit := globalExecLimit / 2
+	if tenantExecLimit < 16*1024*1024 {
+		tenantExecLimit = 16 * 1024 * 1024
+	}
+	queryExecLimit := tenantExecLimit / 2
+	if queryExecLimit < 8*1024*1024 {
+		queryExecLimit = 8 * 1024 * 1024
+	}
 	sq, err := readadapter.NewSQLiteReadServer(readadapter.SQLiteServerConfig{
 		ListenHost:              cfg.ListenHost,
 		PGPort:                  cfg.PGPort,
@@ -129,7 +178,10 @@ func NewSharedReadEngine(cfg Config) (*SharedReadEngine, error) {
 		PageserverGRPCAddr:      cfg.PageserverGRPCAddr,
 		PageserverInternalToken: cfg.PageserverInternalToken,
 		CacheDir:                cfg.CacheDir,
-		CacheKB:                 parseMemoryToKB(cfg.SharedBuffers, 32768),
+		CacheKB:                 parseMemoryToKB(cfg.SharedBuffers, 16384),
+		GlobalMemoryLimitBytes:  globalExecLimit,
+		TenantMemoryLimitBytes:  tenantExecLimit,
+		QueryMemoryLimitBytes:   queryExecLimit,
 		Debug:                   cfg.Debug,
 	})
 	if err != nil {
@@ -323,6 +375,9 @@ func (s *readEngineGRPCServer) SyncTenant(ctx context.Context, req *pb.SyncTenan
 
 func main() {
 	cfg := loadConfig(os.Args[1:])
+	if cfg.PageserverInternalToken == "" && (!isLoopbackListenAddr(cfg.GRPCAddr) || !isLoopbackListenAddr(cfg.MetricsAddr)) {
+		log.Fatalf("[air-read-engine] AIR_INTERNAL_TOKEN must be set when listening on non-loopback addresses (grpc=%q metrics=%q)", cfg.GRPCAddr, cfg.MetricsAddr)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
