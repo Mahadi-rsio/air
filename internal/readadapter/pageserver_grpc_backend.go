@@ -8,13 +8,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Mahadi-rsio/air/internal/meshtransport"
 	"github.com/Mahadi-rsio/air/internal/pageserver"
 	"github.com/Mahadi-rsio/air/internal/pb"
 	"github.com/Mahadi-rsio/air/internal/prom"
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -55,9 +55,13 @@ func NewPageserverGRPCBackend(cfg PageserverGRPCConfig) (*PageserverGRPCBackend,
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 10 * time.Second
 	}
+	dialOption, err := meshtransport.DialOption(cfg.Addr)
+	if err != nil {
+		return nil, err
+	}
 	conn, err := grpc.NewClient(
 		cfg.Addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		dialOption,
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                30 * time.Second,
 			Timeout:             5 * time.Second,

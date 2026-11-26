@@ -40,13 +40,13 @@ var (
 )
 
 type WALSegmentArtifact struct {
-	SegmentName  string `json:"segment_name"`
-	TimelineID   string `json:"timeline_id,omitempty"`
-	R2Key        string `json:"r2_key"`
-	Epoch        int64  `json:"epoch"`
-	CipherBytes  int    `json:"cipher_bytes"`
-	CipherSHA256 string `json:"cipher_sha256,omitempty"`
-	PlainSHA256  string `json:"plain_sha256,omitempty"`
+	SegmentName  string         `json:"segment_name"`
+	TimelineID   string         `json:"timeline_id,omitempty"`
+	R2Key        string         `json:"r2_key"`
+	Epoch        int64          `json:"epoch"`
+	CipherBytes  int            `json:"cipher_bytes"`
+	CipherSHA256 string         `json:"cipher_sha256,omitempty"`
+	PlainSHA256  string         `json:"plain_sha256,omitempty"`
 	CipherETag   string         `json:"cipher_etag,omitempty"`
 	Status       string         `json:"status,omitempty"` // PENDING, VERIFIED_IN_R2, LOCAL_DELETED
 	TimeIndex    []TimeLSNEntry `json:"time_index,omitempty"`
@@ -105,7 +105,15 @@ func saveWALManifestAtomic(path string, m *WALUploadManifest) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 // RunEncryptedBackupStep executes pg_basebackup (FULL or INCR), verifies pg_available_wal_summaries()
@@ -716,10 +724,18 @@ func drainWALSpoolDirWithFaultGen(
 	return uploaded, nil
 }
 
+// ValidateRestoreVerificationQuery accepts the legacy spelling of the built-in restore check.
+func ValidateRestoreVerificationQuery(query string) error {
+	if query := strings.TrimSpace(query); query != "" && query != "SELECT 1;" {
+		return fmt.Errorf("%w: custom restore verification SQL is disabled", ErrInvalidRecoveryTarget)
+	}
+	return nil
+}
+
 // CombineAndReplayPITR downloads the multi-step backup chain (e.g. B0 -> I1 -> I2) and all encrypted
 // WAL segments from R2, extracts them with streaming archive/tar validation & uncompressed byte caps,
 // runs pg_combinebackup + pg_verifybackup, replays archived WAL up to targetLSN, promotes the cluster,
-// executes verifyQuery, and runs pg_amcheck.
+// runs a fixed connectivity check and pg_amcheck.
 func CombineAndReplayPITR(
 	ctx context.Context,
 	agent *cell.Agent,
@@ -785,6 +801,9 @@ func StagePITRRestore(
 	target RecoveryTarget,
 	opts StagePITROptions,
 ) (*StagePITRResult, error) {
+	if err := ValidateRestoreVerificationQuery(opts.VerifyQuery); err != nil {
+		return nil, err
+	}
 	if s3c == nil || strings.TrimSpace(bucket) == "" {
 		return nil, ErrR2ClientRequired
 	}
@@ -1086,12 +1105,9 @@ restore_command = 'cp %s/%%f %%p'
 		}
 	}
 
-	qOut := ""
-	if strings.TrimSpace(opts.VerifyQuery) != "" {
-		qOut, err = agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "psql"), "-h", sockDir, "-p", strconv.Itoa(port), "-U", "postgres", "-d", verifyDB, "-t", "-A", "-c", opts.VerifyQuery)
-		if err != nil {
-			return nil, fmt.Errorf("pitr verifyQuery failed: %w (%s)", err, qOut)
-		}
+	qOut, err := agent.RunPostgresCmd(filepath.Join(agent.PGBin(), "psql"), "-X", "-h", sockDir, "-p", strconv.Itoa(port), "-U", "postgres", "-d", verifyDB, "-t", "-A", "-c", "SELECT 1;")
+	if err != nil {
+		return nil, fmt.Errorf("pitr verification failed: %w (%s)", err, qOut)
 	}
 
 	if opts.RenameDatabaseFrom != "" && opts.RenameDatabaseTo != "" && opts.RenameDatabaseFrom != opts.RenameDatabaseTo {

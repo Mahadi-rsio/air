@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 	"sync"
 	"syscall"
@@ -96,13 +97,19 @@ func watchClientDisconnect(ctx context.Context, client net.Conn, onDisconnect fu
 	}
 }
 
-func sendBackendCancel(host, sockDir string, port int, pid, secret uint32) {
+func sendBackendCancel(host, sockDir string, port int, pid, secret uint32, readTLS ...*tls.Config) {
 	if port <= 0 || pid == 0 {
 		return
 	}
 	bconn, err := dialBackendSocket(host, sockDir, port)
 	if err != nil {
 		return
+	}
+	if len(readTLS) != 0 {
+		bconn, err = dialReadEngineTLS(context.Background(), bconn, host, readTLS[0])
+		if err != nil {
+			return
+		}
 	}
 	defer bconn.Close()
 	_ = bconn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))

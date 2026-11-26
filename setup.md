@@ -61,19 +61,30 @@ Client (psql/SDK) ->|   air-gateway (:5432)  |<- Admin HTTP (:8081) / gRPC (:909
    cd air
    ```
 
-2. **(Optional) Configure secrets in `.env`**:
-   Defaults are pre-configured in `docker-compose.yml` for local development, but for production or custom environments create a `.env` file:
+2. **Configure credentials and certificates.** Keep certificate directories outside the checkout and mount a separate directory for each service.
+
+   | Environment variable | Files and certificate identity |
+   | --- | --- |
+   | `AIR_META_TLS_DIR` | `tls.crt`, `tls.key`; DNS SAN `air-meta-postgres` |
+   | `AIR_SERVER_TLS_DIR` | `ca.crt`, `tls.crt`, `tls.key`; DNS SAN `air-server` |
+   | `AIR_PAGESERVER_TLS_DIR` | `ca.crt`, `tls.crt`, `tls.key`; DNS SAN `air-pageserver` |
+   | `AIR_READ_ENGINE_TLS_DIR` | `ca.crt`, `tls.crt`, `tls.key`; DNS SAN `air-read-engine` |
+   | `AIR_GATEWAY_TLS_DIR` | `ca.crt`, `tls.crt`, `tls.key`; DNS SAN `air-gateway`. Also provide `public.crt` and `public.key` for the hostname SQL clients use. |
+
+   Issue the four AIR service certificates from a dedicated mesh CA and include both server and client authentication usages. In this example, the same CA signs the metadata certificate. Keep the CA private key outside all mounts. Make each service key readable only by its runtime user. PostgreSQL requires its key to be owned by the PostgreSQL user with mode `0600`, or by root with mode `0640` and a group readable by PostgreSQL.
+
+   Set the five directory variables and these values in your shell or a mode-`0600` `.env` file:
+
    ```bash
-   cat <<EOF > .env
-   AIR_INTERNAL_TOKEN=$(openssl rand -hex 24)
-   AIR_MASTER_KEY_HEX=$(openssl rand -hex 32)
-   AIR_BOOTSTRAP_API_KEY=air_live_$(openssl rand -hex 16)
-   AIR_BOOTSTRAP_ACCOUNT_ID=acct_default
-   AIR_META_PG_USER=air_meta
-   AIR_META_PG_PASSWORD=$(openssl rand -hex 16)
-   AIR_META_PG_DB=air_meta
-   EOF
+   export AIR_INTERNAL_TOKEN=$(openssl rand -hex 32)
+   export AIR_MASTER_KEY_HEX=$(openssl rand -hex 32)
+   export AIR_META_PG_PASSWORD=$(openssl rand -hex 32)
+   export AIR_META_DSN="postgres://air_meta:${AIR_META_PG_PASSWORD}@air-meta-postgres:5432/air_meta?sslmode=verify-full&sslrootcert=/run/air-tls/ca.crt"
    ```
+
+   Keep gateway-to-tenant PostgreSQL traffic on a private network. The tenant PostgreSQL listeners use plaintext on that hop.
+
+   For an existing installation, update the metadata role password in PostgreSQL as well as the DSN. Preserve the existing master key until wrapped tenant keys and backup recovery have been migrated and verified. Revoke any previously seeded default bootstrap API key.
 
 3. **Build service images locally and start the stack**:
    ```bash
@@ -84,8 +95,9 @@ Client (psql/SDK) ->|   air-gateway (:5432)  |<- Admin HTTP (:8081) / gRPC (:909
 
 4. **Verify health of all 4 services via `air-gateway`**:
    ```bash
-   curl -fsS http://127.0.0.1:8081/healthz
-   curl -fsS -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8081/v1/cluster/health
+   # Export AIR_INTERNAL_TOKEN in this shell for authenticated requests.
+   docker compose exec -T air-gateway curl -fsS http://127.0.0.1:8081/healthz
+   docker compose exec -T air-gateway curl -fsS -H "X-Air-Internal-Token: ${AIR_INTERNAL_TOKEN}" http://127.0.0.1:8081/v1/cluster/health
    ```
 
 ---
@@ -124,8 +136,10 @@ docker compose -f docker-compose.yml -f compose.ghcr.yml up -d --wait
 Instead of the bundled `air-meta-postgres` container, point `AIR_META_DSN` to any PostgreSQL 15+ / 17 database (e.g. AWS RDS, Google Cloud SQL, Neon, Supabase, or self-hosted HA PostgreSQL):
 
 ```bash
-export AIR_META_DSN="postgres://<user>:<password>@<pg-host>:5432/<db>?sslmode=require"
+export AIR_META_DSN="postgres://<user>:<password>@<pg-host>:5432/<db>?sslmode=verify-full&sslrootcert=system"
 ```
+
+For a private CA, set `sslrootcert` to the CA certificate path inside both containers.
 
 Pass `AIR_META_DSN` to both `air-server` and `air-gateway`:
 - On startup, `air-server` runs schema migrations automatically and provisions control-plane metadata tables (`clusters`, `tenant_events`, `api_keys`, `query_metering`, etc.).
@@ -139,8 +153,8 @@ Pass `AIR_META_DSN` to both `air-server` and `air-gateway`:
 Run the following `curl` command to provision a new tenant database `demo_db` across `air-server`, `air-read-engine`, and `air-pageserver`:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8081/v1/databases \
-  -H "X-Air-Internal-Token: air-dev-internal-token" \
+docker compose exec -T air-gateway curl -sS -X POST http://127.0.0.1:8081/v1/databases \
+  -H "X-Air-Internal-Token: ${AIR_INTERNAL_TOKEN}" \
   -H "Idempotency-Key: idem-demo-db-001" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"demo_db","account_id":"acct_default"}'
@@ -167,24 +181,24 @@ Inspect how the tenant is wired across all components:
 
 ```bash
 # Check Control Plane cluster metadata
-PGPASSWORD=air_meta_pass psql -h 127.0.0.1 -p 5435 -U air_meta -d air_meta \
+docker compose exec -T air-meta-postgres psql -U air_meta -d air_meta \
   -c "SELECT tenant_id, account_id, state, generation, direct_port FROM clusters;"
 
 # Check Pageserver registration (via gateway gRPC proxy)
-curl -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8081/v1/pageserver/tenants
+docker compose exec -T air-gateway curl -H "X-Air-Internal-Token: ${AIR_INTERNAL_TOKEN}" http://127.0.0.1:8081/v1/pageserver/tenants
 
 # Check Read-Engine registration (via gateway gRPC proxy)
-curl -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8081/v1/read-engine/tenants
+docker compose exec -T air-gateway curl -H "X-Air-Internal-Token: ${AIR_INTERNAL_TOKEN}" http://127.0.0.1:8081/v1/read-engine/tenants
 
 # Check Gateway routing and backend connectivity
-curl -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8081/v1/namespaces/demo_db
+docker compose exec -T air-gateway curl -H "X-Air-Internal-Token: ${AIR_INTERNAL_TOKEN}" http://127.0.0.1:8081/v1/namespaces/demo_db
 ```
 
 ### Step 3: Connect and Execute SQL
-Connect through **`air-gateway` on port `5432`**:
+Connect through **`air-gateway` on port `5432`**. The example uses a gateway certificate with `127.0.0.1` as an IP SAN.
 
 ```bash
-psql "postgresql://demo_db:<GENERATED_PASSWORD>@127.0.0.1:5432?sslmode=disable" <<'SQL'
+PGSSLROOTCERT=/path/to/gateway-ca.crt psql "postgresql://demo_db:<GENERATED_PASSWORD>@127.0.0.1:5432/demo_db?sslmode=verify-full" <<'SQL'
 SELECT current_user, current_database(), version();
 
 CREATE TABLE users (
@@ -203,7 +217,7 @@ SQL
 AIR Gateway logs every tenant query and flushes to `query_metering` in `air-meta-postgres`:
 
 ```bash
-PGPASSWORD=air_meta_pass psql -h 127.0.0.1 -p 5435 -U air_meta -d air_meta \
+docker compose exec -T air-meta-postgres psql -U air_meta -d air_meta \
   -c "SELECT id, recorded_at, db_id, bandwidth_bytes, query_time_us, query_type FROM query_metering ORDER BY id DESC LIMIT 10;"
 ```
 
@@ -228,7 +242,7 @@ PGPASSWORD=air_meta_pass psql -h 127.0.0.1 -p 5435 -U air_meta -d air_meta \
 | `AIR_READ_ENGINE_GRPC_ADDR` | `air-read-engine:9092` | Read Engine gRPC endpoint |
 | `AIR_GATEWAY_ADMIN_GRPC_ADDR` | `air-gateway:9093` | Gateway Admin gRPC endpoint |
 | `AIR_BACKEND_HOST` | `air-server` | Hostname advertised to gateway for tenant PG backends |
-| `AIR_BOOTSTRAP_API_KEY` | `air_dev_bootstrap_key` | Initial Bearer API token seeded on startup |
+| `AIR_BOOTSTRAP_API_KEY` | *(empty)* | Optional initial Bearer API token seeded on startup |
 | `AIR_BOOTSTRAP_ACCOUNT_ID` | `acct_default` | Account ID associated with the bootstrap API key |
 | `AIR_PAGESERVER_CACHE_MB` | `64` | Pageserver disk cache and `air_smgr.lfc_max_mb` size (MB) |
 | `AIR_IDLE_TIMEOUT` | *(empty)* | Idle timeout (e.g., `10m`) for automatic scale-to-zero suspension |
@@ -254,7 +268,7 @@ PGPASSWORD=air_meta_pass psql -h 127.0.0.1 -p 5435 -U air_meta -d air_meta \
 | Variable | Default (Compose) | Description |
 | :--- | :--- | :--- |
 | `AIR_GATEWAY_ADDR` | `0.0.0.0:5432` | Client PostgreSQL wire listen address |
-| `AIR_GATEWAY_ADMIN_ADDR` | `0.0.0.0:8081` | Admin HTTP & metrics listen address |
+| `AIR_GATEWAY_ADMIN_ADDR` | `127.0.0.1:8081` | Loopback admin HTTP and metrics listen address |
 | `AIR_GATEWAY_ADMIN_GRPC_ADDR` | `0.0.0.0:9093` | `GatewayAdmin` gRPC listen address |
 | `AIR_DB_GRPC_ADDR` | `air-server:9090` | `AirDBControl` gRPC endpoint |
 | `AIR_PAGESERVER_GRPC_ADDR` | `air-pageserver:9091` | Pageserver gRPC endpoint |

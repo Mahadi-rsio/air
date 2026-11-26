@@ -19,7 +19,7 @@ AIR provides a unified multi-tenant database platform built with 4 interconnecte
 
 ## Authentication Model
 
-All HTTP Control Plane endpoints on `air-gateway` (`:8081`) and all inter-service gRPC calls require the shared `AIR_INTERNAL_TOKEN` (default: `air-dev-internal-token`), except `GET /healthz` which is unauthenticated.
+Gateway management HTTP listens on loopback. Management endpoints and inter-service gRPC calls require the shared `AIR_INTERNAL_TOKEN`, except `GET /healthz` which is unauthenticated. Cross-host gRPC uses mutual TLS.
 
 - **HTTP Requests** (`air-gateway` `:8081`):
   - `X-Air-Internal-Token: <AIR_INTERNAL_TOKEN>` (recommended)
@@ -101,7 +101,7 @@ X-Air-Internal-Token: <AIR_INTERNAL_TOKEN>
 ---
 
 ### Delete / Purge Database
-Cascades teardown in safe reverse order via gRPC: drains gateway poolers → deletes from `air-read-engine` → stops PostgreSQL and purges `air-server` local storage → purges `air-pageserver` layers.
+The gateway drains its pool, then the control plane coordinates cleanup across the configured services. It marks the tenant `PURGED` only after cleanup succeeds. If cleanup fails after deletion begins, the tenant remains `DELETING`. Retry the same request after resolving the reported error. Backup retention, snapshots, and historical object versions are governed by their storage policies.
 
 ```http
 DELETE /v1/databases/:id
@@ -157,11 +157,11 @@ Content-Type: application/json
 {
   "backup_id": "bkp_20261125_001",
   "target_lsn": "0/16B2300",
-  "target_time": "2026-11-25T01:00:00Z",
-  "new_tenant_id": "restored_analytics_db",
-  "verify_query": "SELECT COUNT(*) FROM users;"
+  "new_tenant_id": "restored_analytics_db"
 }
 ```
+
+Restore runs a built-in connectivity check and `pg_amcheck`. Omit `verify_query` or pass the legacy value `SELECT 1;`. Run application-specific checks against the restored database using its tenant credentials.
 
 #### Check Cold Offload Status
 ```http
@@ -289,10 +289,10 @@ Implemented by `air-read-engine`:
 
 ## 6. Client Database Connection (PostgreSQL Wire Protocol)
 
-Applications connect to **`air-gateway` on port `5432`**:
+Applications connect to **`air-gateway` on port `5432`** using a hostname or address covered by its certificate.
 
 ```text
-postgresql://<TENANT_ID>:<PASSWORD>@<GATEWAY_HOST>:5432?sslmode=disable
+postgresql://<TENANT_ID>:<PASSWORD>@<GATEWAY_HOST>:5432/<TENANT_ID>?sslmode=verify-full&sslrootcert=/path/to/gateway-ca.crt
 ```
 
 ### Connection Characteristics

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
@@ -160,6 +161,7 @@ func SCRAMSHA256ClientAuth(rw io.ReadWriter, user, password string) error {
 
 // CancelTarget identifies the backend PostgreSQL process for CancelRequest forwarding.
 type CancelTarget struct {
+	TLS           *tls.Config
 	Host          string
 	SockDir       string
 	Port          int

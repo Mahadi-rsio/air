@@ -5,8 +5,14 @@ primary_region = "sin"
   dockerfile = "../../gateway/Dockerfile"
 
 [env]
+  AIR_MESH_TLS_CA = "/run/air-tls/ca.crt"
+  AIR_MESH_TLS_CERT = "/run/air-tls/tls.crt"
+  AIR_MESH_TLS_KEY = "/run/air-tls/tls.key"
+  AIR_TLS_CERT = "/run/air-tls/public.crt"
+  AIR_TLS_KEY = "/run/air-tls/public.key"
   AIR_GATEWAY_ADDR = "[::]:5432"
-  AIR_GATEWAY_ADMIN_ADDR = "[::]:8081"
+  AIR_GATEWAY_ADMIN_ADDR = "127.0.0.1:8081"
+  AIR_GATEWAY_ADMIN_GRPC_ADDR = "[::]:9093"
   AIR_DB_GRPC_ADDR = "air-pg-server.internal:9090"
   AIR_PAGESERVER_GRPC_ADDR = "air-pg-pageserver.internal:9091"
   AIR_READ_ENGINE_HOST = "air-pg-read-engine.internal"
@@ -21,20 +27,6 @@ primary_region = "sin"
   AIR_WRITE_BUFFER_SESSION_MAX = "2097152"
   GOMEMLIMIT = "180MiB"
 
-[http_service]
-  internal_port = 8081
-  force_https = true
-  auto_stop_machines = "stop"
-  auto_start_machines = true
-  min_machines_running = 0
-
-  [[http_service.checks]]
-    interval = "15s"
-    timeout = "5s"
-    grace_period = "10s"
-    method = "GET"
-    path = "/healthz"
-
 [[services]]
   protocol = "tcp"
   internal_port = 5432
@@ -42,8 +34,33 @@ primary_region = "sin"
   auto_start_machines = true
   min_machines_running = 0
 
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "10s"
+
   [[services.ports]]
     port = 5432
+
+[[files]]
+  guest_path = "/run/air-tls/ca.crt"
+  secret_name = "AIR_MESH_CA_PEM_B64"
+
+[[files]]
+  guest_path = "/run/air-tls/tls.crt"
+  secret_name = "AIR_MESH_CERT_PEM_B64"
+
+[[files]]
+  guest_path = "/run/air-tls/tls.key"
+  secret_name = "AIR_MESH_KEY_PEM_B64"
+
+[[files]]
+  guest_path = "/run/air-tls/public.crt"
+  secret_name = "AIR_GATEWAY_CERT_PEM_B64"
+
+[[files]]
+  guest_path = "/run/air-tls/public.key"
+  secret_name = "AIR_GATEWAY_KEY_PEM_B64"
 
 [[vm]]
   cpu_kind = "shared"

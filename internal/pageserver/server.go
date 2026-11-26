@@ -358,7 +358,7 @@ func (p *Pageserver) isGenerationActive(tenantID, generation string) bool {
 }
 
 // PurgeTenant removes in-memory timelines, local layer/cache files, decoded/index/disk cache entries,
-// and best-effort R2 objects for (tenantID, generation).
+// and reports any errors deleting R2 objects for (tenantID, generation).
 func (p *Pageserver) PurgeTenant(ctx context.Context, tenantID, generation string) error {
 	if err := tenant.ValidateID(tenantID); err != nil {
 		return err
@@ -407,15 +407,17 @@ func (p *Pageserver) PurgeTenant(ctx context.Context, tenantID, generation strin
 					ContinuationToken: token,
 				})
 				if err != nil {
-					debugf("tenant", "PurgeTenant R2 list error tenant=%s prefix=%q err=%v", tenantID, prefix, err)
-					break
+					return fmt.Errorf("list tenant objects under %q: %w", prefix, err)
 				}
 				for _, obj := range out.Contents {
 					if obj.Key != nil {
-						_, _ = p.store.s3c.DeleteObject(ctx, &s3.DeleteObjectInput{
+						_, err := p.store.s3c.DeleteObject(ctx, &s3.DeleteObjectInput{
 							Bucket: aws.String(p.store.bucket),
 							Key:    obj.Key,
 						})
+						if err != nil {
+							return fmt.Errorf("delete tenant object %q: %w", *obj.Key, err)
+						}
 						deletedR2++
 					}
 				}
@@ -434,7 +436,9 @@ func (p *Pageserver) PurgeTenant(ctx context.Context, tenantID, generation strin
 				target = filepath.Join(target, generation)
 			}
 			if rel, rErr := filepath.Rel(baseAbs, target); rErr == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-				_ = os.RemoveAll(target)
+				if err := os.RemoveAll(target); err != nil {
+					return fmt.Errorf("purge tenant layers: %w", err)
+				}
 			}
 		}
 	}

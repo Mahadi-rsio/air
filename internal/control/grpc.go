@@ -11,12 +11,12 @@ import (
 
 	"github.com/Mahadi-rsio/air/internal/backup"
 	"github.com/Mahadi-rsio/air/internal/cell"
+	"github.com/Mahadi-rsio/air/internal/meshtransport"
 	"github.com/Mahadi-rsio/air/internal/pb"
 	"github.com/Mahadi-rsio/air/internal/tenant"
 	"github.com/jackc/pgx/v5"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
@@ -27,11 +27,11 @@ type grpcServer struct {
 }
 
 // NewGRPCServer constructs the Air DB gRPC control server for air-gateway.
-func NewGRPCServer(cp *ControlPlane) *grpc.Server {
-	srv := grpc.NewServer(
+func NewGRPCServer(cp *ControlPlane, options ...grpc.ServerOption) *grpc.Server {
+	srv := grpc.NewServer(append(options,
 		grpc.UnaryInterceptor(cp.grpcAuthInterceptor),
 		grpc.StreamInterceptor(cp.grpcStreamAuthInterceptor),
-	)
+	)...)
 	pb.RegisterAirDBControlServer(srv, &grpcServer{cp: cp})
 	return srv
 }
@@ -387,7 +387,11 @@ func NewGRPCPoolDrainFn(gatewayAdminGRPCAddr, internalToken string) (func(tenant
 	if addr == "" {
 		return nil, nil, fmt.Errorf("gateway admin gRPC address is empty")
 	}
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	dialOption, err := meshtransport.DialOption(addr)
+	if err != nil {
+		return nil, nil, err
+	}
+	conn, err := grpc.NewClient(addr, dialOption)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial gateway admin gRPC %s: %w", addr, err)
 	}

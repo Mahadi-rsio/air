@@ -242,13 +242,13 @@ func TestAdminHTTPServer_UnifiedControlPlane(t *testing.T) {
 		t.Fatalf("read-engine sync failed: code=%d body=%+v", code, reSync)
 	}
 
-	// 4. Deleting DB via gateway cascades to air-server, read-engine, and pageserver
+	// 4. Control owns database deletion and storage cleanup.
 	code, _ = doTestHTTP(t, http.MethodDelete, ts.URL+"/v1/databases/t_unified", cfg.InternalToken, nil)
 	if code != http.StatusOK {
 		t.Fatalf("delete db failed: code=%d", code)
 	}
-	if len(airMock.deleted) != 1 || len(reMock.deleted) != 1 || len(psMock.purged) != 1 {
-		t.Fatalf("expected all 3 backends cleaned up on delete: air=%v re=%v ps=%v", airMock.deleted, reMock.deleted, psMock.purged)
+	if len(airMock.deleted) != 1 || len(reMock.deleted) != 0 || len(psMock.purged) != 0 {
+		t.Fatalf("expected only the control plane called on delete: air=%v re=%v ps=%v", airMock.deleted, reMock.deleted, psMock.purged)
 	}
 
 	// 5. Security: reject traversal / invalid tenant & generation IDs and oversized/malformed bodies

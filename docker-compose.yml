@@ -4,12 +4,12 @@ services:
     container_name: air-meta-postgres
     environment:
       POSTGRES_USER: ${AIR_META_PG_USER:-air_meta}
-      POSTGRES_PASSWORD: ${AIR_META_PG_PASSWORD:-air_meta_pass}
+      POSTGRES_PASSWORD: ${AIR_META_PG_PASSWORD:?Set a unique metadata database password}
       POSTGRES_DB: ${AIR_META_PG_DB:-air_meta}
-    ports:
-      - "${AIR_META_PG_PORT:-5435}:5432"
+    command: ["postgres", "-c", "ssl=on", "-c", "ssl_cert_file=/run/air-tls/tls.crt", "-c", "ssl_key_file=/run/air-tls/tls.key"]
     volumes:
       - air_meta_pg_data:/var/lib/postgresql/data
+      - "${AIR_META_TLS_DIR:?Set the metadata PG certificate directory}:/run/air-tls:ro"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${AIR_META_PG_USER:-air_meta} -d ${AIR_META_PG_DB:-air_meta}"]
       interval: 5s
@@ -25,21 +25,23 @@ services:
       dockerfile: Dockerfile.pageserver
     container_name: air-pageserver
     environment:
+      AIR_MESH_TLS_CA: /run/air-tls/ca.crt
+      AIR_MESH_TLS_CERT: /run/air-tls/tls.crt
+      AIR_MESH_TLS_KEY: /run/air-tls/tls.key
       AIR_DATA_DIR: /var/lib/air-pageserver
       AIR_PAGESERVER_GRPC_ADDR: 0.0.0.0:9091
       AIR_PAGESERVER_CACHE_MB: ${AIR_PAGESERVER_CACHE_MB:-64}
-      AIR_PAGESERVER_DEBUG: ${AIR_PAGESERVER_DEBUG:-true}
-      AIR_INTERNAL_TOKEN: ${AIR_INTERNAL_TOKEN:-air-dev-internal-token}
-      AIR_MASTER_KEY_HEX: ${AIR_MASTER_KEY_HEX:-0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20}
+      AIR_PAGESERVER_DEBUG: ${AIR_PAGESERVER_DEBUG:-false}
+      AIR_INTERNAL_TOKEN: ${AIR_INTERNAL_TOKEN:?Set a unique internal token}
+      AIR_MASTER_KEY_HEX: ${AIR_MASTER_KEY_HEX:?Set a shared 32-byte master key encoded as hex}
       AIR_R2_ENDPOINT: ${AIR_R2_ENDPOINT:-}
       AIR_R2_BUCKET: ${AIR_R2_BUCKET:-}
       AIR_R2_ACCESS_KEY_ID: ${AIR_R2_ACCESS_KEY_ID:-}
       AIR_R2_SECRET_ACCESS_KEY: ${AIR_R2_SECRET_ACCESS_KEY:-}
       AIR_R2_REGION: ${AIR_R2_REGION:-auto}
-    ports:
-      - "${AIR_PAGESERVER_GRPC_PORT:-9091}:9091"
     volumes:
       - air_pageserver_data:/var/lib/air-pageserver
+      - "${AIR_PAGESERVER_TLS_DIR:?Set the service certificate directory}:/run/air-tls:ro"
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9091'"]
       interval: 5s
@@ -60,10 +62,14 @@ services:
       air-pageserver:
         condition: service_healthy
     environment:
+      AIR_MESH_TLS_CA: /run/air-tls/ca.crt
+      AIR_MESH_TLS_CERT: /run/air-tls/tls.crt
+      AIR_MESH_TLS_KEY: /run/air-tls/tls.key
       AIR_DATA_DIR: /var/lib/air
-      AIR_META_DSN: ${AIR_META_DSN:-postgres://air_meta:air_meta_pass@air-meta-postgres:5432/air_meta?sslmode=disable}
+      AIR_META_DSN: ${AIR_META_DSN:?Set a verified TLS metadata database DSN}
       AIR_PG_BIN_DIR: /usr/lib/postgresql/17/bin
       AIR_GRPC_ADDR: 0.0.0.0:9090
+      AIR_GATEWAY_ADMIN_GRPC_ADDR: air-gateway:9093
       AIR_PAGESERVER_ENABLED: ${AIR_PAGESERVER_ENABLED:-true}
       AIR_PAGESERVER_SOCKET: /var/lib/air/pageserver.sock
       AIR_PAGESERVER_CACHE_MB: ${AIR_PAGESERVER_CACHE_MB:-64}
@@ -71,9 +77,9 @@ services:
       AIR_READ_ENGINE_GRPC_ADDR: air-read-engine:9092
       AIR_BACKEND_HOST: air-server
       AIR_PG_LISTEN_ADDRESSES: "*"
-      AIR_INTERNAL_TOKEN: ${AIR_INTERNAL_TOKEN:-air-dev-internal-token}
-      AIR_MASTER_KEY_HEX: ${AIR_MASTER_KEY_HEX:-0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20}
-      AIR_BOOTSTRAP_API_KEY: ${AIR_BOOTSTRAP_API_KEY:-air_dev_bootstrap_key}
+      AIR_INTERNAL_TOKEN: ${AIR_INTERNAL_TOKEN:?Set a unique internal token}
+      AIR_MASTER_KEY_HEX: ${AIR_MASTER_KEY_HEX:?Set a shared 32-byte master key encoded as hex}
+      AIR_BOOTSTRAP_API_KEY: ${AIR_BOOTSTRAP_API_KEY:-}
       AIR_BOOTSTRAP_ACCOUNT_ID: ${AIR_BOOTSTRAP_ACCOUNT_ID:-acct_default}
       AIR_R2_ENDPOINT: ${AIR_R2_ENDPOINT:-}
       AIR_R2_BUCKET: ${AIR_R2_BUCKET:-}
@@ -82,10 +88,9 @@ services:
       AIR_R2_REGION: ${AIR_R2_REGION:-auto}
       AIR_IDLE_TIMEOUT: ${AIR_IDLE_TIMEOUT:-}
       AIR_EVICT_ON_SUSPEND: ${AIR_EVICT_ON_SUSPEND:-true}
-    ports:
-      - "${AIR_GRPC_PORT:-9090}:9090"
     volumes:
       - air_server_data:/var/lib/air
+      - "${AIR_SERVER_TLS_DIR:?Set the service certificate directory}:/run/air-tls:ro"
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9090'"]
       interval: 5s
@@ -104,19 +109,20 @@ services:
       air-pageserver:
         condition: service_healthy
     environment:
+      AIR_MESH_TLS_CA: /run/air-tls/ca.crt
+      AIR_MESH_TLS_CERT: /run/air-tls/tls.crt
+      AIR_MESH_TLS_KEY: /run/air-tls/tls.key
       AIR_READ_ENGINE_DATA_DIR: /var/lib/air-read-engine
       AIR_READ_ENGINE_CACHE_DIR: /var/lib/air-read-engine/cache
       AIR_READ_ENGINE_LISTEN_HOST: 0.0.0.0
       AIR_READ_ENGINE_PG_PORT: 5433
       AIR_READ_ENGINE_GRPC_ADDR: 0.0.0.0:9092
-      AIR_READ_ENGINE_DEBUG: ${AIR_READ_ENGINE_DEBUG:-true}
+      AIR_READ_ENGINE_DEBUG: ${AIR_READ_ENGINE_DEBUG:-false}
       AIR_PAGESERVER_GRPC_ADDR: air-pageserver:9091
-      AIR_INTERNAL_TOKEN: ${AIR_INTERNAL_TOKEN:-air-dev-internal-token}
-    ports:
-      - "${AIR_READ_ENGINE_PG_PORT:-5433}:5433"
-      - "${AIR_READ_ENGINE_GRPC_PORT:-9092}:9092"
+      AIR_INTERNAL_TOKEN: ${AIR_INTERNAL_TOKEN:?Set a unique internal token}
     volumes:
       - air_read_engine_data:/var/lib/air-read-engine
+      - "${AIR_READ_ENGINE_TLS_DIR:?Set the service certificate directory}:/run/air-tls:ro"
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9092'"]
       interval: 5s
@@ -137,20 +143,28 @@ services:
       air-read-engine:
         condition: service_healthy
     environment:
+      AIR_MESH_TLS_CA: /run/air-tls/ca.crt
+      AIR_MESH_TLS_CERT: /run/air-tls/tls.crt
+      AIR_MESH_TLS_KEY: /run/air-tls/tls.key
       AIR_GATEWAY_ADDR: 0.0.0.0:5432
-      AIR_GATEWAY_ADMIN_ADDR: 0.0.0.0:8081
-      AIR_META_DSN: ${AIR_META_DSN:-postgres://air_meta:air_meta_pass@air-meta-postgres:5432/air_meta?sslmode=disable}
+      AIR_GATEWAY_ADMIN_ADDR: 127.0.0.1:8081
+      AIR_GATEWAY_ADMIN_GRPC_ADDR: 0.0.0.0:9093
+      AIR_REQUIRE_TLS: "true"
+      AIR_TLS_CERT: /run/air-tls/public.crt
+      AIR_TLS_KEY: /run/air-tls/public.key
+      AIR_META_DSN: ${AIR_META_DSN:?Set a verified TLS metadata database DSN}
       AIR_DB_GRPC_ADDR: air-server:9090
       AIR_PAGESERVER_GRPC_ADDR: air-pageserver:9091
       AIR_READ_ENGINE_HOST: air-read-engine
       AIR_READ_ENGINE_PORT: 5433
       AIR_READ_ENGINE_GRPC_ADDR: air-read-engine:9092
       AIR_BACKEND_HOST: air-server
-      AIR_INTERNAL_TOKEN: ${AIR_INTERNAL_TOKEN:-air-dev-internal-token}
+      AIR_INTERNAL_TOKEN: ${AIR_INTERNAL_TOKEN:?Set a unique internal token}
       AIR_POOL_MODE: "true"
     ports:
       - "${AIR_GATEWAY_PORT:-5432}:5432"
-      - "${AIR_GATEWAY_ADMIN_PORT:-8081}:8081"
+    volumes:
+      - "${AIR_GATEWAY_TLS_DIR:?Set the gateway certificate directory}:/run/air-tls:ro"
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8081'"]
       interval: 5s

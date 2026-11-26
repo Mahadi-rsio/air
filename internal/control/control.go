@@ -939,7 +939,6 @@ func (cp *ControlPlane) DeleteDatabase(ctx context.Context, accountID, tenantID 
 	if err := tenant.ValidateID(tenantID); err != nil {
 		return err
 	}
-	cp.cancelActiveOffload(tenantID)
 	unlock := cp.lockTenantLifecycle(tenantID)
 	defer unlock()
 
@@ -955,6 +954,7 @@ func (cp *ControlPlane) DeleteDatabase(ctx context.Context, accountID, tenantID 
 		return ErrForbidden
 	}
 
+	cp.cancelActiveOffload(tenantID)
 	if _, err := cp.db.Exec(ctx, `UPDATE clusters SET state = 'DELETING', lifecycle_seq = lifecycle_seq + 1, updated_at = now() WHERE tenant_id = $1`, tenantID); err != nil {
 		return err
 	}
@@ -965,10 +965,14 @@ func (cp *ControlPlane) DeleteDatabase(ctx context.Context, accountID, tenantID 
 	)
 	cp.stopWALReceiver(tenantID)
 	if gw := cp.getGatewayAdmin(); gw != nil {
-		_ = gw.DeleteNamespace(ctx, tenantID)
+		if err := gw.DeleteNamespace(ctx, tenantID); err != nil {
+			return fmt.Errorf("delete gateway namespace: %w", err)
+		}
 	}
 	if re := cp.getReadEngine(); re != nil {
-		_ = re.DeleteTenant(ctx, tenantID)
+		if err := re.DeleteTenant(ctx, tenantID); err != nil {
+			return fmt.Errorf("purge read-engine data: %w", err)
+		}
 	}
 	if cp.agent != nil {
 		if err := cp.agent.StopAndPurgeTenant(tenantID); err != nil {
@@ -976,7 +980,9 @@ func (cp *ControlPlane) DeleteDatabase(ctx context.Context, accountID, tenantID 
 		}
 	}
 	if ps := cp.getPageserver(); ps != nil {
-		_ = ps.PurgeTenant(ctx, tenantID, gen)
+		if err := ps.PurgeTenant(ctx, tenantID, gen); err != nil {
+			return fmt.Errorf("purge pageserver data: %w", err)
+		}
 	}
 	if cp.kms != nil {
 		cp.kms.ShredDEK(tenantID)
@@ -1022,6 +1028,9 @@ func (cp *ControlPlane) GetTenantRouteAndCredentials(ctx context.Context, tenant
 	).Scan(&state, &directPort, &owner, &encB64, &wrappedDEK)
 	if err != nil {
 		return "", 0, "", "", err
+	}
+	if state == "DELETING" || state == "PURGED" {
+		return "", 0, "", "", ErrNotFound
 	}
 	if wrappedDEK != "" {
 		_ = cp.kms.LoadWrappedDEK(tenantID, wrappedDEK)

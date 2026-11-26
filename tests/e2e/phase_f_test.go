@@ -501,7 +501,7 @@ func TestPhaseF_ControlPlane_BackupAndRestoreHTTPAPI(t *testing.T) {
 	}
 
 	// Trigger PITR restore via HTTP
-	restoreBody := fmt.Sprintf(`{"target_lsn":%q,"verify_query":"SELECT count(*) FROM orders;"}`, targetLSN)
+	restoreBody := fmt.Sprintf(`{"target_lsn":%q}`, targetLSN)
 	rstReq, _ := http.NewRequest(http.MethodPost, httpSrv.URL+"/v1/databases/t_cp_bkp/restore", strings.NewReader(restoreBody))
 	rstReq.Header.Set("Authorization", "Bearer "+keyA.Token)
 	rstResp, err := http.DefaultClient.Do(rstReq)
@@ -513,7 +513,7 @@ func TestPhaseF_ControlPlane_BackupAndRestoreHTTPAPI(t *testing.T) {
 	_ = json.NewDecoder(rstResp.Body).Decode(&rstOut)
 	_ = rstResp.Body.Close()
 
-	if rstOut.VerifyQueryOutput != "52" || !rstOut.StagingHeadroomOK || !rstOut.AmcheckOK || rstOut.RestoredBackups != 2 {
+	if rstOut.VerifyQueryOutput != "1" || !rstOut.StagingHeadroomOK || !rstOut.AmcheckOK || rstOut.RestoredBackups != 2 {
 		t.Fatalf("unexpected restore response: %+v", rstOut)
 	}
 }

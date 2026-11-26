@@ -5,6 +5,9 @@ primary_region = "sin"
   dockerfile = "../../Dockerfile.pageserver"
 
 [env]
+  AIR_MESH_TLS_CA = "/run/air-tls/ca.crt"
+  AIR_MESH_TLS_CERT = "/run/air-tls/tls.crt"
+  AIR_MESH_TLS_KEY = "/run/air-tls/tls.key"
   AIR_DATA_DIR = "/var/lib/air-pageserver"
   AIR_PAGESERVER_GRPC_ADDR = "[::]:9091"
   AIR_PAGESERVER_CACHE_MB = "64"
@@ -18,6 +21,18 @@ primary_region = "sin"
   source = "air_pageserver_data"
   destination = "/var/lib/air-pageserver"
   initial_size = "1gb"
+
+[[files]]
+  guest_path = "/run/air-tls/ca.crt"
+  secret_name = "AIR_MESH_CA_PEM_B64"
+
+[[files]]
+  guest_path = "/run/air-tls/tls.crt"
+  secret_name = "AIR_MESH_CERT_PEM_B64"
+
+[[files]]
+  guest_path = "/run/air-tls/tls.key"
+  secret_name = "AIR_MESH_KEY_PEM_B64"
 
 [[vm]]
   cpu_kind = "shared"

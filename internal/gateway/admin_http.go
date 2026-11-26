@@ -335,7 +335,10 @@ func (s *AdminHTTPServer) handleNamespacesRoute(w http.ResponseWriter, r *http.R
 			return true
 		}
 		if s.pools != nil {
-			_ = s.pools.RequestDrain(suffix, 2000*time.Millisecond)
+			if err := s.pools.RequestDrain(suffix, 2000*time.Millisecond); err != nil {
+				writeJSON(w, http.StatusConflict, makeErrorJSON(err.Error()))
+				return true
+			}
 			s.pools.RemoveTenant(suffix)
 		}
 		if s.discovery != nil {
@@ -343,15 +346,19 @@ func (s *AdminHTTPServer) handleNamespacesRoute(w http.ResponseWriter, r *http.R
 		}
 		reDeleted := false
 		if s.reGRPC != nil {
-			if _, err := s.reGRPC.DeleteTenant(r.Context(), suffix); err == nil {
-				reDeleted = true
+			if _, err := s.reGRPC.DeleteTenant(r.Context(), suffix); err != nil {
+				writeJSON(w, http.StatusBadGateway, `{"error":"read engine purge failed"}`)
+				return true
 			}
+			reDeleted = true
 		}
 		psPurged := false
 		if s.psGRPC != nil {
-			if _, err := s.psGRPC.PurgeTenant(r.Context(), suffix, ""); err == nil {
-				psPurged = true
+			if _, err := s.psGRPC.PurgeTenant(r.Context(), suffix, ""); err != nil {
+				writeJSON(w, http.StatusBadGateway, `{"error":"pageserver purge failed"}`)
+				return true
 			}
+			psPurged = true
 		}
 		b, _ := json.Marshal(map[string]any{
 			"status":             "deleted",
@@ -431,15 +438,7 @@ func (s *AdminHTTPServer) handleDatabasesRoute(w http.ResponseWriter, r *http.Re
 			}
 			s.pools.RemoveTenant(tid)
 			s.discovery.EvictCache(tid)
-			code, resp, ok := s.discovery.DeleteDatabase(tid)
-			if ok {
-				if s.reGRPC != nil {
-					_, _ = s.reGRPC.DeleteTenant(r.Context(), tid)
-				}
-				if s.psGRPC != nil {
-					_, _ = s.psGRPC.PurgeTenant(r.Context(), tid, "")
-				}
-			}
+			code, resp, _ := s.discovery.DeleteDatabase(tid)
 			writeJSON(w, code, resp)
 			return true
 		}

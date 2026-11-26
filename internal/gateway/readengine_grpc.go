@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Mahadi-rsio/air/internal/meshtransport"
 	"github.com/Mahadi-rsio/air/internal/pb"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -24,7 +24,11 @@ func NewReadEngineGRPCClient(addr string, internalToken ...string) (*ReadEngineG
 	if addr == "" {
 		return nil, fmt.Errorf("read-engine gRPC address is required")
 	}
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	dialOption, err := meshtransport.DialOption(addr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := grpc.NewClient(addr, dialOption)
 	if err != nil {
 		return nil, fmt.Errorf("dial read-engine gRPC %s: %w", addr, err)
 	}

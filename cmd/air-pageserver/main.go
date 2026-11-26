@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Mahadi-rsio/air/internal/crypto"
+	"github.com/Mahadi-rsio/air/internal/meshtransport"
 	"github.com/Mahadi-rsio/air/internal/pageserver"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -166,6 +167,13 @@ func main() {
 		log.Printf("[air-pageserver] WARNING: AIR_MASTER_KEY_HEX is not set; using local master key file %s", cfg.MasterKeyPath)
 	}
 
+	meshTLS, meshErr := meshtransport.LoadTLS()
+	if meshErr == nil {
+		meshErr = meshtransport.RequireForAddress(cfg.GRPCAddr, meshTLS)
+	}
+	if meshErr != nil {
+		log.Fatal(meshErr)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -216,7 +224,7 @@ func main() {
 		_ = ps.Close()
 		log.Fatalf("grpc listen %s: %v", cfg.GRPCAddr, err)
 	}
-	grpcSrv := pageserver.NewGRPCServer(ps, cfg.InternalToken)
+	grpcSrv := pageserver.NewGRPCServer(ps, cfg.InternalToken, meshtransport.ServerOptions(meshTLS)...)
 	go func() {
 		log.Printf("[air-pageserver] gRPC listening on %s (cache_mb=%d, unix_socket=%q)", cfg.GRPCAddr, cfg.CacheMB, cfg.SocketPath)
 		if err := grpcSrv.Serve(grpcLis); err != nil {

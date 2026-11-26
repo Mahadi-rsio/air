@@ -16,6 +16,7 @@ import (
 	"github.com/Mahadi-rsio/air/internal/config"
 	"github.com/Mahadi-rsio/air/internal/control"
 	"github.com/Mahadi-rsio/air/internal/crypto"
+	"github.com/Mahadi-rsio/air/internal/meshtransport"
 	"github.com/Mahadi-rsio/air/internal/pageserver"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -46,6 +47,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+	if err := meshtransport.ValidateMetadataDSN(cfg.MetaDSN); err != nil {
+		log.Fatal(err)
+	}
 	if cfg.InternalToken == "" && (!isLoopbackListenAddr(cfg.GRPCAddr) || !isLoopbackListenAddr(cfg.HTTPAddr)) {
 		log.Fatalf("[air-server] AIR_INTERNAL_TOKEN must be set when listening on non-loopback addresses (grpc=%q http=%q)", cfg.GRPCAddr, cfg.HTTPAddr)
 	}
@@ -53,6 +57,13 @@ func main() {
 		log.Printf("[air-server] WARNING: AIR_MASTER_KEY_HEX is not set; using local master key file %s", cfg.MasterKeyPath)
 	}
 
+	meshTLS, meshErr := meshtransport.LoadTLS()
+	if meshErr == nil {
+		meshErr = meshtransport.RequireForAddress(cfg.GRPCAddr, meshTLS)
+	}
+	if meshErr != nil {
+		log.Fatal(meshErr)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -97,17 +108,14 @@ func main() {
 		log.Fatalf("init pageserver: %v", err)
 	}
 
-	var reClient control.ReadEngineClient
 	if cfg.ReadEngineGRPCAddr != "" {
-		var reErr error
-		reClient, reErr = control.NewGRPCReadEngineClient(cfg.ReadEngineGRPCAddr, cfg.InternalToken)
-		if reErr != nil {
-			log.Printf("[air-server] read-engine gRPC dial warning (%s): %v", cfg.ReadEngineGRPCAddr, reErr)
-		} else {
-			cp.SetReadEngineClient(reClient)
-			defer func() { _ = reClient.Close() }()
-			log.Printf("[air-server] connected to air-read-engine via gRPC (%s)", cfg.ReadEngineGRPCAddr)
+		reClient, err := control.NewGRPCReadEngineClient(cfg.ReadEngineGRPCAddr, cfg.InternalToken)
+		if err != nil {
+			log.Fatalf("[air-server] configure read-engine gRPC (%s): %v", cfg.ReadEngineGRPCAddr, err)
 		}
+		cp.SetReadEngineClient(reClient)
+		defer func() { _ = reClient.Close() }()
+		log.Printf("[air-server] connected to air-read-engine via gRPC (%s)", cfg.ReadEngineGRPCAddr)
 	}
 
 	if cfg.BootstrapAPIKey != "" {
@@ -139,7 +147,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("grpc listen %s: %v", cfg.GRPCAddr, err)
 	}
-	grpcSrv := control.NewGRPCServer(cp)
+	grpcSrv := control.NewGRPCServer(cp, meshtransport.ServerOptions(meshTLS)...)
 	go func() {
 		log.Printf("[air-server] Air DB gRPC listening on %s", cfg.GRPCAddr)
 		if err := grpcSrv.Serve(grpcLis); err != nil {

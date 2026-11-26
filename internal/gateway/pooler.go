@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -75,6 +76,25 @@ func dialBackendSocketCtx(ctx context.Context, host, sockDir string, port int) (
 	return conn, nil
 }
 
+func dialReadEngineTLS(ctx context.Context, conn net.Conn, host string, cfg *tls.Config) (net.Conn, error) {
+	if cfg == nil || conn.RemoteAddr().Network() == "unix" {
+		return conn, nil
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	clientCfg := cfg.Clone()
+	clientCfg.ServerName = host
+	secure := tls.Client(conn, clientCfg)
+	handshakeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := secure.HandshakeContext(handshakeCtx); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("read-engine TLS handshake: %w", err)
+	}
+	return secure, nil
+}
+
 type WakeFn func() (TenantRoute, error)
 
 type relayStats struct {
@@ -143,6 +163,7 @@ const (
 
 // TenantPool is a per-tenant transaction-mode PostgreSQL connection pooler.
 type TenantPool struct {
+	readTLS        *tls.Config
 	tenantID       string
 	maxBackends    int
 	idleTimeoutSec atomic.Int64
@@ -897,6 +918,7 @@ func (p *TenantPool) tryExecuteOnReadEngine(ctx context.Context, st *clientSessi
 			Host:          rhost,
 			SockDir:       rsock,
 			Port:          rport,
+			TLS:           p.readTLS,
 			BackendPID:    rb.BackendPID,
 			BackendSecret: rb.BackendSecret,
 		})
@@ -908,7 +930,7 @@ func (p *TenantPool) tryExecuteOnReadEngine(ctx context.Context, st *clientSessi
 			st.metrics.RecordQueryCancellation()
 		}
 		st.cancelActiveQuery()
-		sendBackendCancel(rhost, rsock, rport, rb.BackendPID, rb.BackendSecret)
+		sendBackendCancel(rhost, rsock, rport, rb.BackendPID, rb.BackendSecret, p.readTLS)
 		_ = rb.Conn.Close()
 	})
 	defer stopWatch()
@@ -1461,7 +1483,7 @@ func (p *TenantPool) handleExtendedBatch(st *clientSessionState, terminatorType 
 						st.metrics.RecordQueryCancellation()
 					}
 					st.cancelActiveQuery()
-					sendBackendCancel(rhost, rsock, rport, rb.BackendPID, rb.BackendSecret)
+					sendBackendCancel(rhost, rsock, rport, rb.BackendPID, rb.BackendSecret, p.readTLS)
 					_ = rb.Conn.Close()
 				})
 				rc := runBatchOnBackend(rb, true, rwaitUs)
@@ -1924,7 +1946,7 @@ func (p *TenantPool) acquireReadBackend(ctx context.Context, clientID uint64) (*
 	if rport <= 0 && rsock == "" {
 		return nil, fmt.Errorf("read engine disabled")
 	}
-	return p.dialAndStartupCtx(ctx, rhost, rsock, rport, pass, clientID)
+	return p.dialAndStartupCtx(ctx, rhost, rsock, rport, pass, clientID, p.readTLS)
 }
 
 func (p *TenantPool) releaseReadBackend(b *BackendConn, dirty bool) {
@@ -1950,10 +1972,16 @@ func (p *TenantPool) dialAndStartup(host, sockDir string, port int, appPass stri
 	return p.dialAndStartupCtx(context.Background(), host, sockDir, port, appPass, clientID)
 }
 
-func (p *TenantPool) dialAndStartupCtx(ctx context.Context, host, sockDir string, port int, appPass string, clientID uint64) (*BackendConn, error) {
+func (p *TenantPool) dialAndStartupCtx(ctx context.Context, host, sockDir string, port int, appPass string, clientID uint64, readTLS ...*tls.Config) (*BackendConn, error) {
 	conn, err := dialBackendSocketCtx(ctx, host, sockDir, port)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to tenant backend on port %d: %w", port, err)
+	}
+	if len(readTLS) != 0 {
+		conn, err = dialReadEngineTLS(ctx, conn, host, readTLS[0])
+		if err != nil {
+			return nil, err
+		}
 	}
 	b := &BackendConn{
 		Conn:          conn,
@@ -2202,6 +2230,7 @@ func relayFlushBatch(b *BackendConn, client io.ReadWriter, batch []extMsg) (stat
 
 // PoolManager is a thread-safe registry of per-tenant TenantPool instances.
 type PoolManager struct {
+	readTLS        *tls.Config
 	maxBackends    int
 	idleTimeoutSec int
 
@@ -2218,15 +2247,19 @@ type PoolManager struct {
 	pools              map[string]*TenantPool
 }
 
-func NewPoolManager(maxBackends, idleTimeoutSec int) *PoolManager {
+func NewPoolManager(maxBackends, idleTimeoutSec int, readTLS ...*tls.Config) *PoolManager {
 	if idleTimeoutSec <= 0 {
 		idleTimeoutSec = 300
 	}
-	return &PoolManager{
+	manager := &PoolManager{
 		maxBackends:    maxBackends,
 		idleTimeoutSec: idleTimeoutSec,
 		pools:          make(map[string]*TenantPool),
 	}
+	if len(readTLS) > 0 {
+		manager.readTLS = readTLS[0]
+	}
+	return manager
 }
 
 func (pm *PoolManager) SetWriteGovernor(g *WriteGovernor) {
@@ -2320,6 +2353,7 @@ func (pm *PoolManager) GetOrCreate(route TenantRoute, wakeFn WakeFn) *TenantPool
 		return p
 	}
 	p := NewTenantPool(route.TenantID, route.Host, route.SockDir, route.Port, route.AppPassword, pm.maxBackends, pm.idleTimeoutSec)
+	p.readTLS = pm.readTLS
 	if route.State == "SUSPENDED" {
 		p.MarkSuspended()
 	}

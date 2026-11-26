@@ -405,9 +405,9 @@ func main() {
 		cnt, h, err := computeDatasetChecksum(ctx, c)
 		passed := err == nil && missing == 0 && cnt == expectedCnt && h == expectedHash
 		results = append(results, TestResult{
-			Name:   "Test C: Abrupt SIGKILL air-bench",
-			Passed: passed,
-			Detail: fmt.Sprintf("acknowledged_committed=%d found_after_recovery=%d missing=%d base_cnt=%d base_hash_ok=%v", len(committedSeqs), len(found), missing, cnt, h == expectedHash),
+			Name:    "Test C: Abrupt SIGKILL air-bench",
+			Passed:  passed,
+			Detail:  fmt.Sprintf("acknowledged_committed=%d found_after_recovery=%d missing=%d base_cnt=%d base_hash_ok=%v", len(committedSeqs), len(found), missing, cnt, h == expectedHash),
 			Metrics: map[string]any{"acknowledged_committed": len(committedSeqs), "found": len(found), "missing": missing},
 		})
 		port, pass = wPort, wPass
@@ -439,15 +439,36 @@ func main() {
 			return
 		}
 		time.Sleep(2 * time.Second)
-		rBody, rCode, rErr := httpJSON("POST", "/v1/databases/"+db+"/restore", map[string]string{"verify_query": "SELECT count(*) FROM dur_items"}, true)
+		rBody, rCode, rErr := httpJSON("POST", "/v1/databases/"+db+"/restore", map[string]string{}, true)
 		passed := rErr == nil && rCode == 200
+		detail := fmt.Sprintf("backup_code=%d restore_code=%d err=%v", bCode, rCode, rErr)
+		if passed {
+			port, pass, rErr = getRoute(db)
+			var restored *pgx.Conn
+			if rErr == nil {
+				restored, rErr = pgx.Connect(ctx, dsn(port, pass, db))
+			}
+			if rErr == nil {
+				var count int64
+				var hash string
+				count, hash, rErr = computeDatasetChecksum(ctx, restored)
+				restored.Close(ctx)
+				passed = rErr == nil && count == expectedCnt && hash == expectedHash
+				detail += fmt.Sprintf(" expected_rows=%d restored_rows=%d checksum_match=%t", expectedCnt, count, hash == expectedHash)
+			} else {
+				passed = false
+			}
+			if rErr != nil {
+				detail += fmt.Sprintf(" verification_err=%v", rErr)
+			}
+		} else {
+			detail += " restore_resp=" + strings.TrimSpace(string(rBody))
+		}
 		results = append(results, TestResult{
 			Name:   "Test D: WAL & Backup/Restore (PITR verify)",
 			Passed: passed,
-			Detail: fmt.Sprintf("backup_code=%d restore_code=%d restore_resp=%s err=%v", bCode, rCode, strings.TrimSpace(string(rBody)), rErr),
+			Detail: detail,
 		})
-		// Refresh route after restore
-		port, pass, _ = getRoute(db)
 	}()
 
 	// === TEST E: Repeated lifecycle (20 cycles of write -> commit -> suspend -> wake -> verify) ===

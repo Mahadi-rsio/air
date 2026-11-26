@@ -10,11 +10,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Mahadi-rsio/air/internal/meshtransport"
 	"github.com/Mahadi-rsio/air/internal/pb"
 	"github.com/jackc/pgx/v5"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -62,9 +62,13 @@ type TenantDiscovery struct {
 }
 
 func NewTenantDiscovery(cfg Config) (*TenantDiscovery, error) {
+	dialOption, err := meshtransport.DialOption(cfg.GRPCAddr)
+	if err != nil {
+		return nil, err
+	}
 	conn, err := grpc.NewClient(
 		cfg.GRPCAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		dialOption,
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                30 * time.Second,
 			Timeout:             5 * time.Second,
@@ -572,7 +576,7 @@ func (d *TenantDiscovery) syncDatabasesGRPC(parent context.Context) bool {
 	}
 	discovered := make([]TenantRoute, 0, len(resp.Databases))
 	for _, db := range resp.Databases {
-		if db.State == "PURGED" {
+		if db.State == "PURGED" || db.State == "DELETING" {
 			continue
 		}
 		r := TenantRoute{
@@ -703,7 +707,7 @@ func (d *TenantDiscovery) pollMetadataOnce(parent context.Context) {
 		d.pgConn = conn
 	}
 
-	rows, err := d.pgConn.Query(ctx, "SELECT tenant_id, state, direct_port FROM clusters")
+	rows, err := d.pgConn.Query(ctx, "SELECT tenant_id, state, direct_port FROM clusters WHERE state NOT IN ('DELETING', 'PURGED')")
 	if err != nil {
 		_ = d.pgConn.Close(context.Background())
 		d.pgConn = nil

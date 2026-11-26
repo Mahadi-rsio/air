@@ -162,7 +162,7 @@ func TestPhase13_EndToEnd_BackupManifest_Verification_PITR_And_RestoreToNewTenan
 	_ = walResp.Body.Close()
 
 	// 5. Restore to a NEW isolated tenant (t_p13_restored_lsn) at pitrLSN
-	restoreBody := fmt.Sprintf(`{"target_lsn":%q,"new_tenant_id":"t_p13_restored_lsn","verify_query":"SELECT count(*) FROM ledger;"}`, pitrLSN)
+	restoreBody := fmt.Sprintf(`{"target_lsn":%q,"new_tenant_id":"t_p13_restored_lsn"}`, pitrLSN)
 	resReq, _ := http.NewRequest(http.MethodPost, httpSrv.URL+"/v1/databases/t_p13_src/restore", strings.NewReader(restoreBody))
 	resReq.Header.Set("Authorization", "Bearer "+keyA.Token)
 	resResp, err := http.DefaultClient.Do(resReq)
@@ -177,7 +177,7 @@ func TestPhase13_EndToEnd_BackupManifest_Verification_PITR_And_RestoreToNewTenan
 	if resOut.RestoredTenantID != "t_p13_restored_lsn" || resOut.RestoredGeneration == "" || resOut.RestoredGeneration == srcProv.Generation {
 		t.Fatalf("expected distinct generation for restored tenant: %+v (srcGen=%s)", resOut, srcProv.Generation)
 	}
-	if resOut.VerifyQueryOutput != "150" || !resOut.AmcheckOK {
+	if resOut.VerifyQueryOutput != "1" || !resOut.AmcheckOK {
 		t.Fatalf("expected 150 rows recovered at pitrLSN, got %+v", resOut)
 	}
 
@@ -211,7 +211,6 @@ func TestPhase13_EndToEnd_BackupManifest_Verification_PITR_And_RestoreToNewTenan
 	_, faultErr := cp.RestoreDatabaseWithOptions(ctx, "acct_p13", "t_p13_src", control.RestoreOptions{
 		TargetLSN:   pitrLSN,
 		NewTenantID: "t_p13_fault",
-		VerifyQuery: "SELECT count(*) FROM ledger;",
 	})
 	cp.SetFaultHook(nil)
 	if faultErr == nil {

@@ -601,3 +601,11 @@ func TestRecoveryTargetValidation(t *testing.T) {
 		t.Fatalf("expected valid LSN target to pass, got: %v", err)
 	}
 }
+
+func TestStagePITRRestoreRejectsCustomVerification(t *testing.T) {
+	_, err := StagePITRRestore(context.Background(), nil, nil, "", nil, nil, nil, NewLatestRecoveryTarget(),
+		StagePITROptions{VerifyQuery: "SELECT current_user;"})
+	if !errors.Is(err, ErrInvalidRecoveryTarget) {
+		t.Fatalf("expected custom verification SQL to be rejected, got %v", err)
+	}
+}

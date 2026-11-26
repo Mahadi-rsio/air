@@ -71,7 +71,7 @@ Configuration files are located in [`deploy/fly/`](../deploy/fly/):
    - Provider: [Neon](https://neon.tech), Supabase, AWS RDS, or self-hosted PostgreSQL 15+/17.
    - Connection string format:
      ```bash
-     export AIR_META_DSN="postgres://<user>:<password>@<neon-host>/<db>?sslmode=require"
+     export AIR_META_DSN="postgres://<user>:<password>@<neon-host>/<db>?sslmode=verify-full&sslrootcert=system"
      ```
    - Schema tables (`clusters`, `tenant_events`, `query_metering`, `api_keys`, etc.) migrate automatically when `air-pg-server` starts.
 3. **Cloudflare R2 Bucket**:
@@ -129,7 +129,23 @@ fly volumes create air_server_data --app air-pg-server --region sin --size 2 --y
 ```
 
 ### Step 4: Configure App Secrets
-Stage the environment secrets across all apps:
+Issue separate mesh certificates from a private CA. Give each certificate client and server TLS usages and the corresponding app's `.internal` DNS SAN. Also give the gateway mesh certificate the DNS SAN `air-gateway` for access to the read engine. Issue a separate public SQL certificate for `air-pg-gateway.fly.dev`.
+
+With the shared CA certificate at `certs/ca.crt` and each app's certificate and key in a directory named after that app, stage the PEM files from your operator machine:
+
+```bash
+for app in air-pg-pageserver air-pg-read-engine air-pg-server air-pg-gateway; do
+  fly secrets set --app "$app" --stage \
+    AIR_MESH_CA_PEM_B64="$(base64 -w0 < certs/ca.crt)" \
+    AIR_MESH_CERT_PEM_B64="$(base64 -w0 < "certs/$app/tls.crt")" \
+    AIR_MESH_KEY_PEM_B64="$(base64 -w0 < "certs/$app/tls.key")"
+done
+fly secrets set --app air-pg-gateway --stage \
+  AIR_GATEWAY_CERT_PEM_B64="$(base64 -w0 < certs/air-pg-gateway/public.crt)" \
+  AIR_GATEWAY_KEY_PEM_B64="$(base64 -w0 < certs/air-pg-gateway/public.key)"
+```
+
+Stage the remaining environment secrets across all apps:
 
 ```bash
 # 1. Pageserver secrets
@@ -203,9 +219,9 @@ for app in air-pg-pageserver air-pg-read-engine air-pg-server air-pg-gateway; do
 done
 ```
 
-Check the gateway health endpoint:
+Open a gateway shell with `fly ssh console --app air-pg-gateway`. Run admin and health calls from that shell:
 ```bash
-curl -fsS https://air-pg-gateway.fly.dev/healthz
+curl -fsS http://127.0.0.1:8081/healthz
 # Expected output: {"status":"ok"}
 ```
 
@@ -214,24 +230,23 @@ curl -fsS https://air-pg-gateway.fly.dev/healthz
 ## 6. End-to-End Database Operations on Fly.io
 
 ### Step 1: Provision a New Database
-Call the Gateway Admin HTTP API using `AIR_INTERNAL_TOKEN` (which securely proxies to `air-pg-server` over 6PN):
+From the gateway shell, call the Admin HTTP API using `AIR_INTERNAL_TOKEN`. The gateway connects to `air-pg-server` using mutual TLS.
 
 ```bash
-curl -sS -X POST https://air-pg-gateway.fly.dev/v1/databases \
+curl -sS -X POST http://127.0.0.1:8081/v1/databases \
   -H "Authorization: Bearer $AIR_INTERNAL_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"tenant_id": "production_app"}' | jq .
+  -d '{"tenant_id": "production_app"}'
 ```
 
 Save the `password` returned in the response!
 
-### Step 2: Connect via `psql` to Gateway Dedicated IPv4
-Retrieve the public IP and connect:
+### Step 2: Connect via `psql`
+
+From your client machine, connect using the DNS name in the public SQL certificate:
 
 ```bash
-GATEWAY_IP="$(fly ips list --app air-pg-gateway --json | jq -r '.[] | select(.Type=="v4") | .Address')"
-
-psql "postgresql://production_app:<GENERATED_PASSWORD>@${GATEWAY_IP}:5432?sslmode=require"
+psql "postgresql://production_app@air-pg-gateway.fly.dev:5432/production_app?sslmode=verify-full&sslrootcert=system"
 ```
 
 ### Step 3: Run SQL Workloads
@@ -251,10 +266,10 @@ SELECT * FROM accounts;
 
 ### Step 4: Verify Serverless Scale-to-Zero & Auto-Wake
 1. **Auto-Suspend**: `air-pg-server` idle timer suspends inactive databases after 30 seconds (`AIR_IDLE_TIMEOUT = "30s"`).
-2. **Inspect state**:
+2. **Inspect state** from the gateway shell:
    ```bash
-   curl -sS https://air-pg-gateway.fly.dev/v1/namespaces/production_app \
-     -H "Authorization: Bearer $AIR_INTERNAL_TOKEN" | jq .state
+   curl -sS http://127.0.0.1:8081/v1/namespaces/production_app \
+     -H "Authorization: Bearer $AIR_INTERNAL_TOKEN"
    ```
 3. **Transparent Wake**: Running any query or write against `production_app` via port `5432` causes the gateway to hold the query, wake `air-pg-server`, replay the command, and resume normal execution without error.
 
@@ -265,5 +280,5 @@ SELECT * FROM accounts;
 - **Fast Deployments with `Dockerfile.server-fly`**: Full compilation of patched PostgreSQL 17 and `air_smgr.so` takes ~8 minutes. `deploy/fly/Dockerfile.server-fly` compiles only Go binaries and overlays them on top of `ghcr.io/mahadi-rsio/air:server-v2.0.28`, deploying updates in under 45 seconds.
 - **Volume Permissions**: Volumes mounted by Fly are initially owned by `root`. The startup entrypoint scripts ([`scripts/pageserver-entrypoint.sh`](../scripts/pageserver-entrypoint.sh) and [`scripts/read-engine-entrypoint.sh`](../scripts/read-engine-entrypoint.sh)) automatically `chown` the data directories before switching to unprivileged users.
 - **Monitoring & Metrics**:
-  - Prometheus metrics: `https://air-pg-gateway.fly.dev/metrics` (Requires `Authorization: Bearer $AIR_INTERNAL_TOKEN`).
-  - Real-time JSON pool and query stats: `https://air-pg-gateway.fly.dev/internal/v1/metrics`.
+  - Prometheus metrics: `http://127.0.0.1:8081/metrics` (Requires `Authorization: Bearer $AIR_INTERNAL_TOKEN`).
+  - Real-time JSON pool and query stats: `http://127.0.0.1:8081/internal/v1/metrics`.

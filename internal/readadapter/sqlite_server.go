@@ -3,6 +3,8 @@ package readadapter
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -19,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Mahadi-rsio/air/internal/meshtransport"
 	"github.com/Mahadi-rsio/air/internal/prom"
 	"github.com/Mahadi-rsio/air/internal/tenant"
 	"github.com/jackc/pgx/v5"
@@ -26,6 +29,7 @@ import (
 
 // SQLiteServerConfig configures the shared SQLite read-only engine server.
 type SQLiteServerConfig struct {
+	WireTLS                       *tls.Config
 	ListenHost                    string
 	PGPort                        int
 	DataDir                       string
@@ -152,7 +156,7 @@ type SQLiteReadServer struct {
 	tenants map[string]*SQLiteTenantStore
 
 	sessionsMu sync.Mutex
-	sessions   map[uint32]context.CancelFunc
+	sessions   map[uint32]sqliteCancelSession
 
 	tcpLn  net.Listener
 	unixLn net.Listener
@@ -228,7 +232,7 @@ func NewSQLiteReadServer(cfg SQLiteServerConfig) (*SQLiteReadServer, error) {
 		sockDir: sockDir,
 		state:   "STOPPED",
 		tenants:            make(map[string]*SQLiteTenantStore),
-		sessions:           make(map[uint32]context.CancelFunc),
+		sessions:           make(map[uint32]sqliteCancelSession),
 		stopCh:             make(chan struct{}),
 		readerPoolWaitHist: prom.NewHistogram(nil),
 	}
@@ -533,7 +537,7 @@ func (s *SQLiteReadServer) recordQueryErrorWithSQL(sql string, err error) {
 	shape := ClassifyQueryShape(sql)
 	reason := ClassifyFallbackReason(sql, err)
 	s.fallbackTelemetry.RecordFallback(shape, reason)
-	debugf("fallback", "query_error shape=%s reason=%s err=%v sql=%q", shape, reason, err, truncateSQL(sql, 160))
+	debugf("fallback", "query_error shape=%s reason=%s", shape, reason)
 }
 
 // Tenants returns the list of registered tenant IDs.
@@ -560,13 +564,19 @@ func (s *SQLiteReadServer) Start() error {
 		return nil
 	}
 
-	tcpAddr := fmt.Sprintf("%s:%d", s.cfg.ListenHost, s.cfg.PGPort)
+	tcpAddr := net.JoinHostPort(strings.Trim(s.cfg.ListenHost, "[]"), strconv.Itoa(s.cfg.PGPort))
+	if err := meshtransport.RequireForAddress(tcpAddr, s.cfg.WireTLS); err != nil {
+		return err
+	}
 	tcpLn, err := net.Listen("tcp", tcpAddr)
 	if err != nil {
 		return fmt.Errorf("sqlite read server listen tcp %s: %w", tcpAddr, err)
 	}
-	s.tcpLn = tcpLn
 	s.cfg.PGPort = tcpLn.Addr().(*net.TCPAddr).Port
+	if s.cfg.WireTLS != nil {
+		tcpLn = tls.NewListener(tcpLn, s.cfg.WireTLS)
+	}
+	s.tcpLn = tcpLn
 
 	sockPath := filepath.Join(s.sockDir, fmt.Sprintf(".s.PGSQL.%d", s.cfg.PGPort))
 	_ = os.Remove(sockPath)
@@ -575,7 +585,11 @@ func (s *SQLiteReadServer) Start() error {
 		_ = tcpLn.Close()
 		return fmt.Errorf("sqlite read server listen unix %s: %w", sockPath, err)
 	}
-	_ = os.Chmod(sockPath, 0o777)
+	if err := os.Chmod(sockPath, 0o600); err != nil {
+		_ = tcpLn.Close()
+		_ = unixLn.Close()
+		return fmt.Errorf("restrict SQLite read socket: %w", err)
+	}
 	s.unixLn = unixLn
 
 	// Pre-create default 'postgres' database so admin/health connections work immediately.
@@ -668,17 +682,17 @@ func (s *SQLiteReadServer) EnsureTenantDB(tenantID string) error {
 
 // DeleteTenantDB closes and removes a tenant namespace from the shared SQLite read engine.
 func (s *SQLiteReadServer) DeleteTenantDB(tenantID string) error {
-	if tenantID == "" {
+	if tenantID == "" || (tenantID != "postgres" && tenant.ValidateID(tenantID) != nil) {
 		return ErrInvalidTenant
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	ts, ok := s.tenants[tenantID]
 	if ok {
 		delete(s.tenants, tenantID)
 	}
-	s.mu.Unlock()
 	if !ok || ts == nil {
-		return nil
+		return s.removeTenantSQLiteFiles(tenantID)
 	}
 	for _, vid := range ts.vtabIDs {
 		UnregisterNativeTable(vid)
@@ -697,13 +711,20 @@ func (s *SQLiteReadServer) DeleteTenantDB(tenantID string) error {
 	if ts.Writer != nil {
 		_ = ts.Writer.Close()
 	}
-	if ts.DBPath != "" && ts.DBPath != ":memory:" {
-		_ = os.Remove(ts.DBPath)
-		_ = os.Remove(ts.DBPath + "-wal")
-		_ = os.Remove(ts.DBPath + "-shm")
-	}
+
 	debugf("tenant", "DeleteTenantDB tenant=%s native_mode=%v readers=%d", tenantID, ts.NativeMode, len(ts.readers))
-	return nil
+	return s.removeTenantSQLiteFiles(tenantID)
+}
+
+func (s *SQLiteReadServer) removeTenantSQLiteFiles(tenantID string) error {
+	path := filepath.Join(s.dbDir, tenantID+".sqlite3")
+	var failures []error
+	for _, file := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
 }
 
 func (s *SQLiteReadServer) ensureTenantLocked(tenantID string) (*SQLiteTenantStore, error) {
@@ -1180,6 +1201,11 @@ func (sess *sqliteClientSession) sessionCtx() context.Context {
 	return context.Background()
 }
 
+type sqliteCancelSession struct {
+	secret uint32
+	cancel context.CancelFunc
+}
+
 func (s *SQLiteReadServer) serveConn(c net.Conn) {
 	connCtx, connCancel := context.WithCancel(context.Background())
 	defer connCancel()
@@ -1191,10 +1217,14 @@ func (s *SQLiteReadServer) serveConn(c net.Conn) {
 		}
 	}()
 
+	if err := c.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return
+	}
 	params, ok := s.performHandshake(c)
 	if !ok {
 		return
 	}
+	_ = c.SetDeadline(time.Time{})
 	dbName := params["database"]
 	if dbName == "" {
 		dbName = params["user"]
@@ -1208,11 +1238,16 @@ func (s *SQLiteReadServer) serveConn(c net.Conn) {
 		return
 	}
 
+	var secretBytes [4]byte
+	if _, err := rand.Read(secretBytes[:]); err != nil {
+		return
+	}
+	secret := binary.BigEndian.Uint32(secretBytes[:])
 	pid := 20000 + s.connSeq.Add(1)
 	connStart := time.Now()
 	debugf("wire", "connect pid=%d remote=%s tenant=%s user=%s", pid, c.RemoteAddr(), dbName, params["user"])
 	s.sessionsMu.Lock()
-	s.sessions[pid] = connCancel
+	s.sessions[pid] = sqliteCancelSession{secret: secret, cancel: connCancel}
 	s.sessionsMu.Unlock()
 	defer func() {
 		s.sessionsMu.Lock()
@@ -1228,7 +1263,7 @@ func (s *SQLiteReadServer) serveConn(c net.Conn) {
 	writePGParamStatus(&out, "standard_conforming_strings", "on")
 	writePGParamStatus(&out, "default_transaction_read_only", "on")
 	writePGParamStatus(&out, "in_hot_standby", "on")
-	writePGBackendKeyData(&out, pid, 0x51717E01)
+	writePGBackendKeyData(&out, pid, secret)
 	writePGReadyForQuery(&out, 'I')
 	if _, err := c.Write(out.Bytes()); err != nil {
 		return
@@ -1337,10 +1372,10 @@ func (s *SQLiteReadServer) performHandshake(c net.Conn) (map[string]string, bool
 			if len(body) >= 12 {
 				targetPID := binary.BigEndian.Uint32(body[4:8])
 				s.sessionsMu.Lock()
-				cancelFn := s.sessions[targetPID]
+				session, ok := s.sessions[targetPID]
 				s.sessionsMu.Unlock()
-				if cancelFn != nil {
-					cancelFn()
+				if ok && session.secret == binary.BigEndian.Uint32(body[8:12]) {
+					session.cancel()
 				}
 			}
 			return nil, false
@@ -1771,8 +1806,8 @@ func (s *SQLiteReadServer) runReaderQueryWithPlanTyped(
 					s.queriesFailed.Add(1)
 					s.recordQueryErrorWithSQL(sqliteSQL, err)
 				}
-				debugf("query", "exec tenant=%s mode=native_pool gen=%s lsn=%s err=%v dur=%s sql=%q",
-					ts.TenantID, snap.Generation, formatLSNHex(snap.LSN), err, time.Since(start), truncateSQL(sqliteSQL, 160))
+				debugf("query", "exec tenant=%s mode=native_pool gen=%s lsn=%s failed=true dur=%s",
+					ts.TenantID, snap.Generation, formatLSNHex(snap.LSN), time.Since(start))
 				return nil, nil, err
 			}
 			strategy := "sqlite"
@@ -1783,8 +1818,8 @@ func (s *SQLiteReadServer) runReaderQueryWithPlanTyped(
 			if onBatch != nil {
 				rowCount = int(res.RowsChanged)
 			}
-			debugf("query", "exec tenant=%s mode=native_pool gen=%s lsn=%s strategy=%s rows=%d cols=%d dur=%s sql=%q",
-				ts.TenantID, snap.Generation, formatLSNHex(snap.LSN), strategy, rowCount, len(res.Columns), time.Since(start), truncateSQL(sqliteSQL, 160))
+			debugf("query", "exec tenant=%s mode=native_pool gen=%s lsn=%s strategy=%s rows=%d cols=%d dur=%s",
+				ts.TenantID, snap.Generation, formatLSNHex(snap.LSN), strategy, rowCount, len(res.Columns), time.Since(start))
 			return res, plan, nil
 		}
 
@@ -1822,16 +1857,16 @@ func (s *SQLiteReadServer) runReaderQueryWithPlanTyped(
 			s.queriesFailed.Add(1)
 			s.recordQueryErrorWithSQL(sqliteSQL, err)
 		}
-		debugf("query", "exec tenant=%s mode=reader err=%v dur=%s sql=%q",
-			ts.TenantID, err, time.Since(start), truncateSQL(sqliteSQL, 160))
+		debugf("query", "exec tenant=%s mode=reader failed=true dur=%s",
+			ts.TenantID, time.Since(start))
 		return nil, nil, err
 	}
 	rowCount := len(res.Rows)
 	if onBatch != nil {
 		rowCount = int(res.RowsChanged)
 	}
-	debugf("query", "exec tenant=%s mode=reader rows=%d cols=%d dur=%s sql=%q",
-		ts.TenantID, rowCount, len(res.Columns), time.Since(start), truncateSQL(sqliteSQL, 160))
+	debugf("query", "exec tenant=%s mode=reader rows=%d cols=%d dur=%s",
+		ts.TenantID, rowCount, len(res.Columns), time.Since(start))
 	return res, plan, nil
 }
 
@@ -2180,8 +2215,8 @@ func (sess *sqliteClientSession) execSingleStatement(stmt string, args []string,
 	if _, _, strictErr := translatePGToSQLiteStrict(s); strictErr != nil {
 		return strictErr
 	}
-	debugf("sql", "simple tenant=%s plan_cache_hit=%v pg_sql=%q sqlite_sql=%q",
-		sess.tenantID, planHit, truncateSQL(s, 140), truncateSQL(sqliteSQL, 140))
+	debugf("sql", "simple tenant=%s plan_cache_hit=%v",
+		sess.tenantID, planHit)
 	if sess.conn != nil {
 		if err := sess.streamQueryToClient(ts, sqliteSQL, args, nil, out); err != nil {
 			var roErr *SQLiteReadOnlyError
@@ -2878,8 +2913,8 @@ func (sess *sqliteClientSession) handleExecute(body []byte) bool {
 			!strings.Contains(upper, "PG_CURRENT_WAL_LSN()") &&
 			!strings.Contains(upper, "AIR_RO_STATUS()") &&
 			!strings.Contains(upper, "SQLITE_VERSION()") {
-			debugf("sql", "extended_exec tenant=%s portal=%q stmt=%q args=%d sqlite_sql=%q",
-				sess.tenantID, portalName, portal.Stmt.Name, len(portal.Args), truncateSQL(portal.Stmt.SQLiteSQL, 140))
+			debugf("sql", "extended_exec tenant=%s args=%d",
+				sess.tenantID, len(portal.Args))
 			execErr := sess.streamQueryToClient(ts, portal.Stmt.SQLiteSQL, portal.Args, portal.Stmt.ParamOIDs, &out)
 			if execErr != nil {
 				var roErr *SQLiteReadOnlyError

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mahadi-rsio/air/internal/meshtransport"
 	"github.com/Mahadi-rsio/air/internal/pb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -237,12 +238,19 @@ func (s *AdminGRPCServer) Start() (int, error) {
 	if s.listenAddr == "" {
 		return 0, nil
 	}
+	meshTLS, err := meshtransport.LoadTLS()
+	if err != nil {
+		return 0, err
+	}
+	if err := meshtransport.RequireForAddress(s.listenAddr, meshTLS); err != nil {
+		return 0, err
+	}
 	ln, err := net.Listen("tcp", s.listenAddr)
 	if err != nil {
 		return 0, err
 	}
 	s.ln = ln
-	s.srv = grpc.NewServer()
+	s.srv = grpc.NewServer(meshtransport.ServerOptions(meshTLS)...)
 	pb.RegisterGatewayAdminServer(s.srv, s.svc)
 	go func() {
 		_ = s.srv.Serve(ln)

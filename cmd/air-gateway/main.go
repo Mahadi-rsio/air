@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Mahadi-rsio/air/internal/gateway"
+	"github.com/Mahadi-rsio/air/internal/meshtransport"
 )
 
 func isLoopbackListenAddr(addr string) bool {
@@ -40,6 +41,12 @@ func main() {
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("[air-gateway] invalid config: %v", err)
 	}
+	if err := meshtransport.ValidateMetadataDSN(cfg.MetaDSN); err != nil {
+		log.Fatal(err)
+	}
+	if !isLoopbackListenAddr(cfg.AdminAddr) {
+		log.Fatal("[air-gateway] the HTTP admin endpoint must listen on loopback")
+	}
 	if cfg.InternalToken == "" && (!isLoopbackListenAddr(cfg.AdminAddr) || !isLoopbackListenAddr(cfg.AdminGRPCAddr)) {
 		log.Fatalf("[air-gateway] AIR_INTERNAL_TOKEN must be set when admin endpoints listen on non-loopback addresses (admin=%q admin_grpc=%q)", cfg.AdminAddr, cfg.AdminGRPCAddr)
 	}
@@ -50,7 +57,11 @@ func main() {
 	}
 
 	metrics := gateway.NewMetricsRegistry(cfg.MaxClientConns, cfg.MaxTenantClientConns, cfg.MaxUserClientConns)
-	pools := gateway.NewPoolManager(cfg.PoolMaxBackends, cfg.PoolIdleTimeoutSec)
+	meshTLS, err := meshtransport.LoadTLS()
+	if err != nil {
+		log.Fatal(err)
+	}
+	pools := gateway.NewPoolManager(cfg.PoolMaxBackends, cfg.PoolIdleTimeoutSec, meshTLS)
 
 	bufBudget := gateway.NewBufferBudget(cfg.WriteBufferGlobalMax)
 	writeGov := gateway.NewWriteGovernor(cfg)

@@ -40,12 +40,7 @@ func forwardCancelRequest(client net.Conn, cancelReg *CancelRegistry) {
 	if !ok || target.Port <= 0 {
 		return
 	}
-	bconn, err := dialBackendSocket(target.Host, target.SockDir, target.Port)
-	if err != nil {
-		return
-	}
-	defer bconn.Close()
-	_, _ = bconn.Write(BuildCancelRequest(target.BackendPID, target.BackendSecret))
+	sendBackendCancel(target.Host, target.SockDir, target.Port, target.BackendPID, target.BackendSecret, target.TLS)
 }
 
 // HandleClientConnection handles an accepted PostgreSQL client socket end-to-end:

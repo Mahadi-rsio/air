@@ -11,11 +11,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mahadi-rsio/air/internal/meshtransport"
 	"github.com/Mahadi-rsio/air/internal/pageserver"
 	"github.com/Mahadi-rsio/air/internal/pb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
@@ -125,9 +125,13 @@ func NewGRPCPageserverClient(addr, internalToken string) (*GRPCPageserverClient,
 	if addr == "" {
 		return nil, fmt.Errorf("pageserver gRPC address is required")
 	}
+	dialOption, err := meshtransport.DialOption(addr)
+	if err != nil {
+		return nil, err
+	}
 	conn, err := grpc.NewClient(
 		addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		dialOption,
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(maxControlPSGRPCMsgBytes),
 			grpc.MaxCallSendMsgSize(maxControlPSGRPCMsgBytes),

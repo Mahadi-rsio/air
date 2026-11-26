@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Mahadi-rsio/air/internal/meshtransport"
 	"github.com/Mahadi-rsio/air/internal/pb"
 	"github.com/Mahadi-rsio/air/internal/readadapter"
 	"google.golang.org/grpc"
@@ -27,6 +29,7 @@ import (
 )
 
 type Config struct {
+	WireTLS                 *tls.Config
 	GRPCAddr                string
 	ListenHost              string
 	PGPort                  int
@@ -104,7 +107,7 @@ func loadConfig(args []string) Config {
 	fs.StringVar(&cfg.PageserverInternalToken, "internal-token", envOr("AIR_INTERNAL_TOKEN", ""), "Shared internal token for Pageserver gRPC auth")
 	fs.StringVar(&cfg.CacheDir, "cache-dir", envOr("AIR_READ_ENGINE_CACHE_DIR", ""), "Optional local NVMe L2 page cache directory")
 	fs.StringVar(&cfg.MetricsAddr, "metrics-addr", envOr("AIR_READ_ENGINE_METRICS_ADDR", "[::]:9102"), "Optional HTTP /metrics listen address")
-	fs.BoolVar(&cfg.Debug, "debug", envBoolOr("AIR_READ_ENGINE_DEBUG", true), "Enable verbose debug logging")
+	fs.BoolVar(&cfg.Debug, "debug", envBoolOr("AIR_READ_ENGINE_DEBUG", false), "Enable verbose debug logging")
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("parse flags: %v", err)
 	}
@@ -171,6 +174,7 @@ func NewSharedReadEngine(cfg Config) (*SharedReadEngine, error) {
 	}
 	sq, err := readadapter.NewSQLiteReadServer(readadapter.SQLiteServerConfig{
 		ListenHost:              cfg.ListenHost,
+		WireTLS:                 cfg.WireTLS,
 		PGPort:                  cfg.PGPort,
 		DataDir:                 cfg.DataDir,
 		PrimaryConnInfo:         cfg.PrimaryConnInfo,
@@ -373,11 +377,30 @@ func (s *readEngineGRPCServer) SyncTenant(ctx context.Context, req *pb.SyncTenan
 	}, nil
 }
 
+func gatewayListenerTLS(meshTLS *tls.Config) *tls.Config {
+	cfg := meshTLS.Clone()
+	cfg.VerifyConnection = func(state tls.ConnectionState) error {
+		return state.PeerCertificates[0].VerifyHostname("air-gateway")
+	}
+	return cfg
+}
+
 func main() {
 	cfg := loadConfig(os.Args[1:])
 	if cfg.PageserverInternalToken == "" && (!isLoopbackListenAddr(cfg.GRPCAddr) || !isLoopbackListenAddr(cfg.MetricsAddr)) {
 		log.Fatalf("[air-read-engine] AIR_INTERNAL_TOKEN must be set when listening on non-loopback addresses (grpc=%q metrics=%q)", cfg.GRPCAddr, cfg.MetricsAddr)
 	}
+	meshTLS, meshErr := meshtransport.LoadTLS()
+	if meshErr == nil {
+		meshErr = meshtransport.RequireForAddress(cfg.GRPCAddr, meshTLS)
+	}
+	if meshErr != nil {
+		log.Fatal(meshErr)
+	}
+	if meshTLS == nil {
+		log.Fatal("[air-read-engine] mesh TLS certificates are required for the SQL listener")
+	}
+	cfg.WireTLS = gatewayListenerTLS(meshTLS)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -404,7 +427,7 @@ func main() {
 			log.Fatalf("grpc listen %s: %v", cfg.GRPCAddr, gErr)
 		}
 		reSvc := &readEngineGRPCServer{re: re, internalToken: cfg.PageserverInternalToken}
-		grpcSrv = grpc.NewServer(grpc.UnaryInterceptor(reSvc.authUnaryInterceptor))
+		grpcSrv = grpc.NewServer(append(meshtransport.ServerOptions(meshTLS), grpc.UnaryInterceptor(reSvc.authUnaryInterceptor))...)
 		pb.RegisterReadEngineServiceServer(grpcSrv, reSvc)
 		go func() {
 			log.Printf("[air-read-engine] gRPC listening on %s", cfg.GRPCAddr)

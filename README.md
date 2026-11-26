@@ -89,6 +89,10 @@ go test -v -race -count=1 ./...
 
 ### Running `air-server`, `air-read-engine`, and `air-gateway` Locally (Zero-Sync Native Mode)
 
+For Compose, follow the certificate and secret setup before starting the services. [Setup guide](setup.md#option-1-run-with-docker-compose-local-build)
+
+For the commands below, start each process in a separate shell. Set `AIR_MESH_TLS_CA`, `AIR_MESH_TLS_CERT`, and `AIR_MESH_TLS_KEY` in each shell using separate service certificates signed by the same CA. Include `127.0.0.1` as an IP SAN for local listeners and `air-gateway` as a DNS SAN on the gateway mesh certificate. Use the same generated `AIR_INTERNAL_TOKEN` in all three shells. For SQL clients, set `AIR_TLS_CERT` and `AIR_TLS_KEY` on the gateway to a certificate and key for `127.0.0.1`.
+
 ```bash
 # 1. Start air-server (Air DB gRPC :9090 + Cell + Pageserver)
 go run ./cmd/air-server \
@@ -96,8 +100,7 @@ go run ./cmd/air-server \
   -grpc-addr 127.0.0.1:9090 \
   -meta-port 15432 \
   -bootstrap-account-id acct_demo \
-  -bootstrap-api-key air_live_demo_secret_token_12345 \
-  -internal-token air_internal_secret \
+  -internal-token "${AIR_INTERNAL_TOKEN}" \
   -pageserver \
   -pageserver-socket /tmp/air-live/pageserver.sock
 
@@ -115,7 +118,8 @@ go run ./cmd/air-gateway \
   --gateway-admin-addr 127.0.0.1:8081 \
   --db-grpc-addr 127.0.0.1:9090 \
   --read-engine-grpc-addr 127.0.0.1:9092 \
-  --internal-token air_internal_secret \
+  --internal-token "${AIR_INTERNAL_TOKEN}" \
+  --require-tls \
   --pool-mode
 ```
 
@@ -143,7 +147,7 @@ Published automatically on `v*` tags and manual workflow dispatches by [.github/
 - `POST /v1/databases` — Provision an isolated tenant database (`Idempotency-Key` optional on gateway, body `{"tenant_id": "demo_db"}`)
 - `GET /v1/databases` — List databases
 - `GET /v1/databases/{id}` — Inspect database metadata
-- `DELETE /v1/databases/{id}` — Drain pool, stop PG17, purge storage, shred DEK, and mark `PURGED`
+- `DELETE /v1/databases/{id}` — Drain pool, stop PG17, purge storage, shred the tenant DEK, and mark `PURGED` after cleanup succeeds
 - `POST /v1/databases/{id}/suspend` / `start` / `wake` / `lock` / `unlock` — Lifecycle state transitions
 - `GET /v1/databases/{id}/offload` — Check latest R2 cold-offload status
 - `POST /v1/databases/{id}/backups` — Trigger an encrypted full, incremental, or WAL-only backup + WAL drain
@@ -162,11 +166,11 @@ Example with `curl` and `psql`:
 ```bash
 curl -s -X POST http://127.0.0.1:8081/v1/databases \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer air_internal_secret" \
+  -H "Authorization: Bearer ${AIR_INTERNAL_TOKEN}" \
   -H "Idempotency-Key: create-demo-1" \
   -d '{"tenant_id":"demo_db"}'
 
-PGPASSWORD='<PASSWORD>' psql "postgres://app_user@127.0.0.1:5432/demo_db?sslmode=require" \
+PGSSLROOTCERT=/path/to/gateway-ca.crt PGPASSWORD='<PASSWORD>' psql "postgres://demo_db@127.0.0.1:5432/demo_db?sslmode=verify-full" \
   -c "SELECT current_database(), current_user;"
 ```
 

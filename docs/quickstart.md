@@ -11,7 +11,7 @@ Think of AIR as a self-hosted, cloud-native database platform (similar to Neon o
 - **`air-server` (gRPC `:9090`)**: Primary PostgreSQL 17 compute manager, KMS, and backup coordinator (internal gRPC only).
 - **`air-read-engine` (Port `5433` / gRPC `:9092`)**: A fast SQLite-backed read engine that handles `SELECT` queries without waking full PostgreSQL compute (internal gRPC + PG wire only).
 - **`air-pageserver` (gRPC `:9091`)**: Storage layer managing relation pages and Cloudflare R2 / S3 cold storage (internal gRPC only).
-- **`air-meta-postgres` (Port `5435`)**: External PostgreSQL database storing platform configuration and tenant catalogs.
+- **`air-meta-postgres` (internal port `5432`)**: External PostgreSQL database storing platform configuration and tenant catalogs.
 
 ---
 
@@ -19,10 +19,10 @@ Think of AIR as a self-hosted, cloud-native database platform (similar to Neon o
 
 ### Prerequisites
 - [Docker Engine & Docker Compose v2](https://docs.docker.com/get-docker/) installed.
-- PostgreSQL client (`psql`) or `curl`.
+- PostgreSQL client (`psql`).
 
 ### Step 1: Start the AIR Stack
-From your terminal in the repository root:
+Set up the required secrets and certificates before starting Compose. The SQL gateway is the only published port, so the management examples run inside the gateway container. Export `AIR_INTERNAL_TOKEN` in the shell running the commands. [Compose setup](../setup.md#option-1-run-with-docker-compose-local-build)
 
 ```bash
 # Start all 5 services in detached mode and wait for healthy status
@@ -34,11 +34,11 @@ Verify that `air-gateway` and all backend gRPC services are online:
 
 ```bash
 # Gateway liveness
-curl -fsS http://127.0.0.1:8081/healthz
+docker compose exec -T air-gateway curl -fsS http://127.0.0.1:8081/healthz
 # Expected: {"status":"ok"}
 
 # Aggregated 4-service cluster health (air-gateway, air-server, air-read-engine, air-pageserver)
-curl -fsS -H "X-Air-Internal-Token: air-dev-internal-token" http://127.0.0.1:8081/v1/cluster/health
+docker compose exec -T air-gateway curl -fsS -H "X-Air-Internal-Token: ${AIR_INTERNAL_TOKEN}" http://127.0.0.1:8081/v1/cluster/health
 ```
 
 If all services report `"status":"ok"`, your AIR platform is ready!
@@ -52,8 +52,8 @@ In AIR, databases are multi-tenant isolated environments (also called **tenants*
 To create a new database named `my_first_db` (via `air-gateway`, which orchestrates `air-server`, `air-read-engine`, and `air-pageserver` over gRPC):
 
 ```bash
-curl -s -X POST http://127.0.0.1:8081/v1/databases \
-  -H "X-Air-Internal-Token: air-dev-internal-token" \
+docker compose exec -T air-gateway curl -s -X POST http://127.0.0.1:8081/v1/databases \
+  -H "X-Air-Internal-Token: ${AIR_INTERNAL_TOKEN}" \
   -H "Idempotency-Key: first-run-001" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id": "my_first_db", "account_id": "acct_default"}'
@@ -87,15 +87,18 @@ The command returns a JSON response containing connection credentials:
 Always connect through the **AIR Gateway on port `5432`**. The gateway automatically routes writes to the PostgreSQL primary and reads to the read-engine.
 
 ### Connection String Format
+
+Trust the gateway certificate through the client trust store or `PGSSLROOTCERT`. The examples use `127.0.0.1`, which requires that address as an IP SAN on the gateway public certificate.
+
 ```text
-postgresql://<TENANT_ID>:<PASSWORD>@127.0.0.1:5432?sslmode=disable
+postgresql://<TENANT_ID>:<PASSWORD>@127.0.0.1:5432?sslmode=verify-full
 ```
 
 ### Using `psql` Command Line
 Replace `<PASSWORD>` with the password received during database creation:
 
 ```bash
-PGPASSWORD='<PASSWORD>' psql "postgresql://my_first_db@127.0.0.1:5432?sslmode=disable"
+PGPASSWORD='<PASSWORD>' psql "postgresql://my_first_db@127.0.0.1:5432?sslmode=verify-full"
 ```
 
 ### Running CRUD Operations
@@ -171,7 +174,7 @@ main().catch(console.error);
 import psycopg
 
 conn = psycopg.connect(
-    "postgresql://my_first_db:YOUR_PASSWORD@127.0.0.1:5432?sslmode=disable"
+    "postgresql://my_first_db:YOUR_PASSWORD@127.0.0.1:5432?sslmode=verify-full"
 )
 
 with conn.cursor() as cur:
@@ -199,7 +202,7 @@ import (
 
 func main() {
 	ctx := context.Background()
-	dsn := "postgres://my_first_db:YOUR_PASSWORD@127.0.0.1:5432?sslmode=disable"
+	dsn := "postgres://my_first_db:YOUR_PASSWORD@127.0.0.1:5432?sslmode=verify-full"
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		log.Fatalf("unable to connect: %v", err)
@@ -223,42 +226,42 @@ AIR lets you inspect, suspend, wake, backup, and delete databases via HTTP REST 
 
 ### 1. Inspect Database Status
 ```bash
-curl -s http://127.0.0.1:8081/v1/databases/my_first_db \
-  -H "X-Air-Internal-Token: air-dev-internal-token"
+docker compose exec -T air-gateway curl -s http://127.0.0.1:8081/v1/databases/my_first_db \
+  -H "X-Air-Internal-Token: ${AIR_INTERNAL_TOKEN}"
 ```
 
 ### 2. Trigger an Immediate Backup
 ```bash
-curl -s -X POST http://127.0.0.1:8081/v1/databases/my_first_db/backups \
-  -H "X-Air-Internal-Token: air-dev-internal-token" \
+docker compose exec -T air-gateway curl -s -X POST http://127.0.0.1:8081/v1/databases/my_first_db/backups \
+  -H "X-Air-Internal-Token: ${AIR_INTERNAL_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"type": "FULL"}'
 ```
 
 ### 3. List Backups
 ```bash
-curl -s http://127.0.0.1:8081/v1/databases/my_first_db/backups \
-  -H "X-Air-Internal-Token: air-dev-internal-token"
+docker compose exec -T air-gateway curl -s http://127.0.0.1:8081/v1/databases/my_first_db/backups \
+  -H "X-Air-Internal-Token: ${AIR_INTERNAL_TOKEN}"
 ```
 
 ### 4. Suspend an Idle Database (Scale-to-Zero)
 ```bash
-curl -s -X POST http://127.0.0.1:8081/v1/databases/my_first_db/suspend \
-  -H "X-Air-Internal-Token: air-dev-internal-token"
+docker compose exec -T air-gateway curl -s -X POST http://127.0.0.1:8081/v1/databases/my_first_db/suspend \
+  -H "X-Air-Internal-Token: ${AIR_INTERNAL_TOKEN}"
 ```
 
 ### 5. Wake a Suspended Database
 You can wake it explicitly or simply send any query via the gateway on port `5432`:
 ```bash
-curl -s -X POST http://127.0.0.1:8081/v1/databases/my_first_db/start \
-  -H "X-Air-Internal-Token: air-dev-internal-token"
+docker compose exec -T air-gateway curl -s -X POST http://127.0.0.1:8081/v1/databases/my_first_db/start \
+  -H "X-Air-Internal-Token: ${AIR_INTERNAL_TOKEN}"
 ```
 
 ### 6. Delete / Teardown Database
-When you are done with the database:
+Delete the database when you are done with it. If cleanup fails and the tenant remains `DELETING`, resolve the reported error and retry the delete. Retained copies follow your storage retention policy.
 ```bash
-curl -s -X DELETE http://127.0.0.1:8081/v1/databases/my_first_db \
-  -H "X-Air-Internal-Token: air-dev-internal-token"
+docker compose exec -T air-gateway curl -s -X DELETE http://127.0.0.1:8081/v1/databases/my_first_db \
+  -H "X-Air-Internal-Token: ${AIR_INTERNAL_TOKEN}"
 ```
 
 ---
@@ -266,6 +269,6 @@ curl -s -X DELETE http://127.0.0.1:8081/v1/databases/my_first_db \
 ## 7. Next Steps & Advanced Topics
 
 Now that you've got your first database running:
-- Read the [Setup Guide](setup.md) for production deployments with Cloudflare R2 and external HA PostgreSQL.
-- Check the [API Reference](api.md) for full HTTP REST and gRPC endpoint specifications.
-- Explore [Architecture Documentation](docs/architecture/overview.md) to learn how pageserver disaggregation, query routing, and cold offload work under the hood.
+- Read the [Setup Guide](../setup.md) for production deployments with Cloudflare R2 and external HA PostgreSQL.
+- Check the [API Reference](../api.md) for full HTTP REST and gRPC endpoint specifications.
+- Explore [Architecture Documentation](architecture/overview.md) to learn how pageserver disaggregation, query routing, and cold offload work under the hood.

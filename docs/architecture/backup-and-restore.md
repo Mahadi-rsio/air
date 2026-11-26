@@ -41,6 +41,7 @@ sequenceDiagram
    - `parsePGBackupManifestLSNs` extracts the exact `Start-LSN` and `End-LSN` from PostgreSQL's `backup_manifest` so the backup's minimum recovery consistency point (`ConsistencyLSN`) is anchored to PostgreSQL's own backup end LSN.
 2. **Post-Backup WAL Switch & Drain**:
    - Immediately after `RunEncryptedBackupStep`, `backupTenantToR2` runs `DrainAndUploadWALSpool(..., true)` to force a WAL segment switch (`pg_switch_wal()`) and upload every WAL segment needed to reach `ConsistencyLSN`.
+   - The drain syncs the updated WAL upload manifest and its parent directory before removing the local segment.
 3. **Immutable Manifest Publication (`PublishCompletedBackupManifest`)**:
    - A `BackupManifest` is only published after:
      - Every base/incremental archive object in the chain is verified in R2 (`Store.VerifyObject`),
@@ -88,8 +89,10 @@ This produces a unified `pitrManifest` whose `WALEndLSN` extends through $T_1$, 
 
 ### 4.3 Restore Modes
 1. **Validation Restore (`new_tenant_id == ""`)**:
-   - Extracts the backup chain into an isolated staging directory (`<data-dir>/backups/<tenant_id>/pitr_restore_<nanos>`), runs `pg_combinebackup` (for incremental chains) and `pg_verifybackup`, decrypts/decompresses/verifies all WAL segments, replays WAL to the target in a temporary PostgreSQL 17 instance, runs `VerifyQuery` and `pg_amcheck`, records `COMPLETED` in `restore_ops`, and deletes the staging directory.
+   - Extracts the backup chain into an isolated staging directory (`<data-dir>/backups/<tenant_id>/pitr_restore_<nanos>`), runs `pg_combinebackup` (for incremental chains) and `pg_verifybackup`, decrypts/decompresses/verifies all WAL segments, replays WAL to the target in a temporary PostgreSQL 17 instance, runs a fixed `SELECT 1;` connectivity check and `pg_amcheck`, records `COMPLETED` in `restore_ops`, and deletes the staging directory.
 2. **Full Restore Into New Isolated Tenant (`new_tenant_id != ""`)**:
    - Performs the complete staging PITR and verification above with `KeepStaging: true` and `RenameDatabaseFrom: sourceTenantID, RenameDatabaseTo: newTenantID`.
    - Generates a fresh KMS DEK (`epoch = 1`) and `app_user` password for `new_tenant_id`.
    - Moves the verified `combined_pgdata` into `<data-dir>/pgdata/<new_tenant_id>`, configures `air_smgr` and PostgreSQL port/socket settings, fences `epoch = 1` in R2, starts the new PostgreSQL 17 instance, and registers `new_tenant_id` in `clusters` as `ACTIVE`.
+
+Run application-specific verification on the restored tenant through the gateway using the restored tenant credentials.

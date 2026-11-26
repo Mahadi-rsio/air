@@ -186,16 +186,16 @@ type grpcServer struct {
 }
 
 // NewGRPCServer constructs a gRPC server exposing PageserverService for air-server and air-read-engine.
-func NewGRPCServer(ps *Pageserver, internalToken string) *grpc.Server {
+func NewGRPCServer(ps *Pageserver, internalToken string, options ...grpc.ServerOption) *grpc.Server {
 	s := &grpcServer{
 		ps:            ps,
 		internalToken: internalToken,
 	}
-	srv := grpc.NewServer(
+	srv := grpc.NewServer(append(options,
 		grpc.MaxRecvMsgSize(maxGRPCMessageBytes),
 		grpc.MaxSendMsgSize(maxGRPCMessageBytes),
 		grpc.UnaryInterceptor(s.authUnaryInterceptor),
-	)
+	)...)
 	pb.RegisterPageserverServiceServer(srv, s)
 	return srv
 }

@@ -111,6 +111,7 @@ func main() {
 	// Test D: Backup + post-backup WAL + Restore
 	bBody, bCode, bErr := httpJSON("POST", "/v1/databases/"+db+"/backups", map[string]string{"type": "FULL"}, true)
 	log.Printf("Test D backup: code=%d err=%v body=%s", bCode, bErr, strings.TrimSpace(string(bBody)))
+	var restored bool
 	if bErr == nil && bCode < 300 {
 		c, err := pgx.Connect(ctx, dsn(port, pass, db))
 		if err != nil {
@@ -123,14 +124,26 @@ func main() {
 		_, _ = c.Exec(ctx, `SELECT pg_switch_wal()`)
 		c.Close(ctx)
 		time.Sleep(2 * time.Second)
-		rBody, rCode, rErr := httpJSON("POST", "/v1/databases/"+db+"/restore", map[string]string{"verify_query": "SELECT count(*) FROM dur_items"}, true)
+		rBody, rCode, rErr := httpJSON("POST", "/v1/databases/"+db+"/restore", map[string]string{}, true)
 		log.Printf("Test D restore: code=%d err=%v body=%s", rCode, rErr, strings.TrimSpace(string(rBody)))
+		restored = rErr == nil && rCode == 200
 	}
 
 	// Refresh route
 	rb, _, _ = httpJSON("GET", "/internal/v1/tenants/"+db+"/route", nil, false)
 	_ = json.Unmarshal(rb, &route)
 	port, pass = route.Port, route.AppPassword
+	if restored {
+		c, err := pgx.Connect(ctx, dsn(port, pass, db))
+		if err != nil {
+			log.Printf("Test D restored connection failed: %v", err)
+		} else {
+			var replayed bool
+			err := c.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM dur_items WHERE id = 999002)`).Scan(&replayed)
+			c.Close(ctx)
+			log.Printf("Test D restored WAL row present=%t err=%v", replayed, err)
+		}
+	}
 
 	// Test E: 20 cycles
 	failures := 0

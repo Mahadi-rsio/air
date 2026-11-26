@@ -463,8 +463,11 @@ func (cp *ControlPlane) RestoreDatabase(ctx context.Context, accountID, tenantID
 // RestoreDatabaseWithOptions performs a verified PITR restore from R2.
 // When opts.NewTenantID is empty, it runs an isolated staging validation restore and cleans up the staging directory.
 // When opts.NewTenantID is provided, it restores into a newly provisioned, generation-isolated tenant and activates it
-// only after PostgreSQL promotion, verify_query execution, and pg_amcheck succeed.
+// only after PostgreSQL promotion, the built-in connectivity check, and pg_amcheck succeed.
 func (cp *ControlPlane) RestoreDatabaseWithOptions(ctx context.Context, accountID, tenantID string, opts RestoreOptions) (*RestoreResponse, error) {
+	if err := backup.ValidateRestoreVerificationQuery(opts.VerifyQuery); err != nil {
+		return nil, err
+	}
 	if accountID != "" {
 		if err := tenant.ValidateAccountID(accountID); err != nil {
 			return nil, err
@@ -601,14 +604,8 @@ func (cp *ControlPlane) RestoreDatabaseWithOptions(ctx context.Context, accountI
 		return nil, vErr
 	}
 
-	verifyQuery := strings.TrimSpace(opts.VerifyQuery)
-	if verifyQuery == "" {
-		verifyQuery = "SELECT 1;"
-	}
-
 	stageRes, err := backup.StagePITRRestore(ctx, cp.agent, s3c, bucket, pitrManifest, chain, walSegs, target, backup.StagePITROptions{
 		DBName:             tenantID,
-		VerifyQuery:        verifyQuery,
 		KeepStaging:        newTenantID != "",
 		RenameDatabaseFrom: tenantID,
 		RenameDatabaseTo:   newTenantID,

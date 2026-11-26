@@ -803,11 +803,17 @@ func (a *Agent) StopAndPurgeTenant(tenantID string) error {
 		a.kms.ShredDEK(tenantID)
 	}
 	for _, prefix := range []string{"lfc", "spool/wal", "backups", "ps_layers"} {
-		if dir, pErr := tenant.SafeSubpath(a.volDir, prefix, tenantID); pErr == nil {
-			_ = os.RemoveAll(dir)
+		dir, err := tenant.SafeSubpath(a.volDir, prefix, tenantID)
+		if err != nil {
+			return err
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			return err
 		}
 	}
-	_ = os.RemoveAll(claimDir)
+	if err := os.RemoveAll(claimDir); err != nil {
+		return err
+	}
 	return os.RemoveAll(activeBase)
 }
 

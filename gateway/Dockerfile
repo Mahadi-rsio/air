@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM debian:bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
+    ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home --uid 10001 airgw
 
@@ -24,7 +24,7 @@ COPY --from=builder /out-air-gateway /usr/local/bin/air-gateway
 
 USER airgw
 ENV AIR_GATEWAY_ADDR=0.0.0.0:5432 \
-    AIR_GATEWAY_ADMIN_ADDR=0.0.0.0:8081 \
+    AIR_GATEWAY_ADMIN_ADDR=127.0.0.1:8081 \
     AIR_POOL_MODE=true
 
 EXPOSE 5432 8081
