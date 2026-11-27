@@ -645,7 +645,14 @@ export class GatewayAutoscalerDO {
 
     // 3. Stop Machine and verify stopped before deletion.
     await this.flyRequest(`/machines/${encodeURIComponent(burstMachine.id)}/stop`, { method: "POST" });
-    const inspected = await this.flyRequest(`/machines/${encodeURIComponent(burstMachine.id)}`);
+    let inspected = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      inspected = await this.flyRequest(`/machines/${encodeURIComponent(burstMachine.id)}`);
+      if (inspected?.state === "stopped") break;
+      if (attempt + 1 < 10 && c.readinessRetryMs > 0) {
+        await new Promise((r) => setTimeout(r, Math.min(c.readinessRetryMs, 1000)));
+      }
+    }
     if (inspected?.state !== "stopped") {
       this.updateOperation(opId, { state: "deferred", last_error: `machine state ${inspected?.state} != stopped` }, now);
       return { action: "scale_in_deferred_not_stopped", op_id: opId, machine_id: burstMachine.id };
