@@ -157,6 +157,8 @@ export class GatewayAutoscalerDO {
       burstMemoryMb: Number.parseInt(env.BURST_MEMORY_MB || "1024", 10),
       burstVolumeSizeGb: Number.parseInt(env.BURST_VOLUME_SIZE_GB || "1", 10),
       drainTimeoutMs: Number.parseInt(env.DRAIN_TIMEOUT_MS || "30000", 10),
+      readinessMaxAttempts: Number.parseInt(env.READINESS_MAX_ATTEMPTS || "8", 10),
+      readinessRetryMs: Number.parseInt(env.READINESS_RETRY_MS || "1500", 10),
       baselineMachineId: env.BASELINE_MACHINE_ID || "",
       flyToken: env.FLY_API_TOKEN || "",
       internalToken: env.AIR_INTERNAL_TOKEN || "",
@@ -521,13 +523,21 @@ export class GatewayAutoscalerDO {
   }
 
   async verifyAndAdmitBurst(opId, machine, vol, now) {
-    // Verify readiness and real TLS PG probe before admitting traffic.
-    const ready = await this.probeMachinePrivate(machine, "/readyz").catch(() => ({ ok: false }));
-    // Note: machine starts cordoned, so check individual subsystems rather than overall ready=false from cordon.
-    const checks = ready?.data?.checks;
-    const subsystemsOK = Boolean(
-      checks && checks.tls?.ok && checks.discovery?.ok && checks.backends?.ok && checks.metering?.ok
-    );
+    const c = this.cfg();
+    // Poll readiness until the Gateway process finishes booting and passes subsystem checks.
+    let subsystemsOK = false;
+    for (let attempt = 0; attempt < c.readinessMaxAttempts; attempt++) {
+      const ready = await this.probeMachinePrivate(machine, "/readyz").catch(() => ({ ok: false }));
+      // Note: machine starts cordoned, so check individual subsystems rather than overall ready=false from cordon.
+      const checks = ready?.data?.checks;
+      subsystemsOK = Boolean(
+        checks && checks.tls?.ok && checks.discovery?.ok && checks.backends?.ok && checks.metering?.ok
+      );
+      if (subsystemsOK) break;
+      if (attempt + 1 < c.readinessMaxAttempts && c.readinessRetryMs > 0) {
+        await new Promise((r) => setTimeout(r, c.readinessRetryMs));
+      }
+    }
     const tlsPGOK = subsystemsOK ? await this.verifyTLSPostgresProbe(machine).catch(() => false) : false;
 
     if (!subsystemsOK || !tlsPGOK) {
