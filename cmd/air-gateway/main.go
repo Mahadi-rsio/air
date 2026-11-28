@@ -283,7 +283,7 @@ func main() {
 		clientsWG.Add(1)
 		go func(c net.Conn) {
 			defer clientsWG.Done()
-			gateway.HandleClientConnectionWithCancelRouter(c, cfg, &tlsCtx, discovery, pools, metrics, cancelReg, cancelRouter)
+			gateway.HandleClientConnectionWithLifecycle(c, cfg, &tlsCtx, discovery, pools, metrics, cancelReg, cancelRouter, lifecycle)
 		}(conn)
 	}
 

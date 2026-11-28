@@ -1,0 +1,48 @@
+app = "air-pg-autoscaler"
+primary_region = "sin"
+
+[build]
+  dockerfile = "../../Dockerfile.autoscaler"
+
+[env]
+  FLY_APP_NAME = "air-pg-gateway"
+  FLY_API_BASE = "https://api.machines.dev/v1"
+  FLY_REGION = "sin"
+  AUTOSCALER_MODE = "decision_only"
+  AUTO_ADD_ENABLED = "true"
+  AUTO_REMOVE_ENABLED = "false"
+  MAX_GATEWAY_REPLICAS = "2"
+  SUSTAINED_HIGH_TICKS = "3"
+  SUSTAINED_LOW_TICKS = "5"
+  SCALE_OUT_COOLDOWN_SEC = "300"
+  SCALE_IN_COOLDOWN_SEC = "600"
+  HIGH_CONN_UTIL_PCT = "75"
+  LOW_CONN_UTIL_PCT = "25"
+  MIN_SPARE_CONNS = "64"
+  BURST_CPU_KIND = "shared"
+  BURST_CPUS = "4"
+  BURST_MEMORY_MB = "1024"
+  BURST_VOLUME_SIZE_GB = "1"
+  DRAIN_TIMEOUT_MS = "30000"
+  GATEWAY_PRIVATE_HTTP_PORT = "8082"
+  GATEWAY_PG_PORT = "5432"
+  AIR_GATEWAY_TLS_SERVER_NAME = "air-pg-gateway.fly.dev"
+  AUTOSCALER_STATE_DIR = "/var/lib/air-autoscaler"
+  AUTOSCALER_HTTP_ADDR = "[::]:8080"
+  AUTOSCALER_TICK_INTERVAL_SEC = "60"
+  GOMEMLIMIT = "128MiB"
+
+# Required secrets (set via `fly secrets set --app air-pg-autoscaler --stage`):
+#   FLY_API_TOKEN       - app-scoped Fly Machines/Volumes API token for air-pg-gateway
+#   AIR_INTERNAL_TOKEN  - shared internal token matching air-pg-gateway
+#   BASELINE_MACHINE_ID - explicit Fly Machine ID of the protected baseline gateway
+
+[mounts]
+  source = "air_autoscaler_data"
+  destination = "/var/lib/air-autoscaler"
+  initial_size = "1gb"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "256mb"

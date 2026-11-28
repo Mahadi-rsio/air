@@ -79,6 +79,21 @@ func HandleClientConnectionWithCancelRouter(
 	cancelReg *CancelRegistry,
 	cancelRouter *CancelRouter,
 ) {
+	HandleClientConnectionWithLifecycle(conn, cfg, tlsCtx, discovery, pools, metrics, cancelReg, cancelRouter, nil)
+}
+
+// HandleClientConnectionWithLifecycle handles a client connection with optional cross-Gateway CancelRequest routing and lifecycle cordon checks.
+func HandleClientConnectionWithLifecycle(
+	conn net.Conn,
+	cfg Config,
+	tlsCtx *TLSContext,
+	discovery *TenantDiscovery,
+	pools *PoolManager,
+	metrics *MetricsRegistry,
+	cancelReg *CancelRegistry,
+	cancelRouter *CancelRouter,
+	lifecycle *GatewayLifecycle,
+) {
 	defer metrics.ReleaseGlobal()
 	defer conn.Close()
 
@@ -127,6 +142,11 @@ func HandleClientConnectionWithCancelRouter(
 
 	if msgLen == 16 && code == CancelRequestCode {
 		forwardCancelRequest(conn, cancelReg, cancelRouter)
+		return
+	}
+
+	if lifecycle != nil && lifecycle.IsCordoned() {
+		_, _ = conn.Write(BuildErrorResponse("FATAL", "57P03", "gateway is cordoned and not accepting new connections"))
 		return
 	}
 

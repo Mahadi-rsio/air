@@ -1,10 +1,15 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -63,7 +68,9 @@ func (s *stubMeteringSaver) SaveMeteringBatchWithReceipt(ctx context.Context, ba
 }
 
 func newReadyTestDiscovery() *TenantDiscovery {
-	d := &TenantDiscovery{}
+	d := &TenantDiscovery{
+		cache: make(map[string]TenantRoute),
+	}
 	d.MarkSynced()
 	return d
 }
@@ -413,6 +420,166 @@ func TestGatewayLifecycle_DrainInstanceAck(t *testing.T) {
 	res = lifecycle.DrainInstance(context.Background(), "op-clean", time.Second)
 	if !res.Drained || !res.MeteringConfirmed || res.OpID != "op-clean" {
 		t.Fatalf("expected confirmed drain for op-clean, got %+v", res)
+	}
+}
+
+func TestGatewayLifecycle_CordonRejectsNewSessionsPreservesExistingAndCancel(t *testing.T) {
+	// Start mock backend PG server (non-pooled direct proxy mode for deterministic startup + cancel check).
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backendLn.Close()
+	backendPort := backendLn.Addr().(*net.TCPAddr).Port
+
+	var cancelReceived atomic.Bool
+	go func() {
+		for {
+			c, err := backendLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				var hdr [8]byte
+				if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+					return
+				}
+				msgLen := binary.BigEndian.Uint32(hdr[0:4])
+				code := binary.BigEndian.Uint32(hdr[4:8])
+				if msgLen == 16 && code == CancelRequestCode {
+					var rest [8]byte
+					_, _ = io.ReadFull(conn, rest[:])
+					cancelReceived.Store(true)
+					return
+				}
+				if msgLen > 8 {
+					buf := make([]byte, msgLen-8)
+					_, _ = io.ReadFull(conn, buf)
+				}
+				_, _ = conn.Write(BuildAuthOK())
+				_, _ = conn.Write(BuildBackendKeyData(1111, 2222))
+				_, _ = conn.Write(BuildReadyForQuery('I'))
+				// Echo any query bytes back so existing session liveness can be verified.
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	cfg := DefaultConfig()
+	cfg.PoolMode = false
+	cfg.RequireTLS = false
+	cfg.AuthTimeoutMS = 2000
+
+	disc, err := NewTenantDiscovery(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disc.MarkSynced()
+	disc.UpsertRoute(TenantRoute{
+		TenantID:    "t_cordon",
+		State:       "ACTIVE",
+		Host:        "127.0.0.1",
+		Port:        backendPort,
+		AppPassword: "secret",
+	})
+	pools := NewPoolManager(4, 60)
+	defer pools.CloseAll()
+	metrics := NewMetricsRegistry(100, 10, 10)
+	cancelReg := NewCancelRegistry()
+	cancelReg.Register(9001, 8008, CancelTarget{
+		Host:          "127.0.0.1",
+		Port:          backendPort,
+		BackendPID:    1111,
+		BackendSecret: 2222,
+	})
+	lifecycle := NewGatewayLifecycle("gw-cordon", false, nil, disc, pools, metrics, nil, nil, nil)
+
+	gwLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gwLn.Close()
+
+	go func() {
+		for {
+			c, err := gwLn.Accept()
+			if err != nil {
+				return
+			}
+			if !metrics.TryAcquireGlobal() {
+				_ = c.Close()
+				continue
+			}
+			go HandleClientConnectionWithLifecycle(c, cfg, nil, disc, pools, metrics, cancelReg, nil, lifecycle)
+		}
+	}()
+
+	// 1. Open an existing session BEFORE cordoning.
+	existingConn, err := net.DialTimeout("tcp", gwLn.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer existingConn.Close()
+	if _, err := existingConn.Write(BuildStartupMessage(map[string]string{"user": "t_cordon", "database": "t_cordon"})); err != nil {
+		t.Fatal(err)
+	}
+	_ = existingConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	startupResp := make([]byte, 256)
+	n, err := existingConn.Read(startupResp)
+	if err != nil || !bytes.Contains(startupResp[:n], []byte{'Z'}) {
+		t.Fatalf("expected ReadyForQuery for existing session, got n=%d err=%v", n, err)
+	}
+
+	// 2. Cordon the gateway.
+	lifecycle.Cordon()
+	if !lifecycle.IsCordoned() {
+		t.Fatal("expected gateway to be cordoned")
+	}
+
+	// 3. New PostgreSQL session must be rejected with 57P03.
+	newConn, err := net.DialTimeout("tcp", gwLn.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newConn.Close()
+	if _, err := newConn.Write(BuildStartupMessage(map[string]string{"user": "t_cordon", "database": "t_cordon"})); err != nil {
+		t.Fatal(err)
+	}
+	_ = newConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	errBuf := make([]byte, 256)
+	en, err := newConn.Read(errBuf)
+	if err != nil {
+		t.Fatalf("expected ErrorResponse from cordoned gateway, got err=%v", err)
+	}
+	if errBuf[0] != 'E' || !strings.Contains(string(errBuf[:en]), "57P03") {
+		t.Fatalf("expected FATAL 57P03 ErrorResponse, got %q", string(errBuf[:en]))
+	}
+
+	// 4. Existing session must continue to work while cordoned.
+	_ = existingConn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := existingConn.Write([]byte("PING")); err != nil {
+		t.Fatalf("existing session write failed while cordoned: %v", err)
+	}
+	echo := make([]byte, 4)
+	if _, err := io.ReadFull(existingConn, echo); err != nil || string(echo) != "PING" {
+		t.Fatalf("expected existing session echo while cordoned, got %q err=%v", string(echo), err)
+	}
+
+	// 5. CancelRequest must continue to work while cordoned.
+	cancelConn, err := net.DialTimeout("tcp", gwLn.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = cancelConn.Write(BuildCancelRequest(9001, 8008))
+	_ = cancelConn.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !cancelReceived.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !cancelReceived.Load() {
+		t.Fatal("expected CancelRequest to be forwarded while gateway is cordoned")
 	}
 }
 
